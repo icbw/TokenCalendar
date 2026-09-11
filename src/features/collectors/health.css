@@ -1,0 +1,46 @@
+/* Collector health footer（融入内容卡片底部） */
+.health-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--border);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  background: var(--panel);
+  flex-shrink: 0;
+}
+
+.health-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+}
+
+.health-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.health-note {
+  color: var(--text-faint);
+}
+
+.health-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.health-dot.is-healthy {
+  background: #22c55e;
+}
+.health-dot.is-attention {
+  background: var(--warn);
+}
+.health-dot.is-error {
+  background: var(--danger);
+}

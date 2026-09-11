@@ -1,0 +1,25 @@
+# 依赖与构建
+node_modules/
+dist/
+build/
+release/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.log
+
+# 本地数据
+data/
+*.db
+*.db-journal
+
+# 编辑器与系统
+.DS_Store
+
+# Agent 工作产物（可再生 / 临时证据）
+.agent/
+.agents/
+.codebuddy/
+tmp-evidence/
+
+# ZCode 会话产物
+.zcode/

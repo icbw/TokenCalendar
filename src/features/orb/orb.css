@@ -1,0 +1,389 @@
+/* 悬浮球窗口两态样式。颜色变量按窗口拆分（GUIDE 红线：
+   orb 用 --orb-*，不复用 --shell-bg / --widget-card-*）。
+   配色基线：蓝白透明基底;数据渲染紫蓝渐变（
+   洞察图表同族血缘）。主题派生变量由 widgetTheme hook 写入 --orb-*。
+   透明前提：宿主 .orb-shell 全透明全出血。 */
+
+.orb-shell {
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+/* ---------- 收起态：竖向外轮廓贴片条 ---------- */
+
+.orb-pill {
+  position: relative;
+  /* 竖条无容器底框——视觉只有竖条本体（外轮廓+内条）,
+     背景全透明（此前加的实底随尺寸错位根一并撤除;拖动面由 shell+
+     子元素 drag-region 兜住,不依赖可见框）。窗口已收到与竖条等大
+     （32×96 = 24×84 轨道 + 4px 呼吸位）,轨道在窗口内居中。 */
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--orb-card-text, #2b3a55);
+}
+
+/* 两态切换动效（S5,对齐 snap-land 族：~150ms 一次性微动效）：
+   class 从 .is-hidden 摘除时选择器重新匹配 → 动画重放（纯 CSS,无 JS 状态）。
+   orb 无吸附落定语义,触发点只有形态切换本身。 */
+.orb-pill:not(.is-hidden),
+.orb-card:not(.is-hidden) {
+  animation: orb-pop 150ms ease-out;
+}
+
+@keyframes orb-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.orb-pill.is-hidden {
+  visibility: hidden;
+  /* 移出交互面（两态互斥显示,浮层铁律:DOM 常驻不卸载） */
+  pointer-events: none;
+  position: absolute;
+  left: -9999px;
+}
+
+.orb-pill-track {
+  position: relative;
+  width: 24px;
+  height: 84px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 外轮廓 SVG（周额度褪色描边）+ 内条（5h）同轨叠放 */
+.orb-pill-outline {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 外轮廓基线（余量段,深一档确保任何状态下可辨——数据空时这是竖条主视觉） */
+.orb-outline-base {
+  stroke: var(--orb-ring-track-strong, rgba(90, 110, 200, 0.35));
+}
+
+/* 褪色渐变两端（SVG stop 不能直接吃 CSS var 的浏览器兼容差异,用类指定颜色;
+   现代WebView2 支持 CSS 变量在 SVG presentation attribute 上,走 stop-color 类） */
+.orb-outline-stop-hi { stop-color: var(--orb-accent, #6366f1); stop-opacity: 0.95; }
+.orb-outline-stop-lo { stop-color: var(--orb-accent, #6366f1); stop-opacity: 0.15; }
+
+/* 周额度褪色描边：dashoffset 过渡（收起态数据淡入——与内条/展开双环同族,
+   数据更新时余量沿轮廓滑入而非跳变） */
+.orb-outline-fade {
+  transition: stroke-dashoffset var(--dur-slow, 300ms) ease;
+}
+
+/* 内条：5h 额度自下而上填充 */
+.orb-pill-inner {
+  width: 10px;
+  height: 66px;
+  border-radius: 5px;
+  background: var(--orb-ring-track, rgba(90, 110, 200, 0.15));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.orb-pill-inner-fill {
+  width: 100%;
+  border-radius: 5px;
+  background: linear-gradient(180deg, var(--orb-accent-2, #8b5cf6), var(--orb-accent, #6366f1));
+  transition: height var(--dur-slow, 300ms) ease;
+}
+
+/* 平台切换钮已撤——收起态回归
+   「视觉只留竖条本体」;多平台切换收敛到展开卡片头部 chip。 */
+
+/* 竖条状态点已随移除（视觉只留竖条本体;状态表达收敛到
+   展开卡片的右上角状态点+提示行） */
+
+/* ---------- 展开态：卡片 ---------- */
+
+.orb-card {
+  /* S4 防线：宽度锁 240 居中,不随窗口意外尺寸拉伸变形（同竖条防线）。
+     高度 320→232,
+     内边距/间距全面收紧（gap 8→6,padding 12→10）,环缩一档（80/58）。 */
+  width: 240px;
+  flex: none;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px 9px;
+  border-radius: var(--widget-card-radius, 16px);
+  background: var(--orb-card-bg, rgba(245, 248, 255, 0.92));
+  color: var(--orb-card-text, #2b3a55);
+  border: 1px solid var(--orb-card-border, rgba(90, 110, 200, 0.25));
+  box-sizing: border-box;
+  min-height: 0;
+}
+
+.orb-card.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+  position: absolute;
+  left: -9999px;
+}
+
+.orb-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+}
+
+.orb-card-logo {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+}
+
+.orb-card-plan {
+  font-size: 12px;
+  font-weight: 700;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
+/* 平台切换 chip（落点;仅多平台绑定时渲染——带平台名+序号,语义自解释;
+   紧凑胶囊,点击循环切换 orb 显示的平台） */
+.orb-card-cycle {
+  border: none;
+  background: var(--orb-accent-weak, rgba(99, 102, 241, 0.1));
+  color: var(--orb-accent, #6366f1);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  text-transform: capitalize;
+}
+
+.orb-card-cycle:hover { filter: brightness(0.96); }
+
+.orb-card-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--orb-ok, #22c55e);
+  flex-shrink: 0;
+}
+
+.orb-card-dot.is-warn { background: var(--orb-warn, #f59e0b); }
+.orb-card-dot.is-error { background: var(--orb-danger, #ef4444); }
+.orb-card-dot.is-muted { background: var(--orb-muted, #94a3b8); }
+
+.orb-card-collapse {
+  border: none;
+  background: transparent;
+  color: var(--orb-card-text, #2b3a55);
+  opacity: 0.6;
+  cursor: pointer;
+  padding: 2px;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.orb-card-collapse:hover { opacity: 1; }
+
+/* 刷新图标按钮（展开态头部;点击后旋转反馈） */
+.orb-card-iconbtn {
+  border: none;
+  background: transparent;
+  color: var(--orb-card-text, #2b3a55);
+  opacity: 0.6;
+  cursor: pointer;
+  padding: 2px;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.orb-card-iconbtn:hover { opacity: 1; }
+
+.orb-card-iconbtn svg.is-spinning {
+  animation: orb-spin 0.8s linear;
+}
+
+@keyframes orb-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 双环：周额度主环 + 5h 副环（底对齐错位叠放） */
+.orb-rings {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-height: 0;
+}
+
+.orb-ring {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.orb-ring svg { width: 100%; height: 100%; }
+
+.orb-ring-track {
+  stroke: var(--orb-ring-track, rgba(90, 110, 200, 0.15));
+}
+
+.orb-ring-fill {
+  stroke: var(--orb-accent, #6366f1);
+  stroke-linecap: round;
+  transition: stroke-dashoffset var(--dur-slow, 300ms) ease;
+}
+
+.orb-ring.is-empty .orb-ring-fill { stroke: var(--orb-muted, #94a3b8); }
+
+.orb-ring-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+
+.orb-ring-num {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.orb-ring-label {
+  font-size: 9px;
+  opacity: 0.6;
+  text-transform: uppercase;
+}
+
+/* 状态提示行（四态互斥文案;颜色随级别） */
+.orb-card-hint {
+  font-size: 10px;
+  line-height: 1.35;
+  opacity: 0.75;
+}
+
+/* 未绑定空态引导（展开卡片;S5 空态项提前） */
+.orb-card-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--orb-accent-weak, rgba(99, 102, 241, 0.08));
+}
+
+.orb-card-empty-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--orb-card-text, #2b3a55);
+}
+
+.orb-card-empty-sub {
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: var(--orb-card-text-muted, #5a6b8c);
+}
+
+.orb-card-hint.is-ok { color: var(--orb-ok, #16a34a); opacity: 0.9; }
+.orb-card-hint.is-warn { color: var(--orb-warn, #b45309); opacity: 1; }
+.orb-card-hint.is-error { color: var(--orb-danger, #dc2626); opacity: 1; }
+.orb-card-hint.is-muted { opacity: 0.55; }
+
+/* 底部信息行（合一行：刷新时刻 · 5h · 7d 同排;分隔点由 <i> 渲染） */
+.orb-card-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  font-size: 9px;
+  opacity: 0.55;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.orb-card-meta i {
+  font-style: normal;
+  opacity: 0.7;
+}
+
+.orb-card-manage {
+  border: none;
+  background: var(--orb-accent-weak, rgba(99, 102, 241, 0.12));
+  color: var(--orb-accent, #6366f1);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 5px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.orb-card-manage:hover { filter: brightness(0.96); }
+
+/* ---------- 右键菜单（DOM 常驻浮层,铁律：禁止条件卸载） ---------- */
+
+.orb-menu {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--orb-card-bg, rgba(245, 248, 255, 0.97));
+  border: 1px solid var(--orb-card-border, rgba(90, 110, 200, 0.25));
+  box-shadow: 0 4px 16px rgba(30, 41, 89, 0.18);
+}
+
+.orb-menu.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+  left: -9999px;
+  top: -9999px;
+}
+
+.orb-menu button {
+  border: none;
+  background: transparent;
+  color: var(--orb-card-text, #2b3a55);
+  font-size: 11px;
+  text-align: left;
+  padding: 5px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.orb-menu button:hover {
+  background: var(--orb-accent-weak, rgba(99, 102, 241, 0.12));
+}
