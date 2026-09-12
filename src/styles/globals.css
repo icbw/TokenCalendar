@@ -1,0 +1,72 @@
+/* 全局样式（自前代项目移植 + 双模式透明约定）。
+ * 透明检查清单：expanded 模式 body 可用不透明 --bg；
+ * .mode-widget 下任何宿主层都不得携带不透明默认背景（!important 保证）。
+ * ：两窗口都 frameless 透明，宿主层一律 transparent，
+ * 不透明度由卡片/面板自己表达（shell-main / settings-panel / year-card）。 */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: var(--font-size-md);
+  color: var(--text);
+  background: transparent;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Transparent frameless windows （widget + main since): kill opaque
+   page backgrounds so only cards/panels are visible. !important per
+   transparency checklist: no host layer may carry an opaque background. */
+html.mode-widget,
+html.mode-widget body,
+html.mode-widget #root,
+html.mode-expanded,
+html.mode-expanded body,
+html.mode-expanded #root {
+  background: transparent !important;
+}
+
+/* 微动效统一（tokens v2）：分段按钮/图标钮过渡走 --dur-fast + ease-out */
+.seg,
+.year-seg,
+.year-action,
+.titlebar-btn,
+.setting-btn,
+.setting-seg-btn {
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}

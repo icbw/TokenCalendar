@@ -1,0 +1,240 @@
+/* Matrix view: toolbar + layout for expanded mode （对齐挂件设计语言：
+   分段控件改挂件同款 pill — 面板底 + 活动段白卡，替代旧描边连体按钮)。
+   热力图是主体——矩阵区 flex:1 全量显示不滚动;overflow 移除,
+   行多时格子按可用高度收缩（格子 min 10px 保底,极端行数才允许容器滚动）。 */
+
+.matrix-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 12px;
+  min-height: 0;
+  /* 图表面板改为覆盖在本区底部的浮层（absolute 锚定）,本区做裁剪边界 */
+  position: relative;
+  overflow: hidden;
+}
+
+/* 矩阵 + 图表面板的共同舞台——UsageMatrixView 在 style 上生成的
+   --cell-px/--cell-gap-px/--cells-w 共享变量挂在这里,面板（stage 的直接
+   子元素）才能继承;此前面板是 .matrix-view 的兄弟节点,变量断链。 */
+.matrix-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* 图表面板浮层化后 .matrix-view 不再需要自己当裁剪边界（stage 接管定位） */
+.matrix-view {
+  position: static;
+  overflow: visible;
+}
+
+.matrix-toolbar {
+  /* 与矩阵行块完全相同的三列模板 + 整块居中——
+     月份标签在标签列（右缘 = 模型名右缘）,筛选组在格子区列排起
+     （Tokens = 第一格左缘）;筛选组放不下时向右溢出（z 序在上,盖住 Total
+     空列外侧的留白）,单行绝不换行。 */
+  display: grid;
+  grid-template-columns: 150px var(--cells-w, 517px) 92px;
+  gap: 6px 24px; /* 列间距 24px = 月份与格子的加间距 */
+  align-items: center;
+  justify-content: center;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.matrix-toolbar .matrix-month {
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.matrix-toolbar .toolbar-groups {
+  grid-column: 2 / 4; /* 筛选组横跨格子区 + Total 列,溢出不换行 */
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.matrix-month {
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  color: var(--text);
+  margin-right: 2px;
+}
+
+.toolbar-group {
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  background: var(--zero-bg);
+  border-radius: 8px;
+}
+
+.seg {
+  font-size: var(--font-size-xs);
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  white-space: nowrap;
+}
+
+.seg:hover {
+  color: var(--text);
+}
+
+.seg.is-active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+.matrix-sort {
+  font-size: var(--font-size-xs);
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.matrix-loading {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}
+
+/* ---- v3.2/v3.4:热力图主体化——矩阵占满工具栏以下全部高度（面板浮层不再
+   参与竖向分蛋糕）;格子 CSS 单源封顶 minmax（10px, 24px),只缩不放;行数超
+   可用高度时在本区内裁剪（overflow hidden）,不溢出不滚动。 ---- */
+.matrix-view .month-matrix {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 行数超上限提示（已撤:超限行静默隐藏,避免占一条垂直空间;
+   上限在设置页 Matrix → Max rows 调整） */
+
+/* ---- 图表面板（定稿）:stage 底部透明浮层——
+   图表放中列（宽度恒 = --cells-w,居中 = 格子区正下方,slot 中心 = 格子中心,
+   横轴完全对齐）;图标列回面板最右缘（图标本为降干扰,贴边
+   不怕远离）;折叠/展开钮在图标列正下方同一坐标（left 公式以 stage
+   为包含块后失效,统一改右缘锚定）。 ---- */
+.matrix-panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  /* 与矩阵行完全相同的三列模板 + 整块居中 → 图表（中列）与格子区同中心 */
+  display: grid;
+  grid-template-columns: 150px var(--cells-w, 517px) 92px;
+  gap: 6px;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  padding: 0 0 2px;
+}
+
+.matrix-panel-body {
+  grid-column: 2; /* 图表 = 中列 = 格子区正下方,两缘对齐 */
+  width: 100%;
+  min-width: 0;
+}
+
+/* 折叠态:面板只剩右下角一颗展开钮（与展开态折叠钮同坐标） */
+.matrix-panel.is-collapsed {
+  display: block;
+  height: 26px;
+}
+
+/* 图标列:面板最右缘（stage 右缘 6px 内缩）,Stack/Lines/Total（/×) 向下排 */
+.matrix-panel-header {
+  position: absolute;
+  top: 2px;
+  right: 6px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  pointer-events: none; /* 容器穿透,只有钮本身可点 */
+}
+
+/* 折叠/展开箭头:图标列正下方同一坐标（top = 2 + 4×24 = 98px）——
+   展开态 = ▾ 折叠,折叠态 = ▲ 展开,两态同位不跳动。 */
+.matrix-panel-collapse {
+  position: absolute;
+  top: 98px;
+  right: 6px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.matrix-panel-collapse:hover {
+  color: var(--text);
+  background: var(--zero-bg);
+}
+
+/* 渐变柔光底撤销——全透明。曲线/数据点/tooltip 是 SVG 实色绘制,
+   与容器背景无关,不会跟着透明;热力图行完整从曲线间隙透出。 */
+.matrix-panel-chart-bg {
+  display: none;
+}
+
+/* 空态/加载文案靠左下,避开右缘图标列 */
+.matrix-panel-body .insight-empty {
+  padding-right: 40px;
+}
+
+/* 折叠态覆盖:面板高 26px,top:98px 会出界——改贴面板底部（stage 底缘）,
+   视觉位置仍与展开态折叠钮相邻（同在右缘按钮列末端）。 */
+.matrix-panel.is-collapsed .matrix-panel-collapse {
+  top: auto;
+  bottom: 2px;
+}
+
+/* ---- 右缘竖排图标列:Stack / Lines / Total（/ ×),12px 图标,激活态 accent 色。
+   （定位规则见上方 .matrix-panel-header 主块,此处只补 pointer-events。） */
+.matrix-panel-header > * {
+  pointer-events: auto;
+}
+
+.matrix-panel-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.matrix-panel-icon:hover {
+  color: var(--text);
+  background: var(--zero-bg);
+}
+
+.matrix-panel-icon.is-active {
+  color: var(--accent);
+  background: var(--accent-weak);
+}
