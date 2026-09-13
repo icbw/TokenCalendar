@@ -58,3 +58,10 @@ export function onOrbDockChanged(
 export function onOrbDragged(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('orb-dragged', () => cb())
 }
+
+// ㊻悬浮球「指针让出」（Rust orb_dock：光标离开交互主体 → 整窗对鼠标
+// 透明,回到主体 → 恢复）。让出期间 webview 收不到 mouseleave/mousemove,提示浮层
+// 必须由这条信号主动收起,否则会留一块"冻住"的提示挂在画布上。
+export function onOrbPointerPass(cb: (passed: boolean) => void): Promise<Unlisten> {
+  return listen<boolean>('orb-pointer-pass', (p) => cb(p))
+}

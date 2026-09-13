@@ -45,6 +45,46 @@
 //!    完成：前端 set_orb_size（内容锚定）与 Rust 归位各自补偿一次位置的话,两个
 //!    invoke 并发时补偿被算两遍,卡片会横向窜两百像素。
 //!
+//! 5. **画布不抢鼠标：主体之外动态让出**。窗口绕表盘对称
+//!    展开（580×310),画布（内容之外的透明区)只承载 hover 提示,不该拦鼠标。静态
+//!    `HTTRANSPARENT`（WM_NCHITTEST）只覆盖「光标从窗口外进入画布」的通路——
+//!    从主体滑入画布时光标始终没离开本窗口矩形,系统不会重询命中测试,消息继续
+//!    归本窗口（画布遮挡其他程序的 hover 与操作,右键也仍被响应）。
+//!    补一条**动态让出**,两道机制一起上：
+//!     `set_window_body_region`——**硬保证**：光标离开交互主体即把窗口区域
+//!      （`SetWindowRgn`）收紧到「主体 + 阴影余量」,区域外的画布在几何上不属于
+//!      窗口,命中测试绝不会命中（只设样式位不够——㊼ :`WS_EX_TRANSPARENT`
+//!      已生效、画布照样遮挡）;
+//!     `WS_EX_TRANSPARENT` 样式位 + `HTTRANSPARENT` 命中判定——系统级快路径。
+//!    恢复（回主体）= 区域还原整窗 + 清样式位。穿透期间窗口收不到鼠标消息,
+//!    让出/恢复全靠 `PASS_POLL_MS` **常驻轮询**（35ms;「光标从窗口外进入画布」
+//!    也由它兜底——那条路径同样收不到任何消息）。命中口径与点击穿透同源
+//!    （`body_rect` = 可见内容矩形 + 滞回缓冲）;拖动中不切换（移动循环持有鼠标）。
+//!
+//!    **⚠ 翻转的视觉副作用：闪出原生标题栏**。
+//!    根子是窗口对系统的两句话自相矛盾：tao 的 `WM_NCCALCSIZE` 对未装饰窗口返回 0
+//!    （**非客户区面积为零**）,可 `to_window_styles` 又给 `decorations:false` 的窗口
+//!    照置 `WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX`（它只在自己的
+//!    `AdjustWindowRect*` 里屏蔽 caption,样式位照留）,且窗口照常**接受非客户区
+//!    绘制消息**。平时 DWM 替它合成框架、框架面积为零 ⇒ 看不;但带**窗口区域**
+//!    的窗口 DWM 不合成框架,走 user32/uxtheme 的旧式非客户区绘制——那条路径按
+//!    **样式**（不按 NCCALCSIZE 的结果）决定画什么,`WM_NCPAINT` / `WM_NCACTIVATE` /
+//!    `WM_NCUAHDRAWCAPTION` 一到,就把「图标 + 标题 + 最小化/关闭」直接画进窗口
+//!    矩形顶部,下一帧再被 WebView 盖掉 ⇒ 闪 2 帧。让出翻转 = 区域装/卸 + 光标换
+//!    窗口 = 正好凑齐这些消息。法不在让出流程里,而是让窗口**言行一致**,三道
+//!    互相独立的闸：
+//!     `subclass_proc` 拒绝非客户区绘制消息（`WM_NCPAINT` / `WM_NCUAHDRAWCAPTION` /
+//!      `WM_NCUAHDRAWFRAME` 直接返回,`WM_NCACTIVATE` 以 lParam = -1 转发——
+//!      DefWindowProc 据此**不重绘**非客户区,tao 的焦点逻辑照常）——非客户区既然
+//!      声明为零,就不该有任何路径能画它,与 tao 写回什么样式无关;
+//!     `strip_frame_styles` 摘掉整组「带框窗口」特征位（`FRAME_STYLE_BITS` =
+//!      CAPTION | SYSMENU | THICKFRAME | MINIMIZEBOX | MAXIMIZEBOX）——命中测试与
+//!      主题引擎都不再把它当带按钮的框窗（tao 每次 flag 变更都会把整组样式写回 +
+//!      `SWP_FRAMECHANGED`,故由让出轮询逐帧对账复摘）;
+//!     `disable_nc_rendering`（DWMNCRP_DISABLED）把非客户区绘制**固定**在旧式路径
+//!      上——区域装/卸时不再在「DWM 合成 ↔ 旧式绘制」之间来回切换（切换本身也会
+//!      触发一次框架重绘）。三条都只关「框架能不能被画出来」,不碰让出语义。
+//!
 //! DPI 切换的时序：把窗口移到另一台
 //! DPI 不同的显示器时,Windows 发 WM_DPICHANGED,tao 按「保持逻辑尺寸」重排窗口（尺寸与
 //! 位置都会被系统改）。而拖动期间排队的那条消息**在 WM_EXITSIZEMOVE 之后**才到 ⇒ 松手瞬间
@@ -214,6 +254,19 @@ pub fn set_size_anchored(window: &tauri::WebviewWindow, width: f64, height: f64)
     win::set_size_anchored(window, width, height);
 }
 
+/// 指针让出态的复位钩子（窗口显隐切换调用,见 `win:reset_pointer_pass`）：
+/// 隐藏期间没有鼠标消息去复位让出态,不清掉的话下次显示时整窗都会被鼠标穿透;
+/// 常驻轮询也随显隐起停（`active` = 窗口此后是否可）。
+#[cfg(windows)]
+pub fn reset_pointer_pass(window: &tauri::WebviewWindow, active: bool) {
+    win::reset_pointer_pass(window, active);
+}
+
+#[cfg(not(windows))]
+pub fn reset_pointer_pass(window: &tauri::WebviewWindow, active: bool) {
+    let _ = (window, active);
+}
+
 // ---------- Windows 实现 ----------
 
 #[cfg(windows)]
@@ -224,10 +277,18 @@ mod win {
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        CreateRectRgn, DeleteObject, GetMonitorInfoW, GetRgnBox, GetWindowRgn, MonitorFromPoint,
+        SetWindowRgn, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, SIMPLEREGION,
+    };
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED,
     };
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetWindowLongPtrW, KillTimer, SetTimer, SetWindowLongPtrW, SetWindowPos,
+        GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    };
 
     use super::{OrbDockChanged, OrbDockEdge, OrbDockState};
     use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -242,12 +303,65 @@ mod win {
     /// WM_NCHITTEST（lParam = 光标屏幕坐标,低/高 16 位各为 x/y 的有符号短整型）。
     const WM_NCHITTEST: u32 = 0x0084;
     /// WM_DPICHANGED（窗口跨到 DPI 不同的显示器）——本模块在**转发给 tao 之后**
-    /// 重放归位意图（见 `replay_desired`）：tao 会按「保持逻辑尺寸」把窗口重排一次,
-    /// 把我们在 EXITSIZEMOVE 里刚写完的矩形抹掉。
+    /// 排定一次合并重放（见 `schedule_replay`）：tao 会按「保持逻辑尺寸」把窗口
+    /// 重排一次,把我们在 EXITSIZEMOVE 里刚写完的矩形抹掉。
     const WM_DPICHANGED: u32 = 0x02E0;
+    /// WM_TIMER（合并重放的定时器到点;定时器 id = `REPLAY_TIMER_ID`）。
+    const WM_TIMER: u32 = 0x0113;
+    /// 重放去抖定时器的 id（"ORP1"）与合并窗口长度——见 `schedule_replay`。
+    const REPLAY_TIMER_ID: usize = 0x4F52_5031;
+    const REPLAY_DEBOUNCE_MS: u32 = 40;
     /// WM_NCHITTEST 返回码：命中透明边距 → 忽略本窗口,点击交给下层
     /// （点击穿透——「容器不可交互」;HTTRANSPARENT = -1）。
     const HTTRANSPARENT: LRESULT = -1;
+    /// WM_MOUSEMOVE——「指针让出」的一条低成本触发点：从主体滑入画布时光标没有
+    /// 离开本窗口矩形,系统不会重询命中测试,只有本窗口自己的鼠标消息能捕获越界。
+    const WM_MOUSEMOVE: u32 = 0x0200;
+    /// 非客户区绘制消息——本窗口的非客户区
+    /// 由 tao 的 WM_NCCALCSIZE 声明为零,这些消息一律不许画：
+    /// - `WM_NCPAINT`：旧式框架绘制入口（DefWindowProc 按**样式**画标题栏/边框,
+    ///   不看 NCCALCSIZE 的结果——正是「面积为零却画出一条标题栏」的来源）;
+    /// - `WM_NCACTIVATE`：DefWindowProc 借它按激活态重绘标题栏;lParam = -1 是
+    ///   文档化的「只改状态不重绘」约定;
+    /// - `WM_NCUAHDRAWCAPTION` / `WM_NCUAHDRAWFRAME`：
+    ///   主题引擎（uxtheme）绘制标题栏/按钮的请求——自绘框架应用（Chromium、Qt）
+    ///   统一吞掉的一组。
+    const WM_NCPAINT: u32 = 0x0085;
+    const WM_NCACTIVATE: u32 = 0x0086;
+    const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
+    const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
+    /// 指针让出的轮询定时器 id（"ORP2"）与周期——**常驻**（窗口可见期间一直跑）：
+    /// 穿透期间窗口收不到鼠标消息,让出/恢复只能靠轮询发现;「光标从窗口外进入
+    /// 画布」这条通路也靠它兜底（那条路径下窗口同样收不到任何消息）。35ms 在滑行
+    /// 途中约一两帧,进出主体无感;单轮成本 = 几个微秒级系统调用,常驻无压力。
+    const PASS_TIMER_ID: usize = 0x4F52_5032;
+    const PASS_POLL_MS: u32 = 35;
+    /// 让出判定的滞回缓冲（逻辑像素）：光标离主体边缘超过它才算离开;恢复判定
+    /// 不带缓冲（回到矩形内即恢复）——两档之间是一条「维持现状」带,边界不抖动。
+    const PASS_HYSTERESIS_LOGICAL: f64 = 6.0;
+    /// WS_EX_TRANSPARENT：整窗对鼠标透明的**样式位**（让出两件套之一）。
+    /// ⚠ （㊼）：单独设这个位**不足以**让画布不再遮挡——日志
+    /// `pointer pass ON` 已出现（样式设置成功）,画布照旧吃消息、挡住下层程序。
+    /// 真兜底的是 `set_window_body_region`（`SetWindowRgn` 窗口区域收紧,几何级
+    /// 硬保证）;本位置保留作系统级快路径。
+    /// ⚠ 不仿 tao 的 IGNORE_CURSOR_EVENT 连带加 `WS_EX_LAYERED`（tao
+    /// window_state.rs 的映射）：layered 窗口不能显示子窗口内容是经典限制,
+    /// 本窗口是 WebView2 + DComp 透明窗,改绘制路径的风险大于收益。
+    const WS_EX_TRANSPARENT_BIT: u32 = 0x0000_0020;
+
+    /// 「带框窗口」特征位 = `WS_OVERLAPPEDWINDOW` 去掉 `WS_OVERLAPPED`（0)：
+    /// `WS_CAPTION`（0x00C0_0000) | `WS_SYSMENU`（0x0008_0000) | `WS_THICKFRAME`
+    /// （0x0004_0000) | `WS_MINIMIZEBOX`（0x0002_0000) | `WS_MAXIMIZEBOX`（0x0001_0000)。
+    /// tao 对 `decorations:false` 的窗口**保留** CAPTION | SYSMENU（+ MINIMIZEBOX,
+    /// 它只在自己的尺寸计算里屏蔽 caption）,于是窗口在系统眼里**仍是带标题栏、
+    /// 带最小化/关闭按钮的窗体**——非客户区被 tao 的 WM_NCCALCSIZE 归零 ⇒ 平时
+    /// 不可,但旧式非客户区绘制按**样式**画：㊾ 只摘 CAPTION 时闪出的框架里
+    /// 恰好只剩「最小化 + 关闭」两个按钮（= 残留的 SYSMENU | MINIMIZEBOX）。
+    /// 整组摘掉,命中测试/主题引擎才不再把它当框窗（`strip_frame_styles`）;
+    /// 绘制消息本身另由 `subclass_proc` 拒绝。
+    /// 不补 `WS_POPUP`：改窗口大类会牵动 z 序/属主语义,而框架能不能被画出来
+    /// 与它无关。
+    const FRAME_STYLE_BITS: u32 = 0x00CF_0000;
 
     /// **拖动位移判定阈值**（逻辑像素）——移动循环结束时窗口位移 ≥ 此值才算
     /// 「真拖动」,广播 `orb-dragged` 供前端抑制 hover 提示。手抖级位移/原地按下
@@ -383,6 +497,10 @@ mod win {
         /// 移动循环进行中（WM_ENTERSIZEMOVE..EXITSIZEMOVE）——拖动期间不重放意图,
         /// 用户的手才是几何的主人（重放会把窗口从光标下拽走）。
         in_move_loop: AtomicBool,
+        /// **指针让出态**：true = 窗口当前带 `WS_EX_TRANSPARENT`
+        /// （整窗对鼠标透明,系统路由跳过本窗口）。由 `sync_pointer_pass` 单点翻转,
+        /// 只在变化时做样式调用 / 事件 / 定时器 / 日志。
+        pointer_pass: AtomicBool,
     }
 
     static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -406,9 +524,29 @@ mod win {
             drag_origin: Mutex::new(None),
             desired: Mutex::new(None),
             in_move_loop: AtomicBool::new(false),
+            pointer_pass: AtomicBool::new(false),
         };
         match CTX.set(ctx) {
-            Ok(()) => crate::dev_log!("[orb-dock] installed, drag_threshold = {drag_threshold}px"),
+            Ok(()) => {
+                crate::dev_log!("[orb-dock] installed, drag_threshold = {drag_threshold}px");
+                // 指针让出的常驻轮询：穿透后的恢复、以及「光标从窗口外进入画布」
+                // 两条通路都收不到鼠标消息,全靠它扫描光标（35ms,成本可忽略）;
+                // 显隐切换会重设（隐藏停表 / 显示起表,见 reset_pointer_pass）。
+                unsafe { SetTimer(hwnd, PASS_TIMER_ID, PASS_POLL_MS, None) };
+                // 基础样式（诊断用）：记下窗口出厂 STYLE / EXSTYLE——让出机制只在
+                // EXSTYLE 上加 WS_EX_TRANSPARENT 位,样式闸只从 STYLE 上摘带框位,
+                // 日志里两组值前后对照即可核对透明窗的组合与摘位是否生效。
+                let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 };
+                let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 };
+                // 「闪出原生标题栏」的样式闸与 DWM 闸（㊾/㊿,见 FRAME_STYLE_BITS /
+                // disable_nc_rendering;绘制消息闸在 subclass_proc 里常驻）
+                let stripped = strip_frame_styles(hwnd);
+                disable_nc_rendering(hwnd);
+                crate::dev_log!(
+                    "[orb-dock] style = 0x{style:08X} -> 0x{:08X} (frame styles stripped = {stripped}) exstyle = 0x{ex:08X}",
+                    style & !FRAME_STYLE_BITS
+                );
+            }
             Err(_) => crate::dev_log!("[orb-dock] ctx already set (double install?)"),
         }
     }
@@ -421,7 +559,16 @@ mod win {
         _id: usize,
         _ref_data: usize,
     ) -> LRESULT {
-        if msg == WM_ENTERSIZEMOVE {
+        if msg == WM_NCPAINT || msg == WM_NCUAHDRAWCAPTION || msg == WM_NCUAHDRAWFRAME {
+            // 非客户区声明为零（tao WM_NCCALCSIZE → 0）,就不许任何路径画它：
+            // DefWindowProc / uxtheme 是按**样式**画标题栏的,不看非客户区面积
+            // ——这正是让出翻转时「闪出原生标题栏」的绘制入口。
+            return 0;
+        } else if msg == WM_NCACTIVATE {
+            // 激活态变化照常交给 tao（它据 wParam 维护焦点事件）,但 lParam 改成
+            // -1：DefWindowProc 据此**只改状态、不重绘**非客户区。
+            return DefSubclassProc(hwnd, msg, wparam, -1);
+        } else if msg == WM_ENTERSIZEMOVE {
             set_in_move_loop(true);
             remember_drag_origin();
         } else if msg == WM_EXITSIZEMOVE {
@@ -429,17 +576,42 @@ mod win {
             on_exit();
         } else if msg == WM_DPICHANGED {
             // 先让 tao 按它的语义重排（它要更新 scale 缓存并从 lParam 取新尺寸）,
-            // 再把归位意图按**新 DPI** 重放一次——拖动期间排队的这条消息会在
-            // WM_EXITSIZEMOVE 之后才到,不重放就等于放弃归位（
-            // settle reposition （2494,749) -> got （1977,603)）。拖动中不重放
-            // （用户的手是几何的主人）。
+            // 再**排定一次合并重放**（去抖,见 `schedule_replay`）——拖动期间排队的
+            // 这条消息会在 WM_EXITSIZEMOVE 之后才到,不重放就等于放弃归位
+            // （settle reposition （2494,749) -> got （1977,603)）。
+            // 拖动中不重放（用户的手是几何的主人）。
             let r = DefSubclassProc(hwnd, msg, wparam, lparam);
-            replay_desired();
+            schedule_replay(hwnd);
             return r;
+        } else if msg == WM_TIMER && wparam == REPLAY_TIMER_ID {
+            // 合并重放到点：清掉定时器,按当前意图把矩形钉回目标值
+            // （拖动中 `replay_desired` 自会跳过;此刻的几何以用户的手为准）。
+            unsafe { KillTimer(hwnd, REPLAY_TIMER_ID) };
+            replay_desired();
+            return 0;
+        } else if msg == WM_TIMER && wparam == PASS_TIMER_ID {
+            // 指针让出的恢复轮询（穿透期间收不到鼠标消息,只能这样问光标在哪）。
+            if let Some(ctx) = CTX.get() {
+                let window = ctx.window.clone();
+                sync_pointer_pass(&window);
+            }
+            return 0;
+        } else if msg == WM_MOUSEMOVE {
+            // 从主体滑入画布：命中测试不会重询（光标没离开本窗口矩形）,只有这条
+            // 消息能捕获越界 → 主动让出。不拦截,继续转发。
+            if let Some(ctx) = CTX.get() {
+                let window = ctx.window.clone();
+                sync_pointer_pass(&window);
+            }
         } else if msg == WM_NCHITTEST {
             // 点击穿透：命中透明呼吸位 → HTTRANSPARENT（不进 tao 的默认 hit test;
-            // 主体区/拖动中的判定交回默认处理）
+            // 主体区/拖动中的判定交回默认处理）。顺带同步让出态——这条通路覆盖
+            // 「光标从窗口外进入画布」,让出态与命中判定保持同一口径。
             if let Some(hit) = transparent_margin_hit(lparam) {
+                if let Some(ctx) = CTX.get() {
+                    let window = ctx.window.clone();
+                    sync_pointer_pass(&window);
+                }
                 return hit;
             }
         }
@@ -1090,6 +1262,16 @@ mod win {
         true
     }
 
+    /// 排定一次**合并重放**（去抖）：对同一窗口重复 `SetTimer` 会重置计时,于是
+    /// 密集的 WM_DPICHANGED（窗口骑在接缝上时,系统会在两台显示器的归属之间摇摆,
+    ///  `dev-20260913.log` 19:15/19:27 两段各 15-30 条）只换来静默
+    /// `REPLAY_DEBOUNCE_MS` 之后的**一次**写入——「写 → 系统重估 → 再发消息 →
+    /// 再写」的自激回路因此被时间隔断（㊺;单发消息只是晚 40ms
+    /// 重放,用户无感）。
+    fn schedule_replay(hwnd: HWND) {
+        unsafe { SetTimer(hwnd, REPLAY_TIMER_ID, REPLAY_DEBOUNCE_MS, None) };
+    }
+
     /// 清掉归位意图（几何读不到、给不出可重放的目标时用——宁可不重放,也不能让
     /// 旧意图在 DPI 变更后把窗口拽回原处）。
     fn forget_desired() {
@@ -1098,8 +1280,27 @@ mod win {
         }
     }
 
-    /// 统一写入出口：**位置与尺寸都写物理值**,三明治
-    /// （定位 → 定尺寸 → 再定位）+ 读回校验。
+    /// **原子写窗口矩形**（一次 `SetWindowPos` 同时设置位置与尺寸,物理像素）——
+    /// 写入路径唯一的落盘原语（为什么必须原子,见 `write_rect` 的说明）。
+    /// `SWP_NOZORDER` 保持既有 Z 序（悬浮球是置顶窗）,`SWP_NOACTIVATE` 不抢焦点
+    /// （拖动/点击穿透依赖窗口不因写入而激活）。
+    fn apply_rect_atomic(window: &WebviewWindow, x: i32, y: i32, w_phys: i32, h_phys: i32) -> bool {
+        let Ok(hwnd) = window.hwnd() else { return false };
+        unsafe {
+            SetWindowPos(
+                hwnd.0 as HWND,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w_phys,
+                h_phys,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            ) != 0
+        }
+    }
+
+    /// 统一写入出口：**位置与尺寸都写物理值**,
+    /// **原子写入**（一次 `SetWindowPos` 同时设置位置与尺寸）+ 读回校验。
     ///
     /// 尺寸为什么写物理值（推翻㊴ 的「写逻辑值」）：`set_size（LogicalSize)` 的换算在
     /// tao 内部用 `window_state.scale_factor` —— **消息驱动的缓存**。跨屏拖动松手时窗口
@@ -1110,6 +1311,14 @@ mod win {
     /// 再重排 ⇒ 再写错」自激成几百毫秒的消息风暴（贴片嵌入接缝 + 表盘闪烁）。
     /// 物理值不经缓存换算,写的就是目标矩形;系统随后的 DPI 重排由 `replay_desired`
     /// 按同一物理值再钉一次。
+    ///
+    /// 为什么必须**原子**：
+    /// 分步写入必然产生中间态——「展开态大窗口先被放到贴边窄位」「小窗口先跳到接缝」
+    /// 「目标尺寸先落在旧位置」——**每个中间态都是一次独立的窗口矩形变更**,系统会按它
+    /// 重估窗口的显示器归属与 DPI,在接缝附近就演变成 WM_DPICHANGED 连发 + tao 重排 +
+    /// 我们重放的拉锯（同一接缝两侧,先缩后移闪一侧、改先移后缩又闪另一侧
+    /// ——顺序启发式按不住,根因在此）。原子写入把一次归位压缩成**一次**窗口矩形变更:
+    /// 系统只评估最终矩形（跨缝 ≤ 21%,归属稳定）,没有中间态可误判。
     ///
     /// **幂等早退分档**：
     /// - `force = true`（用户动作：贴边归位 / 展开归位 / 尺寸锚定 / 钳回）——**总是精确写**。
@@ -1134,9 +1343,14 @@ mod win {
                 }
             }
         }
-        let _ = window.set_position(PhysicalPosition::new(x, y));
-        let _ = window.set_size(PhysicalSize::new(w_phys, h_phys));
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+        // 一次到位（原子）:没有「大窗口停在贴边窄位」「小窗口先跳接缝」这类中间态,
+        // 系统只会为**最终矩形**做一次归属评估。
+        if !apply_rect_atomic(window, x, y, w_phys, h_phys) {
+            // SetWindowPos 失败（理论上仅句柄异常）⇒ 退回 tao 两条调用,
+            // 至少保证一只脚落地;下面的读回校验会再纠一次。
+            let _ = window.set_position(PhysicalPosition::new(x, y));
+            let _ = window.set_size(PhysicalSize::new(w_phys, h_phys));
+        }
         crate::dev_log!("[orb-dock] write rect ({x},{y}) {w_phys}x{h_phys} phys");
         // 读回校验容差:用户动作（force）收紧到 2——吸附距离对用户是可感知的（本体
         // 距缘固定 4 逻辑）,系统级 1px 取整放过、更大偏移再钉一次;重放（非 force）
@@ -1149,7 +1363,7 @@ mod win {
                     p.x,
                     p.y
                 );
-                let _ = window.set_position(PhysicalPosition::new(x, y));
+                apply_rect_atomic(window, x, y, w_phys, h_phys);
             }
         }
         if let Ok(sz) = window.outer_size() {
@@ -1159,9 +1373,14 @@ mod win {
                     sz.width,
                     sz.height
                 );
-                let _ = window.set_size(PhysicalSize::new(w_phys, h_phys));
+                apply_rect_atomic(window, x, y, w_phys, h_phys);
             }
         }
+        // 几何变了 → 「光标相对主体」的关系也变了（归位可能把主体送到光标下,
+        // 或从光标下挪走）——重设让出区域（尺寸变化可能让系统重置/错位它）,
+        // 再重估一次让出状态（拖动中内部会早退;幂等,静默）。
+        refresh_pass_region(window);
+        sync_pointer_pass(window);
     }
 
     /// 自由松手/恢复的边界钳制：**内容矩形 + 阴影余量**钳回所在显示器工作区
@@ -1320,6 +1539,15 @@ mod win {
         expanded
     }
 
+    /// 交互主体矩形（物理像素）——「点击穿透命中」与「指针让出」共用的唯一口径：
+    /// 形态取权威状态,偏移/尺寸取逻辑常量 × 该屏 scale（现取 DPI,不用 tao 缓存）。
+    fn body_rect(window: &WebviewWindow) -> Option<(i32, i32, i32, i32)> {
+        let pos = window.outer_position().ok()?;
+        let scale = window_dpi_scale(window);
+        let expanded = super::expanded_state(window.app_handle());
+        Some(content_rect((pos.x, pos.y), scale, expanded))
+    }
+
     /// 点击穿透命中判定：光标在两态各自的「交互主体」矩形内 → None（走默认处理）;
     /// 落在透明呼吸位 → Some（HTTRANSPARENT)。
     /// lParam 低/高 16 位 = 光标屏幕坐标（各按 i16 符号扩展——多显示器负坐标在
@@ -1328,17 +1556,262 @@ mod win {
         let ctx = CTX.get()?;
         let x = (lparam & 0xFFFF) as u16 as i16 as i32;
         let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
-        let pos = ctx.window.outer_position().ok()?;
-        // 现取 DPI（不用 tao 缓存）：跨屏拖动中命中区必须跟着窗口真实 DPI 走,
-        // 否则「看得见的表盘点不动、看得见的空白却挡住点击」。
-        let scale = window_dpi_scale(&ctx.window);
-        let expanded = super::expanded_state(ctx.window.app_handle());
-        let (left, top, w, h) = content_rect((pos.x, pos.y), scale, expanded);
+        let (left, top, w, h) = body_rect(&ctx.window)?;
         let inside = x >= left && x < left + w && y >= top && y < top + h;
         if inside {
             None
         } else {
             Some(HTTRANSPARENT)
+        }
+    }
+
+    // ---------- 指针让出 ----------
+
+    /// 现取光标屏幕坐标（物理像素）——穿透期间窗口收不到鼠标消息,只有这个 API
+    /// 能问出光标在哪（恢复轮询的输入）。
+    fn cursor_screen_pos() -> Option<(i32, i32)> {
+        let mut p = POINT { x: 0, y: 0 };
+        (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
+    }
+
+    /// 光标是否在主体矩形外（buf = 滞回缓冲,物理像素;0 即严格在矩形内）。
+    /// 纯函数：让出判定带缓冲 / 恢复判定不带,两档之间是「维持现状」带,防边界抖动。
+    fn pointer_outside(cursor: (i32, i32), body: (i32, i32, i32, i32), buf: i32) -> bool {
+        let (l, t, w, h) = body;
+        cursor.0 < l - buf
+            || cursor.0 >= l + w + buf
+            || cursor.1 < t - buf
+            || cursor.1 >= t + h + buf
+    }
+
+    /// 设/清 `WS_EX_TRANSPARENT`（整窗对鼠标透明）——直接改 EXSTYLE,不走 tao 的
+    /// `set_ignore_cursor_events`（那会连带加 `WS_EX_LAYERED`,见常量注释）。
+    /// **只改样式位,不做 `SetWindowPos（FRAMECHANGED)`**（㊽）：框架重算会让
+    /// 系统把窗口框架整块重绘一遍——「划过容器时瞬间闪出原生窗体/标题栏」
+    /// 的头号来源（每次让出/恢复各一次）;这个样式位的生效本不依赖框架重算,
+    /// 若个别场景不生效,还有 `set_window_body_region` 的区域收紧兜底。
+    /// 返回是否真的改了样式（幂等调用静默返回 false）。
+    fn set_mouse_transparent(hwnd: HWND, on: bool) -> bool {
+        unsafe {
+            let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let next =
+                if on { cur | WS_EX_TRANSPARENT_BIT } else { cur & !WS_EX_TRANSPARENT_BIT };
+            if next == cur {
+                return false;
+            }
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+            true
+        }
+    }
+
+    /// 摘掉窗口样式里的整组「带框窗口」特征位（`FRAME_STYLE_BITS`;幂等,返回是否
+    /// 真的改了）——「闪出原生标题栏」的样式闸。只改样式位,不做
+    /// `SWP_FRAMECHANGED`：绘制方读的是当前样式,框架重算反而是一次整块重绘。
+    /// ⚠ 这不是一次性的活：tao 每次 flag 变更（show/hide、置顶、可缩放…）的
+    /// `apply_diff` 都会 `SetWindowLongW（GWL_STYLE, to_window_styles)` 把整组
+    /// 样式**写回**（连带 `SWP_FRAMECHANGED` 框架重算,见 tao window_state.rs）,
+    /// 所以由让出轮询（`sync_pointer_pass`）逐帧对账 + 显隐钩子（`reset_pointer_pass`）
+    /// 一起保证它长期不在。
+    /// 副作用核对：拖动走 `WM_NCLBUTTONDOWN（HTCAPTION)` → `SC_MOVE` 模态移动循环,
+    /// 不要求窗口真有 caption/系统菜单（无框 popup 惯用同一招）;最小化/关闭由
+    /// tao 直接 `ShowWindow` / `WM_CLOSE`,不经系统菜单。
+    fn strip_frame_styles(hwnd: HWND) -> bool {
+        unsafe {
+            let cur = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            if cur & FRAME_STYLE_BITS == 0 {
+                return false;
+            }
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (cur & !FRAME_STYLE_BITS) as isize);
+            true
+        }
+    }
+
+    /// 关掉 DWM 对该窗口的**非客户区渲染**（「闪出原生标题栏」的 DWM 闸）：把非
+    /// 客户区绘制**固定**在旧式路径上——带窗口区域的窗口 DWM 本就不合成框架,不固定
+    /// 的话每次区域装/卸都在「DWM 合成 ↔ 旧式绘制」之间切一次,切换本身就是一次
+    /// 框架重绘（㊾ 之前的「偶发闪」）;固定后剩下的旧式绘制入口由 `subclass_proc`
+    /// 一律拒绝。一次 DWM 调用、幂等;tao 不碰这个属性（它只写暗色模式那一项）,
+    /// 所以 `install` 与显隐钩子各调一次足够。
+    fn disable_nc_rendering(hwnd: HWND) {
+        let policy: i32 = DWMNCRP_DISABLED;
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY as u32,
+                &policy as *const i32 as *const core::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
+
+    /// 主体 + 阴影余量在**窗口坐标**中的矩形（纯计算,物理像素）——`SetWindowRgn`
+    /// 的输入：主体取 `content_rect` 零原点版（与屏幕坐标口径同源）,外扩一圈
+    /// `CONTENT_MARGIN_LOGICAL`（表盘投影/描边发光不落在区域外,让出瞬间阴影不被裁）。
+    fn body_window_rect_at(scale: f64, expanded: bool) -> (i32, i32, i32, i32) {
+        let (l, t, w, h) = content_rect((0, 0), scale, expanded);
+        let m = (CONTENT_MARGIN_LOGICAL * scale).round() as i32;
+        (l - m, t - m, w + 2 * m, h + 2 * m)
+    }
+
+    /// 现取窗口形态/DPI 的让出区域（窗口坐标,物理像素;见 `body_window_rect_at`）。
+    fn body_window_rect(window: &WebviewWindow) -> (i32, i32, i32, i32) {
+        body_window_rect_at(window_dpi_scale(window), super::expanded_state(window.app_handle()))
+    }
+
+    /// 让出的**硬保证**：把窗口区域收紧到「主体 + 阴影余量」（`SetWindowRgn`）——
+    /// 区域外的画布**在几何上不属于窗口**,命中测试绝不会命中,不依赖「系统是否
+    /// 尊重 WS_EX_TRANSPARENT / HTTRANSPARENT」这类跨进程语义（
+    /// 只设样式位仍被遮挡——画布继续吃消息、挡住下层程序的悬停与点击）。恢复用
+    /// `NULL` 区域（整窗）。
+    /// ⚠ `SetWindowRgn` 成功后**系统接管 region 所有权**,不可再删;失败才自己删。
+    /// `bredraw = 0`：不让系统**立即**重绘（㊽——立即重绘是「划过一次闪一下」的
+    /// 来源之一）;区域变化由合成器在下一帧按新形状重画,无中间帧。
+    /// ⚠ 区域对「框架重算」敏感：tao 若因 show/hide 等操作重排框架会把它重置回
+    /// 整窗——靠 `window_region_matches` 对账自愈（见 `sync_pointer_pass`）。
+    fn set_window_body_region(window: &WebviewWindow, hwnd: HWND, on: bool) {
+        unsafe {
+            if !on {
+                SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
+                return;
+            }
+            let (l, t, w, h) = body_window_rect(window);
+            let rgn = CreateRectRgn(l, t, l + w, t + h);
+            if rgn.is_null() {
+                return;
+            }
+            if SetWindowRgn(hwnd, rgn, 0) == 0 {
+                DeleteObject(rgn);
+            }
+        }
+    }
+
+    /// 窗口当前区域是否已等于目标矩形（读回校验;无区域/非矩形区域一律不匹配）。
+    /// 对账用：tao 的 `SetWindowPos（FRAMECHANGED)` 等会把窗口区域重置回整窗。
+    fn window_region_matches(hwnd: HWND, target: (i32, i32, i32, i32)) -> bool {
+        unsafe {
+            let probe = CreateRectRgn(0, 0, 1, 1);
+            if probe.is_null() {
+                return false;
+            }
+            let kind = GetWindowRgn(hwnd, probe);
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let hit = kind == SIMPLEREGION
+                && GetRgnBox(probe, &mut r) != 0
+                && r.left == target.0
+                && r.top == target.1
+                && r.right == target.2
+                && r.bottom == target.3;
+            DeleteObject(probe);
+            hit
+        }
+    }
+
+    /// **指针让出状态机**：光标离开交互主体 ⇒ 让出鼠标
+    /// （样式位 + 区域收紧两件套）;回主体 ⇒ 恢复。触发点 = WM_NCHITTEST /
+    /// WM_MOUSEMOVE（即时）、常驻轮询（`PASS_TIMER_ID`,35ms——穿透期间收不到
+    /// 鼠标消息,只有轮询能发现「光标回到主体」;「光标从窗口外进入画布」也靠它
+    /// 兜底）、几何写入口（窗口移动改变光标与主体的相对关系）。只有状态翻转才
+    /// 动作;拖动中早退（移动循环持有鼠标,重设样式会打断拖动）。
+    fn sync_pointer_pass(window: &WebviewWindow) {
+        let Some(ctx) = CTX.get() else { return };
+        if in_move_loop() {
+            return;
+        }
+        let Ok(hwnd) = window.hwnd() else { return };
+        let hwnd = hwnd.0 as HWND;
+        let passed = ctx.pointer_pass.load(Ordering::SeqCst);
+        // 带框样式对账（见 FRAME_STYLE_BITS）：tao 的 flag 变更会把整组样式写回、
+        // CAPTION | SYSMENU | MINIMIZEBOX 复活——每轮一次便宜的读回,失配即摘。
+        // 复摘本身不触发框架重算（只改样式位、不带 SWP_FRAMECHANGED）,所以它是
+        // 样式闸的长期保证;`install` 与显隐钩子各摘一次负责「重启/显隐后立刻到位」。
+        if strip_frame_styles(hwnd) {
+            crate::dev_log!("[orb-dock] frame styles re-stripped (tao style rebuild)");
+        }
+        // 样式位校验/自愈：tao 的 show/hide 会用缓存 flags 全量重建样式、抹掉我们
+        // 的位（它不知道我们直接改了 EXSTYLE）——每轮一次便宜的读回,失配即补两件套。
+        let actual =
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_TRANSPARENT_BIT != 0;
+        if actual != passed {
+            set_mouse_transparent(hwnd, passed);
+            set_window_body_region(window, hwnd, passed);
+        }
+        // 区域对账：tao 的 SetWindowPos（FRAMECHANGED) 等操作会把窗口区域重置回
+        // 整窗（它不知道我们设过区域）——每轮读回保底（微秒级）,失配即重设。
+        if passed {
+            let (l, t, w, h) = body_window_rect(window);
+            if !window_region_matches(hwnd, (l, t, l + w, t + h)) {
+                set_window_body_region(window, hwnd, true);
+            }
+        }
+        let Some(cursor) = cursor_screen_pos() else { return };
+        let Some(body) = body_rect(window) else { return };
+        let buf = (PASS_HYSTERESIS_LOGICAL * window_dpi_scale(window)).round() as i32;
+        // 让出：离主体 > buf 才算离开;恢复：回到矩形内即算——两档之间保持现状。
+        let target =
+            if passed { pointer_outside(cursor, body, 0) } else { pointer_outside(cursor, body, buf) };
+        if target == passed {
+            return;
+        }
+        set_mouse_transparent(hwnd, target);
+        set_window_body_region(window, hwnd, target);
+        ctx.pointer_pass.store(target, Ordering::SeqCst);
+        if target {
+            crate::dev_log!(
+                "[orb-dock] pointer pass ON cursor=({},{}) body=({},{},{},{})",
+                cursor.0,
+                cursor.1,
+                body.0,
+                body.1,
+                body.2,
+                body.3
+            );
+        } else {
+            crate::dev_log!("[orb-dock] pointer pass OFF cursor=({},{})", cursor.0, cursor.1);
+        }
+        use tauri::Emitter;
+        let _ = window.app_handle().emit("orb-pointer-pass", target);
+    }
+
+    /// 几何变化后重设让出区域（尺寸/位置/DPI 变化可能让系统重置或错位窗口区域）;
+    /// 只在让出态有意义,幂等静默。
+    fn refresh_pass_region(window: &WebviewWindow) {
+        let Some(ctx) = CTX.get() else { return };
+        if !ctx.pointer_pass.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(hwnd) = window.hwnd() else { return };
+        set_window_body_region(window, hwnd.0 as HWND, true);
+    }
+
+    /// 复位让出态（显隐切换调用;`active` = 窗口此后是否可）：清两件套 + 复位
+    /// 标记;可见才启动常驻轮询（隐藏期间没必要扫光标）。隐藏期间没有鼠标消息,
+    /// 残留的让出态会在下次显示时把整个窗口从鼠标里吃掉（主体都点不动）——所以
+    /// **无条件清样式与区域**（不依赖状态标记:tao 重建样式可能已把位抹掉,
+    /// 标记与真实样式可能不同步）。
+    pub fn reset_pointer_pass(window: &WebviewWindow, active: bool) {
+        let Some(ctx) = CTX.get() else { return };
+        let was = ctx.pointer_pass.swap(false, Ordering::SeqCst);
+        if let Ok(hwnd) = window.hwnd() {
+            let hwnd = hwnd.0 as HWND;
+            let changed = set_mouse_transparent(hwnd, false);
+            set_window_body_region(window, hwnd, false);
+            // 显隐钩子顺带把「原生标题栏」的样式闸与 DWM 闸再按一遍：tao 的
+            // show/hide 走 `apply_diff`,会把整组带框样式连同 `SWP_FRAMECHANGED`
+            // 一起写回（见 strip_frame_styles 注释）——这里摘掉才能让窗口一露面
+            // 就是无框的。
+            let restripped = strip_frame_styles(hwnd);
+            disable_nc_rendering(hwnd);
+            if restripped {
+                crate::dev_log!("[orb-dock] frame styles re-stripped (visibility)");
+            }
+            if active {
+                unsafe { SetTimer(hwnd, PASS_TIMER_ID, PASS_POLL_MS, None) };
+            } else {
+                unsafe { KillTimer(hwnd, PASS_TIMER_ID) };
+            }
+            if was || changed {
+                crate::dev_log!("[orb-dock] pointer pass reset (visibility, active={active})");
+            }
         }
     }
 
@@ -1661,6 +2134,37 @@ mod win {
         fn looks_expanded_by_nearest_size() {
             assert!(!looks_expanded(PILL_W_LOGICAL, PILL_H_LOGICAL));
             assert!(looks_expanded(EXPANDED_W_LOGICAL, EXPANDED_H_LOGICAL));
+        }
+
+        /// 指针让出的滞回两档（修㊻）：让出判定带缓冲（离主体 > buf 才算离开）、
+        /// 恢复判定不带（回到矩形内即恢复）——两档之间是「维持现状」带,边界不抖动。
+        #[test]
+        fn pointer_pass_hysteresis_bands() {
+            // 主体 (100,50)-(232,160)（物理视角;右/下为半开区间）
+            let body = rect(100, 50, 132, 110);
+            // 矩形内：不让出
+            assert!(!pointer_outside((150, 100), body, 6));
+            // 左边外 2px：在 6px 缓冲带内 → 维持现状（不算离开）
+            assert!(!pointer_outside((98, 100), body, 6));
+            // 左边外 8px：超出缓冲 → 让出
+            assert!(pointer_outside((92, 100), body, 6));
+            // 恢复档（buf=0）：矩形边界内即算「回主体」,刚好压边（半开区间）算外
+            assert!(!pointer_outside((100, 50), body, 0));
+            assert!(!pointer_outside((231, 159), body, 0));
+            assert!(pointer_outside((99, 50), body, 0));
+            assert!(pointer_outside((232, 160), body, 0));
+            // 缓冲同时作用于右/下两侧
+            assert!(!pointer_outside((236, 164), body, 6));
+            assert!(pointer_outside((239, 167), body, 6));
+        }
+
+        /// 让出区域（修㊼）= 主体 + 阴影余量（窗口坐标,物理像素）——展开态 @1.5:
+        /// 主体 (353,150,198,165) 各边外扩 24 → (329,126,246,213);
+        /// 收起态 @2.0:主体 (32,32,48,168) 外扩 32 → (0,0,112,232)。
+        #[test]
+        fn pass_region_wraps_body_with_margin() {
+            assert_eq!(body_window_rect_at(1.5, true), (329, 126, 246, 213));
+            assert_eq!(body_window_rect_at(2.0, false), (0, 0, 112, 232));
         }
 
         /// 意图 → **物理**矩形（修㊵）：逻辑 → 物理的换算取**目标屏自己的 scale**——

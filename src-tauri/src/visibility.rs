@@ -70,6 +70,12 @@ pub fn set_visible(app: &AppHandle, label: &str, visible: bool) -> Result<(), St
     } else {
         window.hide().map_err(|e| e.to_string())?;
     }
+    // ㊻/㊼：悬浮球的「指针让出」态跨显隐不可残留——隐藏期间没有鼠标
+    // 消息去复位它,下次显示时整窗会被鼠标穿透（主体也点不动）;显隐两条路径都
+    // 复位,并让常驻轮询随可见性起停（active = 本次操作后的可见性）。
+    if label == ORB_LABEL {
+        crate::orb_dock::reset_pointer_pass(&window, visible);
+    }
     store_visible(&state, label, visible);
     window_state::persist(app, &state);
     tray::sync_checks(&state);

@@ -707,6 +707,23 @@ export default function OrbWindow() {
       off?.()
     }
   }, [muteTips])
+  // 指针让出（㊻）：光标离开交互主体 → Rust 把整窗对鼠标透明（画布不再挡下层
+  // 程序的 hover / 点击）。穿透期间 webview 收不到 mouseleave,提示会"冻"在屏上
+  // ——收到让出信号立刻清掉。
+  useEffect(() => {
+    let off: (() => void) | null = null
+    let disposed = false
+    void events.onOrbPointerPass((passed) => {
+      if (passed) clearTip()
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else off = unlisten
+    })
+    return () => {
+      disposed = true
+      off?.()
+    }
+  }, [clearTip])
   // 两态切换/停靠变化时元素被移出视口（left:-9999px）收不到 mouseleave,
   // 不主动清会留一块「僵尸提示」挂在窗口里
   useEffect(() => {
@@ -809,8 +826,10 @@ export default function OrbWindow() {
   return (
     <div
       className={`orb-shell${expanded ? ' is-expanded' : ''}`}
-      onDoubleClick={expanded ? undefined : expand}
-      onContextMenu={onContextMenu}
+      // 右键 / 双击只挂在**内容容器**（.orb-pill / .orb-orb）上：shell 是整个窗口
+      // （100vw×100vh),挂它等于"透明画布也响应右键"。㊻：OS 侧由 Rust 指针让出
+      // 解决（光标离开主体 → 整窗对鼠标透明）,这里是前端纵深——真漏进来一块
+      // 画布区右键也不再响应（画布右键弹菜单、还挡住下层程序）。
       // 提示收尾两处兜底： 按下即收 + 抑制——拖动走 OS 移动循环,期间 webview
       // 收不到 mousemove、也收不到 mouseup,只靠「拖动结束」的 orb-dragged 兜不住
       // （拖动中若有 mousemove 漏进来就会重新冒提示）;按钮豁免,点按钮不抑制
@@ -832,6 +851,10 @@ export default function OrbWindow() {
       <div
         className={`orb-pill${expanded ? ' is-hidden' : ''}${refreshing ? ' is-refreshing' : ''}${waiting ? ' is-waiting' : ''}`}
         data-tauri-drag-region="deep"
+        // ㊻：右键（收起态 = 刷新）与双击展开收窄到竖条本体上——不再由 shell
+        // 整窗承接（is-hidden 时 pointer-events:none,天然互斥）。
+        onContextMenu={onContextMenu}
+        onDoubleClick={expand}
       >
         <div className="orb-pill-track">
           {/* 外轮廓 = 周额度（⑲,与展开态表盘外环同源）：轨道 rect（淡）+ 整圈
@@ -920,6 +943,8 @@ export default function OrbWindow() {
       <div
         className={`orb-orb${expanded ? '' : ' is-hidden'}`}
         data-tauri-drag-region="deep"
+        // ㊻：右键（展开态 = Hide orb 菜单）收窄到内容块,画布区不再响应。
+        onContextMenu={onContextMenu}
       >
         <div
           className={`orb-orb-dial${refreshing ? ' is-refreshing' : ''}${waiting ? ' is-waiting' : ''}`}
