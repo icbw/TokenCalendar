@@ -1,0 +1,53 @@
+/* 共享悬浮提示（主窗口月矩阵 + 挂件年度热力图，统一为同组件同格式）。
+   自 monthMatrix.css 拆出，避免挂件窗口加载整份月矩阵样式。 */
+.matrix-tooltip {
+  position: fixed;
+  transform: translate(-50%, -100%);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+  padding: 8px 10px;
+  font-size: var(--font-size-sm);
+  z-index: 1000;
+  pointer-events: none;
+  min-width: 150px;
+}
+
+/* 翻转到锚点下方时（挂件上缘钳制）：位移基线改到顶边。 */
+.matrix-tooltip.is-below {
+  transform: translate(-50%, 0);
+}
+
+/* 紧凑单行变体：高度 ≈ 一行格子（23px），上下浮动只压住
+   相邻一行，hover 的那一行永远可见（原两行 52px 在矮窗里压住 2〜3 行，往下滑
+   看不到自己 hover 的行）。 */
+.matrix-tooltip.is-compact {
+  padding: 4px 8px;
+  min-width: 0;
+  white-space: nowrap;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+.matrix-tooltip.is-compact .matrix-tooltip-line {
+  color: var(--text);
+  line-height: 1.3;
+}
+
+/* 隐藏态：DOM 常驻（透明 WebView2 上条件卸载会留脏像素残影），仅移出
+   窗口并关可见性；不用 display:none（同样触发层销毁）。 */
+.matrix-tooltip.is-hidden {
+  visibility: hidden;
+}
+
+.matrix-tooltip-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
+.matrix-tooltip-line {
+  color: var(--text-muted);
+  line-height: 1.5;
+}

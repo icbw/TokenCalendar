@@ -1,0 +1,174 @@
+/* 主窗口外壳（现代化）：frameless + 自绘标题栏 + 四层栅格。
+   设计语言对齐挂件卡片（tokens v2）。
+   边缘策略：外缘呼吸位**全透明** + DWM 系统阴影充当
+   悬浮投影——主窗口与挂件同为可缩放 frameless（THICKFRAME），系统阴影压不掉
+转正即可；卡片自身不再画 CSS 投影（避免双重阴影 + CSS
+   阴影在透明环边缘被窗口矩形硬切）。标题栏保留半透明条（实体感）。
+   注意：挂件窗口宿主也挂 .shell 类（.shell.is-widget）——主窗口样式**只属于
+   .is-expanded**；挂件宿主必须保持全透明全出血。 */
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  box-sizing: border-box;
+}
+
+/* 主窗口（expanded）专属：外缘全透明呼吸位（DWM 阴影的落点区）。 */
+.shell.is-expanded {
+  padding: 8px;
+  background: transparent;
+}
+
+.shell.is-expanded.is-maximized {
+  padding: 0;
+}
+
+/* 挂件宿主：窗口即卡片，全透明全出血 */
+.shell.is-widget {
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ---- 第一层：自绘标题栏（半透明悬浮条，圆角独立于内容卡片） ----
+   alpha 走 --shell-bg-alpha（默认 0.8，设置页可调；
+   与挂件 bgOpacity 零关联——解耦约定的延续）。 */
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--titlebar-h);
+  flex-shrink: 0;
+  padding-left: 12px;
+  margin-bottom: 8px;
+  user-select: none;
+  background: rgba(var(--shell-bg) / var(--shell-bg-alpha, 0.8));
+  border-radius: var(--radius-lg);
+}
+
+/* 最大化铺满：半透明失去意义（无桌面露出），转实底、去圆角与间距 */
+.shell.is-expanded.is-maximized .titlebar {
+  margin-bottom: 0;
+  border-radius: 0;
+  background: rgb(var(--shell-bg));
+}
+
+.titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.titlebar-logo {
+  /* CSS 渐变紫贴图 → app 图标（img 资产,与 bundle 图标同源）;
+     图标自带圆角与玻璃描边,CSS 不再加 border-radius 叠加 */
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
+.titlebar-title {
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  color: var(--text);
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  /* 悬停矩形内收，避免顶出圆角条 */
+  padding-right: 6px;
+}
+
+.titlebar-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+  margin: 0 4px;
+}
+
+/* 窗口控制按钮：无 hover 底的老式矩形（Win11 语言），关闭钮悬停变红 */
+.titlebar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 100%;
+  color: var(--text-muted);
+  border-radius: 0;
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+
+.titlebar-btn:hover {
+  background: var(--accent-weak);
+  color: var(--text);
+}
+
+.titlebar-btn.is-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* 顶层视图 seg（文字按钮与 Widget 同款组件形式,不再用图形）。
+   标题栏底是半透明条,.seg 的 zero-bg 底在此不可见——激活态用白卡 + 阴影。 */
+.titlebar-view {
+  border-radius: var(--radius-sm);
+}
+
+.titlebar-view.is-active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+/* Widget 显隐分段钮（标题栏内） */
+.titlebar-widget {
+  margin-right: 4px;
+}
+
+/* Orbit 悬浮球显隐钮（Widget 左侧,同款 seg 形式;复用 .titlebar-view
+   的圆角与激活白卡样式,仅补右间距与 Widget 分组） */
+.titlebar-orb {
+  margin-right: 4px;
+}
+
+/* ---- 内容行：内容卡片（矩阵视图 / 设置视图共用容器，设置入主区） ---- */
+.shell-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ---- 内容卡片：圆角容器承载工具栏 + 矩阵 + 状态条（挂件同源 16px 圆角）。
+   悬浮投影由窗口级 DWM 阴影承担（见文件头），卡片自身不画 CSS 投影。 ---- */
+.shell-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+
+.shell.is-expanded.is-maximized .shell-main {
+  border-radius: 0;
+  border: none;
+}
+
+/* ---- spike：主窗口毛玻璃材质态（material-on 由 materialTheme
+   挂载）。Mica/Acrylic 背板填满窗口矩形（呼吸位与卡片圆角外均透材质），
+   CSS 圆角裁不住 DWM 背板——圆角切换 DWM 单源（Rust 联动 ROUND/DONOTROUND，
+   本文件不动圆角）；.shell-main 改半透明叠色让材质透出（78% 为 spike 起点，
+   调优）。最大化态保持转实底语义之上的透明度即可：color-mix 特异性
+   高于 .is-maximized 覆盖链，最大化时系统自动方角 + 呼吸位归零，材质透出
+   只来自卡片底叠色。 ---- */
+html.material-on .shell.is-expanded .shell-main {
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}

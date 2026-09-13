@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "PHASE03 双窗口最小权限：事件监听 + 挂件拖动热区（窗口 show/hide 由 Rust 侧可见性原语统一执行，前端不再直接调用）；PHASE11 起含 orb（拖动热区同族授权,缺 orb 会导致 data-tauri-drag-region 在该窗口静默失效）",
+  "windows": ["main", "widget", "orb"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "updater:default"
+  ]
+}
