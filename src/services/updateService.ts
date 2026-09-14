@@ -49,6 +49,12 @@ function errText(e: unknown): string {
   if (/network|dns|connect|timed? ?out/i.test(s)) {
     return 'Network error while checking for updates.'
   }
+  // 安装包验签失败（公钥与签名不配套等）：自动安装没有出路，直接指向手动下载。
+  // 事故背景：tauri.conf.json 的 pubkey 曾与私钥不配套，下载到 100% 后
+  // 在此处抛错——此前原文文案不指向任何动作，用户只看到「没有开始安装」。
+  if (/signature|minisign|verification failed/i.test(s)) {
+    return 'The downloaded package failed signature verification. Download the installer from the releases page instead.'
+  }
   return s
 }
 

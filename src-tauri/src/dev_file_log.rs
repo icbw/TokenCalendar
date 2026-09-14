@@ -1,13 +1,13 @@
 //! dev 文件日志。
 //!
 //! 设计约束：
-//! - **仅 dev 构建生效**（`debug_assertions`）——release 二进制零行为差异、
-//!   零文件写入（发布数据根保持干净）;
+//! - **仅 dev 构建生效**：整个模块由 `main.rs` 的 `#[cfg（debug_assertions)]`，
+//!   release 不编译（零行为差异、零文件写入——发布数据根与 %TEMP% 都保持干净）;
 //! - 落点 = **临时测试目录** `%TEMP%\tokencalendar-dev-logs\`（不进仓库、
 //!   不进数据根;跨 dev 会话可读,诊断完随手可删）;
 //! - 单文件封顶 1MB,超限滚动到 .old（覆盖）——防止无界增长;
 //! - 每次启动清理 7 天前的旧文件（冗余清理）;
-//! - `dev_log!` 宏双写:文件 + 控制台（保持既有控制台习惯）。
+//! - `dev_log!` 宏（定义在 crate 根 `main.rs`）双写:文件 + 控制台（保持既有控制台习惯）。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -60,43 +60,30 @@ pub fn init() {
     let _ = SINK.set(file.map(Mutex::new));
 }
 
-/// 双写一行（时间戳前缀;仅 dev 构建有输出——release 内联为空,零成本）。
+/// 双写一行（时间戳前缀;本模块仅 dev 构建编译，release 无此代码）。
 pub fn write_line(line: &str) {
-    #[cfg(debug_assertions)]
-    {
-        if let Some(Some(mutex)) = SINK.get().map(|s| s.as_ref()) {
-            if let Ok(mut f) = mutex.lock() {
-                // 滚动:超限 → 丢弃当前文件为 .old,重开当日文件
-                if f.metadata().map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-                    if let Some(dir) = log_dir() {
-                        let today = format!("dev-{}", chrono::Local::now().format("%Y%m%d"));
-                        let _ = std::fs::rename(
-                            dir.join(format!("{today}.log")),
-                            dir.join("dev-rolled.old.log"),
-                        );
-                        if let Ok(nf) = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(dir.join(format!("{today}.log")))
-                        {
-                            *f = nf;
-                        }
+    if let Some(Some(mutex)) = SINK.get().map(|s| s.as_ref()) {
+        if let Ok(mut f) = mutex.lock() {
+            // 滚动:超限 → 丢弃当前文件为 .old,重开当日文件
+            if f.metadata().map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+                if let Some(dir) = log_dir() {
+                    let today = format!("dev-{}", chrono::Local::now().format("%Y%m%d"));
+                    let _ = std::fs::rename(
+                        dir.join(format!("{today}.log")),
+                        dir.join("dev-rolled.old.log"),
+                    );
+                    if let Ok(nf) = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join(format!("{today}.log")))
+                    {
+                        *f = nf;
                     }
                 }
-                let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
-                let _ = writeln!(f, "[{stamp}] {line}");
             }
+            let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
+            let _ = writeln!(f, "[{stamp}] {line}");
         }
-        eprintln!("{line}");
     }
-    #[cfg(not(debug_assertions))]
-    let _ = line;
-}
-
-/// 结构化日志宏:任意表达式拼接（调用方负责不含 token/密钥——凭据安全走查门覆盖）。
-#[macro_export]
-macro_rules! dev_log {
-    ($($arg:tt)*) => {
-        $crate::dev_file_log::write_line(&format!($($arg)*))
-    };
+    eprintln!("{line}");
 }

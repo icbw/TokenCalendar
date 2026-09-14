@@ -5,6 +5,7 @@ mod chrome;
 mod collector;
 mod commands;
 mod data_root;
+#[cfg(debug_assertions)]
 mod dev_file_log;
 mod effects;
 #[cfg(test)]
@@ -24,6 +25,26 @@ use tauri::{Manager, WindowEvent};
 
 use collector::store::Store;
 use data_root::DataRoot;
+
+/// 结构化 dev 日志宏：任意表达式拼接（调用方负责不含 token/密钥——凭据安全走查门覆盖）。
+/// dev 构建双写文件 + 控制台；release 构建**不展开任何调用**（模块整体不进编译，
+/// 记参也不参与格式化——零成本、零文件写入）。定义在 crate 根：模块被 cfg 后
+/// 调用点（`crate:dev_log!`）仍处处可解析。
+#[macro_export]
+macro_rules! dev_log {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        {
+            $crate::dev_file_log::write_line(&format!($($arg)*));
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // release：记参仍参与 `format_args!` 的编译期格式校验（不移动、不分配、
+            // 不落盘——只是让内联捕获的变量保持「被使用」，避免 unused 警告）。
+            let _ = format_args!($($arg)*);
+        }
+    }};
+}
 
 pub struct AppState {
     /// 数据根（setup 首行解析,运行期不变;全部自有数据落点经此派生）。
@@ -153,7 +174,8 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             // dev 文件日志最先初始化（仅 dev 构建;落 %TEMP%\tokencalendar-dev-logs\,
-            // Agent 诊断可读;release 零写入）
+            // Agent 诊断可读;release 不编译此模块——零写入）
+            #[cfg(debug_assertions)]
             dev_file_log::init();
             dev_log!("[boot] tokencalendar {} starting", env!("CARGO_PKG_VERSION"));
             // 数据根最先解析（全部自有数据落点的前置依赖;dev/安装版在此分流）
