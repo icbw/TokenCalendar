@@ -1,0 +1,713 @@
+/* 悬浮球窗口两态样式。颜色变量按窗口拆分（GUIDE 红线：
+   orb 用 --orb-*，不复用 --shell-bg / --widget-card-*）。
+   配色基线：蓝白透明基底;数据渲染紫蓝渐变（
+   洞察图表同族血缘）。主题派生变量由 widgetTheme hook 写入 --orb-*。
+   透明前提：宿主 .orb-shell 全透明全出血。 */
+
+.orb-shell {
+  /* 环/条配色单点定义：
+     周额度（长周期）= 青 → 蓝 → 紫 —— 表盘外环与收起态竖条外轮廓同源;
+     5h（短周期）= 紫 → 蓝 —— 表盘内环与收起态竖条内条同源。
+     两处消费同一组值,改色只改这里（SVG stop 经 orb-weekly-stop-* /
+     orb-gauge-stop-* 类消费,DOM 渐变直接 var 引用）。 */
+  --orb-grad-weekly-hi: #9cecff;
+  --orb-grad-weekly-mid: #668cff;
+  --orb-grad-weekly-lo: #9c4fff;
+  --orb-grad-five-hi: #8e63ff;
+  --orb-grad-five-lo: #279cff;
+  /* 轨道色（周额度环 / 5h 环与条共用——⑱ 同步） */
+  --orb-rail-weekly: rgba(146, 166, 224, 0.26);
+  --orb-rail-five: rgba(120, 140, 205, 0.16);
+  /* 数据过渡时长（㉖）：新数据落库时余量弧/进度条把差值滑出来的时间——
+     刷新第二段（落位）要看得清「涨/跌」,所以比 UI 微动效（--dur-fast
+     0.12s）慢一档;改快会让落位变回「跳一下」。 */
+  --orb-dur-data: 450ms;
+  /* 根容器即窗口（定位上下文——展开态 .orb-orb 绝对定位到固定偏移,见下） */
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  /* 收起态竖条在窗口内居中（窗口 56×116 = 本体 24×84 + 每边 16px 呼吸位,
+     贴死左上角会把投影裁在窗口边界）。展开态内容不走这里——它绝对定位到
+     （235,100)（见下:窗口绕表盘视觉中心对称,多出的透明区是 hover 提示位画布） */
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+/* ---------- 收起态：竖向胶囊贴边条 ---------- */
+
+.orb-pill {
+  position: relative;
+  /* 视觉升级：乳白玻璃胶囊底
+     +白描边+轻投影——「只留本体」的语义不变（胶囊即竖条本体,非容器框）,
+     质感与球形态同族（玻璃堆叠:胶囊 44% 透明度层）。窗口 56×116 = 胶囊
+     24×84 + 每边 16px 透明呼吸位（㉑:旧版 4px,投影/发光被窗口边界截断）,
+     胶囊在窗口内居中。 */
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--orb-card-text, #2b3a55);
+}
+
+/* 两态切换动效（S5,对齐 snap-land 族：~150ms 一次性微动效）：
+   class 从 .is-hidden 摘除时选择器重新匹配 → 动画重放（纯 CSS,无 JS 状态）。
+   orb 无吸附落定语义,触发点只有形态切换本身。 */
+.orb-pill:not(.is-hidden),
+.orb-orb:not(.is-hidden) {
+  animation: orb-pop 150ms ease-out;
+}
+
+@keyframes orb-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.orb-pill.is-hidden {
+  visibility: hidden;
+  /* 移出交互面（两态互斥显示,浮层铁律:DOM 常驻不卸载） */
+  pointer-events: none;
+  position: absolute;
+  left: -9999px;
+}
+
+.orb-pill-track {
+  position: relative;
+  width: 24px;
+  height: 84px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 玻璃胶囊底：乳白渐变+白描边+轻投影,与球形态质感同族 */
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(230, 238, 255, 0.38));
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 12px;
+  box-shadow:
+    0 2px 10px rgba(15, 35, 110, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  box-sizing: border-box;
+}
+
+/* 外轮廓 SVG（周额度进度描边）+ 内条（5h）同轨叠放。
+   overflow: visible——SVG 默认 hidden,进度描边的 drop-shadow 发光会被
+   viewBox 裁掉（外扩 4px 正好用满窗口呼吸位,不会出窗口） */
+.orb-pill-outline {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+/* 外轮廓轨道（⑱）：与展开态表盘外环轨道同款淡蓝——旧版是深灰蓝「底色」,
+   整套外圈因此发灰,与表盘的青蓝紫不同族（用户截图指出的「灰色圈」）。 */
+.orb-outline-base {
+  stroke: var(--orb-rail-weekly);
+}
+
+/* 周额度进度（⑱ 起 = 青 → 蓝 → 紫渐变,与表盘外环同源;stop 类 =
+   orb-weekly-stop-*,与表盘共用同一组 CSS 定义,不存在两套色值）。
+   ㉘改「水位」语义：整圈轮廓常亮（描边色/渐变由
+   path 的 SVG 属性给）,由 .orb-pill-level 遮罩切掉水位线以上——余量减少时
+   两侧竖边**一起向下退**,与内条自下而上的线性消耗读法对齐。旧版是
+   dasharray 画的一圈弧（从 12 点起步绕圈）,读不出「消耗」且缺口只在一侧。 */
+
+/* 发光与表盘外环同档（㉑：窗口呼吸位 4 → 16px,不必再压半径）。㉘ 起挂在
+   外层 g 上：遮罩在滤镜**之后**应用,挂在被遮罩的 path 上会把水位线处的光晕
+   硬切一刀。opacity 过渡 = 刷新扫描态的压暗（㉗ 右键刷新）。 */
+.orb-pill-fade {
+  filter: drop-shadow(0 0 5px rgba(124, 116, 255, 0.28));
+  transition: opacity 160ms ease-out;
+}
+
+/* 水位遮罩内容（㉘）：矩形（宽度留余量,因为遮罩区域只有 24 宽）整体纵向平移
+   = 水位线;填充是㉙ 起挂上的竖向渐变（上黑下白 → 水位线上方渐隐,
+   #orbPillLevelFade）,所以这里**不要**再写 fill——CSS 会盖掉 SVG 属性,
+   淡出就没了。
+   过渡挂在 transform 上——数据落位时水位自己滑下来,不需要动任何 SVG 几何
+   属性（那可不可靠另说,这里的表达式最直白）。 */
+.orb-pill-level {
+  transition: transform var(--orb-dur-data, 450ms) ease;
+}
+
+/* 内条轨道（⑱）：与展开态表盘内环轨道同款。高度抽成局部变量（㉘）：填充的
+   渐变要按轨道高度锚定,别把 66px 再写一遍 */
+.orb-pill-inner {
+  --orb-pill-bar-h: 66px;
+  width: 10px;
+  height: var(--orb-pill-bar-h);
+  border-radius: 5px;
+  background: var(--orb-rail-five);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+/* 内条填充：5h = **蓝 → 紫**——
+   与表盘内环同源同值,方向按竖条自己的读法自上而下（越往下越紫,与「消耗在下、
+   剩余在上」一致）。旧版是紫 → 蓝,读起来是反的。
+   渐变**锚定到轨道高度**（background-size + background-position:bottom）：否则
+   余量变少时整条色带被压进那一小段里,同一高度上的颜色随余量漂移,和外轮廓的
+   绝对配色（按高度固定）对不上。 */
+.orb-pill-inner-fill {
+  width: 100%;
+  border-radius: 5px;
+  background: linear-gradient(180deg, var(--orb-grad-five-lo), var(--orb-grad-five-hi));
+  background-size: 100% var(--orb-pill-bar-h);
+  background-position: 0 bottom;
+  box-shadow: 0 0 5px rgba(120, 110, 250, 0.34);
+  /* opacity 供刷新扫描态压暗（㉗） */
+  transition:
+    height var(--orb-dur-data, 450ms) ease,
+    opacity 160ms ease-out;
+}
+
+/* 平台切换钮已撤——收起态回归
+   「视觉只留竖条本体」;多平台切换收敛到展开卡片头部 chip。 */
+
+/* 竖条状态点已随移除（视觉只留竖条本体;状态表达收敛到
+   展开卡片的右上角状态点+提示行） */
+
+/* ---------- 展开态：周额度环 + 中央 5h 表盘 ---------- */
+/* 极简基线：外圈 = 周额度进度环（壳体轮廓本身,正圆;三轮缩小
+   150 → 130 → 118 → 110）,直径 ≈ 旧版「内圈」（中央 5h 表盘）的量级。
+   环内四件内容：5h 剩余大数（**无总量 / 100**）/
+   5h 重置时刻（HH:MM）/ 平台 + 套餐名一行（**无状态点**、无 Active 文字,
+   状态文案落 hover 提示）/ 周重置倒计时（纯文字,不加粗无背景）。
+   完整口径（剩余/总量/重置）与状态文案由**分位置 hover 浮层**承载
+   （零视觉占用但不丢数据;㉕ 起为自绘玻璃浮层,原生 title 已退役）。
+   功能按钮移出外圈,右侧一列悬挂按钮（订阅设置 / 刷新 / 缩小 / 切换订阅;
+   默认隐去,悬浮/键盘聚焦淡入,见 .orb-orb-hang）。
+   投影由窗口呼吸位承接（内容左上 （235,100);窗口 580×310,右侧/底部多出的
+   透明区是 hover 提示的落点画布——主体之外点击穿透,不抢鼠标）。 */
+
+.orb-orb {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  align-self: center;
+  color: var(--orb-card-text, #23304d);
+  font-family: inherit;
+}
+
+/* 展开态内容定位：窗口 580×310,
+   坐标 （235, 100) 使**表盘视觉中心 = 窗口中心**（235+55=580/2、100+55=310/2;
+   盘径 150 → 130 → 118 → 110 三轮重算——）。
+   为什么必须对称：Windows 按**窗口矩形中心**判定窗口属于哪台显示器——右偏的
+   透明画布会让「窗口中心过接缝」早于「表盘视觉中心过接缝」,系统提前把窗口判给
+   另一侧屏。
+   绝对定位而非改 flex 居中:.orb-orb 自带 align-self:center,排在 flex 里还得
+   反着覆盖一遍;绝对定位是单点声明,也不受 .orb-shell 的居中规则影响。
+   偏移量与 Rust 侧 EXPANDED_PAD_L/T_LOGICAL 同源,勿单改一处。 */
+.orb-shell.is-expanded .orb-orb {
+  position: absolute;
+  left: 235px;
+  top: 100px;
+}
+
+.orb-orb.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+  position: absolute;
+  left: -9999px;
+}
+
+/* 表盘本体（壳体 + 周额度环 + 中央内容;title 承载被撤浮标的数据）。
+   三轮：150 → 130 → 118 → 110px——SVG 走 viewBox 等比缩放
+   （r74/r70 常量与描边宽度自动跟随）。 */
+.orb-orb-dial {
+  position: relative;
+  width: 110px;
+  height: 110px;
+  flex: none;
+}
+
+/* 表盘 SVG：玻璃底 + 外缘高光 + 周额度环（轨道/进度）同图叠放 */
+.orb-orb-shell {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* 投影半径受窗口呼吸位约束：向下 5+12=17px < 20px 底部呼吸位,不会被裁 */
+.orb-orb-glass {
+  filter:
+    drop-shadow(0 5px 12px rgba(24, 44, 120, 0.18))
+    drop-shadow(0 2px 4px rgba(70, 90, 180, 0.1));
+}
+
+.orb-orb-rim {
+  stroke: rgba(255, 255, 255, 0.7);
+  stroke-width: 1.2;
+}
+
+/* 轨道与进度：环是「容器轮廓」而非主角——描边细、半透明、发光克制 */
+.orb-orb-track {
+  stroke: var(--orb-rail-weekly);
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+
+.orb-orb-fill {
+  stroke: url(#orbWeeklyGrad);
+  stroke-width: 5;
+  stroke-linecap: round;
+  opacity: 0.9;
+  filter: drop-shadow(0 0 5px rgba(124, 116, 255, 0.28));
+  /* opacity 过渡供刷新扫描态压暗（㉖）;dasharray 过渡 = 数据落位时余量弧
+     把「涨/跌」滑出来的那一段（值走 inline style,见 OrbWindow） */
+  transition:
+    stroke-dasharray var(--orb-dur-data, 450ms) ease,
+    opacity 160ms ease-out;
+}
+
+/* 周额度渐变（长周期：青 → 蓝 → 紫;与中央 5h 环的紫 → 蓝色相错开,
+   用户不看文字也能分辨「外面 = 长周期 / 里面 = 短周期」）。
+   ⑱：色值改由 .orb-shell 的 --orb-grad-weekly-* 单点提供——
+   收起态竖条外轮廓的渐变 stop 复用同一组类,两处必然同色。 */
+.orb-weekly-stop-hi { stop-color: var(--orb-grad-weekly-hi); }
+.orb-weekly-stop-mid { stop-color: var(--orb-grad-weekly-mid); }
+.orb-weekly-stop-lo { stop-color: var(--orb-grad-weekly-lo); }
+
+/* ---------- 外挂按钮列（⑯：功能按钮移出外圈,挂在表盘右侧） ---------- */
+/* 四个按钮从上到下 = 管理订阅 / 刷新 / 缩小 / 切换订阅。列高 = 4×16 + 3×5 =
+   79px < 表盘 110px,由 .orb-orb 的 align-items:center 垂直居中;切换订阅在
+   单绑定时禁用（保持列高恒定,不做条件渲染——避免形态抖动）。
+   ⑰：按钮直径 28 → 19px,不再喧宾夺主——表盘是
+   读数主体,按钮列退为附属控件。
+   第七轮：直径 19 → 16px + **默认完全隐去**（opacity 0
+   + pointer-events:none,后者补）——鼠标悬浮 orb（或键盘聚焦按钮）
+   才淡入,移出后渐隐;隐去 = 同时退出命中门（那块区域恢复可拖动、不误触按钮）。 */
+
+.orb-orb-hang {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: none;
+  opacity: 0;
+  transition: opacity 260ms ease;
+  /* 隐去 = 同时退出命中门：静止时这一列既不可点、也不
+     吃鼠标——否则 16px 宽的隐形热区会把「想拖窗口」变成误触按钮（button 豁免
+     drag-region,在按钮上按下既拖不动窗口、松手还触发动作）。命中落回 .orb-orb
+     （deep 拖动区）后,这块区域恢复为「可拖动的空白」。 */
+  pointer-events: none;
+}
+
+/* 悬浮显示（.orb-orb = 球 + 按钮列整块交互体）/ 键盘聚焦也显示 */
+.orb-orb:hover .orb-orb-hang,
+.orb-orb-hang:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.orb-hang-btn {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--orb-card-text, #23304d);
+  cursor: pointer;
+  /* 投影随直径收窄（16px 圆内 2+5 档仍偏重,再降一档） */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    0 1px 4px rgba(70, 90, 180, 0.12);
+  transition:
+    background var(--dur-fast, 0.12s) ease,
+    transform var(--dur-fast, 0.12s) ease;
+}
+
+.orb-hang-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.78);
+  transform: translateY(-1px);
+}
+
+.orb-hang-btn:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.orb-hang-btn svg {
+  width: 8px;
+  height: 8px;
+}
+
+/* 中央 5h 主表盘（唯一读数：白盘 + 环形进度;中心偏上给套餐名/状态让位）。
+   六档（当日回滚）：周倒计时曾放大 10 → 11（行高 13）,因与套餐名
+   9px 反差过大不好看而调回 10 / 11——位置始终不动（表盘 top 10、两行
+   bottom 24·11）,盘-文字间距随字号复原为 5。 */
+.orb-orb-gauge-wrap {
+  position: absolute;
+  top: 10px;
+  left: 0;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+/* 盘径：92 → 80 → 68 → 60px;读数两级字号同步
+   微调（见下）。命中半径随 DOM 尺寸自适应（OrbWindow onDialMove）。 */
+.orb-gauge {
+  position: relative;
+  width: 60px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.orb-gauge svg {
+  width: 100%;
+  height: 100%;
+  /* 环形发光（drop-shadow）外扩不被 SVG 视口裁掉 */
+  overflow: visible;
+  /* 表盘白盘（玻璃堆叠最实的一层——读数落点） */
+  background: radial-gradient(
+    circle at 50% 46%,
+    #ffffff 0%,
+    rgba(252, 253, 255, 0.96) 58%,
+    rgba(238, 244, 255, 0.9) 100%
+  );
+  border-radius: 50%;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.9),
+    inset 0 -5px 10px rgba(150, 175, 240, 0.14),
+    0 3px 10px rgba(70, 90, 180, 0.1);
+  box-sizing: border-box;
+}
+
+.orb-gauge-track {
+  stroke: var(--orb-rail-five);
+}
+
+.orb-gauge-fill {
+  stroke: url(#orbFiveGrad);
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 3px rgba(120, 110, 250, 0.38));
+  /* 5h 环的读数走 dashoffset（周长换算）;过渡同上——值走 inline style */
+  transition:
+    stroke-dashoffset var(--orb-dur-data, 450ms) ease,
+    opacity 160ms ease-out;
+}
+
+/* 中央 5h 渐变（短周期：紫 → 蓝,与周额度环的青 → 紫色相错开）。
+   ⑱：色值同样单点在 .orb-shell（--orb-grad-five-*）,收起态内条
+   以同值 var 消费。 */
+.orb-gauge-stop-hi { stop-color: var(--orb-grad-five-hi); }
+.orb-gauge-stop-lo { stop-color: var(--orb-grad-five-lo); }
+
+.orb-gauge.is-empty .orb-gauge-fill { stroke: var(--orb-muted, #94a3b8); }
+
+.orb-gauge-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+
+/* 读数两级排版权重（⑱）：剩余大数 > 重置时刻;随盘径同步微调
+   （30 → 26 → 22 → 20px / 12 → 11 → 10 → 9px）,盘内留白收紧。 */
+.orb-gauge-num {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 0.94;
+  letter-spacing: -0.05em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 5h 重置时刻（HH:MM）——直接当标签读数,不再是「5H」文字 */
+.orb-gauge-reset {
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1.2;
+  opacity: 0.55;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 底部两行：上排 = 周重置倒计时
+   （较宽的读数上移）,下排 = 平台 + 套餐名（不加粗 / 缩小字号;状态点删除
+   ——连接状态文案本来就在 hover 提示里,点属冗余）。位置由 bottom 决定,
+   与 DOM 顺序无关（这里按「套餐行 → 重置行」书写）。 */
+.orb-orb-plan {
+  position: absolute;
+  bottom: 11px;
+  /* 居中方式 = left 50% + 自身半宽位移 + width:max-content（替代 left:0 +
+     width:100% + flex 居中）:命中区收缩到文字本身——整条 110px 带会盖住
+     外环下弧,hover 到环上却弹套餐行提示（㉕ 命中区口径）。 */
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 11px;
+}
+
+.orb-orb-reset {
+  position: absolute;
+  bottom: 24px;
+  /* 同上:命中区 = 倒计时文字本身,不占整条带宽 */
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 11px;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+/* 状态点（提示浮层用,㊱ 起只剩这一处消费方）：hover 提示的四态级别点。
+   套餐行旁边那颗常驻点已删（连接状态文案本就落 hover 提示,常驻点属冗余）。 */
+.orb-card-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--orb-ok, #22c55e);
+  flex-shrink: 0;
+}
+
+.orb-card-dot.is-warn { background: var(--orb-warn, #f59e0b); }
+.orb-card-dot.is-error { background: var(--orb-danger, #ef4444); }
+.orb-card-dot.is-muted { background: var(--orb-muted, #94a3b8); }
+
+/* ---------- 刷新扫描态（㉖：点击刷新后两枚进度环同时动） ---------- */
+/* 白光短弧沿环奔跑（18% 弧长 / 1.1s 一圈,与余量弧同径同宽）,周额度环与
+   中央 5h 表盘同时进入「重新测量」态;余量弧压暗但**不清零**——数字与弧长
+   仍是真值,动的只是「正在取新数据」这件事。
+   动画走 stroke-dashoffset 而不是 CSS transform： 不依赖 transform-box /
+   transform-origin 的浏览器实现差异; 不覆盖 SVG transform 属性（表盘环靠
+   rotate（-90) 把起点对到 12 点）。dasharray「18 82」的周期正好 = 一整圈
+   （pathLength 已归一到 100）→ 0 → -100 是无缝循环。 */
+.orb-orb-sweep,
+.orb-gauge-sweep,
+.orb-pill-sweep {
+  stroke: rgba(255, 255, 255, 0.95);
+  stroke-linecap: round;
+  stroke-dasharray: 18 82;
+  opacity: 0;
+  transition: opacity 160ms ease-out;
+  /* 白弧 + 饱和蓝紫光晕：底色（玻璃/白盘）与余量弧上都要看得见——纯白弧
+     在近白底与淡色轨道上对比不足,靠饱和光晕给出边缘（这是它唯一的可见性
+     来源,改色时别把光晕调淡） */
+  filter:
+    drop-shadow(0 0 3px rgba(86, 108, 240, 0.85))
+    drop-shadow(0 0 7px rgba(124, 116, 255, 0.5));
+}
+
+.orb-orb-sweep {
+  stroke-width: 5;
+}
+
+.orb-gauge-sweep {
+  stroke-width: 6.5;
+}
+
+/* 收起态竖条（㉗）：与展开态同一条扫掠弧,描边宽度对齐竖条外轮廓（3） */
+.orb-pill-sweep {
+  stroke-width: 3;
+}
+
+.orb-orb-dial.is-refreshing .orb-orb-sweep,
+.orb-orb-dial.is-refreshing .orb-gauge-sweep,
+.orb-pill.is-refreshing .orb-pill-sweep {
+  opacity: 1;
+  animation: orb-sweep-run 1.1s linear infinite;
+}
+
+/* 余量弧压暗：读数仍可辨（不是空态）,主角让给扫掠弧。**只挂第一段**
+   （`.is-waiting` = 还没见新数据）——新数据落库（landing）立刻摘掉压暗,
+   「涨/跌」的滑移才会在正常亮度下被看见（这是用户要的「后半段」）。
+   收起态竖条同理：外轮廓弧与内条一起压暗（两个进度可视都要「重新测量」） */
+.orb-orb-dial.is-waiting .orb-orb-fill,
+.orb-orb-dial.is-waiting .orb-gauge-fill,
+.orb-pill.is-waiting .orb-pill-fade,
+.orb-pill.is-waiting .orb-pill-inner-fill {
+  opacity: 0.42;
+}
+
+/* ---------- 待机（standby）：主轮询退档期间整体减淡 ---------- */
+/* 读数长期无变化 → 检测放慢（封顶 30 分钟）,悬浮球整体
+   透明度提高 50%（opacity 减半）——静置期降低视觉占用;任何变化回基础档,
+   亮度同步恢复。挂在两个形态本体上（透明画布不参与,不影响穿透命中判定）,
+   与刷新扫描态的压暗（opacity 相乘）互不冲突;400ms 过渡进出都柔和。 */
+.orb-pill,
+.orb-orb {
+  transition: opacity 400ms ease;
+}
+
+.orb-shell.is-standby .orb-pill,
+.orb-shell.is-standby .orb-orb {
+  opacity: 0.5;
+}
+
+@keyframes orb-sweep-run {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
+/* 图标自转与两环扫描态同寿（㉖）：刷新时长现在跟真实取数走（≥1.2s）,
+   一次性 0.8s 会在环还在跑的时候先停住 */
+.orb-hang-btn svg.is-spinning {
+  animation: orb-spin 0.8s linear infinite;
+}
+
+@keyframes orb-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 未绑定空态（⑱）：读数行显示「—」、套餐名显示 Not bound（点 muted 灰）,
+   与有数据形态同构,不再需要专门的空态规则 */
+
+/* ---------- hover 提示浮层（㉕：替代原生 title 工具提示） ---------- */
+/* 视觉与悬挂按钮/右键菜单同族：乳白玻璃底 + 白描边 + 轻投影;排版两级——
+   小字大写标签（口径名）+ 主读数（加粗）+ 补充行（淡小）。尺寸压在读数
+   卡片量级,不做系统工具提示那种大边距长句。
+   ⚠ pointer-events 必须为 none：提示跟光标走,若它挡住光标会立刻触发
+   mouseleave,提示闪成一片（因此它不承接任何交互,仅被钳制在可用落点内）。
+   位置由 placeTip/tipSpan 计算（可用落点 = 窗口矩形 ∩ 屏幕工作区;
+   展开窗口右侧/底部是提示位画布,靠屏边时窗口会挂出屏外）,这里只管外观。 */
+.orb-tip {
+  position: fixed;
+  z-index: 60;
+  max-width: 188px;
+  padding: 4px 9px 5px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(237, 243, 255, 0.9));
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow:
+    0 5px 14px rgba(24, 44, 120, 0.18),
+    0 1px 3px rgba(70, 90, 180, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  color: var(--orb-card-text, #23304d);
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--dur-fast, 0.12s) ease-out;
+}
+
+/* 显示态淡入（对齐 orb-pop 族的一次性微动效）;隐藏即断可见性,不留残影 */
+.orb-tip:not(.is-hidden) {
+  opacity: 1;
+}
+
+/* 隐藏态：DOM 常驻（透明 WebView2 上条件卸载留脏像素）,只关可见性 + 移出窗 */
+.orb-tip.is-hidden {
+  visibility: hidden;
+  left: -9999px;
+  top: -9999px;
+}
+
+/* 口径名（小字全大写淡色）——与表盘的克制感一致,不抢读数 */
+.orb-tip-label {
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 11px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  opacity: 0.45;
+}
+
+/* 主读数行（状态类提示带四态点,点与首行文字对齐——不随两行文案居中） */
+.orb-tip-primary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 5px;
+}
+
+.orb-tip-primary .orb-card-dot {
+  margin-top: 4px;
+}
+
+/* 主读数（唯一定值口径）与补充行（重置信息等）权重两级 */
+.orb-tip-line {
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 13px;
+  letter-spacing: 0.01em;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.orb-tip-line.is-primary {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  opacity: 1;
+}
+
+/* ---------- 右键菜单（DOM 常驻浮层,铁律：禁止条件卸载） ---------- */
+
+.orb-menu {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--orb-card-bg, rgba(245, 248, 255, 0.97));
+  border: 1px solid var(--orb-card-border, rgba(90, 110, 200, 0.25));
+  box-shadow: 0 4px 16px rgba(30, 41, 89, 0.18);
+}
+
+.orb-menu.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+  left: -9999px;
+  top: -9999px;
+}
+
+.orb-menu button {
+  border: none;
+  background: transparent;
+  color: var(--orb-card-text, #2b3a55);
+  font-size: 11px;
+  text-align: left;
+  padding: 5px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.orb-menu button:hover {
+  background: var(--orb-accent-weak, rgba(99, 102, 241, 0.12));
+}

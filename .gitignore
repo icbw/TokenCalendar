@@ -1,0 +1,5 @@
+# 依赖与构建产物（公开面只有源码，构建/运行时只会生成以下内容）
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/

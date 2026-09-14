@@ -1,0 +1,402 @@
+/* 设置页（自右缘窄面板改为内容区全幅独立视图，三子 tab）。
+   视图替换而非浮层：占满 .shell-main，无遮罩无滑入 overlay（规避透明窗口
+   脏像素风险面）。转场仅内容淡入（tokens v2 动效语言）。
+   旧 .settings-panel 类随面板形态退役（右缘嵌板版本已删）。 */
+
+.settings-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  animation: settings-fade var(--dur-normal) var(--ease-out);
+}
+
+@keyframes settings-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ---- 工具条：返回钮 + 子 tab 条（pill 语言对齐矩阵工具栏/年份切换）
+   与中间面板对齐——内容限宽 720px 同面板居中;
+   返回键在 General 左侧（面板左缘外侧一点）,tab 条从面板左缘排起。 ---- */
+.settings-toolbar {
+  display: flex;
+  justify-content: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.settings-toolbar-inner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 720px;
+}
+
+.settings-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-size-xs);
+  padding: 4px 9px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.settings-back:hover {
+  background: var(--accent-weak);
+  color: var(--text);
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  background: var(--zero-bg);
+  border-radius: 8px;
+}
+
+.settings-tab {
+  font-size: var(--font-size-xs);
+  line-height: 1;
+  padding: 4px 12px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.settings-tab:hover {
+  color: var(--text);
+}
+
+.settings-tab.is-active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+/* ---- 内容区：全幅滚动，行式布局沿用 setting-* 约定 ---- */
+.settings-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* ---- 挂件美化组 ---- */
+.setting-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  position: relative; /* 取色弹层（absolute）的定位基准 */
+}
+
+.setting-swatches {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 槽位容器：色板行 + 取色弹层，弹层 absolute 锚定本行正下方
+   （四槽位各就各位，不再写死 top——主界面组三行各自展开）。 */
+.setting-color-field {
+  position: relative;
+}
+
+.setting-swatch {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  transition: transform var(--dur-fast) ease, box-shadow var(--dur-fast) ease;
+}
+
+.setting-swatch:hover {
+  transform: translateY(-1px);
+}
+
+.setting-swatch.is-active {
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent);
+}
+
+.setting-swatch-mark {
+  font-size: 10px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+/* 取色弹层：DOM 常驻（铁律——透明 WebView2 上条件卸载留脏像素）。
+   closed = 移出视口 + visibility 关闭；open = 视口内常态。 */
+.color-popover {
+  width: 200px;
+  padding: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  box-shadow: var(--shadow-2);
+  z-index: 30;
+  /* 锚定槽位容器（.setting-color-field）正下方；不再依赖 block 内写死 top */
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) ease;
+}
+
+.color-popover.is-open {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.color-popover-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.color-popover-input .react-colorful__hex-input {
+  width: 90px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text);
+  background: var(--panel);
+}
+
+/* react-colorful BEM 覆写（自绘皮肤：圆角/指针对齐 tokens v2） */
+.color-popover .react-colorful {
+  width: 100%;
+}
+
+.color-popover .react-colorful__saturation {
+  border-radius: 6px;
+  border-bottom: none;
+}
+
+.color-popover .react-colorful__hue {
+  border-radius: 6px;
+  margin-top: 8px;
+  height: 12px;
+}
+
+/* 预览卡：所见即所得（色板/调色盘改色即时反映对比度派生结果） */
+.setting-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--widget-card-border);
+  border-radius: var(--radius-card);
+}
+
+.setting-preview-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--widget-card-text);
+}
+
+.setting-preview-cells {
+  display: flex;
+  gap: 4px;
+}
+
+.setting-preview-cells i {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  display: inline-block;
+  background: var(--widget-zero-bg);
+}
+
+.setting-preview-cells i.lv1 { background: #dbeafe; }
+.setting-preview-cells i.lv2 { background: #bfdbfe; }
+.setting-preview-cells i.lv3 { background: #93c5fd; }
+.setting-preview-cells i.lv4 { background: #60a5fa; }
+.setting-preview-cells i.lv5 { background: #3b82f6; }
+
+/* ---- 以下为行式控件样式（自右缘面板平移，选择器不变） ---- */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--font-size-md);
+}
+
+/* 档位行右侧的分段控件不随 space-between 拉伸 */
+.setting-row .setting-seg {
+  margin-left: 12px;
+}
+
+/* boost：行内数字输入（阈值/自定义间隔）与单位后缀。
+   与 setting-seg 同族的窄控件语言（零内边距基调、圆角、弱边框）。 */
+.setting-num {
+  margin-left: 12px;
+  width: 52px;
+  padding: 3px 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text);
+  background: var(--zero-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  text-align: right;
+}
+.setting-num:focus {
+  outline: none;
+  border-color: var(--accent, #7aa2ff);
+}
+.setting-num:disabled {
+  opacity: 0.45;
+}
+/* 隐藏 number 输入的浏览器步进箭头（值域窄,直接键入更快） */
+.setting-num::-webkit-outer-spin-button,
+.setting-num::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.setting-num {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.setting-unit {
+  margin-left: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}
+
+.setting-note {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  line-height: 1.6;
+}
+
+/* Widget design parameters */
+.setting-value {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* 尺寸档位分段按钮：large/medium/small 三选一。 */
+.setting-seg {
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  background: var(--zero-bg);
+  border-radius: 8px;
+}
+
+.setting-seg-btn {
+  font-size: var(--font-size-xs);
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.setting-seg-btn:hover {
+  color: var(--text);
+}
+
+.setting-seg-btn.is-active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* 禁用段（ToggleRow 的 dev 构建禁改态 / Bind 缺凭据）：降透明度但仍可 hover 读 title。 */
+.setting-seg-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.setting-row input[type='range'] {
+  flex: 1;
+  max-width: 260px;
+  margin-left: 12px;
+  accent-color: var(--accent);
+}
+
+/* 分组标题与按钮 */
+.setting-section {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}
+
+.setting-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 路径输入（数据 tab:迁移/备份/恢复目标目录） */
+.setting-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text);
+  background: var(--panel);
+  font-family: inherit;
+}
+
+.setting-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.setting-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text);
+  background: var(--panel);
+}
+
+.setting-btn:hover:not(:disabled) {
+  background: var(--accent-weak);
+}
+
+.setting-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.setting-btn.is-active {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+}

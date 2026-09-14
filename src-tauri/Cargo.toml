@@ -1,0 +1,48 @@
+[package]
+name = "tokencalendar"
+version = "0.5.5"
+description = "TokenCalendar — desktop widget for AI agent token usage"
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# CodeBuddy 官网用量导出 xlsx（imports 导入）解析;xlsx/zip 自 0.23 起内置,无需 feature。
+calamine = { version = "0.28", default-features = false }
+# DSH 会话日志为多帧 zstd 拼接容器（dsh.rs 帧扫描 + 逐帧解压;只读用途）。
+zstd = "0.13"
+tauri-plugin-dialog = "2.7.3"
+# 应用内更新检查（设置·About）：更新源 = 公开仓 Release 的 latest.json；
+# 安装包签名校验由插件按 tauri.conf.json 的 pubkey 内置执行，不可关闭。
+tauri-plugin-updater = "2"
+# PHASE11 subscription/：低频（分钟级）订阅额度轮询——同步阻塞客户端即可,
+# 不引入 tokio 运行时;rustls 纯 Rust TLS,无 OpenSSL 依赖。
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+tauri-plugin-autostart = "2"
+
+[target.'cfg(windows)'.dependencies]
+# PHASE10 snap.rs：SetWindowSubclass/DefSubclassProc（comctl32 子类化）。
+# WM_* 常量本地定义（snap.rs），不引 Win32_UI_WindowsAndMessaging；
+# Gdi（工作区 rcWork）随 S2 吸附逻辑引入。
+# HiDpi（PHASE11 修㊴）：orb_dock 的 `window_dpi_scale` 用 GetDpiForWindow **现取**
+# 窗口 DPI——tao 的 scale_factor() 是缓存，跨屏瞬间会拿到旧值。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# PHASE07 P2 毛玻璃 spike：tauri 2 依赖树已自带 0.6.0（传递依赖），显式声明直绑
+# ——apply_mica/apply_acrylic 的 Win32 路径与版本门槛（17763/22000/22523）已按
+# 该版本源码核实（设计文档 §4.1），不走 tauri set_effects 的间接映射层。
+window-vibrancy = "0.6"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

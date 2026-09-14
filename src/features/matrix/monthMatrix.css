@@ -1,0 +1,195 @@
+/* 月矩阵布局：固定行头 + 31 列 + 行总量
+   格子尺寸 CSS 单源封顶,只随窗口缩小不放大。
+   格子尺寸改 JS 双轴等比（UsageMatrixView ResizeObserver
+   量测宽高,cell = min（17, 宽预算/31, 高预算/行数),gap = cell/5 与原版 15:3
+   同比例——行距恒 = 列距）;结果写进 --cell-px/--cell-gap-px/--cells-w 三个
+   共享变量。格子区宽度恒 = --cells-w（不再 minmax 拉伸）,整个
+   「标签|格子|Total」块作为一个整体在中列内居中——两侧文字间距封顶,放大
+   窗口不再把文字推离格子。工具栏/图表面板消费同一组变量对齐格子两缘。 */
+
+.month-matrix {
+  --label-width: 150px;
+  --total-width: 92px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  outline: none;
+  width: 100%;
+}
+
+/* 表头（与行同列模板:label | 格子区 | total;格子区宽度恒 = --cells-w） */
+.matrix-header {
+  display: grid;
+  grid-template-columns: var(--label-width) var(--cells-w, 517px) var(--total-width);
+  gap: 6px;
+  align-items: end;
+  justify-content: center; /* 整块居中:两侧文字间距封顶 */
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.matrix-header-days {
+  display: grid;
+  grid-template-columns: repeat(var(--day-count, 31), var(--cell-px, 17px));
+  gap: var(--cell-gap-px, 3px);
+}
+
+.matrix-header-day {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  text-align: center;
+  line-height: 1;
+}
+
+/* 31 天滚动窗口：窗口内属于上月/更早的表头列淡化（月缩写列保持可读） */
+.matrix-header-day.is-muted {
+  color: var(--text-faint);
+  opacity: 0.55;
+}
+
+.matrix-header-label,
+.matrix-header-total {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  text-align: right;
+  padding: 0 2px;
+}
+
+/* 行（与表头同列模板+整块居中,标签与格子的间距恒定不随窗口放大） */
+.matrix-row {
+  display: grid;
+  grid-template-columns: var(--label-width) var(--cells-w, 517px) var(--total-width);
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+}
+
+.matrix-row.is-selected-row .matrix-row-name {
+  color: var(--selected-ring);
+}
+
+.matrix-row-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm);
+  color: var(--text);
+  text-align: right;
+  justify-content: flex-end;
+  padding: 2px 4px;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.matrix-row-label:hover {
+  background: var(--accent-weak);
+}
+
+.matrix-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.matrix-row-health {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.matrix-row-health.is-attention {
+  background: var(--warn);
+}
+.matrix-row-health.is-error {
+  background: var(--danger);
+}
+
+.matrix-row-cells {
+  display: grid;
+  grid-template-columns: repeat(var(--day-count, 31), var(--cell-px, 17px));
+  gap: var(--cell-gap-px, 3px);
+}
+
+/* 单元格（bugfix:宽高都显式取 --cell-px——删 aspect-ratio 后 height
+   会塌成文字行高,格子变横线;JS 等比缩放保证两轴同尺寸） */
+.day-cell {
+  width: var(--cell-px, 17px);
+  height: var(--cell-px, 17px);
+  border-radius: 6px;
+  border: 1px solid transparent;
+  outline: none; /* 重置 button 默认 focus outline，避免零格子上残留蓝边框 */
+  appearance: none; /* 禁用系统 native button 样式 */
+  position: relative;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: inherit;
+  font-family: inherit;
+  background: transparent; /* 默认透明；zero/normal/estimated 等用 inline style 覆盖 */
+  transition: transform 0.05s ease, box-shadow 0.05s ease;
+}
+
+.day-cell:focus,
+.day-cell:focus-visible {
+  outline: none;
+}
+
+/* 真实零值：明显淡灰底（区别于"未来"无底色） */
+.day-cell.is-zero {
+  background-color: var(--zero-bg);
+}
+
+/* 未来日期：完全透明（不抢视觉） */
+.day-cell.is-future {
+  background: transparent !important;
+  cursor: default;
+}
+
+.day-cell:hover,
+.day-cell.is-hover {
+  transform: scale(1.18);
+  z-index: 1;
+}
+
+.day-cell-value {
+  pointer-events: none;
+}
+
+.day-cell.is-zero {
+  /* 真实零值底色在矩阵里通过 inline style 直接设置；这里只定义 hover/future 行为 */
+  color: var(--text-faint);
+}
+
+.day-cell.is-future {
+  background: transparent !important;
+  cursor: default;
+  pointer-events: none; /* 未来日期不可点击 */
+}
+
+.day-cell.is-estimated {
+  border-style: dashed;
+  border-color: var(--estimated-dash);
+}
+
+.day-cell.is-error {
+  cursor: not-allowed;
+}
+
+.day-cell.is-selected {
+  box-shadow: 0 0 0 2px var(--selected-ring);
+  z-index: 2;
+}
+
+/* 行总量 */
+.matrix-row-total {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  padding: 0 2px;
+}
+
+/* Tooltip 样式已抽至 matrixTooltip.css（挂件与主窗口共用同组件同格式） */

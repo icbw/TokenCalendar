@@ -1,0 +1,476 @@
+/* 数据洞察视图：三区块卡片（趋势环比 / 异常日 / 积分月报）。
+   视觉对齐 tokens v2：面板卡 + 手写 CSS 条形（项目不引图表库）。
+   全部消费现有主题变量（--panel/--border/--accent…），主题管线零改动。
+   最大宽度面板——对照矩阵视图整块宽度（~885px）,
+   全屏时内容居中不铺满;工具栏参照矩阵式排布,单行不换行。 */
+
+/* 工具栏固定不随滚动（设置页同款）——
+   .insights-view 改纯纵向 flex 固定架（不滚动）,工具栏 flex-shrink:0
+   常驻顶部;滚动职责下放给 .insights-scroll（只包卡片内容）。 */
+
+.insights-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  flex: 1;        /* 撑满 .shell-main（纵向 flex）,高度约束才能传给滚动区 */
+  min-height: 0;
+  max-width: 900px; /* 矩阵整块（标签+格子+Total）满格宽度同档,居中 */
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* 滚动区:只包卡片内容;工具栏在其外固定 */
+.insights-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ---- 区块卡片骨架 ---- */
+
+.insight-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  flex-shrink: 0;
+}
+
+.insight-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.insight-card-title {
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  color: var(--text);
+}
+
+.insight-card-sub {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}
+
+.insight-empty {
+  font-size: var(--font-size-sm);
+  color: var(--text-faint);
+  padding: 10px 0;
+}
+
+/* ---- 主图工具行（口径控件;v3.8 单行 nowrap;v3.9 独立成行——
+   不与图表面板共用卡片,参照矩阵视图「工具栏在上、面板在下」两块结构,
+   自带面板底/描边/圆角成为独立一条） ---- */
+
+.insight-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap; /* 矩阵式单行:控件放不下横向溢出,绝不换行 */
+  overflow-x: auto;  /* 极窄窗口兜底:横向滚动而非换行 */
+  scrollbar-width: none;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  flex-shrink: 0; /* 固定行:不被滚动区压缩 */
+}
+
+.insight-toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ---- 系列图例（可点击筛选） ---- */
+
+.series-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 6px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border-radius: 20px;
+  border: 1px solid transparent;
+}
+
+.legend-item:hover {
+  color: var(--text);
+  background: var(--zero-bg);
+}
+
+.legend-item.is-active {
+  color: var(--text);
+  background: var(--accent-weak);
+  border-color: var(--accent);
+}
+
+.legend-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* ---- 占比环（主图下方同口径构成） ---- */
+
+.donut-wrap {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- 趋势环比 ---- */
+
+.trend-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 2px 0 4px;
+}
+
+.trend-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-width: 52px;
+  flex: 1;
+}
+
+.trend-value {
+  font-size: var(--font-size-xs);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-bar-track {
+  width: 100%;
+  max-width: 64px;
+  height: 72px;
+  display: flex;
+  align-items: flex-end;
+  background: var(--zero-bg);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.trend-bar {
+  width: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  min-height: 2px;
+}
+
+.trend-month {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.trend-mom {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-mom.is-up {
+  color: #059669;
+}
+
+.trend-mom.is-down {
+  color: var(--danger);
+}
+
+.trend-mom.is-flat {
+  color: var(--text-faint);
+}
+
+/* ---- 异常日（单行 31 格热力条） ---- */
+
+.anomaly-heatmap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.anomaly-heatmap-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.anomaly-heatmap-none,
+.anomaly-heatmap-count {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.anomaly-heatmap-none {
+  color: var(--text-faint);
+}
+
+.anomaly-heatmap-count {
+  color: var(--accent);
+}
+
+.anomaly-strip {
+  display: flex;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.anomaly-cell {
+  flex: 1;
+  height: 22px;
+  border-radius: 4px;
+  min-width: 0;
+  cursor: default;
+}
+
+/* 非异常日:有数据中性灰 / 无数据更浅 */
+.anomaly-cell.is-flat {
+  background: var(--zero-bg);
+}
+
+.anomaly-cell.is-zero {
+  background: color-mix(in srgb, var(--zero-bg) 45%, transparent);
+}
+
+/* 异常日按 |z| 强度上色（|z|≥2 起步,更强更深）:
+   高位离群（用量暴增）= 红阶;低位离群（骤降）= 蓝阶。
+   color-mix 无法按 |z| 数值插值,用三档类（JS 侧按 |z| 落档）。 */
+.anomaly-cell.is-high.z2 { background: #fca5a5; } /* |z| 2~3 */
+.anomaly-cell.is-high.z3 { background: #f87171; } /* |z| 3~4 */
+.anomaly-cell.is-high.z4 { background: #dc2626; } /* |z| ≥ 4 */
+.anomaly-cell.is-low.z2 { background: #93c5fd; }
+.anomaly-cell.is-low.z3 { background: #60a5fa; }
+.anomaly-cell.is-low.z4 { background: #2563eb; }
+
+/* ---- 积分月报 ---- */
+
+.credit-month {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--font-size-xs);
+  padding: 2px 6px;
+  color-scheme: inherit;
+}
+
+.credit-guide {
+  padding: 6px 2px;
+}
+
+.credit-guide-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+
+.credit-guide-body {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  margin: 0;
+  line-height: 1.6;
+}
+
+.credit-guide-body code {
+  background: var(--zero-bg);
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  font-size: var(--font-size-xs);
+}
+
+.credit-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.credit-totals {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+}
+
+.credit-total-note .credit-total-label {
+  font-weight: 400;
+}
+
+/* 区分模型开关（双组图） */
+.credit-mode-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.credit-mode-toggle input {
+  accent-color: var(--accent);
+}
+
+/* 双组图容器与按模型分组 */
+.credit-combo {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.credit-combo-model {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+.credit-combo-model-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+/* 双组图固定语义色图例（与 charts COMBO_* 常量一一对应） */
+.combo-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.combo-legend .legend-item {
+  cursor: default;
+  padding: 0;
+}
+
+.credit-total-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.credit-total-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}
+
+.credit-total-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.credit-section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.credit-section-title {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.credit-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.credit-model-row {
+  display: grid;
+  grid-template-columns: 150px 1fr auto 36px;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-xs);
+}
+
+.credit-model-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.credit-model-track {
+  height: 10px;
+  background: var(--zero-bg);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.credit-model-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 5px;
+  min-width: 2px;
+}
+
+.credit-model-value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.credit-model-share {
+  color: var(--text-faint);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.credit-days {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.credit-day-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.credit-day-bar-track {
+  width: 100%;
+  height: 46px;
+  display: flex;
+  align-items: flex-end;
+}
+
+.credit-day-bar {
+  width: 100%;
+  background: var(--accent);
+  opacity: 0.75;
+  border-radius: 2px 2px 0 0;
+}
+
+.credit-day-label {
+  font-size: 9px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
