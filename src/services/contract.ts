@@ -123,3 +123,246 @@ export interface RangeSeriesResultContract {
   series_labels: string[]
   points: RangeSeriesPointContract[]
 }
+
+// ---- 项目维与任务分析（与 commands.rs / collector/task_query.rs 对齐）----
+// 调用约定:get_project_month_rows / get_task_turns 参数名 snake_case（rename_all），其余单词参数。
+
+/** 项目维 metric:token 三列 + 计数 + 时间成本（wait = Σ wall_ms 等待,human = Σ idle_ms 人工,毫秒,并列不相加）。 */
+export type ProjectMetric = 'total' | 'input' | 'output' | 'turns' | 'model_calls' | 'tool_calls' | 'wait' | 'human'
+export type ProjectGroupBy = 'project' | 'agent' | 'model'
+
+/** get_project_month_rows 参数（返回 MatrixResult;message_counts = Σ turns）。 */
+export interface ProjectMonthRowsArgs {
+  month: string
+  group_by: ProjectGroupBy
+  metric: ProjectMetric
+}
+
+/** get_project_breakdown 参数（返回 BreakdownDay[],tokens = total）:
+ * kind=project → 每日 Agent 构成;kind=agent|model → 每日项目构成。 */
+export interface ProjectBreakdownArgs {
+  kind: ProjectGroupBy
+  key: string
+  month: string
+}
+
+/** 本地日闭区间（"YYYY-MM-DD"）。 */
+export interface DayRangeContract {
+  start_day: string
+  end_day: string
+}
+
+export interface TaskFiltersContract {
+  agent?: string
+  project?: string
+}
+
+export type TaskSortField =
+  | 'started_at'
+  | 'turns'
+  | 'steps'
+  | 'tool_calls'
+  | 'wall_ms'
+  | 'model_ms'
+  | 'tool_ms'
+  | 'error_count'
+  | 'aborted_count'
+  | 'subagent_count'
+  | 'subagent_calls'
+  | 'total_tokens'
+
+export interface TaskSortContract {
+  field: TaskSortField
+  direction: 'asc' | 'desc'
+}
+
+/** limit 1..500（缺省 50）。 */
+export interface TaskPageReqContract {
+  offset: number
+  limit: number
+}
+
+/** get_task_list 参数:filters / sort / page 可省（不过滤 / started_at 降序 / 前 50 条）。 */
+export interface TaskListArgs {
+  range: DayRangeContract
+  filters?: TaskFiltersContract
+  sort?: TaskSortContract
+  page?: TaskPageReqContract
+}
+
+/** 任务 = 有轮的根会话（子会话已并入,不单独出现）。时间字段毫秒;null = 源无该值（CodeBuddy）,
+ * JSONL 族 model_ms / tool_ms 为估算。title 是内容列:仅本地展示,不得进入导出。 */
+export interface TaskRowContract {
+  agent: string
+  session_id: string
+  /** 解析后的有效项目键（S5:合并目标 / __scratch / 原键）。 */
+  project: string
+  /** 有效项目展示名（alias 优先）。 */
+  project_label: string
+  /** 会话首轮的原始目录键。 */
+  project_raw: string
+  started_at: number
+  ended_at: number | null
+  title: string | null
+  turns: number
+  /** = model_calls（含子代理）。 */
+  steps: number
+  tool_calls: number
+  wall_ms: number | null
+  model_ms: number | null
+  tool_ms: number | null
+  /** API / 工具错误（S4-R 起不含用户中止）。 */
+  error_count: number
+  /** 用户中止的轮数（S4-R）。 */
+  aborted_count: number
+  subagent_count: number
+  subagent_calls: number
+  total_tokens: number
+}
+
+export interface TaskPageContract {
+  /** 过滤后总数（分页前）。 */
+  total: number
+  rows: TaskRowContract[]
+}
+
+/** get_task_turns 参数（子会话 id → 空列表）。 */
+export interface TaskTurnsArgs {
+  agent: string
+  session_id: string
+}
+
+export interface TaskTurnContract {
+  /** 按开始时间 1..n。 */
+  turn_seq: number
+  day: string
+  project: string
+  model: string
+  started_at: number
+  ended_at: number | null
+  wall_ms: number | null
+  model_ms: number | null
+  tool_ms: number | null
+  /** 仅 ZCode 有值。 */
+  ttft_ms: number | null
+  /** 原始轮间空档（首轮 null,不截断）。 */
+  gap_ms: number | null
+  steps: number
+  tool_calls: number
+  subagent_count: number
+  subagent_calls: number
+  error_count: number
+  retry_count: number
+  /** 用户中止（S4-R,与 error_count 分列）。 */
+  aborted: boolean
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+}
+
+/** get_effort_series 参数（返回 RangeSeriesResultContract;bucket 仅 day）。 */
+export interface EffortSeriesArgs {
+  range: DayRangeContract
+  bucket: 'day'
+  dimension: ProjectGroupBy | 'total'
+  metric: ProjectMetric
+  filter?: { dimension: ProjectGroupBy; key: string }
+}
+
+export interface GapBucketContract {
+  lo_ms: number
+  /** null = 开放上界（最后一桶）。 */
+  hi_ms: number | null
+  count: number
+}
+
+/** get_gap_histogram（range) 返回:gap_ms 对数分桶（[0,1s) + 1s×10^（k/4),k=0..24,共 26 桶）+ 当前阈值两侧合计。 */
+export interface GapHistogramContract {
+  threshold_ms: number
+  buckets: GapBucketContract[]
+  total: number
+  /** gap ≤ 阈值:计入 idle（= 范围内 Σ daily_project.idle_ms）。 */
+  within_count: number
+  within_ms: number
+  beyond_count: number
+  beyond_ms: number
+}
+
+/** get_project_span（project?) 返回（S4-R）:给定项目 = 生命周期（daily_project 首末日）;
+ * 省略 = 全部数据首末日（All 范围起点）;无数据 = null。 */
+export interface DaySpanContract {
+  first_day: string
+  last_day: string
+}
+
+/** get_idle_threshold 返回。 */
+export interface IdleThresholdInfoContract {
+  minutes: number
+  default_minutes: number
+  min_minutes: number
+  max_minutes: number
+}
+
+/** set_idle_threshold（minutes) 返回（写 prefs.json idleThresholdMin + 同步重算 daily_project + emit usage:changed）。 */
+export interface IdleThresholdAppliedContract {
+  minutes: number
+  recomputed_days: number
+  elapsed_ms: number
+}
+
+// ---- 项目管理（与 commands.rs / collector/project_meta.rs 对齐）----
+
+export type ProjectStatus = 'active' | 'hidden' | 'merged' | 'scratch'
+
+/** list_project_meta 每个目录键一行。 */
+export interface ProjectMetaRowContract {
+  key: string
+  label: string
+  alias: string | null
+  hidden: boolean
+  merged_into: string | null
+  merged_label: string | null
+  note: string | null
+  status: ProjectStatus
+  /** 有 meta 行（显式管理过,自动规则不作用）。 */
+  managed: boolean
+  /** 分析视图里的有效键;null = 不可见（自身隐藏,或合并目标 / Scratch 被隐藏）。 */
+  effective_key: string | null
+  agents: string[]
+  sessions: number
+  turns: number
+  tokens: number
+  first_day: string | null
+  last_day: string | null
+  updated_at: number | null
+  folder_exists: boolean
+}
+
+export interface ProjectMetaListContract {
+  rows: ProjectMetaRowContract[]
+  scratch_hidden: boolean
+  scratch_alias: string | null
+}
+
+/** set_project_meta（input):单条 upsert（alias / note 空 = 清除,≤ 120 字符）;reset = 删行回到自动态。 */
+export interface ProjectMetaInputContract {
+  project_key: string
+  alias: string | null
+  hidden: boolean
+  note: string | null
+  reset: boolean
+}
+
+export interface ScratchRuleContract {
+  enabled: boolean
+  min_sessions: number
+  min_turns: number
+  unknown_as_scratch: boolean
+}
+
+export interface ScratchRuleInfoContract {
+  rule: ScratchRuleContract
+  defaults: ScratchRuleContract
+  min_sessions_bounds: [number, number]
+  min_turns_bounds: [number, number]
+}

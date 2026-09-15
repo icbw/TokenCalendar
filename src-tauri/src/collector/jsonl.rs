@@ -95,8 +95,13 @@ pub fn tail(path: &Path, start_offset: u64, max_bytes: u64) -> std::io::Result<T
         None => 0,
     };
     let new_offset = start_offset + complete_end as u64;
-    let text = String::from_utf8_lossy(&buf[..complete_end]);
-    let lines = text.lines().map(|l| l.trim_end_matches('\r').to_string()).collect();
+    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（S4-R 缺陷 A,见 collector/text.rs）。
+    // 与 str:lines 同语义:完整行以 '\n' 结尾,split 末尾多出的空段丢弃,中间空行保留。
+    let mut lines: Vec<String> = buf[..complete_end]
+        .split(|&b| b == b'\n')
+        .map(|l| super::text::decode_bytes(l).trim_end_matches('\r').to_string())
+        .collect();
+    lines.pop();
     Ok(Tail::Advanced { new_offset, lines })
 }
 

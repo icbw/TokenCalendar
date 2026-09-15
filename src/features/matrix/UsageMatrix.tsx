@@ -31,6 +31,10 @@ export interface UsageMatrixProps {
   selectedRow?: string | null
   onSelectCell(rowKey: string, day: number): void
   onSelectRow(rowKey: string): void
+  /** :格值格式化（缺省 token 紧凑格式;时间成本指标传 formatDuration）。 */
+  formatValue?: (v: number) => string
+  /** hover 读数单位（缺省 "tokens";wait / human 时间指标传对应单位）。 */
+  valueUnit?: string
 }
 
 interface TooltipState {
@@ -50,6 +54,8 @@ export default function UsageMatrix({
   selectedRow,
   onSelectCell,
   onSelectRow,
+  formatValue = formatCompact,
+  valueUnit = 'tokens',
 }: UsageMatrixProps) {
   const gridRef = useRef<HTMLDivElement>(null)
   const [tooltip, setTooltip] = useState<TooltipState | null>(null)
@@ -85,7 +91,7 @@ export default function UsageMatrix({
     if (v === 0 && (c ?? 0) === 0) {
       lines.push('No usage')
     } else {
-      lines.push(`${formatCompact(v)} tokens${c != null ? ` · ${c.toLocaleString('en-US')} messages` : ''}`)
+      lines.push(`${formatValue(v)} ${valueUnit}${c != null ? ` · ${c.toLocaleString('en-US')} messages` : ''}`)
       const isEst = row.cellOpts?.(day)?.estimated
       if (isEst) lines.push('Quality: estimated')
     }
@@ -94,7 +100,7 @@ export default function UsageMatrix({
       ? `${MONTH_ABBR[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`
       : `${row.label} · ${dayLabels[day]}`
     setTooltip({ anchor: el, content: { title, lines } })
-  }, [rows, dayLabels, dates])
+  }, [rows, dayLabels, dates, formatValue, valueUnit])
 
   const hideTooltip = useCallback(() => setTooltip(null), [])
 
@@ -206,7 +212,7 @@ export default function UsageMatrix({
                 )
               })}
             </div>
-            <div className="matrix-row-total">{formatCompact(row.total)}</div>
+            <div className="matrix-row-total">{formatValue(row.total)}</div>
           </div>
         )
       })}

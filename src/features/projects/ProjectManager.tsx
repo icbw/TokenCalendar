@@ -1,0 +1,544 @@
+// 项目管理面板:Settings·Projects tab 与主窗口内弹出层（ProjectManagerModal）共用。
+// 结构:规则区（自动折叠开关 + 两个阈值 + Unknown 归 Scratch + Scratch 显隐）/ 列表区（筛选 · 排序 · 批量条 · 表格）。
+// 数据:list_project_meta（每目录键一行,状态按当前规则解析）;写操作经 projectService,成功后后端发 usage:changed,
+// 本面板与各分析视图经既有监听重取。active = false 时不取数（弹出层常驻 DOM,关闭时只停取数）。
+// 行存在性语义见 Rust project_meta.rs:Rename / Hide / Unhide / Keep 都让键脱离自动规则;Reset 回到自动态。
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { events, projectService } from '../../services'
+import type { ProjectMetaList, ProjectMetaRow, ProjectStatus, ScratchRuleInfo, WriteResult } from '../../services'
+import { formatCompact, formatFull } from '../matrix/matrixScale'
+import { setDesignPrefs } from '../settings/designPrefs'
+import './projects.css'
+
+type StatusFilter = 'all' | ProjectStatus
+type SortKey = 'recent' | 'sessions'
+
+const STATUS_FILTERS: { v: StatusFilter; label: string; hint: string }[] = [
+  { v: 'all', label: 'All', hint: 'Every folder seen in the data' },
+  { v: 'active', label: 'Active', hint: 'Shown as their own project' },
+  { v: 'hidden', label: 'Hidden', hint: 'Left out of analysis views and project lists' },
+  { v: 'merged', label: 'Merged', hint: 'Counted under another project' },
+  { v: 'scratch', label: 'Scratch', hint: 'Collapsed into Scratch by the rule below' },
+]
+
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+function dayLabel(day: string | null): string {
+  if (!day) return '—'
+  const [y, m, d] = day.split('-').map(Number)
+  const year = y !== new Date().getFullYear() ? `, ${y}` : ''
+  return `${MONTH_ABBR[m - 1]} ${d}${year}`
+}
+
+function statusText(r: ProjectMetaRow): string {
+  switch (r.status) {
+    case 'hidden':
+      return 'Hidden'
+    case 'merged':
+      return `Merged → ${r.mergedLabel ?? r.mergedInto ?? ''}`
+    case 'scratch':
+      return 'Scratch'
+    default:
+      return 'Active'
+  }
+}
+
+function statusHint(r: ProjectMetaRow, scratchHidden: boolean): string {
+  const lines: string[] = []
+  if (r.status === 'merged' && r.mergedInto) lines.push(`Counted under ${r.mergedInto}`)
+  if (r.status === 'scratch') lines.push(scratchHidden ? 'Collapsed into Scratch (Scratch is hidden)' : 'Collapsed into Scratch by the rule')
+  if (r.status !== 'hidden' && r.effectiveKey === null && r.status !== 'scratch') lines.push('Not visible: its target project is hidden')
+  if (r.managed && r.status === 'active') lines.push('Managed: the Scratch rule does not apply')
+  return lines.join('\n')
+}
+
+export default function ProjectManager({ active }: { active: boolean }) {
+  const [list, setList] = useState<ProjectMetaList | null | undefined>(undefined)
+  const [ruleInfo, setRuleInfo] = useState<ScratchRuleInfo | null>(null)
+  const [refreshTick, setRefreshTick] = useState(0)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const [filter, setFilter] = useState<StatusFilter>('all')
+  const [sort, setSort] = useState<SortKey>('recent')
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [renaming, setRenamingState] = useState<{ key: string; value: string } | null>(null)
+  // 编辑态的同步镜像:Enter 保存后输入框卸载可能再触发一次 blur（旧闭包仍持有编辑态）,以 ref 判重防止同一改名写两次
+  const renamingRef = useRef(renaming)
+  const setRenaming = (next: { key: string; value: string } | null) => {
+    renamingRef.current = next
+    setRenamingState(next)
+  }
+  /** 合并选择器:sources = 待合并的键;target = 选中的目标键。 */
+  const [merging, setMerging] = useState<{ sources: string[]; target: string } | null>(null)
+
+  // 规则阈值输入草稿（失焦 / 回车才提交;非法值回退）
+  const [sessionsDraft, setSessionsDraft] = useState('')
+  const [turnsDraft, setTurnsDraft] = useState('')
+
+  useEffect(() => {
+    if (!active) return
+    let timer = 0
+    let off: (() => void) | null = null
+    void events.onUsageChanged(() => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => setRefreshTick((t) => t + 1), 300)
+    }).then((unlisten) => {
+      off = unlisten
+    })
+    return () => {
+      window.clearTimeout(timer)
+      off?.()
+    }
+  }, [active])
+
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
+    void Promise.all([projectService.listProjectMeta(), projectService.getScratchRule()]).then(([l, r]) => {
+      if (cancelled) return
+      setList(l)
+      setRuleInfo(r)
+      if (r) {
+        setSessionsDraft(String(r.rule.minSessions))
+        setTurnsDraft(String(r.rule.minTurns))
+      }
+      // 刷新后已不存在的选中键剔除
+      if (l) setSelected((prev) => new Set([...prev].filter((k) => l.rows.some((row) => row.key === k))))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [active, refreshTick])
+
+  // 关闭弹出层时收起编辑态
+  useEffect(() => {
+    if (active) return
+    renamingRef.current = null
+    setRenamingState(null)
+    setMerging(null)
+    setError(null)
+  }, [active])
+
+  const run = useCallback(async <T,>(op: () => Promise<WriteResult<T>>): Promise<boolean> => {
+    setBusy(true)
+    setError(null)
+    const res = await op()
+    setBusy(false)
+    if (!res.ok) {
+      setError(res.error)
+      return false
+    }
+    // usage:changed 会触发重取;这里立即再取一次,避免去抖窗口内的旧状态闪回
+    setRefreshTick((t) => t + 1)
+    return true
+  }, [])
+
+  const rows = useMemo(() => list?.rows ?? [], [list])
+  const byKey = useMemo(() => new Map(rows.map((r) => [r.key, r])), [rows])
+  const counts = useMemo(() => {
+    const c: Record<StatusFilter, number> = { all: rows.length, active: 0, hidden: 0, merged: 0, scratch: 0 }
+    for (const r of rows) c[r.status] += 1
+    return c
+  }, [rows])
+  /** 被他人合并进来的键（不能再作合并源）。 */
+  const targets = useMemo(() => new Set(rows.map((r) => r.mergedInto).filter((k): k is string => !!k)), [rows])
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const out = rows.filter(
+      (r) =>
+        (filter === 'all' || r.status === filter) &&
+        (!q || r.key.toLowerCase().includes(q) || r.label.toLowerCase().includes(q) || (r.alias ?? '').toLowerCase().includes(q)),
+    )
+    if (sort === 'sessions') {
+      out.sort((a, b) => b.sessions - a.sessions || b.turns - a.turns || a.label.localeCompare(b.label))
+    } else {
+      out.sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? '') || b.sessions - a.sessions || a.label.localeCompare(b.label))
+    }
+    return out
+  }, [rows, filter, sort, query])
+
+  const toggleSelect = (key: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  const allVisibleSelected = visible.length > 0 && visible.every((r) => selected.has(r.key))
+  const toggleSelectAll = () =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (allVisibleSelected) visible.forEach((r) => next.delete(r.key))
+      else visible.forEach((r) => next.add(r.key))
+      return next
+    })
+
+  // ---- 行操作 ----
+
+  const setHidden = (r: ProjectMetaRow, hidden: boolean) => run(() => projectService.setProjectMeta(r.key, { alias: r.alias, hidden, note: r.note }))
+
+  const saveRename = async () => {
+    const editing = renamingRef.current
+    if (!editing) return
+    setRenaming(null)
+    const r = byKey.get(editing.key)
+    if (!r) return
+    const alias = editing.value.trim()
+    if (alias === (r.alias ?? '')) return
+    await run(() => projectService.setProjectMeta(r.key, { alias: alias || null, hidden: r.hidden, note: r.note }))
+  }
+
+  const batchHide = async () => {
+    const keys = [...selected]
+    for (const k of keys) {
+      const r = byKey.get(k)
+      if (!r || r.hidden) continue
+      if (!(await run(() => projectService.setProjectMeta(r.key, { alias: r.alias, hidden: true, note: r.note })))) return
+    }
+    setSelected(new Set())
+  }
+
+  const mergeCandidates = useMemo(() => {
+    if (!merging) return []
+    const src = new Set(merging.sources)
+    return rows.filter((r) => !src.has(r.key) && r.mergedInto === null).sort((a, b) => a.label.localeCompare(b.label))
+  }, [merging, rows])
+  const blockedSources = merging ? merging.sources.filter((k) => targets.has(k)) : []
+
+  const confirmMerge = async () => {
+    if (!merging || !merging.target) return
+    if (await run(() => projectService.mergeProjects(merging.sources, merging.target))) {
+      setMerging(null)
+      setSelected(new Set())
+    }
+  }
+
+  // ---- 规则 ----
+
+  const applyRule = async (patch: Partial<ScratchRuleInfo['rule']>) => {
+    if (!ruleInfo) return
+    const next = { ...ruleInfo.rule, ...patch }
+    setBusy(true)
+    setError(null)
+    const res = await projectService.setScratchRule(next)
+    setBusy(false)
+    if (!res.ok) {
+      setError(res.error)
+      setSessionsDraft(String(ruleInfo.rule.minSessions))
+      setTurnsDraft(String(ruleInfo.rule.minTurns))
+      return
+    }
+    setRuleInfo(res.value)
+    const r = res.value.rule
+    setDesignPrefs({ scratchRuleEnabled: r.enabled, scratchMinSessions: r.minSessions, scratchMinTurns: r.minTurns, scratchUnknown: r.unknownAsScratch })
+    setRefreshTick((t) => t + 1)
+  }
+
+  const commitNumber = (field: 'minSessions' | 'minTurns', draft: string) => {
+    if (!ruleInfo) return
+    const [lo, hi] = field === 'minSessions' ? ruleInfo.minSessionsBounds : ruleInfo.minTurnsBounds
+    const n = Number(draft)
+    const reset = () => (field === 'minSessions' ? setSessionsDraft(String(ruleInfo.rule.minSessions)) : setTurnsDraft(String(ruleInfo.rule.minTurns)))
+    if (!Number.isInteger(n) || n < lo || n > hi) {
+      setError(`${field === 'minSessions' ? 'Sessions' : 'Turns'} must be a whole number from ${lo} to ${hi}`)
+      reset()
+      return
+    }
+    if (n === ruleInfo.rule[field]) return
+    void applyRule({ [field]: n })
+  }
+
+  const toggleScratchHidden = (hidden: boolean) =>
+    run(() => projectService.setProjectMeta(projectService.SCRATCH_KEY, { alias: list?.scratchAlias ?? null, hidden, note: null }))
+
+  const rule = ruleInfo?.rule
+  const selectedCount = selected.size
+
+  return (
+    <div className="pm">
+      <div className="setting-section">Scratch rule</div>
+      <div className="setting-block">
+        <Toggle
+          label="Collapse small folders into Scratch"
+          title="Folders with few sessions and few turns are shown as one Scratch project. Renamed, kept, hidden or merged folders are not affected."
+          checked={rule?.enabled ?? true}
+          disabled={!rule || busy}
+          onChange={(v) => void applyRule({ enabled: v })}
+        />
+        <div className="setting-row">
+          <span title="A folder is collapsed only when both counts are below these numbers">Collapse when</span>
+          <div className="pm-rule-nums">
+            <span className="setting-unit">fewer than</span>
+            <input
+              className="setting-num"
+              type="number"
+              aria-label="Session threshold"
+              value={sessionsDraft}
+              min={ruleInfo?.minSessionsBounds[0]}
+              max={ruleInfo?.minSessionsBounds[1]}
+              disabled={!rule || !rule.enabled || busy}
+              onChange={(e) => setSessionsDraft(e.target.value)}
+              onBlur={() => commitNumber('minSessions', sessionsDraft)}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+            <span className="setting-unit">sessions and fewer than</span>
+            <input
+              className="setting-num"
+              type="number"
+              aria-label="Turn threshold"
+              value={turnsDraft}
+              min={ruleInfo?.minTurnsBounds[0]}
+              max={ruleInfo?.minTurnsBounds[1]}
+              disabled={!rule || !rule.enabled || busy}
+              onChange={(e) => setTurnsDraft(e.target.value)}
+              onBlur={() => commitNumber('minTurns', turnsDraft)}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+            <span className="setting-unit">turns</span>
+          </div>
+        </div>
+        <Toggle
+          label="Unknown project goes to Scratch"
+          title="Sessions without a working directory (for example CodeBuddy cloud workspaces)"
+          checked={rule?.unknownAsScratch ?? true}
+          disabled={!rule || busy}
+          onChange={(v) => void applyRule({ unknownAsScratch: v })}
+        />
+        <Toggle
+          label="Hide Scratch"
+          title="Leave the Scratch project out of analysis views and project lists"
+          checked={list?.scratchHidden ?? false}
+          disabled={!list || busy}
+          onChange={(v) => void toggleScratchHidden(v)}
+        />
+        {ruleInfo && (
+          <div className="setting-note">
+            Default: collapse on, fewer than {ruleInfo.defaults.minSessions} sessions and fewer than {ruleInfo.defaults.minTurns} turns, Unknown goes to Scratch.
+          </div>
+        )}
+      </div>
+
+      <div className="setting-section">Folders</div>
+      <div className="setting-block pm-list-block">
+        <div className="pm-toolbar">
+          <div className="setting-seg" role="group" aria-label="Status filter">
+            {STATUS_FILTERS.map((f) => (
+              <button
+                key={f.v}
+                type="button"
+                className={`setting-seg-btn${filter === f.v ? ' is-active' : ''}`}
+                title={f.hint}
+                onClick={() => setFilter(f.v)}
+              >
+                {f.label} <span className="pm-count">{counts[f.v]}</span>
+              </button>
+            ))}
+          </div>
+          <div className="setting-seg" role="group" aria-label="Sort">
+            <button type="button" className={`setting-seg-btn${sort === 'recent' ? ' is-active' : ''}`} title="Most recent activity first" onClick={() => setSort('recent')}>
+              Recent
+            </button>
+            <button type="button" className={`setting-seg-btn${sort === 'sessions' ? ' is-active' : ''}`} title="Most sessions first" onClick={() => setSort('sessions')}>
+              Sessions
+            </button>
+          </div>
+          <input className="setting-input pm-search" type="search" placeholder="Filter by name or path" value={query} onChange={(e) => setQuery(e.target.value)} />
+        </div>
+
+        {selectedCount > 0 && !merging && (
+          <div className="pm-batchbar">
+            <span>{selectedCount} selected</span>
+            <button className="setting-btn" disabled={busy} onClick={() => void batchHide()} title="Hide every selected folder">
+              Hide
+            </button>
+            <button className="setting-btn" disabled={busy} onClick={() => setMerging({ sources: [...selected], target: '' })} title="Count the selected folders under one project">
+              Merge into…
+            </button>
+            <button className="setting-btn" onClick={() => setSelected(new Set())}>
+              Clear
+            </button>
+          </div>
+        )}
+
+        {merging && (
+          <div className="pm-batchbar pm-mergebar">
+            <span>
+              Merge {merging.sources.length === 1 ? (byKey.get(merging.sources[0])?.label ?? merging.sources[0]) : `${merging.sources.length} folders`} into
+            </span>
+            <select
+              className="matrix-sort pm-target"
+              value={merging.target}
+              aria-label="Merge target"
+              onChange={(e) => setMerging({ ...merging, target: e.target.value })}
+            >
+              <option value="">Choose a project…</option>
+              {mergeCandidates.map((r) => (
+                <option key={r.key} value={r.key} title={r.key}>
+                  {r.label}
+                  {r.status !== 'active' ? ` (${r.status})` : ''}
+                </option>
+              ))}
+            </select>
+            <button className="setting-btn is-active" disabled={busy || !merging.target || blockedSources.length > 0} onClick={() => void confirmMerge()}>
+              Merge
+            </button>
+            <button className="setting-btn" onClick={() => setMerging(null)}>
+              Cancel
+            </button>
+            {blockedSources.length > 0 && (
+              <span className="pm-error">
+                {blockedSources.map((k) => byKey.get(k)?.label ?? k).join(', ')} already {blockedSources.length === 1 ? 'has' : 'have'} merged folders; unmerge those first
+              </span>
+            )}
+          </div>
+        )}
+
+        {error && (
+          <div className="pm-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        {list === undefined ? (
+          <div className="setting-note">Loading…</div>
+        ) : list === null ? (
+          <div className="setting-note">Data unavailable (service not running)</div>
+        ) : visible.length === 0 ? (
+          <div className="setting-note">{rows.length === 0 ? 'No project folders collected yet' : 'No folders match this filter'}</div>
+        ) : (
+          <div className="pm-table-wrap">
+            <table className="pm-table">
+              <thead>
+                <tr>
+                  <th className="pm-col-check">
+                    <input type="checkbox" aria-label="Select all shown" checked={allVisibleSelected} onChange={toggleSelectAll} />
+                  </th>
+                  <th className="is-left">Name</th>
+                  <th className="is-left">Agents</th>
+                  <th title="Root sessions">Sessions</th>
+                  <th title="User turns">Turns</th>
+                  <th title="Total tokens">Tokens</th>
+                  <th className="is-left" title="First and last active day">Active</th>
+                  <th className="is-left">Status</th>
+                  <th className="is-left">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((r) => {
+                  const isRenaming = renaming?.key === r.key
+                  const hint = statusHint(r, list.scratchHidden)
+                  return (
+                    <tr key={r.key} className={`pm-row is-${r.status}${selected.has(r.key) ? ' is-selected' : ''}`}>
+                      <td className="pm-col-check">
+                        <input type="checkbox" aria-label={`Select ${r.label}`} checked={selected.has(r.key)} onChange={() => toggleSelect(r.key)} />
+                      </td>
+                      <td className="is-left pm-name" title={r.alias ? `${r.alias}\n${r.key}` : r.key}>
+                        {isRenaming ? (
+                          <input
+                            className="setting-input pm-rename"
+                            autoFocus
+                            maxLength={projectService.META_TEXT_MAX}
+                            placeholder={r.key.split('/').filter(Boolean).pop() ?? r.key}
+                            value={renaming.value}
+                            onChange={(e) => setRenaming({ key: r.key, value: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') void saveRename()
+                              if (e.key === 'Escape') setRenaming(null)
+                            }}
+                            onBlur={() => void saveRename()}
+                          />
+                        ) : (
+                          <>
+                            <span className="pm-label">{r.label}</span>
+                            <span className="pm-path">{r.key}</span>
+                          </>
+                        )}
+                      </td>
+                      <td className="is-left pm-agents" title={r.agents.join(', ')}>
+                        {r.agents.join(', ') || '—'}
+                      </td>
+                      <td>{formatFull(r.sessions)}</td>
+                      <td>{formatFull(r.turns)}</td>
+                      <td title={formatFull(r.tokens)}>{formatCompact(r.tokens)}</td>
+                      <td className="is-left pm-days">
+                        {r.firstDay === r.lastDay ? dayLabel(r.firstDay) : `${dayLabel(r.firstDay)} – ${dayLabel(r.lastDay)}`}
+                      </td>
+                      <td className="is-left" title={hint || undefined}>
+                        <span className={`pm-status is-${r.status}${r.effectiveKey === null && r.status !== 'hidden' ? ' is-invisible' : ''}`}>{statusText(r)}</span>
+                      </td>
+                      <td className="is-left">
+                        <div className="pm-actions">
+                        <button className="pm-act" disabled={busy} title="Set a display name (empty = folder name)" onClick={() => setRenaming({ key: r.key, value: r.alias ?? '' })}>
+                          Rename
+                        </button>
+                        {r.hidden ? (
+                          <button className="pm-act" disabled={busy} title="Show this folder again" onClick={() => void setHidden(r, false)}>
+                            Unhide
+                          </button>
+                        ) : (
+                          <button className="pm-act" disabled={busy} title="Leave out of analysis views and project lists (data is kept)" onClick={() => void setHidden(r, true)}>
+                            Hide
+                          </button>
+                        )}
+                        {r.status === 'scratch' && (
+                          <button className="pm-act" disabled={busy} title="Keep as its own project; the Scratch rule stops applying" onClick={() => void setHidden(r, false)}>
+                            Keep
+                          </button>
+                        )}
+                        {r.mergedInto ? (
+                          <button className="pm-act" disabled={busy} title={`Stop counting under ${r.mergedLabel ?? r.mergedInto}`} onClick={() => void run(() => projectService.unmergeProjects([r.key]))}>
+                            Unmerge
+                          </button>
+                        ) : (
+                          <button
+                            className="pm-act"
+                            disabled={busy || targets.has(r.key)}
+                            title={targets.has(r.key) ? 'Other folders are merged into this one' : 'Count this folder under another project'}
+                            onClick={() => setMerging({ sources: [r.key], target: '' })}
+                          >
+                            Merge into…
+                          </button>
+                        )}
+                        {r.folderExists && (
+                          <button className="pm-act" title="Open in File Explorer" onClick={() => void projectService.openProjectFolder(r.key).then((res) => !res.ok && setError(res.error))}>
+                            Open folder
+                          </button>
+                        )}
+                        {r.managed && (
+                          <button className="pm-act is-muted" disabled={busy} title="Clear name, hidden and merge settings; the Scratch rule applies again" onClick={() => void run(() => projectService.resetProjectMeta(r.key))}>
+                            Reset
+                          </button>
+                        )}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Off / On 两段开关（与设置页 ToggleRow 同一视觉语言;该组件未导出,这里按同一类名复刻）。 */
+function Toggle({ label, title, checked, disabled = false, onChange }: { label: string; title?: string; checked: boolean; disabled?: boolean; onChange(v: boolean): void }) {
+  return (
+    <div className="setting-row">
+      <span title={title}>{label}</span>
+      <div className="setting-seg" role="group" aria-label={label}>
+        <button type="button" className={`setting-seg-btn${!checked ? ' is-active' : ''}`} disabled={disabled} aria-pressed={!checked} onClick={() => onChange(false)}>
+          Off
+        </button>
+        <button type="button" className={`setting-seg-btn${checked ? ' is-active' : ''}`} disabled={disabled} aria-pressed={checked} onClick={() => onChange(true)}>
+          On
+        </button>
+      </div>
+    </div>
+  )
+}

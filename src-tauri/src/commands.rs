@@ -370,6 +370,374 @@ pub fn get_range_series(query: RangeSeriesQuery, state: State<'_, AppState>) -> 
     })
 }
 
+// ---------- 项目维与任务命令（只读 daily_project / turn / session,与既有命令并列） ----------
+//
+// 口径见 collector/task_query.rs 文件头。任务类型里的 `title` 是内容列:只随 IPC 回 UI,
+// 任何导出 / 文件序列化路径一律不得引用这些类型（export_month 只读 daily_usage）。
+
+pub use crate::collector::task_query::{DaySpan, GapHistogram, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn};
+use crate::collector::project_meta::{self, ProjectMetaInput, ProjectMetaList, ScratchRule};
+use crate::collector::task_store;
+
+/// 本地日闭区间 [start_day, end_day]（"YYYY-MM-DD"）。
+#[derive(Debug, Deserialize)]
+pub struct DayRange {
+    pub start_day: String,
+    pub end_day: String,
+}
+
+/// 范围上限（天）:防御性限长,约十年。
+const MAX_RANGE_DAYS: i64 = 3660;
+
+fn parse_range(range: &DayRange) -> Result<(chrono::NaiveDate, chrono::NaiveDate), String> {
+    let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| format!("invalid day: {d}"));
+    let (start, end) = (parse(&range.start_day)?, parse(&range.end_day)?);
+    if end < start {
+        return Err("end_day before start_day".into());
+    }
+    if (end - start).num_days() > MAX_RANGE_DAYS {
+        return Err(format!("range too long (max {MAX_RANGE_DAYS} days)"));
+    }
+    Ok((start, end))
+}
+
+/// 日闭区间 → 本地时间 [start 0 点, end 次日 0 点) 毫秒（DST 缺失的本地 0 点取最早有效时刻）。
+fn range_millis(range: &DayRange) -> Result<(i64, i64), String> {
+    use chrono::TimeZone;
+    let (start, end) = parse_range(range)?;
+    let midnight = |d: chrono::NaiveDate| -> Result<i64, String> {
+        let naive = d.and_hms_opt(0, 0, 0).ok_or("invalid day")?;
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|dt| dt.timestamp_millis())
+            .ok_or_else(|| "invalid local midnight".to_string())
+    };
+    Ok((midnight(start)?, midnight(end + chrono::Duration::days(1))?))
+}
+
+/// 项目维月度矩阵（形状 = get_monthly_matrix）。group_by: project | agent | model;
+/// metric: total | input | output | turns | model_calls | tool_calls | wait（Σ wall_ms）| human（Σ idle_ms）。
+/// message_counts = 该格对话轮次（Σ turns）。
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_project_month_rows(month: String, group_by: String, metric: String, state: State<'_, AppState>) -> Result<MatrixResult, String> {
+    if !matches!(group_by.as_str(), "project" | "agent" | "model") {
+        return Err(format!("unsupported group_by: {group_by}"));
+    }
+    if crate::collector::task_query::project_metric_col(&metric).is_none() {
+        return Err(format!("unsupported metric: {metric}"));
+    }
+    let dim = month_dim(&month)?;
+    let rows = with_reader(&state, |store| Ok(store.project_month_rows(&month, &group_by, &metric, today(), &project_meta::scratch_rule())))?
+        .ok_or_else(|| format!("invalid month: {month}"))?;
+    Ok(MatrixResult {
+        month,
+        days_in_month: dim,
+        generated_at: now_millis(),
+        rows: rows
+            .into_iter()
+            .map(|r| MatrixRow { key: r.key, label: r.label, values: r.values, message_counts: r.message_counts, month_total: r.month_total })
+            .collect(),
+    })
+}
+
+/// 项目维行钻取（形状 = get_breakdown,tokens = total）:kind = project → 每日 Agent 构成;
+/// kind = agent | model → 每日项目构成。
+#[tauri::command]
+pub fn get_project_breakdown(kind: String, key: String, month: String, state: State<'_, AppState>) -> Result<Vec<BreakdownDay>, String> {
+    month_dim(&month)?;
+    let days = with_reader(&state, |store| Ok(store.project_breakdown(&kind, &key, &month, today(), &project_meta::scratch_rule())))?
+        .ok_or_else(|| format!("unsupported kind: {kind}"))?;
+    Ok(days
+        .into_iter()
+        .map(|d| BreakdownDay {
+            day: d.day,
+            slices: d.slices.map(|list| list.into_iter().map(|s| BreakdownSlice { key: s.key, label: s.label, tokens: s.tokens }).collect()),
+        })
+        .collect())
+}
+
+/// 任务列表（有轮的根会话,会话开始时间落在范围内;子会话已并入父任务、不单独出现）。
+/// filters / sort / page 缺省:不过滤 / started_at 降序 / 前 50 条（limit ≤ 500）。
+#[tauri::command]
+pub fn get_task_list(
+    range: DayRange,
+    filters: Option<TaskFilters>,
+    sort: Option<TaskSort>,
+    page: Option<TaskPageReq>,
+    state: State<'_, AppState>,
+) -> Result<TaskPage, String> {
+    let (start_ms, end_ms) = range_millis(&range)?;
+    let sort = sort.unwrap_or_default();
+    with_reader(&state, |store| {
+        Ok(store.task_list(start_ms, end_ms, &filters.unwrap_or_default(), &sort, &page.unwrap_or_default(), &project_meta::scratch_rule()))
+    })?
+    .ok_or_else(|| format!("unsupported sort field: {}", sort.field))
+}
+
+/// 单会话逐轮明细（物化层,按开始时间 1..n;子会话 id → 空列表）。
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_task_turns(agent: String, session_id: String, state: State<'_, AppState>) -> Result<Vec<TaskTurn>, String> {
+    with_reader(&state, |store| store.task_turns(&agent, &session_id))
+}
+
+/// 曲线维度筛选（可选）:dimension = agent | model | project。
+#[derive(Debug, Deserialize)]
+pub struct SeriesFilter {
+    pub dimension: String,
+    pub key: String,
+}
+
+/// 时间成本曲线（形状 = get_range_series,读 daily_project）。bucket 仅 day（不支持 hour）;
+/// dimension: agent | model | project | total;metric 同 get_project_month_rows。
+#[tauri::command]
+pub fn get_effort_series(
+    range: DayRange,
+    bucket: String,
+    dimension: String,
+    metric: String,
+    filter: Option<SeriesFilter>,
+    state: State<'_, AppState>,
+) -> Result<RangeSeriesResult, String> {
+    if bucket != "day" {
+        return Err(format!("unsupported bucket: {bucket} (only 'day')"));
+    }
+    if crate::collector::task_query::project_metric_col(&metric).is_none() {
+        return Err(format!("unsupported metric: {metric}"));
+    }
+    parse_range(&range)?;
+    let series = with_reader(&state, |store| {
+        let f = filter.as_ref().map(|f| (f.dimension.as_str(), f.key.as_str()));
+        Ok(store.effort_series(&range.start_day, &range.end_day, &bucket, &dimension, &metric, f, &project_meta::scratch_rule()))
+    })?
+    .ok_or_else(|| "invalid dimension or filter".to_string())?;
+    Ok(RangeSeriesResult {
+        series_keys: series.series_keys,
+        series_labels: series.series_labels,
+        points: series.points.into_iter().map(|p| RangeSeriesPointOut { bucket: p.bucket, values: p.values }).collect(),
+    })
+}
+
+/// 数据跨度（S4-R,时间过滤）:`project` 给定 → 该项目生命周期（daily_project 首末日）;
+/// 省略 → 全部数据首末日（daily_usage ∪ daily_project,「All」范围起点）。无数据 → null。
+#[tauri::command]
+pub fn get_project_span(project: Option<String>, state: State<'_, AppState>) -> Result<Option<DaySpan>, String> {
+    with_reader(&state, |store| Ok(store.data_span(project.as_deref().filter(|p| !p.is_empty()), &project_meta::scratch_rule())))
+}
+
+/// 轮间空档直方图（gap_ms 对数分桶 + 当前阈值两侧合计;按轮的本地日过滤）。
+#[tauri::command]
+pub fn get_gap_histogram(range: DayRange, state: State<'_, AppState>) -> Result<GapHistogram, String> {
+    parse_range(&range)?;
+    with_reader(&state, |store| Ok(store.gap_histogram(&range.start_day, &range.end_day, task_store::idle_threshold_ms(), &project_meta::scratch_rule())))?
+        .ok_or_else(|| "invalid range".to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdleThresholdInfo {
+    pub minutes: u32,
+    pub default_minutes: u32,
+    pub min_minutes: u32,
+    pub max_minutes: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdleThresholdApplied {
+    pub minutes: u32,
+    /// 重算覆盖的 （agent, 日) 格数。
+    pub recomputed_days: usize,
+    /// 全表重算耗时（毫秒,不含 prefs 落盘）。
+    pub elapsed_ms: u64,
+}
+
+fn idle_threshold_info() -> IdleThresholdInfo {
+    IdleThresholdInfo {
+        minutes: (task_store::idle_threshold_ms() / 60_000) as u32,
+        default_minutes: (crate::collector::store::IDLE_THRESHOLD_MS / 60_000) as u32,
+        min_minutes: task_store::IDLE_THRESHOLD_MIN_MINUTES,
+        max_minutes: task_store::IDLE_THRESHOLD_MAX_MINUTES,
+    }
+}
+
+/// 启动时从 prefs.json 载入离开阈值（缺键 / 非法 → 默认 30 分钟）。须早于采集线程 spawn。
+pub fn load_idle_threshold(app: &AppHandle) {
+    let Ok(dr) = crate::data_root::current(app) else { return };
+    if let Some(m) = std::fs::read_to_string(dr.prefs_path()).ok().as_deref().and_then(task_store::threshold_from_prefs) {
+        task_store::set_idle_threshold_minutes(m);
+    }
+}
+
+#[tauri::command]
+pub fn get_idle_threshold() -> IdleThresholdInfo {
+    idle_threshold_info()
+}
+
+/// 设置离开阈值（分钟）:合并写入 prefs.json `idleThresholdMin`（其余键原样）→ 下发运行时值 →
+/// 同步重算 daily_project 全表（只读原始层,不动游标）→ emit `usage:changed`。
+/// 重算走独立短连接的 IMMEDIATE 事务,与采集写串行（锁忙重试 3 次）;失败时运行时值与 prefs
+/// 已生效,采集线程下次启动按阈值标记自愈。
+#[tauri::command]
+pub async fn set_idle_threshold(app: AppHandle, minutes: u32) -> Result<IdleThresholdApplied, String> {
+    if !(task_store::IDLE_THRESHOLD_MIN_MINUTES..=task_store::IDLE_THRESHOLD_MAX_MINUTES).contains(&minutes) {
+        return Err(format!(
+            "minutes out of range ({}..={})",
+            task_store::IDLE_THRESHOLD_MIN_MINUTES,
+            task_store::IDLE_THRESHOLD_MAX_MINUTES
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = crate::data_root::current(&app)?.prefs_path();
+        let raw = std::fs::read_to_string(&path).ok();
+        write_prefs_atomic(&path, &task_store::prefs_with_threshold(raw.as_deref(), minutes))?;
+        task_store::set_idle_threshold_minutes(minutes);
+        let started = std::time::Instant::now();
+        let mut store = collector::open_store(&app)?;
+        let mut attempt = 0;
+        let recomputed_days = loop {
+            match store.recompute_projects(task_store::idle_threshold_ms()) {
+                Ok(n) => break n,
+                Err(e) if attempt < 3 && (e.contains("locked") || e.contains("busy")) => attempt += 1,
+                Err(e) => return Err(e),
+            }
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        crate::dev_log!("[collector] idle threshold {} min: recomputed {} day(s) in {} ms", minutes, recomputed_days, elapsed_ms);
+        collector::notify_usage_changed(&app, &std::collections::BTreeSet::new());
+        Ok(IdleThresholdApplied { minutes, recomputed_days, elapsed_ms })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------- 项目管理 ----------
+
+/// 独立短连接执行一次项目映射写入（IMMEDIATE 事务,与采集写串行;锁忙重试 3 次）→ emit `usage:changed`。
+fn write_project_meta<T>(app: &AppHandle, f: impl Fn(&mut Store) -> Result<T, String>) -> Result<T, String> {
+    let mut store = collector::open_store(app)?;
+    let mut attempt = 0;
+    let out = loop {
+        match f(&mut store) {
+            Ok(v) => break v,
+            Err(e) if attempt < 3 && (e.contains("locked") || e.contains("busy")) => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    collector::notify_usage_changed(app, &std::collections::BTreeSet::new());
+    Ok(out)
+}
+
+/// 目录键 → 本机路径（只对形如盘符路径 / 绝对路径的键;unknown / Scratch → None）。
+fn project_folder(key: &str) -> Option<std::path::PathBuf> {
+    let b = key.as_bytes();
+    let is_drive = b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic();
+    if !(is_drive || key.starts_with('/')) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(if is_drive { key.replace('/', "\\") } else { key.to_string() });
+    path.is_dir().then_some(path)
+}
+
+/// 管理面板列表:每个目录键一行（key / alias / hidden / merged_into / 状态 / agents / 会话 / 轮 / tokens / 首末日 /
+/// 目录是否存在）+ Scratch 伪项目的隐藏态。状态按当前自动折叠规则解析。
+#[tauri::command]
+pub fn list_project_meta(state: State<'_, AppState>) -> Result<ProjectMetaList, String> {
+    let mut list = with_reader(&state, |store| store.list_project_meta(&project_meta::scratch_rule()))?;
+    for r in &mut list.rows {
+        r.folder_exists = project_folder(&r.key).is_some();
+    }
+    Ok(list)
+}
+
+/// 单条 upsert:alias / note（trim 后 ≤ 120 字符,空 = 清除）、hidden;`reset = true` 删行回到自动态。
+#[tauri::command]
+pub async fn set_project_meta(app: AppHandle, input: ProjectMetaInput) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_project_meta(&app, |store| store.set_project_meta(&input)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 把 keys 合并进 into（一层;拒绝并入自身、目标已合并、源是合并目标、Scratch）。返回合并键数。
+#[tauri::command]
+pub async fn merge_projects(app: AppHandle, keys: Vec<String>, into: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || write_project_meta(&app, |store| store.merge_projects(&keys, &into)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 取消合并（变空的 meta 行删除,回到自动态）。返回实际取消的键数。
+#[tauri::command]
+pub async fn unmerge_projects(app: AppHandle, keys: Vec<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || write_project_meta(&app, |store| store.unmerge_projects(&keys)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScratchRuleInfo {
+    pub rule: ScratchRule,
+    pub defaults: ScratchRule,
+    pub min_sessions_bounds: (u32, u32),
+    pub min_turns_bounds: (u32, u32),
+}
+
+fn scratch_rule_info() -> ScratchRuleInfo {
+    ScratchRuleInfo {
+        rule: project_meta::scratch_rule(),
+        defaults: ScratchRule::DEFAULT,
+        min_sessions_bounds: project_meta::SCRATCH_MIN_SESSIONS_BOUNDS,
+        min_turns_bounds: project_meta::SCRATCH_MIN_TURNS_BOUNDS,
+    }
+}
+
+/// 启动时从 prefs.json 载入自动折叠规则（缺键 / 非法逐键回落默认）。与离开阈值同处调用。
+pub fn load_scratch_rule(app: &AppHandle) {
+    let Ok(dr) = crate::data_root::current(app) else { return };
+    if let Ok(raw) = std::fs::read_to_string(dr.prefs_path()) {
+        project_meta::set_scratch_rule(ScratchRule::from_prefs(&raw));
+    }
+}
+
+#[tauri::command]
+pub fn get_scratch_rule() -> ScratchRuleInfo {
+    scratch_rule_info()
+}
+
+/// 设置自动折叠规则:校验 → 合并写 prefs.json `scratch*` 四键（其余键原样）→ 下发运行时值 → emit
+/// `usage:changed`。规则只作用于查询时的解析层,不重算任何表。前端成功后须同步 setDesignPrefs 四键。
+#[tauri::command]
+pub async fn set_scratch_rule(app: AppHandle, rule: ScratchRule) -> Result<ScratchRuleInfo, String> {
+    rule.validate()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = crate::data_root::current(&app)?.prefs_path();
+        let raw = std::fs::read_to_string(&path).ok();
+        write_prefs_atomic(&path, &rule.merge_into_prefs(raw.as_deref()))?;
+        project_meta::set_scratch_rule(rule);
+        collector::notify_usage_changed(&app, &std::collections::BTreeSet::new());
+        Ok(scratch_rule_info())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 在文件管理器中打开项目目录（只对库中已知且本机存在的目录键）。
+#[tauri::command]
+pub fn open_project_folder(key: String, state: State<'_, AppState>) -> Result<(), String> {
+    if !with_reader(&state, |store| Ok(store.project_key_known(&key)))? {
+        return Err("unknown project".into());
+    }
+    let path = project_folder(&key).ok_or_else(|| "folder not found".to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer").arg(path).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("unsupported platform".into())
+    }
+}
+
 // ---------- Collector 命令（真实源健康面板） ----------
 
 /// 四源固定列出：probe 实时探测路径/schema,历史健康与计数读 source_state。
@@ -814,12 +1182,17 @@ pub fn set_prefs_raw(app: AppHandle, json: String) -> Result<(), String> {
     // JSON 合法性防御（坏串不落盘）
     serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("invalid json: {}", e))?;
     let path = crate::data_root::current(&app)?.prefs_path();
+    write_prefs_atomic(&path, &json)
+}
+
+/// prefs.json 原子替换写（tmp + rename）。
+fn write_prefs_atomic(path: &std::path::Path, json: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 // ---------- Window 命令（可见性原语在 visibility.rs，此处仅挂件尺寸） ----------
@@ -955,4 +1328,55 @@ pub fn main_toggle_maximize(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn main_close(app: AppHandle) -> Result<(), String> {
     crate::visibility::set_visible(&app, crate::visibility::MAIN_LABEL, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(a: &str, b: &str) -> DayRange {
+        DayRange { start_day: a.into(), end_day: b.into() }
+    }
+
+    #[test]
+    fn day_range_validation_and_local_bounds() {
+        let (lo, hi) = range_millis(&range("2026-09-01", "2026-09-01")).unwrap();
+        assert!((23 * 3_600_000..=25 * 3_600_000).contains(&(hi - lo)), "单日区间 ≈ 24h（DST 日 23/25h）");
+        assert_eq!(crate::collector::millis_to_local_day(lo).as_deref(), Some("2026-09-01"));
+        assert_eq!(crate::collector::millis_to_local_day(hi - 1).as_deref(), Some("2026-09-01"));
+        assert!(parse_range(&range("2026-09-02", "2026-09-01")).is_err());
+        assert!(parse_range(&range("2026-9-x", "2026-09-01")).is_err());
+        assert!(parse_range(&range("2000-01-01", "2026-09-01")).is_err(), "超长范围");
+    }
+
+    #[test]
+    fn prefs_atomic_write_merges_threshold() {
+        let dir = std::env::temp_dir().join(format!("tc_prefs_{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        write_prefs_atomic(&path, r#"{"locked":true}"#).unwrap();
+        let raw = std::fs::read_to_string(&path).ok();
+        write_prefs_atomic(&path, &task_store::prefs_with_threshold(raw.as_deref(), 45)).unwrap();
+        let back = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(task_store::threshold_from_prefs(&back), Some(45));
+        assert!(back.contains(r#""locked":true"#));
+    }
+
+    #[test]
+    fn project_folder_only_for_existing_path_keys() {
+        assert!(project_folder("unknown").is_none());
+        assert!(project_folder(crate::collector::project_meta::SCRATCH_KEY).is_none());
+        assert!(project_folder("relative/dir").is_none());
+        let dir = std::env::temp_dir();
+        let key = crate::collector::turns::normalize_project(&dir.display().to_string());
+        assert!(project_folder(&key).is_some(), "{key}");
+        assert!(project_folder(&format!("{key}/tc-no-such-dir-{}", std::process::id())).is_none());
+    }
+
+    #[test]
+    fn idle_threshold_info_defaults() {
+        let info = idle_threshold_info();
+        assert_eq!((info.default_minutes, info.min_minutes, info.max_minutes), (30, 1, 1440));
+        assert!((info.min_minutes..=info.max_minutes).contains(&info.minutes));
+    }
 }

@@ -120,6 +120,24 @@ export interface DesignPrefs {
    * 仅「Check for updates」手动触发。更新源与签名校验
    * services/updateService.ts（仅安装版生效）。 */
   autoUpdate: boolean
+  /** 离开阈值（分钟,1〜1440;undefined = 30）:轮间空档 ≤ 阈值才计入「人工时间」。
+   * **写入方是 Rust `set_idle_threshold`**（合并写 prefs.json 并同步重算 daily_project）;
+   * 前端改阈值时须同时 setDesignPrefs 本键,否则 persist 的旧快照会把它覆盖回去（S4 接线）。 */
+  idleThresholdMin?: number
+  /** Tasks 列表标签:time（开始时间,默认）⇄ title（会话标题,空时回退 time）。
+   * undefined = time。title 是内容列,只在 Tasks 列表渲染。 */
+  taskLabelMode?: 'time' | 'title'
+  /** -R 选定单个项目时,Tasks / Insights 的范围自动切到该项目生命周期（undefined = 开）。
+   * 用户在项目生命周期模式下手改范围即写 false;范围控件的「Project span」按钮写回 true。 */
+  projectAutoRange?: boolean
+  /** 项目自动折叠规则（设置·Projects）:根会话数 < scratchMinSessions 且总轮数 < scratchMinTurns 的
+   * 目录折叠进内置 Scratch 项目;scratchUnknown = 无目录源（unknown）归 Scratch。undefined = 开 / 2 / 5 / 开。
+   * **写入方是 Rust `set_scratch_rule`**（合并写 prefs.json 并下发运行时值）;前端改规则时须同时 setDesignPrefs
+   * 四键,否则 persist 的旧快照会把它们覆盖回去（同 idleThresholdMin）。 */
+  scratchRuleEnabled?: boolean
+  scratchMinSessions?: number
+  scratchMinTurns?: number
+  scratchUnknown?: boolean
 }
 
 const KEY = 'tokencalendar.design'
@@ -183,6 +201,26 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   if (p.orbBoostIntervalSecs !== undefined && !(typeof p.orbBoostIntervalSecs === 'number' && Number.isInteger(p.orbBoostIntervalSecs) && p.orbBoostIntervalSecs >= 30 && p.orbBoostIntervalSecs <= 240)) {
     delete p.orbBoostIntervalSecs
+  }
+  // 离开阈值:整数分钟 1〜1440（与 Rust task_store 同域）,越界视为未设置。
+  if (p.idleThresholdMin !== undefined && !(typeof p.idleThresholdMin === 'number' && Number.isInteger(p.idleThresholdMin) && p.idleThresholdMin >= 1 && p.idleThresholdMin <= 1440)) {
+    delete p.idleThresholdMin
+  }
+  if (p.taskLabelMode !== undefined && p.taskLabelMode !== 'time' && p.taskLabelMode !== 'title') {
+    delete p.taskLabelMode
+  }
+  if (p.projectAutoRange !== undefined && typeof p.projectAutoRange !== 'boolean') {
+    delete p.projectAutoRange
+  }
+  // 自动折叠规则:布尔 + 整数域（与 Rust project_meta:SCRATCH_*_BOUNDS 同域）。
+  for (const k of ['scratchRuleEnabled', 'scratchUnknown'] as const) {
+    if (p[k] !== undefined && typeof p[k] !== 'boolean') delete p[k]
+  }
+  if (p.scratchMinSessions !== undefined && !(typeof p.scratchMinSessions === 'number' && Number.isInteger(p.scratchMinSessions) && p.scratchMinSessions >= 1 && p.scratchMinSessions <= 50)) {
+    delete p.scratchMinSessions
+  }
+  if (p.scratchMinTurns !== undefined && !(typeof p.scratchMinTurns === 'number' && Number.isInteger(p.scratchMinTurns) && p.scratchMinTurns >= 1 && p.scratchMinTurns <= 500)) {
+    delete p.scratchMinTurns
   }
   // 应用更新开关：非布尔值视为未设置（回落默认开）。
   if (p.autoUpdate !== undefined && typeof p.autoUpdate !== 'boolean') {

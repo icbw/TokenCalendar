@@ -9,8 +9,11 @@
 //! - `source_cursor` 每源每 scope 的增量游标（JSON）
 //! - `source_state` 每源健康状态（list_sources 的数据源）
 //! - `request_model` 官网导出对账映射（CodeBuddy 请求 ID → 模型，见 collector/imports.rs）
+//! - `project_meta` 项目管理映射（别名 / 隐藏 / 合并,常驻不随迁移清空,见 collector/project_meta.rs）
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use super::turns::UNKNOWN_PROJECT;
 use std::path::Path;
 
 use chrono::NaiveDate;
@@ -19,17 +22,23 @@ use rusqlite::Connection;
 /// 一次采集批次的提交物：聚合增量 + 游标推进，同事务落库。
 #[derive(Default)]
 pub struct Batch {
-    /// （day, agent_key, model_key) → [input, output, total, requests] 累加量。
-    /// requests = 请求/回合数（每 add 一次计 1：zcode model_usage 行、claude
-    /// assistant 行、codex token_count 回合、workbuddy function_call、codebuddy request）。
-    pub entries: BTreeMap<(String, String, String), [i64; 4]>,
-    /// （day, hour, agent_key, model_key) → [input, output, total] 累加量
+    /// （day, agent_key, model_key) → [input, output, total, turns, cache_read, cache_write] 累加量。
+    /// turns = 对话轮次（request_count 列,守则）;cache 两列 v7 起落库（源原始口径,
+    /// 不参与 input/total 换算,见守则）。
+    pub entries: BTreeMap<(String, String, String), [i64; 6]>,
+    /// （day, hour, agent_key, model_key) → [input, output, total, cache_read, cache_write] 累加量
     /// （小时粒度,与日聚合同事务提交;hour = 本地时 0-23）。
-    pub hourly: BTreeMap<(String, u8, String, String), [i64; 3]>,
+    pub hourly: BTreeMap<(String, u8, String, String), [i64; 5]>,
     /// （scope, cursor_json) 游标推进（同事务提交，防崩溃重计）。
     pub cursors: Vec<(String, String)>,
     /// 实际采集到的事件数（用于 events_collected 与 usage:changed 判定）。
     pub events: u64,
+    /// （agent, session, turn_seq) → 轮现状（整行覆盖写 turn_raw / turn_part,幂等）。
+    pub turns: BTreeMap<(String, String, i64), TurnRow>,
+    /// （agent, session) → 会话元数据（合并写 session）。
+    pub sessions: BTreeMap<(String, String), SessionRow>,
+    /// 整会话重建（ZCode 按会话重算覆盖）——提交时先清该会话原始轮行。
+    pub replaced_sessions: BTreeSet<(String, String)>,
 }
 
 impl Batch {
@@ -54,28 +63,152 @@ impl Batch {
         total: i64,
         turns: i64,
     ) {
-        if total == 0 && input == 0 && output == 0 {
+        self.add_usage(day, hour, agent, model, Tokens { input, output, total, cache_read: 0, cache_write: 0 }, turns);
+    }
+
+    /// 完整入口：带 cache 分项。cache 列只做展示分段,不改 input/total 口径。
+    pub fn add_usage(&mut self, day: &str, hour: Option<u8>, agent: &str, model: &str, t: Tokens, turns: i64) {
+        if t.total == 0 && t.input == 0 && t.output == 0 && t.cache_read == 0 && t.cache_write == 0 {
             return;
         }
         let e = self
             .entries
             .entry((day.to_string(), agent.to_string(), model.to_string()))
-            .or_insert([0, 0, 0, 0]);
-        e[0] += input;
-        e[1] += output;
-        e[2] += total;
+            .or_insert([0; 6]);
+        e[0] += t.input;
+        e[1] += t.output;
+        e[2] += t.total;
         e[3] += turns;
+        e[4] += t.cache_read;
+        e[5] += t.cache_write;
         if let Some(h) = hour {
             let he = self
                 .hourly
                 .entry((day.to_string(), h, agent.to_string(), model.to_string()))
-                .or_insert([0, 0, 0]);
-            he[0] += input;
-            he[1] += output;
-            he[2] += total;
+                .or_insert([0; 5]);
+            he[0] += t.input;
+            he[1] += t.output;
+            he[2] += t.total;
+            he[3] += t.cache_read;
+            he[4] += t.cache_write;
         }
         self.events += 1;
     }
+
+    /// 写入一轮现状（同键后写覆盖先写:累加器每次 flush 都是整轮快照）。
+    pub fn add_turn(&mut self, agent: &str, row: TurnRow) {
+        self.turns.insert((agent.to_string(), row.session_id.clone(), row.turn_seq), row);
+    }
+
+    /// 合并会话元数据：project / parent 取首个非空,title 取最新非空,起止取 min / max。
+    pub fn upsert_session(&mut self, agent: &str, row: SessionRow) {
+        let key = (agent.to_string(), row.session_id.clone());
+        match self.sessions.get_mut(&key) {
+            None => {
+                self.sessions.insert(key, row);
+            }
+            Some(cur) => {
+                if cur.project_key.as_deref().map_or(true, |p| p == UNKNOWN_PROJECT) {
+                    if row.project_key.is_some() {
+                        cur.project_key = row.project_key;
+                    }
+                }
+                if cur.parent_id.is_none() {
+                    cur.parent_id = row.parent_id;
+                }
+                if row.title.is_some() {
+                    cur.title = row.title;
+                }
+                cur.started_at = min_opt(cur.started_at, row.started_at);
+                cur.ended_at = cur.ended_at.max(row.ended_at);
+            }
+        }
+    }
+
+    /// 标记整会话重建（提交时先删该会话全部 turn_raw / turn_part,再写本批行）。
+    pub fn replace_session(&mut self, agent: &str, session_id: &str) {
+        self.replaced_sessions.insert((agent.to_string(), session_id.to_string()));
+    }
+}
+
+fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+/// 轮的一个 （本地日, 模型) 切片:token 与调用在这里按事件自身的日 / 模型落账,
+/// 保证 daily_project（折叠项目后）与 daily_usage 逐 （day, agent, model) 守恒。
+/// `turn_mark` = 该切片计入 request_count 的轮数（与 daily_usage 同一次判定）。
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TurnPart {
+    pub day: String,
+    pub model: String,
+    pub input: i64,
+    pub output: i64,
+    pub total: i64,
+    pub model_calls: i64,
+    pub turn_mark: i64,
+}
+
+/// 单个会话（含子会话）的一轮自身值;tokens 由 parts 求和。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TurnRow {
+    pub session_id: String,
+    pub turn_seq: i64,
+    /// 首条响应的本地日（无响应 = 轮首本地日）。
+    pub day: String,
+    pub project_key: String,
+    /// 首条响应的模型（守则无响应 = 最近已知模型 / unknown）。
+    pub model_key: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub wall_ms: Option<i64>,
+    pub model_ms: Option<i64>,
+    pub tool_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub gap_ms: Option<i64>,
+    pub model_calls: i64,
+    pub tool_calls: i64,
+    /// API / 工具错误（不含用户中止）。
+    pub error_count: i64,
+    pub retry_count: i64,
+    /// 用户主动中止（S4-R:Codex turn_aborted、ZCode cancelled_by_user、DSH interrupted、
+    /// 零响应即被下一次输入顶掉）;与 error_count 分列,不互相计入。
+    pub aborted: bool,
+    pub parts: Vec<TurnPart>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub project_key: Option<String>,
+    pub parent_id: Option<String>,
+    /// 【内容列】见 `CONTENT_COLUMNS`。
+    pub title: Option<String>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+}
+
+/// 内容列清单：仅本地可视化;任何导出 / 上报 / 云端聚合一律排除。
+pub const CONTENT_COLUMNS: &[(&str, &str)] = &[("session", "title")];
+
+/// 离开阈值**默认值**:gap ≤ 阈值才计入 idle_ms。运行时值由 designPrefs
+/// `idleThresholdMin` 下发,见 `task_store:idle_threshold_ms`。
+pub const IDLE_THRESHOLD_MS: i64 = 30 * 60 * 1000;
+
+/// 一条 usage 事件的 token 分项：input = cache-exclusive、
+/// output = provider 口径、total = provider total;cache_read / cache_write = 源原始
+/// cache 命中 / 写入量（无该字段的源为 0）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tokens {
+    pub input: i64,
+    pub output: i64,
+    pub total: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
 }
 
 pub struct StoreRow {
@@ -159,13 +292,172 @@ pub struct Store {
     conn: Connection,
 }
 
+/// 当前 schema 版本。
+/// v7 / v8 / v9 均未发布即被取代（补齐轮 / 会话列与原始层;S3 两个轮次;
+/// S4-R 中止与错误分列:turn_raw / turn 加 aborted、daily_project 加 aborted_count）,
+/// 用户 6 → 10 一次清库。
+pub const SCHEMA_VERSION: i64 = 10;
+
+/// 迁移时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
+/// （迁移曾漏重建 source_cursor;由测试 `reset_drop_and_create_lists_match` 守护）。
+const RESET_TABLES: &[&str] = &[
+    "daily_usage",
+    "hourly_usage",
+    "source_cursor",
+    "session",
+    "turn_raw",
+    "turn_part",
+    "turn",
+    "daily_project",
+];
+
+const RESET_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS daily_usage (
+    day               TEXT    NOT NULL,
+    agent_key         TEXT    NOT NULL,
+    model_key         TEXT    NOT NULL,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    request_count     INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, agent_key, model_key)
+);
+CREATE TABLE IF NOT EXISTS hourly_usage (
+    day               TEXT    NOT NULL,
+    hour              INTEGER NOT NULL,
+    agent_key         TEXT    NOT NULL,
+    model_key         TEXT    NOT NULL,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, hour, agent_key, model_key)
+);
+CREATE TABLE IF NOT EXISTS source_cursor (
+    source_id   TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    cursor_json TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (source_id, scope)
+);
+-- 会话（任务）元数据,含子会话（parent_id 非空,不单独成任务）。
+-- title 是唯一的【内容列】:仅本地可视化,导出 / 上报一律排除（CONTENT_COLUMNS）。
+CREATE TABLE IF NOT EXISTS session (
+    agent_key      TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    project_key    TEXT NOT NULL,
+    parent_id      TEXT,
+    title          TEXT,
+    started_at     INTEGER NOT NULL,
+    ended_at       INTEGER,
+    subagent_count INTEGER NOT NULL DEFAULT 0,
+    subagent_calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_key, session_id)
+);
+CREATE INDEX IF NOT EXISTS session_by_parent ON session (agent_key, parent_id);
+-- 轮原始层（采集器写入）:每个会话（含子会话）每轮的**自身值**,累加器整行覆盖,幂等。
+CREATE TABLE IF NOT EXISTS turn_raw (
+    agent_key      TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    turn_seq       INTEGER NOT NULL,
+    day            TEXT NOT NULL,
+    project_key    TEXT NOT NULL,
+    model_key      TEXT NOT NULL,
+    started_at     INTEGER NOT NULL,
+    ended_at       INTEGER NOT NULL,
+    wall_ms        INTEGER,
+    model_ms       INTEGER,
+    tool_ms        INTEGER,
+    ttft_ms        INTEGER,
+    gap_ms         INTEGER,
+    model_calls    INTEGER NOT NULL DEFAULT 0,
+    tool_calls     INTEGER NOT NULL DEFAULT 0,
+    error_count    INTEGER NOT NULL DEFAULT 0,
+    retry_count    INTEGER NOT NULL DEFAULT 0,
+    aborted        INTEGER NOT NULL DEFAULT 0,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_tokens   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_key, session_id, turn_seq)
+);
+CREATE INDEX IF NOT EXISTS turn_raw_by_day ON turn_raw (agent_key, day);
+-- 轮的 (本地日, 模型) 切片:token / 调用按事件自身日与模型落账（与 daily_usage 逐格守恒）。
+CREATE TABLE IF NOT EXISTS turn_part (
+    agent_key      TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    turn_seq       INTEGER NOT NULL,
+    day            TEXT NOT NULL,
+    model_key      TEXT NOT NULL,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_tokens   INTEGER NOT NULL DEFAULT 0,
+    model_calls    INTEGER NOT NULL DEFAULT 0,
+    turn_mark      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_key, session_id, turn_seq, day, model_key)
+);
+CREATE INDEX IF NOT EXISTS turn_part_by_day ON turn_part (agent_key, day);
+-- 轮级事实（任务视图读表）:只含根会话,子会话的 token / 调用 / 模型与工具时间按时间并入父轮
+-- （由 turn_raw 物化重算）;gap_ms 为原始轮间空档,阈值在聚合时套用。
+CREATE TABLE IF NOT EXISTS turn (
+    agent_key      TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    turn_seq       INTEGER NOT NULL,
+    day            TEXT NOT NULL,
+    project_key    TEXT NOT NULL,
+    model_key      TEXT NOT NULL,
+    started_at     INTEGER NOT NULL,
+    ended_at       INTEGER,
+    wall_ms        INTEGER,
+    model_ms       INTEGER,
+    tool_ms        INTEGER,
+    ttft_ms        INTEGER,
+    gap_ms         INTEGER,
+    model_calls    INTEGER NOT NULL DEFAULT 0,
+    tool_calls     INTEGER NOT NULL DEFAULT 0,
+    subagent_count INTEGER NOT NULL DEFAULT 0,
+    subagent_calls INTEGER NOT NULL DEFAULT 0,
+    error_count    INTEGER NOT NULL DEFAULT 0,
+    retry_count    INTEGER NOT NULL DEFAULT 0,
+    aborted        INTEGER NOT NULL DEFAULT 0,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_tokens   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_key, session_id, turn_seq)
+);
+CREATE INDEX IF NOT EXISTS turn_by_day ON turn (day, agent_key);
+-- 项目维日聚合（由 turn_raw / turn_part 按日重算覆盖;idle_ms 已套离开阈值）。
+CREATE TABLE IF NOT EXISTS daily_project (
+    day            TEXT NOT NULL,
+    agent_key      TEXT NOT NULL,
+    model_key      TEXT NOT NULL,
+    project_key    TEXT NOT NULL,
+    turns          INTEGER NOT NULL DEFAULT 0,
+    model_calls    INTEGER NOT NULL DEFAULT 0,
+    tool_calls     INTEGER NOT NULL DEFAULT 0,
+    wall_ms        INTEGER NOT NULL DEFAULT 0,
+    model_ms       INTEGER NOT NULL DEFAULT 0,
+    tool_ms        INTEGER NOT NULL DEFAULT 0,
+    idle_ms        INTEGER NOT NULL DEFAULT 0,
+    subagent_calls INTEGER NOT NULL DEFAULT 0,
+    error_count    INTEGER NOT NULL DEFAULT 0,
+    aborted_count  INTEGER NOT NULL DEFAULT 0,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_tokens   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, agent_key, model_key, project_key)
+);";
+
+
 pub fn days_in_month(y: i32, m: u32) -> u32 {
     let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid next month");
     (first_next - NaiveDate::from_ymd_opt(y, m, 1).expect("valid month")).num_days() as u32
 }
 
-fn parse_month(month: &str) -> Option<(i32, u32)> {
+pub(super) fn parse_month(month: &str) -> Option<(i32, u32)> {
     let (y, m) = month.split_once('-')?;
     let y: i32 = y.parse().ok()?;
     let m: u32 = m.parse().ok()?;
@@ -188,26 +480,12 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self, String> {
+        // 常驻表（迁移不清）：source_state 健康状态、request_model 官网对账账本、
+        // project_meta 项目管理映射（用户维护的元数据,清库重扫后原样生效）。
+        // 清库重扫的表统一在 RESET_SCHEMA,由 user_version 迁移 DROP + CREATE。
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 4000;
-             CREATE TABLE IF NOT EXISTS daily_usage (
-                 day           TEXT    NOT NULL,
-                 agent_key     TEXT    NOT NULL,
-                 model_key     TEXT    NOT NULL,
-                 input_tokens  INTEGER NOT NULL DEFAULT 0,
-                 output_tokens INTEGER NOT NULL DEFAULT 0,
-                 total_tokens  INTEGER NOT NULL DEFAULT 0,
-                 request_count INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (day, agent_key, model_key)
-             );
-             CREATE TABLE IF NOT EXISTS source_cursor (
-                 source_id   TEXT NOT NULL,
-                 scope       TEXT NOT NULL,
-                 cursor_json TEXT NOT NULL,
-                 updated_at  INTEGER NOT NULL,
-                 PRIMARY KEY (source_id, scope)
-             );
              CREATE TABLE IF NOT EXISTS source_state (
                  source_id           TEXT PRIMARY KEY,
                  probe_status        TEXT NOT NULL DEFAULT 'no_source',
@@ -226,6 +504,14 @@ impl Store {
                  day         TEXT,
                  credit      REAL,
                  PRIMARY KEY (source_id, request_id)
+             );
+             CREATE TABLE IF NOT EXISTS project_meta (
+                 project_key  TEXT PRIMARY KEY,
+                 alias        TEXT,
+                 hidden       INTEGER NOT NULL DEFAULT 0,
+                 merged_into  TEXT,
+                 note         TEXT,
+                 updated_at   INTEGER NOT NULL
              );",
         )
         .map_err(|e| e.to_string())?;
@@ -235,44 +521,52 @@ impl Store {
         // event_msg/user_message 才是用户输入)→ 清库重扫。
         // v6 = 小时粒度:新增 hourly_usage（day,hour,agent,model),
         // 清 daily_usage+source_cursor 重扫（游标已推进,历史行补不上小时维)。
+        // v7 = 合并迁移: 新表 session / turn / daily_project（项目维与时间成本,
+        // 现有三表主键与读 SQL 不动); daily_usage / hourly_usage 加 cache_read_tokens /
+        // cache_write_tokens（双组图三段); Codex 轮信号改 event_msg/task_started
+        // （主会话;user_message 保留兼容)→ 清库重扫。
+        // v9 = （未发布即取代):Claude 缺 origin 的零调用输入不成轮、
+        // ZCode 子会话不计 request_count → 清库重扫。
+        // v8 = （未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
+        // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
+        // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
         // 口径语义与实现模式见 §对话轮。
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-        if version < 6 {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS daily_usage;
-                 DROP TABLE IF EXISTS source_cursor;
-                 CREATE TABLE IF NOT EXISTS daily_usage (
-                     day           TEXT    NOT NULL,
-                     agent_key     TEXT    NOT NULL,
-                     model_key     TEXT    NOT NULL,
-                     input_tokens  INTEGER NOT NULL DEFAULT 0,
-                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                     total_tokens  INTEGER NOT NULL DEFAULT 0,
-                     request_count INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (day, agent_key, model_key)
-                 );
-                 CREATE TABLE IF NOT EXISTS hourly_usage (
-                     day           TEXT    NOT NULL,
-                     hour          INTEGER NOT NULL,
-                     agent_key     TEXT    NOT NULL,
-                     model_key     TEXT    NOT NULL,
-                     input_tokens  INTEGER NOT NULL DEFAULT 0,
-                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                     total_tokens  INTEGER NOT NULL DEFAULT 0,
-                     PRIMARY KEY (day, hour, agent_key, model_key)
-                 );
-                 CREATE TABLE IF NOT EXISTS source_cursor (
-                     source_id   TEXT NOT NULL,
-                     scope       TEXT NOT NULL,
-                     cursor_json TEXT NOT NULL,
-                     updated_at  INTEGER NOT NULL,
-                     PRIMARY KEY (source_id, scope)
-                 );
-                 PRAGMA user_version = 6;",
-            )
+        if version < SCHEMA_VERSION {
+            let drops: String = RESET_TABLES.iter().map(|t| format!("DROP TABLE IF EXISTS {t};\n")).collect();
+            conn.execute_batch(&format!(
+                "BEGIN;\n{drops}{RESET_SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+            ))
             .map_err(|e| e.to_string())?;
         }
         Ok(Store { conn })
+    }
+
+    /// 同 crate 采集子模块的只读查询入口（`task_query`;写路径仍只走 commit）。
+    pub(super) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// 同 crate 采集子模块的写事务入口（`project_meta` 的用户映射写入;不经 commit）。
+    pub(super) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
+    /// 按离开阈值重算 daily_project 全表（只读原始层 turn_raw / turn_part,不动游标）,
+    /// 并落阈值标记。IMMEDIATE 事务:与采集写串行,半算状态不落盘。返回重算的 （agent, 日) 数。
+    pub fn recompute_projects(&mut self, idle_threshold_ms: i64) -> Result<usize, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let n = super::task_store::recompute_all(&tx, idle_threshold_ms)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    /// daily_project 当前套用的离开阈值（None = 从未全表重算过,如迁移后的新库）。
+    pub fn project_threshold_marker(&self) -> Option<i64> {
+        super::task_store::threshold_marker(&self.conn)
     }
 
     pub fn get_cursor(&self, source_id: &str, scope: &str) -> Option<String> {
@@ -292,17 +586,20 @@ impl Store {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO daily_usage (day, agent_key, model_key, input_tokens, output_tokens, total_tokens, request_count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "INSERT INTO daily_usage (day, agent_key, model_key, input_tokens, output_tokens, total_tokens, request_count,
+                                              cache_read_tokens, cache_write_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                      ON CONFLICT(day, agent_key, model_key) DO UPDATE SET
                         input_tokens  = input_tokens  + excluded.input_tokens,
                         output_tokens = output_tokens + excluded.output_tokens,
                         total_tokens  = total_tokens  + excluded.total_tokens,
-                        request_count = request_count + excluded.request_count",
+                        request_count = request_count + excluded.request_count,
+                        cache_read_tokens  = cache_read_tokens  + excluded.cache_read_tokens,
+                        cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens",
                 )
                 .map_err(|e| e.to_string())?;
-            for ((day, agent, model), [input, output, total, requests]) in &batch.entries {
-                stmt.execute(rusqlite::params![day, agent, model, input, output, total, requests])
+            for ((day, agent, model), [input, output, total, requests, cache_read, cache_write]) in &batch.entries {
+                stmt.execute(rusqlite::params![day, agent, model, input, output, total, requests, cache_read, cache_write])
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -310,16 +607,19 @@ impl Store {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO hourly_usage (day, hour, agent_key, model_key, input_tokens, output_tokens, total_tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "INSERT INTO hourly_usage (day, hour, agent_key, model_key, input_tokens, output_tokens, total_tokens,
+                                               cache_read_tokens, cache_write_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                      ON CONFLICT(day, hour, agent_key, model_key) DO UPDATE SET
                         input_tokens  = input_tokens  + excluded.input_tokens,
                         output_tokens = output_tokens + excluded.output_tokens,
-                        total_tokens  = total_tokens  + excluded.total_tokens",
+                        total_tokens  = total_tokens  + excluded.total_tokens,
+                        cache_read_tokens  = cache_read_tokens  + excluded.cache_read_tokens,
+                        cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens",
                 )
                 .map_err(|e| e.to_string())?;
-            for ((day, hour, agent, model), [input, output, total]) in &batch.hourly {
-                stmt.execute(rusqlite::params![day, *hour as i64, agent, model, input, output, total])
+            for ((day, hour, agent, model), [input, output, total, cache_read, cache_write]) in &batch.hourly {
+                stmt.execute(rusqlite::params![day, *hour as i64, agent, model, input, output, total, cache_read, cache_write])
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -344,6 +644,8 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         }
+        // 轮 / 会话原始层 + 物化 + 项目维重算,与聚合和游标同一事务。
+        super::task_store::apply(&tx, batch)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -474,19 +776,25 @@ impl Store {
     }
 
     /// 失效某源全部聚合（导入带来新映射/正后调用）：清该源 daily_usage、
-    /// hourly_usage 与全部游标,下轮 collect 从头重读。request_model 表本身
-    /// 保留（就是对账依据）。
+    /// hourly_usage、session / turn_raw / turn_part / turn / daily_project与全部游标,下轮 collect
+    /// 从头重读。request_model 表本身保留（就是对账依据）。同事务:半清状态不落盘。
     pub fn invalidate_source(&mut self, source_id: &str) -> Result<u64, String> {
-        let n = self
-            .conn
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let n = tx
             .execute("DELETE FROM daily_usage WHERE agent_key = ?1", [source_id])
             .map_err(|e| e.to_string())?;
-        self.conn
-            .execute("DELETE FROM hourly_usage WHERE agent_key = ?1", [source_id])
-            .map_err(|e| e.to_string())?;
-        self.conn
-            .execute("DELETE FROM source_cursor WHERE source_id = ?1", [source_id])
-            .map_err(|e| e.to_string())?;
+        for sql in [
+            "DELETE FROM hourly_usage WHERE agent_key = ?1",
+            "DELETE FROM session WHERE agent_key = ?1",
+            "DELETE FROM turn_raw WHERE agent_key = ?1",
+            "DELETE FROM turn_part WHERE agent_key = ?1",
+            "DELETE FROM turn WHERE agent_key = ?1",
+            "DELETE FROM daily_project WHERE agent_key = ?1",
+            "DELETE FROM source_cursor WHERE source_id = ?1",
+        ] {
+            tx.execute(sql, [source_id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(n as u64)
     }
 
@@ -661,12 +969,13 @@ impl Store {
     /// 导出明细（聚合粒度即契约明细粒度）：day, agent, model, total>0。
     pub fn export_rows(&self, month: &str) -> Result<Vec<(String, String, String, i64)>, String> {
         let prefix = format!("{}-%", month);
+        const SQL: &str = "SELECT day, agent_key, model_key, total_tokens FROM daily_usage
+                 WHERE day LIKE ?1 AND total_tokens > 0 ORDER BY day, agent_key, model_key";
+        // 内容列排除:导出 SQL 不得触碰 CONTENT_COLUMNS 所在表。
+        debug_assert!(CONTENT_COLUMNS.iter().all(|(table, _)| !SQL.split_whitespace().any(|w| w == *table)));
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT day, agent_key, model_key, total_tokens FROM daily_usage
-                 WHERE day LIKE ?1 AND total_tokens > 0 ORDER BY day, agent_key, model_key",
-            )
+            .prepare(SQL)
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([&prefix], |r| {
@@ -923,6 +1232,210 @@ impl Store {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TestTurn {
+    pub session_id: String,
+    pub turn_seq: i64,
+    pub day: String,
+    pub project_key: String,
+    pub model_key: String,
+    pub wall_ms: Option<i64>,
+    pub model_ms: Option<i64>,
+    pub tool_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub gap_ms: Option<i64>,
+    pub model_calls: i64,
+    pub tool_calls: i64,
+    pub subagent_count: i64,
+    pub subagent_calls: i64,
+    pub error_count: i64,
+    pub retry_count: i64,
+    pub aborted: bool,
+    pub total_tokens: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TestSession {
+    pub session_id: String,
+    pub project_key: String,
+    pub parent_id: Option<String>,
+    pub title: Option<String>,
+    pub subagent_count: i64,
+    pub subagent_calls: i64,
+}
+
+#[cfg(test)]
+impl Store {
+    /// 物化 turn 表（根会话）按会话 / 开始时间排序。
+    pub fn test_turns(&self, agent: &str) -> Vec<TestTurn> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, turn_seq, day, project_key, model_key, wall_ms, model_ms, tool_ms, ttft_ms, gap_ms,
+                        model_calls, tool_calls, subagent_count, subagent_calls, error_count, retry_count, total_tokens, aborted
+                 FROM turn WHERE agent_key = ?1 ORDER BY session_id, started_at, turn_seq",
+            )
+            .unwrap();
+        stmt.query_map([agent], |r| {
+            Ok(TestTurn {
+                session_id: r.get(0)?,
+                turn_seq: r.get(1)?,
+                day: r.get(2)?,
+                project_key: r.get(3)?,
+                model_key: r.get(4)?,
+                wall_ms: r.get(5)?,
+                model_ms: r.get(6)?,
+                tool_ms: r.get(7)?,
+                ttft_ms: r.get(8)?,
+                gap_ms: r.get(9)?,
+                model_calls: r.get(10)?,
+                tool_calls: r.get(11)?,
+                subagent_count: r.get(12)?,
+                subagent_calls: r.get(13)?,
+                error_count: r.get(14)?,
+                retry_count: r.get(15)?,
+                total_tokens: r.get(16)?,
+                aborted: r.get::<_, i64>(17)? != 0,
+            })
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    }
+
+    pub fn test_sessions(&self, agent: &str) -> Vec<TestSession> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, project_key, parent_id, title, subagent_count, subagent_calls
+                 FROM session WHERE agent_key = ?1 ORDER BY session_id",
+            )
+            .unwrap();
+        stmt.query_map([agent], |r| {
+            Ok(TestSession {
+                session_id: r.get(0)?,
+                project_key: r.get(1)?,
+                parent_id: r.get(2)?,
+                title: r.get(3)?,
+                subagent_count: r.get(4)?,
+                subagent_calls: r.get(5)?,
+            })
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    }
+
+    /// 任务列表口径:根会话（parent_id 为空）且有轮。
+    pub fn test_task_sessions(&self, agent: &str) -> Vec<String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.session_id FROM session s
+                 WHERE s.agent_key = ?1 AND s.parent_id IS NULL
+                   AND EXISTS (SELECT 1 FROM turn t WHERE t.agent_key = s.agent_key AND t.session_id = s.session_id)
+                 ORDER BY s.started_at, s.session_id",
+            )
+            .unwrap();
+        stmt.query_map([agent], |r| r.get::<_, String>(0)).unwrap().flatten().collect()
+    }
+
+    /// 守恒断言:daily_project 折叠 project_key 后逐 （day, agent, model) 与 daily_usage 的
+    /// total_tokens / request_count 相等（双向全连接）。返回不一致描述,空 = 守恒。
+    pub fn test_project_conservation(&self) -> Vec<String> {
+        let sql = "
+            WITH u AS (SELECT day, agent_key, model_key, SUM(total_tokens) t, SUM(request_count) n FROM daily_usage GROUP BY 1, 2, 3),
+                 p AS (SELECT day, agent_key, model_key, SUM(total_tokens) t, SUM(turns) n FROM daily_project GROUP BY 1, 2, 3),
+                 k AS (SELECT day, agent_key, model_key FROM u UNION SELECT day, agent_key, model_key FROM p)
+            SELECT k.day, k.agent_key, k.model_key, COALESCE(u.t, 0), COALESCE(p.t, 0), COALESCE(u.n, 0), COALESCE(p.n, 0)
+            FROM k LEFT JOIN u USING (day, agent_key, model_key) LEFT JOIN p USING (day, agent_key, model_key)
+            WHERE COALESCE(u.t, 0) <> COALESCE(p.t, 0) OR COALESCE(u.n, 0) <> COALESCE(p.n, 0)
+            ORDER BY 1, 2, 3";
+        let mut stmt = self.conn.prepare(sql).unwrap();
+        stmt.query_map([], |r| {
+            Ok(format!(
+                "{} {} {}: tokens daily={} project={} | turns daily={} project={}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?
+            ))
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    }
+
+    /// smoke 诊断:（原始轮数, 根会话物化轮数, 负 wall 行数, 子会话数, 任务数)。
+    pub fn test_task_stats(&self, agent: &str) -> (i64, i64, i64, i64, i64) {
+        let q = |sql: &str| self.conn.query_row(sql, [agent], |r| r.get::<_, i64>(0)).unwrap_or(-1);
+        (
+            q("SELECT COUNT(*) FROM turn_raw WHERE agent_key = ?1"),
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1"),
+            q("SELECT COUNT(*) FROM turn_raw WHERE agent_key = ?1 AND (wall_ms < 0 OR model_ms < 0 OR tool_ms < 0 OR gap_ms < 0)"),
+            q("SELECT COUNT(*) FROM session WHERE agent_key = ?1 AND parent_id IS NOT NULL"),
+            self.test_task_sessions(agent).len() as i64,
+        )
+    }
+
+    /// smoke 诊断:月内 （request_count Σ, 物化轮行数, 零调用轮, Σ error_count)。
+    pub fn test_month_turn_stats(&self, agent: &str, month: &str) -> (i64, i64, i64, i64) {
+        let prefix = if month.is_empty() { "%".to_string() } else { format!("{month}-%") };
+        let q = |sql: &str| self.conn.query_row(sql, rusqlite::params![agent, prefix], |r| r.get::<_, i64>(0)).unwrap_or(-1);
+        (
+            q("SELECT COALESCE(SUM(request_count), 0) FROM daily_usage WHERE agent_key = ?1 AND day LIKE ?2"),
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1 AND day LIKE ?2"),
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1 AND day LIKE ?2 AND model_calls = 0"),
+            q("SELECT COALESCE(SUM(error_count), 0) FROM turn WHERE agent_key = ?1 AND day LIKE ?2"),
+        )
+    }
+
+    /// smoke 诊断（S4-R）:物化轮 （中止轮数, 带错误轮数, Σerror, 既中止又带错误的轮数)。
+    pub fn test_abort_error_stats(&self, agent: &str) -> (i64, i64, i64, i64) {
+        let q = |sql: &str| self.conn.query_row(sql, [agent], |r| r.get::<_, i64>(0)).unwrap_or(-1);
+        (
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1 AND aborted = 1"),
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1 AND error_count > 0"),
+            q("SELECT COALESCE(SUM(error_count), 0) FROM turn WHERE agent_key = ?1"),
+            q("SELECT COUNT(*) FROM turn WHERE agent_key = ?1 AND aborted = 1 AND error_count > 0"),
+        )
+    }
+
+    /// 子会话出现在任务列表里的个数（应恒为 0）。
+    pub fn test_child_sessions_in_tasks(&self, agent: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM turn t JOIN session s ON s.agent_key = t.agent_key AND s.session_id = t.session_id
+                 WHERE t.agent_key = ?1 AND s.parent_id IS NOT NULL",
+                [agent],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1)
+    }
+
+    /// smoke 诊断:月内每 agent 的 （cache_read, cache_write, hourly_total, daily_total)。
+    pub fn cache_totals(&self, month: &str) -> Vec<(String, i64, i64, i64, i64)> {
+        let prefix = format!("{month}-%");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT d.agent_key, SUM(d.cache_read_tokens), SUM(d.cache_write_tokens), SUM(d.total_tokens),
+                        (SELECT COALESCE(SUM(h.total_tokens), 0) FROM hourly_usage h WHERE h.agent_key = d.agent_key AND h.day LIKE ?1)
+                 FROM daily_usage d WHERE d.day LIKE ?1 GROUP BY d.agent_key",
+            )
+            .unwrap();
+        stmt.query_map([&prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(4)?, r.get(3)?)))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+}
+
 pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -954,6 +1467,7 @@ pub fn model_label(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn insert(conn: &mut Store, day: &str, agent: &str, model: &str, i: i64, o: i64, t: i64) {
         let mut batch = Batch::default();
@@ -1269,10 +1783,234 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v5_creates_hourly_and_resets() {
-        // 模拟 v5 旧库（有 daily_usage 旧 schema,无 hourly_usage）重开:
-        // init 应 DROP 重建 + 推版本到 6。经临时文件走真实 Store::open 路径。
-        let dir = std::env::temp_dir().join(format!("tc_v6_test_{}", std::process::id()));
+    fn migration_from_unreleased_v9_resets_to_v10() {
+        // v9 仅存在于开发库:turn_raw / turn / daily_project 缺 aborted 列,中止轮混在 error_count 里 → 清库重扫。
+        let dir = std::env::temp_dir().join(format!("tc_v10_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("migrate9.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let v9_schema = RESET_SCHEMA
+                .replace("    aborted        INTEGER NOT NULL DEFAULT 0,\n", "")
+                .replace("    aborted_count  INTEGER NOT NULL DEFAULT 0,\n", "");
+            assert!(!v9_schema.contains("aborted"), "构造的 v9 schema 不应含 aborted 列");
+            conn.execute_batch(&format!(
+                "{v9_schema}
+                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','codex','m',10,3);
+                 INSERT INTO source_cursor VALUES ('codex','files','{{}}',1);
+                 PRAGMA user_version = 9;"
+            ))
+            .unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, 10);
+            assert!(store.get_cursor("codex", "files").is_none(), "游标清空 = 全量重扫");
+            assert!(store.export_rows("2026-09").unwrap().is_empty());
+            for (t, c) in [("turn_raw", "aborted"), ("turn", "aborted"), ("daily_project", "aborted_count")] {
+                assert!(table_columns(&store, t).contains(&c.to_string()), "{t}.{c}");
+            }
+        }
+        for f in ["migrate9.db", "migrate9.db-wal", "migrate9.db-shm"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+
+    #[test]
+    fn migration_from_unreleased_v8_resets_to_current() {
+        // v8 仅存在于开发库:schema 与 v9 相同,但 Claude 零调用行 / ZCode 子会话轮次口径变了 → 清库重扫。
+        let dir = std::env::temp_dir().join(format!("tc_v9_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("migrate8.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(&format!(
+                "{RESET_SCHEMA}
+                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','zcode','m',10,3);
+                 INSERT INTO source_cursor VALUES ('zcode','db','{{}}',1);
+                 PRAGMA user_version = 8;"
+            ))
+            .unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(store.get_cursor("zcode", "db").is_none(), "游标清空 = 全量重扫");
+            assert!(store.export_rows("2026-09").unwrap().is_empty());
+        }
+        for f in ["migrate8.db", "migrate8.db-wal", "migrate8.db-shm"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+
+    #[test]
+    fn migration_from_unreleased_v7_resets_to_current() {
+        // v7 仅存在于开发库（未发布）:session 缺 subagent_calls、无原始层 → 重开清库升到当前版本。
+        let dir = std::env::temp_dir().join(format!("tc_v8_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("migrate7.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (agent_key TEXT, session_id TEXT, project_key TEXT, parent_id TEXT, title TEXT,
+                     started_at INTEGER, ended_at INTEGER, subagent_count INTEGER, PRIMARY KEY (agent_key, session_id));
+                 INSERT INTO session VALUES ('codex','s','p',NULL,NULL,1,2,0);
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(table_columns(&store, "session").contains(&"subagent_calls".to_string()));
+            assert!(table_columns(&store, "turn").contains(&"ended_at".to_string()));
+            for t in ["turn_raw", "turn_part"] {
+                assert!(!table_columns(&store, t).is_empty(), "缺原始层 {t}");
+            }
+            assert!(store.test_sessions("codex").is_empty(), "v7 开发库数据随迁移清空");
+        }
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(dir.join("migrate7.db-wal"));
+        let _ = std::fs::remove_file(dir.join("migrate7.db-shm"));
+    }
+
+    fn part(day: &str, model: &str, total: i64, calls: i64, mark: i64) -> TurnPart {
+        TurnPart { day: day.into(), model: model.into(), input: total, output: 0, total, model_calls: calls, turn_mark: mark }
+    }
+
+    fn raw_turn(sid: &str, seq: i64, day: &str, start: i64, gap: Option<i64>, parts: Vec<TurnPart>) -> TurnRow {
+        TurnRow {
+            session_id: sid.into(),
+            turn_seq: seq,
+            day: day.into(),
+            project_key: "e:/p".into(),
+            model_key: parts.first().map(|p| p.model.clone()).unwrap_or_else(|| "unknown".into()),
+            started_at: start,
+            ended_at: start + 1_000,
+            wall_ms: Some(1_000),
+            model_ms: Some(400),
+            tool_ms: Some(100),
+            ttft_ms: None,
+            gap_ms: gap,
+            model_calls: parts.iter().map(|p| p.model_calls).sum(),
+            tool_calls: 1,
+            error_count: 0,
+            retry_count: 0,
+            aborted: false,
+            parts,
+        }
+    }
+
+    /// 跨午夜 / 多模型的轮:token 与 turns 按切片的日与模型落账,daily_project 仍逐格守恒;
+    /// idle 只计 gap ≤ 阈值;子会话 wall / idle 不入项目维,调用计入 subagent_calls。
+    #[test]
+    fn daily_project_conservation_idle_and_child_rules() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut b = Batch::default();
+        let t = |i: i64| Tokens { input: i, output: 0, total: i, cache_read: 0, cache_write: 0 };
+        // daily_usage 同源写入（模拟适配器 response() 的双写）
+        b.add_usage("2026-09-01", Some(23), "a", "m1", t(10), 1);
+        b.add_usage("2026-09-02", Some(0), "a", "m2", t(20), 0);
+        b.add_usage("2026-09-02", Some(1), "a", "m1", t(5), 1);
+        b.add_usage("2026-09-02", Some(1), "a", "m3", t(7), 0);
+        b.add_turn("a", raw_turn("root", 1, "2026-09-01", 1_000_000, None, vec![part("2026-09-01", "m1", 10, 1, 1), part("2026-09-02", "m2", 20, 1, 0)]));
+        b.add_turn("a", raw_turn("root", 2, "2026-09-02", 9_000_000, Some(IDLE_THRESHOLD_MS + 1), vec![part("2026-09-02", "m1", 5, 1, 1)]));
+        b.add_turn("a", raw_turn("child", 1, "2026-09-02", 9_000_500, Some(5_000), vec![part("2026-09-02", "m3", 7, 1, 0)]));
+        b.upsert_session("a", SessionRow { session_id: "root".into(), project_key: Some("e:/p".into()), ..SessionRow::default() });
+        b.upsert_session("a", SessionRow { session_id: "child".into(), project_key: Some("e:/p".into()), parent_id: Some("root".into()), ..SessionRow::default() });
+        s.commit("a", &b).unwrap();
+        assert!(s.test_project_conservation().is_empty(), "{:?}", s.test_project_conservation());
+
+        let (wall, idle, sub_calls, calls): (i64, i64, i64, i64) = s
+            .conn
+            .query_row(
+                "SELECT SUM(wall_ms), SUM(idle_ms), SUM(subagent_calls), SUM(model_calls) FROM daily_project WHERE day = '2026-09-02'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(wall, 1_000, "只计根会话 wall（子会话在父轮墙钟内）");
+        assert_eq!(idle, 0, "gap 超阈值不计 idle;子会话 gap 不计");
+        assert_eq!((sub_calls, calls), (1, 3));
+        let turns = s.test_turns("a");
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[1].subagent_count, turns[1].subagent_calls, turns[1].model_calls), (1, 1, 2), "子轮按时间并入第 2 轮");
+        assert_eq!(turns[1].model_ms, Some(800));
+        assert_eq!(turns[1].wall_ms, Some(1_000));
+    }
+
+    #[test]
+    fn invalidate_source_clears_task_layers_and_replace_session_rebuilds() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut b = Batch::default();
+        b.add_usage("2026-09-01", Some(9), "zcode", "m", Tokens { input: 3, output: 0, total: 3, cache_read: 0, cache_write: 0 }, 1);
+        b.add_turn("zcode", raw_turn("s", 1, "2026-09-01", 1_000, None, vec![part("2026-09-01", "m", 3, 1, 1)]));
+        b.add_turn("zcode", raw_turn("s", 2, "2026-09-01", 5_000, Some(3_000), vec![]));
+        s.commit("zcode", &b).unwrap();
+        assert_eq!(s.test_turns("zcode").len(), 2);
+        // 整会话重建:第 2 轮消失 → turn / daily_project 同步收缩
+        let mut b = Batch::default();
+        b.replace_session("zcode", "s");
+        b.add_turn("zcode", raw_turn("s", 1, "2026-09-01", 1_000, None, vec![part("2026-09-01", "m", 3, 1, 1)]));
+        s.commit("zcode", &b).unwrap();
+        assert_eq!(s.test_turns("zcode").len(), 1);
+        assert!(s.test_project_conservation().is_empty(), "{:?}", s.test_project_conservation());
+        s.invalidate_source("zcode").unwrap();
+        assert_eq!(s.test_task_stats("zcode").0, 0);
+        assert!(s.test_turns("zcode").is_empty() && s.test_sessions("zcode").is_empty());
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM daily_project", [], |r| r.get(0)).unwrap();
+        let p: i64 = s.conn.query_row("SELECT COUNT(*) FROM turn_part", [], |r| r.get(0)).unwrap();
+        assert_eq!((n, p), (0, 0));
+    }
+
+    #[test]
+    fn content_columns_never_in_export() {
+        assert_eq!(CONTENT_COLUMNS, &[("session", "title")]);
+        let mut s = Store::open_in_memory().unwrap();
+        insert(&mut s, "2026-09-01", "zcode", "m", 1, 1, 2);
+        // 导出只读 daily_usage 元数据列（debug_assert 守护 SQL 不触碰内容列）
+        assert_eq!(s.export_rows("2026-09").unwrap().len(), 1);
+    }
+
+    fn table_columns(store: &Store, table: &str) -> Vec<String> {
+        let mut stmt = store.conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(1)).unwrap().flatten().collect()
+    }
+
+    #[test]
+    fn reset_drop_and_create_lists_match() {
+        // 守则 §3.5:迁移 DROP 清单与 CREATE 清单逐一对应（多一张 = 残表,少一张 = 缺表）。
+        let created: BTreeSet<&str> = RESET_SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS ")
+            .skip(1)
+            .filter_map(|s| s.split_whitespace().next())
+            .collect();
+        let dropped: BTreeSet<&str> = RESET_TABLES.iter().copied().collect();
+        assert_eq!(created, dropped);
+        assert_eq!(RESET_TABLES.len(), dropped.len(), "DROP 清单无重复");
+    }
+
+    #[test]
+    fn fresh_db_has_full_schema() {
+        let s = Store::open_in_memory().unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        for t in RESET_TABLES.iter().chain(["source_state", "request_model"].iter()) {
+            assert!(!table_columns(&s, t).is_empty(), "缺表 {t}");
+        }
+    }
+
+    #[test]
+    fn migration_from_v6_resets_and_adds_phase12_schema() {
+        // 模拟 v6 旧库（无 cache 列、无三张新表;对账账本有数据）重开:
+        // init 应 DROP 重建清库表 + 推版本到 7,request_model / source_state 原样保留。
+        let dir = std::env::temp_dir().join(format!("tc_v7_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("migrate.db");
         let _ = std::fs::remove_file(&db);
@@ -1282,19 +2020,70 @@ mod tests {
                 "CREATE TABLE daily_usage (day TEXT, agent_key TEXT, model_key TEXT,
                      input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, request_count INTEGER,
                      PRIMARY KEY (day, agent_key, model_key));
-                 INSERT INTO daily_usage VALUES ('2026-09-01','zcode','glm',1,1,2,1);
-                 PRAGMA user_version = 5;",
+                 CREATE TABLE hourly_usage (day TEXT, hour INTEGER, agent_key TEXT, model_key TEXT,
+                     input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER,
+                     PRIMARY KEY (day, hour, agent_key, model_key));
+                 CREATE TABLE source_cursor (source_id TEXT, scope TEXT, cursor_json TEXT, updated_at INTEGER,
+                     PRIMARY KEY (source_id, scope));
+                 CREATE TABLE request_model (source_id TEXT NOT NULL, request_id TEXT NOT NULL, model_key TEXT NOT NULL,
+                     client TEXT, day TEXT, credit REAL, PRIMARY KEY (source_id, request_id));
+                 INSERT INTO daily_usage VALUES ('2026-09-01','codex','gpt',1,1,2,1);
+                 INSERT INTO hourly_usage VALUES ('2026-09-01',9,'codex','gpt',1,1,2);
+                 INSERT INTO source_cursor VALUES ('codex','f','{}',1);
+                 INSERT INTO request_model VALUES ('codebuddy','r1','glm','CodeBuddyIDE','2026-09-01',1.5);
+                 PRAGMA user_version = 6;",
             )
             .unwrap();
         }
         {
             let store = Store::open(&db).unwrap();
             let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, 6, "v5 库重开应迁移到 v6");
-            // 旧数据已清（清库重扫语义）,hourly_usage 可查
-            assert_eq!(store.range_series("2026-09-01", "2026-09-01", "hour", "total", "total", None).unwrap().points.len(), 24);
+            assert_eq!(v, SCHEMA_VERSION, "v6 库重开应一次迁移到当前版本（6 → 10）");
+            // 清库重扫语义:聚合与游标全清
+            assert!(store.month_rows("2026-09", "agent", "total", TODAY).unwrap().is_empty());
+            assert!(store.get_cursor("codex", "f").is_none());
+            // cache 两列只加在日/时表;主键不变
+            for t in ["daily_usage", "hourly_usage"] {
+                let cols = table_columns(&store, t);
+                assert!(cols.contains(&"cache_read_tokens".to_string()) && cols.contains(&"cache_write_tokens".to_string()), "{t} 缺 cache 列");
+            }
+            for t in ["session", "turn_raw", "turn_part", "turn", "daily_project"] {
+                assert!(!table_columns(&store, t).is_empty(), "缺新表 {t}");
+            }
+            // 对账账本不属清库表
+            assert_eq!(store.request_model_count("codebuddy"), 1);
+        }
+        {
+            // 二次打开:版本已到位,不再清库
+            let mut store = Store::open(&db).unwrap();
+            insert(&mut store, "2026-09-02", "zcode", "glm", 1, 1, 2);
+            drop(store);
+            let store = Store::open(&db).unwrap();
+            assert_eq!(store.month_rows("2026-09", "agent", "total", TODAY).unwrap().len(), 1);
         }
         let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(dir.join("migrate.db-wal"));
+        let _ = std::fs::remove_file(dir.join("migrate.db-shm"));
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn cache_columns_accumulate_daily_and_hourly() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut b = Batch::default();
+        let t = Tokens { input: 10, output: 5, total: 115, cache_read: 100, cache_write: 7 };
+        b.add_usage("2026-09-01", Some(9), "claude-code", "m", t, 1);
+        b.add_usage("2026-09-01", Some(10), "claude-code", "m", t, 0);
+        s.commit("claude-code", &b).unwrap();
+        let (cr, cw, rc): (i64, i64, i64) = s
+            .conn
+            .query_row("SELECT cache_read_tokens, cache_write_tokens, request_count FROM daily_usage", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((cr, cw, rc), (200, 14, 1));
+        let (hcr, hcw): (i64, i64) = s
+            .conn
+            .query_row("SELECT SUM(cache_read_tokens), SUM(cache_write_tokens) FROM hourly_usage", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((hcr, hcw), (200, 14), "小时表 cache 按日合计守恒");
     }
 }

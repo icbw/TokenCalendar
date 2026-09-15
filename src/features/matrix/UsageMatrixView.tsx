@@ -10,11 +10,14 @@ import { events, usageService } from '../../services'
 import type { BreakdownDay } from '../../services'
 import type { UsageRow } from '../../services/types'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
+import { TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip } from '../insights/analytics'
 import './matrixView.css'
 
-type GroupBy = 'agent' | 'model'
+/** :project 维走 get_project_month_rows / get_project_breakdown;agent / model 维命令不变。 */
+export type GroupBy = 'agent' | 'model' | 'project'
 type Bucket = 'day' | 'week' | 'cumulative'
-type Metric = 'total' | 'input' | 'output'
+/** wait / human = 时间成本（毫秒,并列不相加）,仅 project 维可选（其余维度无时间数据）。 */
+type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
 /** 排序策略按视图分账：agent/model 各自记忆互不串扰;
  * 'group'（By family,家族聚合排序）仅 model 视图合法。 */
 type SortBy = 'monthTotal' | 'name' | 'group'
@@ -96,6 +99,7 @@ function bucketTotal(values: (number | null)[], bucket: Bucket): number {
 
 // model 视图显示名简化：canonical key → "provider family tier"
 function simplifyLabel(key: string, groupBy: GroupBy): string {
+  if (groupBy === 'project') return projectDisplayName(key)
   if (groupBy === 'agent') return key
   const parts = key.split('/')
   if (parts.length >= 5) return `${parts[0]}/${parts[1]} ${parts[3]}`
@@ -106,7 +110,7 @@ function simplifyLabel(key: string, groupBy: GroupBy): string {
  * deepseek-v4-flash/pro → deepseek、gpt-5.6-sol/luna/terra → gpt、
  * claude-opus-5/sonnet-5 → claude;agent 视图与无分段 key 原样成组。 */
 function familyOf(key: string, groupBy: GroupBy): string {
-  if (groupBy === 'agent') return key
+  if (groupBy !== 'model') return key
   return key.split(/[-_/]/)[0] ?? key
 }
 
@@ -123,13 +127,16 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
 }) {
   const [internalGroupBy, setInternalGroupBy] = useState<GroupBy>('agent')
   const effectiveGroupBy = groupBy ?? internalGroupBy
+  const [bucket, setBucket] = useState<Bucket>('day')
+  const [metricPick, setMetric] = useState<Metric>('total')
+  // 时间指标只属于 project 维:离开 project 维即回落 Tokens（派生兜底 + 切维时显式复位）
+  const metric: Metric = isTimeMetric(metricPick) && effectiveGroupBy !== 'project' ? 'total' : metricPick
   const setGroupBy = (g: GroupBy) => {
+    if (g !== 'project' && isTimeMetric(metricPick)) setMetric('total')
     if (onGroupByChange) onGroupByChange(g)
     else setInternalGroupBy(g)
   }
-  const [bucket, setBucket] = useState<Bucket>('day')
-  const [metric, setMetric] = useState<Metric>('total')
-  const [sortBy, setSortBy] = useState<ViewSort>({ agent: 'monthTotal', model: 'group' })
+  const [sortBy, setSortBy] = useState<ViewSort>({ agent: 'monthTotal', model: 'group', project: 'monthTotal' })
   const [scaleMode, setScaleMode] = useState<'global' | 'perRow'>('global')
   const [selected, setSelected] = useState<{ rowKey: string; day: number } | null>(null)
   const [internalExpanded, setInternalExpanded] = useState<string | null>(null)
@@ -171,9 +178,10 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     setLoading(true)
     void Promise.all(
       WINDOW_MONTHS.map((m) =>
-        usageService
-          .getMonthlyMatrix({ month: m, groupBy: effectiveGroupBy, metric, bucket: 'day', normalization: scaleMode })
-          .then((res) => ({ m, res })),
+        (effectiveGroupBy === 'project'
+          ? usageService.getProjectMonthRows(m, 'project', metric)
+          : usageService.getMonthlyMatrix({ month: m, groupBy: effectiveGroupBy, metric: metric as 'total' | 'input' | 'output', bucket: 'day', normalization: scaleMode })
+        ).then((res) => ({ m, res })),
       ),
     ).then((list) => {
       if (cancelled) return
@@ -217,6 +225,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
         [...merged.values()].map((e) => ({
           key: e.key,
           label: simplifyLabel(e.key, effectiveGroupBy),
+          subtitle: effectiveGroupBy === 'project' ? projectTooltip(e.key) : undefined,
           values: e.values,
           counts: e.counts,
           total: e.values.reduce<number>((s, v) => s + (v ?? 0), 0),
@@ -274,8 +283,13 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       setExpandedData(null)
       if (useMock) return
       try {
-        const kind = effectiveGroupBy === 'agent' ? 'agent' : 'model'
-        const list = await Promise.all(WINDOW_MONTHS.map((m) => usageService.getBreakdown(kind, rowKey, m)))
+        const list = await Promise.all(
+          WINDOW_MONTHS.map((m) =>
+            effectiveGroupBy === 'project'
+              ? usageService.getProjectBreakdown('project', rowKey, m)
+              : usageService.getBreakdown(effectiveGroupBy, rowKey, m),
+          ),
+        )
         if (list.every((x) => x === null)) {
           setExpandedData(null)
           return
@@ -391,16 +405,33 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
                 {m === 'total' ? 'Tokens' : m === 'input' ? 'Input' : 'Output'}
               </button>
             ))}
+            {/* 时间成本指标（与 token 并列,不相加）;非 project 维禁用 + 提示*/}
+            {(['wait', 'human'] as const).map((m) => {
+              const off = effectiveGroupBy !== 'project'
+              return (
+                <button
+                  key={m}
+                  className={`seg${metric === m ? ' is-active' : ''}${off ? ' is-disabled' : ''}`}
+                  title={off ? `${TIME_METRIC_LABELS[m].label}: time data is only available in the Project view` : TIME_METRIC_LABELS[m].hint}
+                  aria-disabled={off || undefined}
+                  onClick={() => {
+                    if (!off) setMetric(m)
+                  }}
+                >
+                  {TIME_METRIC_LABELS[m].label}
+                </button>
+              )
+            })}
           </div>
           <div className="toolbar-group">
-            {(['agent', 'model'] as GroupBy[]).map((g) => (
+            {(['agent', 'model', 'project'] as GroupBy[]).map((g) => (
               <button
                 key={g}
                 className={`seg${effectiveGroupBy === g ? ' is-active' : ''}`}
-                title={g === 'agent' ? 'One row per agent' : 'One row per model'}
+                title={g === 'agent' ? 'One row per agent' : g === 'model' ? 'One row per model' : 'One row per project (working directory)'}
                 onClick={() => setGroupBy(g)}
               >
-                {g === 'agent' ? 'Agent' : 'Model'}
+                {g === 'agent' ? 'Agent' : g === 'model' ? 'Model' : 'Project'}
               </button>
             ))}
           </div>
@@ -454,13 +485,15 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
           )
         }
         onSelectRow={toggleExpand}
+        formatValue={isTimeMetric(metric) ? formatDuration : undefined}
+        valueUnit={isTimeMetric(metric) ? TIME_METRIC_LABELS[metric].unit : undefined}
       />
 
       {/* 受控模式（面板联动）不渲染内联展开——构成曲线由 FullWindow 的
           MatrixPanel 绘制;仅独立模式保留内联 RowBreakdown。*/}
       {!onRowSelect && effectiveExpanded && (
         <RowBreakdown
-          kind={effectiveGroupBy === 'agent' ? 'agent' : 'model'}
+          kind={effectiveGroupBy}
           rowKey={effectiveExpanded}
           label={matrixRows.find((r) => r.key === effectiveExpanded)?.label ?? effectiveExpanded}
           month={RANGE_LABEL}

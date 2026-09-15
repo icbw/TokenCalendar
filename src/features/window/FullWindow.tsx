@@ -9,8 +9,11 @@ import appLogo from '../../assets/app-logo.png'
 import UsageMatrixView from '../matrix/UsageMatrixView'
 import MatrixPanel from '../matrix/MatrixPanel'
 import CollectorHealth from '../collectors/CollectorHealth'
-import SettingsPage from '../settings/SettingsPage'
+import SettingsPage, { type SettingsTab } from '../settings/SettingsPage'
+import ProjectManagerModal from '../projects/ProjectManagerModal'
 import InsightsView from '../insights/InsightsView'
+import TasksView from '../tasks/TasksView'
+import type { GroupBy as MatrixGroupBy } from '../matrix/UsageMatrixView'
 import { events, updateService, windowService } from '../../services'
 import { getDesignPrefs } from '../settings/designPrefs'
 import { useShowOnLoad } from './useShowOnLoad'
@@ -22,7 +25,8 @@ import './shell.css'
 // 矩阵与图表拆成两个独立视图按钮——'matrix'（热力图）
 // 与 'insights'（洞察图表）本来就是两个视图,共用主内容区三态互斥;齿轮（settings)
 // 逻辑不变。'matrix' 视图 = 矩阵 + 下方全系列联动曲线（跟随矩阵 groupBy）。
-type MainView = 'matrix' | 'insights' | 'settings'
+// 'tasks'（任务列表）为第三个视图按钮,与 matrix / insights 三态互斥。
+type MainView = 'matrix' | 'insights' | 'tasks' | 'settings'
 
 export default function FullWindow() {
   useShowOnLoad()
@@ -41,7 +45,7 @@ export default function FullWindow() {
   }, [])
 
   const [view, setView] = useState<MainView>('matrix')
-  const [settingsTab, setSettingsTab] = useState<'general' | 'appearance' | 'data' | 'subscriptions' | 'about'>('general')
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
   const [widgetVisible, setWidgetVisible] = useState(false)
   // 悬浮球可见性（顶栏 Orbit 按钮；与托盘/设置页同源单一广播）
   const [orbVisible, setOrbVisible] = useState(false)
@@ -60,7 +64,7 @@ export default function FullWindow() {
       if (nav.view === 'settings') {
         const t = nav.tab
         setSettingsTab(
-          t === 'general' || t === 'appearance' || t === 'data' || t === 'subscriptions' || t === 'about'
+          t === 'general' || t === 'appearance' || t === 'projects' || t === 'data' || t === 'subscriptions' || t === 'about'
             ? t
             : 'general',
         )
@@ -100,12 +104,21 @@ export default function FullWindow() {
   // 9.1 联动：'model' 视图的曲线跟随矩阵 groupBy（Model 视角 → 全模型曲线;
   // Agent 视角 → 全 Agent 曲线）。groupBy 状态提升到 FullWindow,UsageMatrixView
   // 受控消费;切到 chart 视图再回来时保持上次视角。
-  const [matrixGroupBy, setMatrixGroupBy] = useState<'agent' | 'model'>('agent')
+  const [matrixGroupBy, setMatrixGroupByState] = useState<MatrixGroupBy>('agent')
   // v3.1 图表面板状态（会话记忆,切视图/重启窗口不丢——保持在 FullWindow 不随
   // 面板卸载重置）:选中行（null = 预设全系列）、折叠、合计模式。
   const [panelRow, setPanelRow] = useState<string | null>(null)
   const [panelCollapsed, setPanelCollapsed] = useState(false)
   const [panelTotalOnly, setPanelTotalOnly] = useState(false)
+  // 进出 project 维时清掉面板选中行——项目键与 agent / model 键不同族,
+  // 带过去只会钻取出空曲线（agent ⇄ model 之间的既有行为不动）。
+  const setMatrixGroupBy = useCallback(
+    (g: MatrixGroupBy) => {
+      if (g !== matrixGroupBy && (matrixGroupBy === 'project' || g === 'project')) setPanelRow(null)
+      setMatrixGroupByState(g)
+    },
+    [matrixGroupBy],
+  )
   const handleRowSelect = useCallback((rowKey: string | null) => {
     // 与 chart 页行联动同逻辑:点行名 → 显示该行;再点同一行 → 恢复预设
     setPanelRow((prev) => (prev === rowKey ? null : rowKey))
@@ -233,6 +246,13 @@ export default function FullWindow() {
             Insights
           </button>
           <button
+            className={`seg titlebar-view${view === 'tasks' ? ' is-active' : ''}`}
+            onClick={() => setView('tasks')}
+            title="Tasks: per-session turns, steps and time"
+          >
+            Tasks
+          </button>
+          <button
             className={`seg titlebar-view${view === 'settings' ? ' is-active' : ''}`}
             onClick={() => setView((v) => (v === 'settings' ? 'matrix' : 'settings'))}
             title="Settings"
@@ -263,6 +283,8 @@ export default function FullWindow() {
             <SettingsPage onBack={() => setView('matrix')} initialTab={settingsTab} />
           ) : view === 'insights' ? (
             <InsightsView />
+          ) : view === 'tasks' ? (
+            <TasksView />
           ) : (
             <>
               {/* 热力图主体化——矩阵区 flex:1 全量显示（去滚动）,图表面板
@@ -293,6 +315,8 @@ export default function FullWindow() {
           )}
         </main>
       </div>
+      {/* 项目管理弹出层（Tasks / Insights 的「Manage projects…」入口;DOM 常驻,只切类名显隐）*/}
+      <ProjectManagerModal />
     </div>
   )
 }

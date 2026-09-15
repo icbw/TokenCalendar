@@ -12,12 +12,16 @@ import { useEffect, useMemo, useState } from 'react'
 import { events, usageService } from '../../services'
 import type { BreakdownDay } from '../../services'
 import { LineChart, StackedBarChart, type SeriesSpec } from '../insights/charts'
+import { projectDisplayName } from '../insights/analytics'
+import type { GroupBy } from './UsageMatrixView'
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const ymd = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
 
 export interface MatrixPanelProps {
-  groupBy: 'agent' | 'model'
+  /** :project 维 → 选中行走 get_project_breakdown（每日 Agent 构成）,
+   * 预设走 get_effort_series（project, total);曲线口径恒为 tokens,不跟随矩阵指标。 */
+  groupBy: GroupBy
   /** null = preset （all series); otherwise = matrix row key （row linkage). */
   selectedRow: string | null
   collapsed: boolean
@@ -74,7 +78,13 @@ export default function MatrixPanel({
       // Row breakdown: pull month by month across the window and stitch
       setLoading(true)
       const months = [...new Set([startDay.slice(0, 7), endDay.slice(0, 7)])]
-      void Promise.all(months.map((m) => usageService.getBreakdown(groupBy, selectedRow, m))).then((list) => {
+      void Promise.all(
+        months.map((m) =>
+          groupBy === 'project'
+            ? usageService.getProjectBreakdown('project', selectedRow, m)
+            : usageService.getBreakdown(groupBy, selectedRow, m),
+        ),
+      ).then((list) => {
         if (cancelled) return
         setLoading(false)
         if (list.every((x) => x === null)) {
@@ -120,14 +130,16 @@ export default function MatrixPanel({
 
     // Preset: range_series （multi-series or total single-series)
     setLoading(true)
-    void usageService
-      .getRangeSeries({
-        startDay,
-        endDay,
-        bucket: 'day',
-        dimension: totalOnly ? 'total' : groupBy,
-        metric: 'total',
-      })
+    void (groupBy === 'project' && !totalOnly
+      ? usageService.getEffortSeries({ startDay, endDay, dimension: 'project', metric: 'total' })
+      : usageService.getRangeSeries({
+          startDay,
+          endDay,
+          bucket: 'day',
+          dimension: totalOnly ? 'total' : (groupBy as 'agent' | 'model'),
+          metric: 'total',
+        })
+    )
       .then((res) => {
         if (cancelled) return
         setLoading(false)
@@ -141,7 +153,7 @@ export default function MatrixPanel({
         setSeries(
           res.seriesKeys.map((k, i) => ({
             key: k,
-            label: k === '__total__' ? 'All sources' : res.seriesLabels[i] ?? k,
+            label: k === '__total__' ? 'All sources' : groupBy === 'project' ? projectDisplayName(k) : res.seriesLabels[i] ?? k,
             values: res.points.map((p) => p.values[i] ?? 0),
           })),
         )
@@ -152,9 +164,9 @@ export default function MatrixPanel({
   }, [groupBy, selectedRow, totalOnly, refreshTick])
 
   const title = useMemo(() => {
-    if (selectedRow !== null) return selectedRow
+    if (selectedRow !== null) return groupBy === 'project' ? projectDisplayName(selectedRow) : selectedRow
     if (totalOnly) return 'All · total'
-    return groupBy === 'model' ? 'All models' : 'All agents'
+    return groupBy === 'model' ? 'All models' : groupBy === 'project' ? 'All projects' : 'All agents'
   }, [selectedRow, totalOnly, groupBy])
 
   if (collapsed) {

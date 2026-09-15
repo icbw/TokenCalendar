@@ -1,7 +1,8 @@
 //! WorkBuddy 适配器：`~/.workbuddy/projects/**/*.jsonl` 递归（provider_reported 主源）。
 //!
 //! 口径：
-//! - 仅 `type=="function_call"` 且 `providerData.rawUsage` 存在的行；
+//! - `providerData.rawUsage` 存在的 `function_call` 行与 **assistant `message` 行**（纯文本
+//!   最终回复的 usage 挂在 message 行上,本机 71 条,旧口径漏计）；
 //! - cache_read = `prompt_cache_hit_tokens`（clamp ≥0）；input = prompt_tokens - cache_read
 //!   （prompt 已含 cache hit,拆出 cache-exclusive input）；output = completion_tokens；
 //! - total = `rawUsage.total_tokens`（含 cache 与 reasoning,不重复加总）,≤0 时回退 input+output；
@@ -10,7 +11,15 @@
 //!
 //! 对话轮计数：`type=="message" && role=="user"` 是真实用户输入（function_call
 //! 是模型发起的**工具调用**,不是对话,勿计入）→ 置 pending 标志,下一条带 rawUsage
-//! 的 function_call 行按其模型计 1 turn 并清位;pending 持久化进游标。
+//! 的行按其模型计 1 turn 并清位;pending 持久化进游标。v8:子代理文件
+//! （`<session>/subagents/agent-*.jsonl`）的提示行不计轮。
+//!
+//! 轮与时间：用户 message 开轮;带 usage 的行 = 模型调用（按
+//! `providerData.messageId` 去重）;`function_call.callId` → `function_call_result.callId`
+//! 配对算 tool_ms;assistant message `status=="incomplete"` 计错（S4-R 复核:源不区分截断 / 失败 /
+//! 中断,不当作用户中止;零响应被下一次输入顶掉的轮由累加器记中止）。会话 = `sessionId`,
+//! 子代理文件 parent = 上两级目录名;
+//! 项目 = 行级 `cwd`;标题（内容列）= `ai-title.aiTitle`。
 //!
 //! db（session 级 estimated 口径）与 traces 兜底源不接入——避免低质量数据混入
 //! 主指标。
@@ -20,7 +29,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::store::{Batch, Store};
+use super::store::{Batch, Store, Tokens};
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, FileCursor, ProbeOutcome,
     advance_file, clamp0, epoch_number_to_millis, load_cursor, millis_to_local_day_hour, seal_cursor,
@@ -38,10 +47,10 @@ static META: AdapterMeta = AdapterMeta {
 };
 
 enum WbLine {
-    /// 主会话真实用户输入行（message role=user,开启新 turn)。
+    /// 真实用户输入行（message role=user,开启新 turn)。
     UserInput,
-    /// function_call 行带 rawUsage:（本地日, 本地小时, 模型, input, output, total)。
-    Usage { day: String, hour: u8, model: String, input: i64, output: i64, total: i64 },
+    /// 带 rawUsage 的 function_call / assistant message 行:（本地日, 本地小时, 模型, token 分项)。
+    Usage { day: String, hour: u8, model: String, tokens: Tokens },
     None,
 }
 
@@ -53,35 +62,40 @@ impl WorkBuddyAdapter {
         WorkBuddyAdapter { projects_dir }
     }
 
-    /// 从一行提取：真实用户输入（置 pending)/ function_call usage 行 / 无关。
+    /// 从一行提取：真实用户输入 / 带 usage 行 / 无关（测试入口;采集走 `process_line`）。
+    #[cfg(test)]
     fn parse_line(line: &str) -> WbLine {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return WbLine::None };
+        Self::classify(&v)
+    }
+
+    fn classify(v: &Value) -> WbLine {
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("message") => {
-                // role=="user" = 真实用户输入（assistant 的 message 行是回复文本,不带 usage)
-                if v.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    WbLine::UserInput
-                } else {
-                    WbLine::None
-                }
-            }
-            Some("function_call") => {
-                let Some((day, hour, model, input, output, total)) = Self::parse_usage(&v) else {
+            Some("message") if v.get("role").and_then(|r| r.as_str()) == Some("user") => WbLine::UserInput,
+            Some("message") | Some("function_call") => {
+                let Some((day, hour, model, tokens)) = Self::parse_usage(v) else {
                     return WbLine::None;
                 };
-                WbLine::Usage { day, hour, model, input, output, total }
+                WbLine::Usage { day, hour, model, tokens }
             }
             _ => WbLine::None,
         }
     }
 
-    /// function_call 行的 usage 提取（原 parse_line 主体)。
-    fn parse_usage(v: &Value) -> Option<(String, u8, String, i64, i64, i64)> {
+    /// 带 rawUsage 行的 usage 提取。
+    /// cache_write = `prompt_cache_write_tokens`（缺失退 `cache_creation_input_tokens`）。
+    fn parse_usage(v: &Value) -> Option<(String, u8, String, Tokens)> {
         let raw = v.get("providerData")?.get("rawUsage")?;
         let prompt = clamp0(raw.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0));
         let completion = clamp0(raw.get("completion_tokens").and_then(|x| x.as_i64()).unwrap_or(0));
         let cache_read = clamp0(raw.get("prompt_cache_hit_tokens").and_then(|x| x.as_i64()).unwrap_or(0));
         let input = (prompt - cache_read).max(0);
+        let cache_write = clamp0(
+            raw.get("prompt_cache_write_tokens")
+                .or_else(|| raw.get("cache_creation_input_tokens"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+        );
         let total_raw = raw.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
         let total = if total_raw > 0 { total_raw } else { input + completion };
         if total <= 0 {
@@ -97,7 +111,67 @@ impl WorkBuddyAdapter {
             .to_string();
         let ts = epoch_number_to_millis(v.get("timestamp")?.as_f64()?)?;
         let (day, hour) = millis_to_local_day_hour(ts)?;
-        Some((day, hour, model, input, completion, total))
+        Some((day, hour, model, Tokens { input, output: completion, total, cache_read, cache_write }))
+    }
+}
+
+impl WorkBuddyAdapter {
+    fn process_line(line: &str, cursor: &mut FileCursor, batch: &mut Batch, months: &mut BTreeSet<String>, parent: Option<&str>) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        let agent = META.id;
+        let st = &mut cursor.turn;
+        let child = parent.is_some();
+        if let Some(sid) = v.get("sessionId").and_then(|x| x.as_str()) {
+            st.set_session(sid);
+        }
+        if let Some(p) = parent {
+            st.set_parent(p);
+        }
+        if let Some(cwd) = v.get("cwd").and_then(|x| x.as_str()) {
+            st.set_project(cwd);
+        }
+        let ts = v.get("timestamp").and_then(|t| t.as_f64()).and_then(epoch_number_to_millis);
+        let ty = v.get("type").and_then(|t| t.as_str());
+        if ty == Some("ai-title") {
+            if let Some(t) = v.get("aiTitle").and_then(|x| x.as_str()) {
+                st.set_title(t, 1);
+            }
+            return;
+        }
+        let Some(ts) = ts else { return };
+        match Self::classify(&v) {
+            WbLine::UserInput => {
+                st.begin(batch, agent, ts, !child);
+                if !child {
+                    cursor.pending_turn = true;
+                }
+            }
+            WbLine::Usage { day, hour, model, tokens } => {
+                let mark = (cursor.pending_turn && !child) as i64;
+                let id = v.pointer("/providerData/messageId").and_then(|x| x.as_str());
+                if st.response(batch, agent, ts, Some(hour), &model, tokens, id, mark) == 1 {
+                    cursor.pending_turn = false;
+                }
+                months.insert(day[..7].to_string());
+            }
+            WbLine::None => st.touch(ts),
+        }
+        match ty {
+            Some("function_call") => {
+                if let Some(id) = v.get("callId").and_then(|x| x.as_str()) {
+                    st.tool_start(batch, agent, ts, id);
+                }
+            }
+            Some("function_call_result") => {
+                if let Some(id) = v.get("callId").and_then(|x| x.as_str()) {
+                    st.tool_end(ts, id);
+                }
+            }
+            Some("message") if v.get("status").and_then(|x| x.as_str()) == Some("incomplete") => {
+                st.error(batch, agent, ts);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -131,22 +205,19 @@ impl Adapter for WorkBuddyAdapter {
             let Some(consume) = advance_file(&path, &mut cursor) else { continue };
             let mut cursor = if consume.reset { FileCursor::fresh() } else { cursor };
 
+            // 子代理文件:<projects>/<proj>/<session>/subagents/agent-*.jsonl → parent = <session>
+            let parent_dir = path
+                .parent()
+                .filter(|d| d.file_name().and_then(|n| n.to_str()) == Some("subagents"))
+                .and_then(|d| d.parent())
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string);
+            cursor.turn.set_file_scope(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             for line in &consume.lines {
-                match Self::parse_line(line) {
-                    WbLine::UserInput => cursor.pending_turn = true,
-                    WbLine::Usage { day, hour, model, input, output, total } => {
-                        let turns = if cursor.pending_turn {
-                            cursor.pending_turn = false;
-                            1
-                        } else {
-                            0
-                        };
-                        batch.add_hour(&day, Some(hour), META.id, &model, input, output, total, turns);
-                        months.insert(day[..7].to_string());
-                    }
-                    WbLine::None => {}
-                }
+                Self::process_line(line, &mut cursor, &mut batch, &mut months, parent_dir.as_deref());
             }
+            cursor.turn.flush(&mut batch, META.id);
             cursor.offset = consume.new_offset;
             seal_cursor(&mut cursor, &path, &scope, &mut batch);
         }
@@ -172,7 +243,7 @@ mod tests {
 
     fn expect_usage(line: &str) -> (String, u8, String, i64, i64, i64) {
         match WorkBuddyAdapter::parse_line(line) {
-            WbLine::Usage { day, hour, model, input, output, total } => (day, hour, model, input, output, total),
+            WbLine::Usage { day, hour, model, tokens: t } => (day, hour, model, t.input, t.output, t.total),
             _ => panic!("expected usage"),
         }
     }
@@ -187,6 +258,8 @@ mod tests {
         assert_eq!(total, 1200);
         assert_eq!(model, "glm-5.3");
         assert_eq!(day.len(), 10);
+        let WbLine::Usage { tokens, .. } = WorkBuddyAdapter::parse_line(&line(1_757_000_000_000.0, None, "m", 1000, 200, 400, 1200)) else { panic!() };
+        assert_eq!((tokens.cache_read, tokens.cache_write), (400, 0));
     }
 
     #[test]
@@ -226,6 +299,74 @@ mod tests {
             WbLine::None
         ));
         assert!(matches!(WorkBuddyAdapter::parse_line("bad"), WbLine::None));
+    }
+
+    #[test]
+    fn assistant_message_usage_counts() {
+        // v8:纯文本最终回复（assistant message 带 rawUsage）入账
+        let msg = r#"{"id":"m9","timestamp":1757000000000,"type":"message","role":"assistant","status":"completed","sessionId":"s1","providerData":{"messageId":"mid9","model":"glm-5.3","rawUsage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0}}}"#;
+        assert!(matches!(WorkBuddyAdapter::parse_line(msg), WbLine::Usage { .. }));
+    }
+
+    // ---------- PHASE12 S2:冻结样本行（2026-09-15 本机真实结构,键集保持,正文脱敏） ----------
+
+    const T: i64 = 1_788_602_400_000;
+    fn row(ty: &str, dt: i64, extra: &str) -> String {
+        format!(r#"{{"id":"i{dt}","parentId":"p","type":"{ty}","timestamp":{},"cwd":"E:\\Work\\Demo","sessionId":"s1"{extra}}}"#, T + dt)
+    }
+    fn pd(mid: &str, usage: Option<(i64, i64, i64)>) -> String {
+        let u = usage
+            .map(|(p, c, hit)| format!(r#","rawUsage":{{"prompt_tokens":{p},"completion_tokens":{c},"total_tokens":{},"prompt_cache_hit_tokens":{hit},"prompt_cache_miss_tokens":0,"credit":0.1}}"#, p + c))
+            .unwrap_or_default();
+        format!(r#","providerData":{{"messageId":"{mid}","model":"glm-5.3","requestModelId":"glm-5.3","requestModelName":"GLM-5.3","traceId":"t","conversationRequestId":"c","agent":"cli"{u}}}"#)
+    }
+
+    #[test]
+    fn s2_turns_times_and_subagent_merge() {
+        let main = [
+            row("message", 0, r#","role":"user","content":[{"type":"input_text","text":"<redacted>"}]"#),
+            row("reasoning", 2_000, &format!(r#","content":[]{}"#, pd("m1", None))),
+            row("function_call", 3_000, &format!(r#","name":"read_file","callId":"c1","arguments":"{{}}"{}"#, pd("m1", Some((1000, 100, 400))))),
+            row("function_call_result", 6_000, r#","name":"read_file","callId":"c1","status":"completed","output":"<redacted>""#),
+            row("message", 9_000, &format!(r#","role":"assistant","status":"completed","content":[]{}"#, pd("m2", Some((500, 50, 0))))),
+            r#"{"type":"ai-title","aiTitle":"<ai title>","cwd":"E:\\Work\\Demo","sessionId":"s1","timestamp":1788602410000}"#.to_string(),
+            row("message", 60_000, r#","role":"user","content":[]"#),
+            row("message", 62_000, &format!(r#","role":"assistant","status":"incomplete","content":[]{}"#, pd("m3", None))),
+        ];
+        let sub = [
+            row("message", 4_000, r#","role":"user","content":[]"#).replace(r#""sessionId":"s1""#, r#""sessionId":"sub1""#),
+            row("function_call", 5_000, &format!(r#","name":"grep","callId":"sc1","arguments":"{{}}"{}"#, pd("sm1", Some((100, 10, 0)))))
+                .replace(r#""sessionId":"s1""#, r#""sessionId":"sub1""#),
+        ];
+        let dir = std::env::temp_dir().join(format!("tc_wb_s2_{}", std::process::id()));
+        let proj = dir.join("projects").join("E--Projects-Demo");
+        let subdir = proj.join("s1").join("subagents");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(proj.join("s1.jsonl"), main.join("\n") + "\n").unwrap();
+        std::fs::write(subdir.join("agent-x.jsonl"), sub.join("\n") + "\n").unwrap();
+        let adapter = WorkBuddyAdapter { projects_dir: dir.join("projects") };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok);
+
+        let turns = store.test_turns(META.id);
+        assert_eq!(turns.len(), 2);
+        let t1 = &turns[0];
+        assert_eq!((t1.model_calls, t1.tool_calls, t1.subagent_count, t1.subagent_calls), (3, 2, 1, 1), "调用含子代理");
+        assert_eq!((t1.wall_ms, t1.tool_ms, t1.model_ms), (Some(9_000), Some(3_000), Some(1_000 + 3_000 + 1_000)));
+        assert_eq!(t1.total_tokens, 1100 + 550 + 110);
+        assert_eq!((t1.ttft_ms, t1.gap_ms), (None, None));
+        let t2 = &turns[1];
+        assert_eq!((t2.model_calls, t2.error_count, t2.aborted, t2.wall_ms, t2.gap_ms), (0, 1, false, Some(2_000), Some(51_000)), "incomplete 计错,不算中止");
+        let sessions = store.test_sessions(META.id);
+        let root = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        assert_eq!((root.title.as_deref(), root.project_key.as_str()), (Some("<ai title>"), "e:/Work/Demo"));
+        assert_eq!(sessions.iter().find(|s| s.session_id == "sub1").unwrap().parent_id.as_deref(), Some("s1"));
+        assert_eq!(store.test_task_sessions(META.id), vec!["s1".to_string()]);
+        let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
+        assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 1, "子代理提示行与无响应轮不计");
+        assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
 
     #[test]

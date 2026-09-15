@@ -12,7 +12,12 @@ pub mod codex;
 pub mod dsh;
 pub mod imports;
 pub mod jsonl;
+pub mod project_meta;
 pub mod store;
+pub mod task_query;
+pub mod task_store;
+pub mod text;
+pub mod turns;
 pub mod workbuddy;
 pub mod zcode;
 /// 真实四源 smoke（仅测试编译,本机手动 `cargo test -- --ignored` 触发)。
@@ -21,7 +26,7 @@ mod smoke;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -136,7 +141,13 @@ pub fn rfc3339_to_local_day_hour(s: &str) -> Option<(String, u8)> {
     Some((dt.format("%Y-%m-%d").to_string(), dt.hour() as u8))
 }
 
-/// Unix 毫秒 → 本地日。
+/// RFC3339 时间串 → Unix 毫秒（轮时间线用）。
+pub fn rfc3339_to_millis(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp_millis())
+}
+
+/// Unix 毫秒 → 本地日（起六源全走 `millis_to_local_day_hour`,仅测试沿用）。
+#[cfg(test)]
 pub fn millis_to_local_day(millis: i64) -> Option<String> {
     let dt = Local.timestamp_millis_opt(millis).single()?;
     Some(dt.format("%Y-%m-%d").to_string())
@@ -185,6 +196,15 @@ pub struct FileCursor {
     /// 下一条带 usage 的行按其模型计一次 turn 并清位。随游标持久化,跨批次/轮次正确。
     #[serde(default)]
     pub pending_turn: bool,
+    /// Codex：本文件是子代理会话（session_meta.parent_thread_id 非空）→ 不计轮。
+    #[serde(default)]
+    pub subagent: bool,
+    /// Codex：本文件已出现过 task_started → 旧 user_message 信号不再置位（防同轮双计）。
+    #[serde(default)]
+    pub task_signal: bool,
+    /// 轮累加器（会话 / 当前轮 / 未配对工具 / 响应去重窗口）。
+    #[serde(default)]
+    pub turn: turns::TurnState,
 }
 
 impl FileCursor {
@@ -200,6 +220,9 @@ impl FileCursor {
             base_total: 0,
             model: String::new(),
             pending_turn: false,
+            subagent: false,
+            task_signal: false,
+            turn: turns::TurnState::default(),
         }
     }
     /// 文件 generation 与游标一致且已读到 EOF → 无新内容。
@@ -283,8 +306,17 @@ fn run(app: AppHandle, mut store: Store) {
         imports::migrate_legacy_dir(&root.imports_dir());
     }
 
+    // daily_project 套用的离开阈值与运行时值（prefs 载入）不一致 → 全表重算一次
+    // （新库 / 迁移清库后标记缺失、上次 set_idle_threshold 重算失败,均在此自愈）。
+    let threshold = task_store::idle_threshold_ms();
+    if store.project_threshold_marker() != Some(threshold) {
+        match store.recompute_projects(threshold) {
+            Ok(n) => crate::dev_log!("[collector] daily_project recomputed for idle threshold {} ms ({} day(s))", threshold, n),
+            Err(e) => crate::dev_log!("[collector] daily_project recompute failed: {}", e),
+        }
+    }
+
     let adapters = default_adapters();
-    let mut revision: u64 = 0;
     let mut first_pass = true;
 
     loop {
@@ -315,8 +347,7 @@ fn run(app: AppHandle, mut store: Store) {
                         store.record_success(meta.id, adapter.probe().fingerprint.as_deref());
                         // 有新数据或首轮完成 → 通知前端刷新
                         if outcome.events > 0 || first_pass {
-                            revision += 1;
-                            emit_changed(&app, &outcome.months, revision);
+                            notify_usage_changed(&app, &outcome.months);
                         }
                         if outcome.events > 0 {
                             crate::dev_log!("[collector] {} +{} events", meta.id, outcome.events);
@@ -342,12 +373,16 @@ struct ChangedKeys {
     revision: u64,
 }
 
-fn emit_changed(app: &AppHandle, months: &BTreeSet<String>, revision: u64) {
+/// usage:changed 订号（采集线程与命令面共用,单调递增）。
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// 广播 `usage:changed`（采集批次提交后;起 `set_idle_threshold` 重算后复用）。
+pub fn notify_usage_changed(app: &AppHandle, months: &BTreeSet<String>) {
     let payload = ChangedKeys {
         months: months.iter().cloned().collect(),
         agent_keys: Vec::new(),
         model_keys: Vec::new(),
-        revision,
+        revision: REVISION.fetch_add(1, Ordering::SeqCst) + 1,
     };
     if let Err(e) = app.emit("usage:changed", payload) {
         crate::dev_log!("[collector] emit usage:changed failed: {}", e);

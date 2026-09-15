@@ -1,6 +1,6 @@
 // SettingsPage：设置页（自右缘窄面板改为内容区全幅独立视图）。
-// 子 tab：General（行为）/ Appearance（美化）/ Data（导出）/ Subscriptions
-// （订阅额度）/ About（版本与更新）。
+// 子 tab：General（行为）/ Appearance（美化）/ Projects（项目管理）/ Data（导出）/
+// Subscriptions（订阅额度）/ About（版本与更新）。
 // 外观 tab 的挂件美化组：预定义色板 + react-colorful 取色弹层 + hex 输入 +
 // 恢复默认；色与透明度分离（调色盘只改色相，alpha 仍走 bgOpacity 滑条）。
 // 浮层铁律：取色弹层 DOM 常驻不卸载——隐藏=移出视口+visibility，
@@ -12,14 +12,16 @@ import { autostartService, collectorService, dataService, events, exportService,
 import { currentMonth } from '../../lib/time'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, orbBoostConfig, SIZE_PRESETS, RADIUS_PRESETS, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
+import ProjectManager from '../projects/ProjectManager'
 import './settings.css'
 
-type SettingsTab = 'general' | 'appearance' | 'data' | 'subscriptions' | 'about'
+export type SettingsTab = 'general' | 'appearance' | 'projects' | 'data' | 'subscriptions' | 'about'
 
 /** 页签（hint = hover 提示：一句话说明本页管什么）。 */
 const TABS: { id: SettingsTab; label: string; hint: string }[] = [
   { id: 'general', label: 'General', hint: 'Collection, matrix and widget behavior' },
   { id: 'appearance', label: 'Appearance', hint: 'Colors, glass material and corner radius' },
+  { id: 'projects', label: 'Projects', hint: 'Rename, hide and merge project folders; Scratch rule' },
   { id: 'data', label: 'Data', hint: 'Storage, backup, restore and export' },
   { id: 'subscriptions', label: 'Subscriptions', hint: 'Quota polling, boost monitoring and binding' },
   { id: 'about', label: 'About', hint: 'Version and updates' },
@@ -99,9 +101,10 @@ export default function SettingsPage({ onBack, initialTab }: { onBack(): void; i
           </div>
         </div>
       </div>
-      <div className="settings-content" role="tabpanel">
+      <div className={`settings-content${tab === 'projects' ? ' is-wide' : ''}`} role="tabpanel">
         {tab === 'general' && <GeneralTab />}
         {tab === 'appearance' && <AppearanceTab />}
+        {tab === 'projects' && <ProjectManager active />}
         {tab === 'data' && <DataTab />}
         {tab === 'subscriptions' && <SubscriptionsTab />}
         {tab === 'about' && <AboutTab />}

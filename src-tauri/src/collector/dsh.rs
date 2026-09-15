@@ -30,6 +30,11 @@
 //!   前缀事件数,`seq < inheritedEventCount` 跳过。
 //! - request/header、request/context、turn/start、session/title* 等一律忽略
 //!   （title 生成无 usage;request/header 每会话仅一条,不可作请求计数）。
+//! - **轮与时间**：真实用户输入开轮（与 pending 同一判据,splice 进活跃 turn 的
+//!   追加输入同样开新轮,保证轮数 == request_count）;带 usage 的 assistant/message = 模型调用
+//!   （model_ms 按相邻事件估算）;`tool/call` 的 seq 与 `tool/result.sourceEventSeqs` 配对算
+//!   tool_ms;`turn/end` 闭轮;`data.interrupted` 记中止（S4-R,用户中断不计错）。会话 = 会话目录名,项目 = 头行 `cwd`;
+//!   事件级 seq 水位（`event_seq`）防代际重读重复累计。DSH 无子代理与标题落库。
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -37,7 +42,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::store::{Batch, Store};
+use super::store::{Batch, Store, Tokens};
+use super::turns::TurnState;
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, ProbeOutcome, clamp0,
     home_dir, millis_to_local_day_hour, TAIL_MAX_BYTES,
@@ -91,6 +97,12 @@ struct DshCursor {
     /// 对话轮 pending 标志（真实用户输入 → 下一条 usage 行计 1 turn）。
     #[serde(default)]
     pending_turn: bool,
+    /// 轮事件 seq 水位（全事件类型;usage 仍以 last_seq 为准）。
+    #[serde(default = "default_last_seq")]
+    event_seq: i64,
+    /// 轮累加器。
+    #[serde(default)]
+    turn: TurnState,
 }
 
 fn default_last_seq() -> i64 {
@@ -107,6 +119,8 @@ impl DshCursor {
             last_seq: -1,
             inherited: 0,
             pending_turn: false,
+            event_seq: -1,
+            turn: TurnState::default(),
         }
     }
     fn to_json(&self) -> String {
@@ -302,11 +316,10 @@ fn decompress_frames(buf: &[u8], frames: &[(usize, usize)]) -> (Vec<u8>, usize) 
 }
 
 fn split_lines(text: &[u8]) -> Vec<String> {
-    let s = String::from_utf8_lossy(text);
-    s.lines()
-        .map(|l| l.trim_end_matches('\r'))
+    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（S4-R,头行 cwd;见 collector/text.rs）
+    text.split(|&b| b == b'\n')
+        .map(|l| super::text::decode_bytes(l).trim_end_matches('\r').to_string())
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
         .collect()
 }
 
@@ -371,19 +384,33 @@ fn normalize_model(model: &str) -> String {
 }
 
 enum DshLine {
-    /// 头行（type=="session",仅日志首）：种子会话继承前缀长度。
-    Header { inherited: i64 },
+    /// 头行（type=="session",仅日志首）：种子会话继承前缀长度 + 工作目录。
+    Header { inherited: i64, cwd: Option<String> },
     /// 真实用户输入（kind=="user"）。
-    UserInput { seq: i64 },
+    UserInput { seq: i64, time: Option<i64> },
+    /// 无 usage 的 assistant/message（interrupted 计错）。
+    Assistant { seq: i64, time: i64, interrupted: bool },
+    /// 工具调用（tool/call）:以自身 seq 为配对键。
+    ToolCall { seq: i64, time: i64 },
+    /// 工具结果（tool/result）:sourceEventSeqs = 对应调用的 seq。
+    ToolResult { seq: i64, time: i64, calls: Vec<i64> },
+    /// 轮结束（turn/end）。
+    TurnEnd { seq: i64, time: i64 },
     /// usage 行（assistant/message + data.usage）。
     Usage {
         seq: i64,
+        time: i64,
+        id: Option<String>,
+        interrupted: bool,
         day: String,
         hour: u8,
         model: String,
         input: i64,
         output: i64,
         total: i64,
+        /// cacheReadTokens / cacheWriteTokens（后者缺失为 0）。
+        cache_read: i64,
+        cache_write: i64,
     },
     None,
 }
@@ -398,6 +425,7 @@ fn parse_line(line: &str) -> DshLine {
                 .get("inheritedEventCount")
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0),
+            cwd: v.get("cwd").and_then(|x| x.as_str()).map(str::to_string),
         },
         Some("user/message") => {
             // 真实用户输入判据 = source.kind=="user"（结构化字段,非字符串匹配）。
@@ -406,41 +434,60 @@ fn parse_line(line: &str) -> DshLine {
                 return DshLine::None;
             };
             if kind == Some("user") {
-                DshLine::UserInput { seq }
+                DshLine::UserInput { seq, time: v.get("time").and_then(|x| x.as_i64()) }
             } else {
                 DshLine::None
             }
         }
         Some("assistant/message") => {
-            let Some(usage) = v.pointer("/data/usage") else {
+            let (Some(seq), Some(time)) = (v.get("seq").and_then(|x| x.as_i64()), v.get("time").and_then(|x| x.as_i64())) else {
                 return DshLine::None;
+            };
+            let interrupted = v.pointer("/data/interrupted").map_or(false, |x| x.as_bool().unwrap_or(!x.is_null()));
+            let Some(usage) = v.pointer("/data/usage") else {
+                return DshLine::Assistant { seq, time, interrupted };
             };
             let input = clamp0(usage.get("inputTokens").and_then(|x| x.as_i64()).unwrap_or(0));
             let output = clamp0(usage.get("outputTokens").and_then(|x| x.as_i64()).unwrap_or(0));
             if input == 0 && output == 0 {
-                return DshLine::None;
+                return DshLine::Assistant { seq, time, interrupted };
             }
             let total = usage
                 .get("totalTokens")
                 .and_then(|x| x.as_i64())
                 .map(clamp0)
                 .unwrap_or(input + output);
+            let cache_read = clamp0(usage.get("cacheReadTokens").and_then(|x| x.as_i64()).unwrap_or(0));
+            let cache_write = clamp0(usage.get("cacheWriteTokens").and_then(|x| x.as_i64()).unwrap_or(0));
             let model = v
                 .pointer("/data/message/source/model")
                 .and_then(|m| m.as_str())
                 .filter(|s| !s.is_empty())
                 .map(normalize_model)
                 .unwrap_or_else(|| "unknown".to_string());
-            let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) else {
-                return DshLine::None;
-            };
-            let Some(time) = v.get("time").and_then(|x| x.as_i64()) else {
-                return DshLine::None;
-            };
             let Some((day, hour)) = millis_to_local_day_hour(time) else {
                 return DshLine::None;
             };
-            DshLine::Usage { seq, day, hour, model, input, output, total }
+            let id = v.pointer("/data/message/id").and_then(|x| x.as_str()).map(str::to_string);
+            DshLine::Usage { seq, time, id, interrupted, day, hour, model, input, output, total, cache_read, cache_write }
+        }
+        Some(ty @ ("tool/call" | "tool/result" | "turn/end")) => {
+            let (Some(seq), Some(time)) = (v.get("seq").and_then(|x| x.as_i64()), v.get("time").and_then(|x| x.as_i64())) else {
+                return DshLine::None;
+            };
+            match ty {
+                "tool/call" => DshLine::ToolCall { seq, time },
+                "tool/result" => DshLine::ToolResult {
+                    seq,
+                    time,
+                    calls: v
+                        .get("sourceEventSeqs")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                        .unwrap_or_default(),
+                },
+                _ => DshLine::TurnEnd { seq, time },
+            }
         }
         _ => DshLine::None,
     }
@@ -499,42 +546,84 @@ impl Adapter for DshAdapter {
             }
 
             let mut next = cursor;
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                next.turn.set_session(name);
+            }
             for line in &consume.lines {
-                match parse_line(line) {
-                    DshLine::Header { inherited } => next.inherited = inherited,
-                    DshLine::UserInput { seq } => {
+                let parsed = parse_line(line);
+                // 轮事件水位 + 种子前缀守卫（usage 另有 last_seq 水位,见下）
+                let fresh = |next: &mut DshCursor, seq: i64| {
+                    let ok = seq > next.event_seq && seq >= next.inherited;
+                    next.event_seq = next.event_seq.max(seq);
+                    ok
+                };
+                match parsed {
+                    DshLine::Header { inherited, cwd } => {
+                        next.inherited = inherited;
+                        if let Some(c) = cwd {
+                            next.turn.set_project(&c);
+                        }
+                    }
+                    DshLine::UserInput { seq, time } => {
                         // 水位 + 种子双守卫：已消费行与父会话继承行不置位。
                         if seq > next.last_seq && seq >= next.inherited {
                             next.pending_turn = true;
                         }
+                        if fresh(&mut next, seq) {
+                            if let Some(t) = time {
+                                next.turn.begin(&mut batch, META.id, t, true);
+                            }
+                        }
                     }
-                    DshLine::Usage { seq, day, hour, model, input, output, total } => {
+                    DshLine::Usage { seq, time, id, interrupted, day, hour, model, input, output, total, cache_read, cache_write } => {
+                        next.event_seq = next.event_seq.max(seq);
                         if seq > next.last_seq {
                             next.last_seq = seq;
                             if seq >= next.inherited {
-                                let turns = if next.pending_turn {
+                                let t = Tokens { input, output, total, cache_read, cache_write };
+                                let mark = next.pending_turn as i64;
+                                if next.turn.response(&mut batch, META.id, time, Some(hour), &model, t, id.as_deref(), mark) == 1 {
                                     next.pending_turn = false;
-                                    1
-                                } else {
-                                    0
-                                };
-                                batch.add_hour(
-                                    &day,
-                                    Some(hour),
-                                    META.id,
-                                    &model,
-                                    input,
-                                    output,
-                                    total,
-                                    turns,
-                                );
+                                }
+                                if interrupted {
+                                    next.turn.abort(&mut batch, META.id, time);
+                                }
                                 months.insert(day[..7].to_string());
                             }
+                        }
+                    }
+                    DshLine::Assistant { seq, time, interrupted } => {
+                        if fresh(&mut next, seq) {
+                            if interrupted && next.turn.open.is_some() {
+                                next.turn.abort(&mut batch, META.id, time);
+                            } else {
+                                next.turn.touch(time);
+                            }
+                        }
+                    }
+                    DshLine::ToolCall { seq, time } => {
+                        if fresh(&mut next, seq) {
+                            next.turn.tool_start(&mut batch, META.id, time, &seq.to_string());
+                        }
+                    }
+                    DshLine::ToolResult { seq, time, calls } => {
+                        if fresh(&mut next, seq) {
+                            for c in calls {
+                                next.turn.tool_end(time, &c.to_string());
+                            }
+                            next.turn.touch(time);
+                        }
+                    }
+                    DshLine::TurnEnd { seq, time } => {
+                        if fresh(&mut next, seq) && next.turn.open.is_some() {
+                            next.turn.touch(time);
+                            next.turn.close(&mut batch, META.id);
                         }
                     }
                     DshLine::None => {}
                 }
             }
+            next.turn.flush(&mut batch, META.id);
             next.offset = consume.new_offset;
             if let Some((size, mtime)) = super::jsonl::generation(&file) {
                 next.size = size;
@@ -565,7 +654,7 @@ mod tests {
     #[test]
     fn real_user_vs_injected_lines() {
         // 真实用户行（kind=user,带 rpcId）→ 置 pending
-        assert!(matches!(parse_line(REAL_USER), DshLine::UserInput { seq: 8 }));
+        assert!(matches!(parse_line(REAL_USER), DshLine::UserInput { seq: 8, time: Some(_) }));
         // 注入伪行（agent-instructions / plugin / skill-catalog）→ 忽略
         assert!(matches!(parse_line(INJECTED_INSTRUCTIONS), DshLine::None));
         assert!(matches!(parse_line(INJECTED_PLUGIN), DshLine::None));
@@ -576,7 +665,7 @@ mod tests {
 
     #[test]
     fn usage_line_fields_and_conservation() {
-        let DshLine::Usage { seq, day, hour, model, input, output, total } = parse_line(USAGE_TURN1)
+        let DshLine::Usage { seq, day, hour, model, input, output, total, cache_read, cache_write, .. } = parse_line(USAGE_TURN1)
         else {
             panic!("expected usage");
         };
@@ -584,15 +673,18 @@ mod tests {
         assert_eq!(input, 6475);
         assert_eq!(output, 46);
         assert_eq!(total, 14713); // provider total = 6475+46+8192
+        assert_eq!((cache_read, cache_write), (8192, 0));
         assert_eq!(model, "deepseek-v4-flash"); // 归一化后
         assert_eq!(day.len(), 10);
         assert!(hour <= 23);
-        // 无 usage 的 assistant 行 → 忽略（不消费 pending）
-        assert!(matches!(parse_line(r#"{"type":"assistant/message","seq":30,"time":1788902002626,"data":{"turn":2,"step":2,"message":{"source":{"model":"m"}}}}"#), DshLine::None));
+        // 无 usage 的 assistant 行 → Assistant（不入账、不消费 pending）
+        assert!(matches!(parse_line(r#"{"type":"assistant/message","seq":30,"time":1788902002626,"data":{"turn":2,"step":2,"message":{"source":{"model":"m"}}}}"#), DshLine::Assistant { seq: 30, interrupted: false, .. }));
         // 坏 JSON → 忽略
         assert!(matches!(parse_line("not json"), DshLine::None));
+        // tool/call → 以自身 seq 为配对键
+        assert!(matches!(parse_line(TOOL_CALL), DshLine::ToolCall { seq: 20, .. }));
         // 无关事件类型 → 忽略
-        assert!(matches!(parse_line(TOOL_CALL), DshLine::None));
+        assert!(matches!(parse_line(r#"{"type":"step/start","seq":21,"time":1788901890301,"data":{"turn":1,"step":2}}"#), DshLine::None));
     }
 
     #[test]
@@ -602,7 +694,7 @@ mod tests {
         let mut turns = Vec::new();
         for line in [REAL_USER, USAGE_TURN1, USAGE_TURN2] {
             match parse_line(line) {
-                DshLine::UserInput { seq } => {
+                DshLine::UserInput { seq, .. } => {
                     if seq > cursor.last_seq && seq >= cursor.inherited {
                         cursor.pending_turn = true;
                     }
@@ -756,13 +848,13 @@ mod tests {
         let mut batch = Batch::default();
         for line in &consume.lines {
             match parse_line(line) {
-                DshLine::Header { inherited } => cursor.inherited = inherited,
-                DshLine::UserInput { seq } => {
+                DshLine::Header { inherited, .. } => cursor.inherited = inherited,
+                DshLine::UserInput { seq, .. } => {
                     if seq > cursor.last_seq && seq >= cursor.inherited {
                         cursor.pending_turn = true;
                     }
                 }
-                DshLine::Usage { seq, day, hour, model, input, output, total } => {
+                DshLine::Usage { seq, day, hour, model, input, output, total, .. } => {
                     if seq > cursor.last_seq {
                         cursor.last_seq = seq;
                         if seq >= cursor.inherited {
@@ -776,7 +868,7 @@ mod tests {
                         }
                     }
                 }
-                DshLine::None => {}
+                _ => {}
             }
         }
         cursor.offset = consume.new_offset;
@@ -813,6 +905,41 @@ mod tests {
         assert_eq!(batch.hourly.len(), batch.entries.len());
     }
 
+    /// PHASE12 S2:冻结真实闭合会话走完整 collect——轮表 / 会话 / 项目维守恒 + 二次采集幂等。
+    #[test]
+    fn s2_fixture_session_turns_via_collect() {
+        let root = std::env::temp_dir().join(format!("tc_dsh_s2_{}", std::process::id()));
+        let sess = root.join("sessions").join("--E-Projects-Demo--").join("session-bdcf4e24-fixture");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::copy(fixture_path(), sess.join("session.v3.jsonl.zstd")).unwrap();
+        let adapter = DshAdapter { sessions_dir: root.join("sessions") };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        // 模拟代际切换:游标文件名置空 → offset 归零重读,事件水位防重复累计
+        let scope = sess.display().to_string();
+        let mut c: DshCursor = serde_json::from_str(&store.get_cursor(META.id, &scope).unwrap()).unwrap();
+        c.file.clear();
+        let mut b = Batch::default();
+        b.cursors.push((scope.clone(), c.to_json()));
+        store.commit(META.id, &b).unwrap();
+        let ok2 = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ok && ok2);
+
+        let turns = store.test_turns(META.id);
+        assert_eq!(turns.len(), 2, "两次测试对话 = 两轮");
+        assert!(turns.iter().all(|t| t.model_calls == 1 && t.error_count == 0));
+        assert!(turns.iter().all(|t| t.wall_ms.unwrap_or(-1) >= 0 && t.model_ms.unwrap_or(-1) >= 0));
+        assert!(turns.iter().all(|t| t.ttft_ms.is_none()));
+        assert_eq!(turns[0].gap_ms, None);
+        assert!(turns[1].gap_ms.unwrap_or(-1) > 0, "第二轮有轮间空档");
+        assert_eq!(turns.iter().map(|t| t.total_tokens).sum::<i64>(), 29478, "与官方 projcache 对账值一致");
+        assert_eq!(store.test_task_sessions(META.id), vec!["session-bdcf4e24-fixture".to_string()]);
+        let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
+        assert_eq!(rows[0].month_total, 29478, "重读不重计");
+        assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
     #[test]
     fn watermark_dedup_on_regenerated_log() {
         // 代际重编码场景：同一份日志重读（如代际切换 offset 归零）→ 水位去重,零重计。
@@ -824,13 +951,13 @@ mod tests {
         let mut batch2 = Batch::default();
         for line in &consume.lines {
             match parse_line(line) {
-                DshLine::Header { inherited } => cursor.inherited = inherited,
-                DshLine::UserInput { seq } => {
+                DshLine::Header { inherited, .. } => cursor.inherited = inherited,
+                DshLine::UserInput { seq, .. } => {
                     if seq > cursor.last_seq && seq >= cursor.inherited {
                         cursor.pending_turn = true;
                     }
                 }
-                DshLine::Usage { seq, day, hour, model, input, output, total } => {
+                DshLine::Usage { seq, day, hour, model, input, output, total, .. } => {
                     if seq > cursor.last_seq {
                         cursor.last_seq = seq;
                         if seq >= cursor.inherited {
@@ -839,7 +966,7 @@ mod tests {
                         }
                     }
                 }
-                DshLine::None => {}
+                _ => {}
             }
         }
         assert_eq!(batch2.events, 0, "水位去重:重读不得重计");
@@ -859,13 +986,13 @@ mod tests {
         let mut batch = Batch::default();
         for line in [header, inherited_usage, inherited_user, own_user, own_usage] {
             match parse_line(line) {
-                DshLine::Header { inherited } => cursor.inherited = inherited,
-                DshLine::UserInput { seq } => {
+                DshLine::Header { inherited, .. } => cursor.inherited = inherited,
+                DshLine::UserInput { seq, .. } => {
                     if seq > cursor.last_seq && seq >= cursor.inherited {
                         cursor.pending_turn = true;
                     }
                 }
-                DshLine::Usage { seq, day, hour, model, input, output, total } => {
+                DshLine::Usage { seq, day, hour, model, input, output, total, .. } => {
                     if seq > cursor.last_seq {
                         cursor.last_seq = seq;
                         if seq >= cursor.inherited {
@@ -874,7 +1001,7 @@ mod tests {
                         }
                     }
                 }
-                DshLine::None => {}
+                _ => {}
             }
         }
         assert_eq!(cursor.inherited, 2);

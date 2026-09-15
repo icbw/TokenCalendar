@@ -75,6 +75,10 @@ export interface SeriesSpec {
   values: number[]
 }
 
+/** :数值格式化钩子（缺省 = token 口径:hover 千分位、轴 / 环紧凑）。
+ * 时间成本指标（毫秒）传入 formatDuration,hover / 轴 / 环同一格式。 */
+export type ValueFormat = (v: number) => string
+
 interface Margin {
   top: number
   right: number
@@ -160,7 +164,7 @@ interface HoverState {
 
 // ---- 通用 hover 层（crosshair + 卡片 tooltip） ----
 
-function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, stackedTotal, scale = 1 }: {
+function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, stackedTotal, scale = 1, fmt = formatFull }: {
   hover: HoverState
   plot: { w: number; h: number }
   bucketLabels: string[]
@@ -172,6 +176,7 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   /** v3.7.2:SVG 渲染缩放系数——foreignObject 内容按 1/scale 放大,图表随
    * 格子缩小时 tooltip 保持真实 CSS 像素尺寸可读。 */
   scale?: number
+  fmt?: ValueFormat
 }) {
   const i = hover.index
   const total = series.reduce((s, sr) => s + (sr.values[i] ?? 0), 0)
@@ -220,19 +225,19 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
         >
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontWeight: 700, marginBottom: 3 }}>
             <span>{bucketLabels[i]}</span>
-            <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatFull(total)}</span>
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmt(total)}</span>
           </div>
-          {rows.map((r) => (
-            <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 5, lineHeight: '18px' }}>
+          {rows.map((r, ri) => (
+            <div key={`${ri}-${r.label}`} style={{ display: 'flex', alignItems: 'center', gap: 5, lineHeight: '18px' }}>
               <span style={{ width: 7, height: 7, borderRadius: 2, background: r.color, flexShrink: 0 }} />
               <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1 }}>{r.label}</span>
-              <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatFull(r.value)}</span>
+              <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmt(r.value)}</span>
             </div>
           ))}
           {restCount > 0 && (
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, lineHeight: '16px', color: 'var(--text-faint)' }}>
               <span>+{restCount} more</span>
-              <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatFull(restValue)}</span>
+              <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmt(restValue)}</span>
             </div>
           )}
           {allRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No data</div>}
@@ -249,13 +254,14 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
 // 完全对齐格子,日期由表头行表达）;浮层模式四边贴边（left/right 2px 描边半宽,
 // bottom 6px）——绘图区两缘 = 格子两缘,宽度随 --cells-w 等比缩放。
 
-export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true }: {
+export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue }: {
   series: SeriesSpec[]
   buckets: string[]
   height?: number
   showYAxis?: boolean
   showGrid?: boolean
   showXAxis?: boolean
+  formatValue?: ValueFormat
 }) {
   const width = 760
   const n = buckets.length
@@ -284,8 +290,9 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
       onMouseMove={onMove} onMouseLeave={() => setHover(null)}
     >
       <defs>
-        {series.map((s) => (
-          <linearGradient key={s.key} id={`grad-${s.key.replace(/[^a-zA-Z0-9]/g, '_')}`} x1="0" y1="0" x2="0" y2="1">
+        {/* id 带系列序号——项目路径含非 ASCII 字符时清洗后会撞名（渐变串色）*/}
+        {series.map((s, si) => (
+          <linearGradient key={s.key} id={`grad-${si}-${s.key.replace(/[^a-zA-Z0-9]/g, '_')}`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={colorFor(s.key)} stopOpacity={0.22} />
             <stop offset="100%" stopColor={colorFor(s.key)} stopOpacity={0.02} />
           </linearGradient>
@@ -295,7 +302,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
         <g key={i}>
           <line x1={margin.left} x2={margin.left + plot.w} y1={yOf(t)} y2={yOf(t)} stroke="var(--border)" strokeWidth={1} />
           <text x={margin.left - 6} y={yOf(t) + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
-            {formatCompact(t)}
+            {(formatValue ?? formatCompact)(t)}
           </text>
         </g>
       ))}
@@ -305,13 +312,13 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
           <text key={b} x={xOf(i)} y={height - 6} textAnchor="middle" fontSize={10} fill="var(--text-faint)">{lbl}</text>
         ) : null
       })}
-      {series.map((s) => {
+      {series.map((s, si) => {
         const pts = s.values.map((v, i) => [xOf(i), yOf(v)] as [number, number])
         const line = smoothPath(pts)
         const area = `${line} L${xOf(n - 1)},${margin.top + plot.h} L${xOf(0)},${margin.top + plot.h} Z`
         return (
           <g key={s.key}>
-            <path d={area} fill={`url(#grad-${s.key.replace(/[^a-zA-Z0-9]/g, '_')})`} />
+            <path d={area} fill={`url(#grad-${si}-${s.key.replace(/[^a-zA-Z0-9]/g, '_')})`} />
             <path d={line} fill="none" stroke={colorFor(s.key)} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
           </g>
         )
@@ -325,7 +332,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
             />
           ))}
           <HoverCard
-            hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} scale={svgScale}
+            hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} scale={svgScale} fmt={formatValue}
           />
         </>
       )}
@@ -335,13 +342,14 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
 
 // ---- 堆叠柱图（圆角顶 + crosshair） ----
 
-export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true }: {
+export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue }: {
   series: SeriesSpec[]
   buckets: string[]
   height?: number
   showYAxis?: boolean
   showGrid?: boolean
   showXAxis?: boolean
+  formatValue?: ValueFormat
 }) {
   const width = 760
   const [hover, setHover] = useState<HoverState | null>(null)
@@ -377,7 +385,7 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
           <g key={i}>
             <line x1={margin.left} x2={margin.left + plot.w} y1={y} y2={y} stroke="var(--border)" strokeWidth={1} />
             <text x={margin.left - 6} y={y + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
-              {formatCompact(t)}
+              {(formatValue ?? formatCompact)(t)}
             </text>
           </g>
         )
@@ -417,7 +425,7 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
       })}
       {hover && hover.index < n && (
         <HoverCard
-          hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} stackedTotal scale={svgScale}
+          hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} stackedTotal scale={svgScale} fmt={formatValue}
         />
       )}
     </svg>
@@ -661,11 +669,14 @@ export function ComboChart({ series, buckets, height = 230 }: {
 // 每条目 = 色点 + 名称 | tokens 值 + 百分比;
 // 超过每侧 6 项截断,余量并入「+N more」行（title 提示完整清单,不做 tooltip 卡）。
 
-export function DonutChart({ items, centerLabel, unitLabel, height = 190 }: {
+export function DonutChart({ items, centerLabel, unitLabel, height = 190, formatValue = formatCompact, titleFor }: {
   items: { key: string; label: string; value: number }[]
   centerLabel: string
   unitLabel: string
   height?: number
+  formatValue?: ValueFormat
+  /** 图例名 hover 提示（缺省 = label;项目维传完整路径）。 */
+  titleFor?: (key: string, label: string) => string
 }) {
   const total = items.reduce((s, it) => s + it.value, 0)
   if (total <= 0 || items.length === 0) {
@@ -708,8 +719,8 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190 }: {
   const legendRow = (a: (typeof arcs)[number]) => (
     <div key={a.key} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, lineHeight: '20px' }}>
       <span style={{ width: 8, height: 8, borderRadius: 2, background: colorFor(a.key), flexShrink: 0 }} />
-      <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }} title={a.label}>{a.label}</span>
-      <span style={{ color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>{formatCompact(a.value)}</span>
+      <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }} title={titleFor ? titleFor(a.key, a.label) : a.label}>{a.label}</span>
+      <span style={{ color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>{formatValue(a.value)}</span>
       <span style={{ color: 'var(--text-faint)', width: 38, textAlign: 'right', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>
         {(a.frac * 100).toFixed(1)}%
       </span>
@@ -721,8 +732,8 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190 }: {
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
         {leftItems.map(legendRow)}
         {overflowCount > 0 && (
-          <div style={{ fontSize: 10, color: 'var(--text-faint)', lineHeight: '20px' }} title={arcs.map((a) => `${a.label} ${formatCompact(a.value)}`).join('\n')}>
-            +{overflowCount} more ({formatCompact(overflowValue)})
+          <div style={{ fontSize: 10, color: 'var(--text-faint)', lineHeight: '20px' }} title={arcs.map((a) => `${a.label} ${formatValue(a.value)}`).join('\n')}>
+            +{overflowCount} more ({formatValue(overflowValue)})
           </div>
         )}
       </div>
@@ -731,7 +742,7 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190 }: {
           <path key={a.key} d={a.d} fill={colorFor(a.key)} stroke="var(--panel)" strokeWidth={1.5} />
         ))}
         <text x={cx} y={cy - 3} textAnchor="middle" fontSize={15} fontWeight={700} fill="var(--text)">
-          {formatCompact(total)}
+          {formatValue(total)}
         </text>
         <text x={cx} y={cy + 13} textAnchor="middle" fontSize={10} fill="var(--text-faint)">{unitLabel}</text>
       </svg>

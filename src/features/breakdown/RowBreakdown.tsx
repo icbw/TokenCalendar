@@ -8,7 +8,7 @@ import { formatCompact } from '../matrix/matrixScale'
 import './breakdown.css'
 
 interface RowBreakdownProps {
-  kind: 'agent' | 'model'
+  kind: 'agent' | 'model' | 'project'
   rowKey: string
   label: string
   month: string

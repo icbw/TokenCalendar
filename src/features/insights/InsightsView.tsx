@@ -9,12 +9,16 @@ import type { CreditSummary, RangeSeriesPoint, RangeSeriesResult } from '../../s
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, COMBO_IN, COMBO_OUT, COMBO_CREDIT, type ComboSeries, type SeriesSpec } from './charts'
 import { formatFull } from '../matrix/matrixScale'
+import { OUTLIER_Z, TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
+import { Seg } from './Seg'
+import RangeControl from './RangeControl'
+import { HOUR_BUCKET_MAX_DAYS, rangeShortLabel, spanDays } from './range'
+import { useRangeSelection } from './useRangeSelection'
+import { openProjectManager } from '../projects/projectManagerStore'
+import '../projects/projects.css'
 import './insights.css'
 
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-const OUTLIER_Z = 2.0
-const OUTLIER_MIN_SAMPLES = 7
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const ymd = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
@@ -27,45 +31,23 @@ const fullMonthLabel = (m: string) => {
 // ---- 口径控件（分段控件,样式复用 .seg） ----
 
 type Bucket = 'day' | 'hour'
-type Dimension = 'agent' | 'model' | 'total'
-type Metric = 'total' | 'input' | 'output'
+/** :project 维 / 时间指标走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series 不变。 */
+type Dimension = 'agent' | 'model' | 'project' | 'total'
+type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
 type ChartKind = 'line' | 'stack'
-type RangeDays = 7 | 30 | 90
 
-const RANGE_LABELS: Record<RangeDays, string> = { 7: '7d', 30: '30d', 90: '90d' }
-
-function Seg<T extends string | number>({ value, options, onChange }: {
-  value: T
-  /** hint = hover 提示（缺省回落到 label）。 */
-  options: { v: T; label: string; hint?: string }[]
-  onChange: (v: T) => void
-}) {
-  return (
-    <div className="toolbar-group">
-      {options.map((o) => (
-        <button
-          key={String(o.v)}
-          className={`seg${value === o.v ? ' is-active' : ''}`}
-          title={o.hint ?? o.label}
-          onClick={() => onChange(o.v)}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  )
-}
+// Seg 分段控件已抽到 ./Seg（Tasks 视图复用;新增 disabled）。
 
 // ---- 主图卡 ----
 
 // 自定义 hook 形态——工具栏与卡片拆成两个返回件,由
 // InsightsView 装配:工具栏固定在滚动区外（设置页同款）,卡片随内容滚动。
 function useTrendBlock() {
-  const now = new Date()
-  const [rangeDays, setRangeDays] = useState<RangeDays>(30)
   const [bucket, setBucket] = useState<Bucket>('day')
   const [dimension, setDimension] = useState<Dimension>('model')
-  const [metric, setMetric] = useState<Metric>('total')
+  const [metricPick, setMetric] = useState<Metric>('total')
+  // 时间指标只在 project / total 维有数据:其它维回落 Tokens（切维时也显式复位）
+  const metric: Metric = isTimeMetric(metricPick) && (dimension === 'agent' || dimension === 'model') ? 'total' : metricPick
   const [kind, setKind] = useState<ChartKind>('line')
   const [filterKey, setFilterKey] = useState<string>('') // '' = 全部
   const [data, setData] = useState<RangeSeriesResult | null>(null)
@@ -87,41 +69,55 @@ function useTrendBlock() {
     }
   }, [])
 
-  const endDay = ymd(now)
-  const startDay = useMemo(() => {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-    d.setDate(d.getDate() - (rangeDays - 1))
-    return ymd(d)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rangeDays, refreshTick])
+  // S4-R 范围:7d/30d/90d/All/Custom;project 维筛到单个项目时默认切到该项目生命周期
+  const selection = useRangeSelection(dimension === 'project' ? filterKey : '', refreshTick)
+  const { startDay, endDay } = selection.range
 
-  // 范围 × 粒度合法性:小时粒度只在 7/30 天给（90 天 × 24 = 2160 点无意义）
-  const effectiveBucket: Bucket = bucket === 'hour' && rangeDays === 90 ? 'day' : bucket
+  // project 维或时间指标 → daily_project 曲线（get_effort_series,无小时表）
+  const useEffort = dimension === 'project' || isTimeMetric(metric)
+  // 范围 × 粒度合法性:小时粒度只在 ≤ 31 天的范围给（更长范围小时点数无意义）;effort 曲线仅 day
+  const hourTooLong = spanDays(selection.range) > HOUR_BUCKET_MAX_DAYS
+  const effectiveBucket: Bucket = hourTooLong || useEffort ? 'day' : bucket
+
+  // 系列展示名:合计系列统一英文名;project 维取路径末段（完整路径走 hover）
+  const seriesLabel = useCallback(
+    (key: string, label: string | undefined) =>
+      key === '__total__' ? 'All sources' : dimension === 'project' ? projectDisplayName(key) : label ?? key,
+    [dimension],
+  )
 
   const filterOptions = useMemo(() => {
-    // 筛选维度与展示维度同族（agent 维筛 agent,model 维筛 model）;total 维无筛选
-    return (data?.seriesKeys ?? []).map((k, i) => ({ key: k, label: data?.seriesLabels[i] ?? k }))
-  }, [data])
+    // 筛选维度与展示维度同族（agent 维筛 agent,model 维筛 model,project 维筛 project）;total 维无筛选
+    return (data?.seriesKeys ?? []).map((k, i) => ({ key: k, label: seriesLabel(k, data?.seriesLabels[i]) }))
+  }, [data, seriesLabel])
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    void usageService
-      .getRangeSeries({
-        startDay,
-        endDay,
-        bucket: effectiveBucket,
-        dimension,
-        metric,
-        // 筛选:展示维 = agent → 筛 agent;展示维 = model → 筛 model;total 无筛选
-        filterDimension: dimension === 'total' || !filterKey ? undefined : dimension,
-        filterKey: dimension === 'total' || !filterKey ? undefined : filterKey,
-      })
-      .then((res) => {
-        if (cancelled) return
-        setData(res)
-        setLoading(false)
-      })
+    const req =
+      dimension === 'project' || isTimeMetric(metric)
+        ? usageService.getEffortSeries({
+            startDay,
+            endDay,
+            dimension,
+            metric,
+            filter: dimension === 'total' || !filterKey ? undefined : { dimension, key: filterKey },
+          })
+        : usageService.getRangeSeries({
+            startDay,
+            endDay,
+            bucket: effectiveBucket,
+            dimension,
+            metric,
+            // 筛选:展示维 = agent → 筛 agent;展示维 = model → 筛 model;total 无筛选
+            filterDimension: dimension === 'total' || !filterKey ? undefined : dimension,
+            filterKey: dimension === 'total' || !filterKey ? undefined : filterKey,
+          })
+    void req.then((res) => {
+      if (cancelled) return
+      setData(res)
+      setLoading(false)
+    })
     return () => {
       cancelled = true
     }
@@ -129,8 +125,9 @@ function useTrendBlock() {
 
   const series: SeriesSpec[] = useMemo(() => {
     if (!data) return []
-    return data.seriesKeys.map((k, i) => ({ key: k, label: data.seriesLabels[i] ?? k, values: data.points.map((p) => p.values[i] ?? 0) }))
-  }, [data])
+    return data.seriesKeys.map((k, i) => ({ key: k, label: seriesLabel(k, data.seriesLabels[i]), values: data.points.map((p) => p.values[i] ?? 0) }))
+  }, [data, seriesLabel])
+  const timeFmt = isTimeMetric(metric) ? formatDuration : undefined
   const buckets = data?.points.map((p) => p.bucket) ?? []
 
   // 占比环数据:主图范围内各系列合计
@@ -143,7 +140,9 @@ function useTrendBlock() {
         .sort((a, b) => b.value - a.value),
     [series, dimension],
   )
-  const donutUnit = metric === 'total' ? 'tokens' : metric === 'input' ? 'input tokens' : 'output tokens'
+  const donutUnit = isTimeMetric(metric)
+    ? TIME_METRIC_LABELS[metric].unit
+    : metric === 'total' ? 'tokens' : metric === 'input' ? 'input tokens' : 'output tokens'
 
   const pickFilter = useCallback(
     (k: string) => {
@@ -152,9 +151,24 @@ function useTrendBlock() {
     [],
   )
 
+  // 手改范围:非项目维时清图例筛选（系列集随范围变,沿用）;项目维保留——筛选即项目选择,
+  // 清掉会连带退出项目生命周期
+  const rangeSelection = useMemo(
+    () => ({
+      ...selection,
+      choose: (next: Parameters<typeof selection.choose>[0]) => {
+        selection.choose(next)
+        if (dimension !== 'project') setFilterKey('')
+      },
+    }),
+    [selection, dimension],
+  )
+
   // 拆成两个返回件——toolbar（固定行）与 card（随滚动内容）。
+  // S4-R:范围控件（含自定义日期与区间文字）单列第二行,工具栏主行仍保持单行不换行。
   return {
     toolbar: (
+      <>
       <header className="insight-toolbar">
         <span className="insight-card-title">Usage trend</span>
         <Seg
@@ -166,15 +180,19 @@ function useTrendBlock() {
           onChange={setKind}
         />
         <Seg
-          value={rangeDays}
-          options={([7, 30, 90] as RangeDays[]).map((d) => ({ v: d, label: RANGE_LABELS[d], hint: `Last ${d} days` }))}
-          onChange={(v) => { setRangeDays(v); setFilterKey('') }}
-        />
-        <Seg
           value={effectiveBucket}
           options={[
             { v: 'day' as Bucket, label: 'Day', hint: 'Group by day' },
-            { v: 'hour' as Bucket, label: 'Hour', hint: 'Group by hour' },
+            {
+              v: 'hour' as Bucket,
+              label: 'Hour',
+              hint: useEffort
+                ? 'Hourly buckets are not available for projects or time metrics'
+                : hourTooLong
+                  ? `Hourly buckets need a range of ${HOUR_BUCKET_MAX_DAYS} days or less`
+                  : 'Group by hour',
+              disabled: useEffort || hourTooLong,
+            },
           ]}
           onChange={setBucket}
         />
@@ -183,9 +201,14 @@ function useTrendBlock() {
           options={[
             { v: 'model' as Dimension, label: 'Model', hint: 'One series per model' },
             { v: 'agent' as Dimension, label: 'Agent', hint: 'One series per agent' },
+            { v: 'project' as Dimension, label: 'Project', hint: 'One series per project (working directory)' },
             { v: 'total' as Dimension, label: 'Total', hint: 'Single all-source series' },
           ]}
-          onChange={(v) => { setDimension(v); setFilterKey('') }}
+          onChange={(v) => {
+            setDimension(v)
+            setFilterKey('')
+            if ((v === 'agent' || v === 'model') && isTimeMetric(metricPick)) setMetric('total')
+          }}
         />
         <Seg
           value={metric}
@@ -193,11 +216,24 @@ function useTrendBlock() {
             { v: 'total' as Metric, label: 'Tokens', hint: 'Total tokens' },
             { v: 'input' as Metric, label: 'Input', hint: 'Input tokens' },
             { v: 'output' as Metric, label: 'Output', hint: 'Output tokens' },
+            ...(['wait', 'human'] as const).map((m) => {
+              const off = dimension === 'agent' || dimension === 'model'
+              return {
+                v: m as Metric,
+                label: TIME_METRIC_LABELS[m].label,
+                hint: off ? `${TIME_METRIC_LABELS[m].label}: time data is only available in Project or Total` : TIME_METRIC_LABELS[m].hint,
+                disabled: off,
+              }
+            }),
           ]}
           onChange={setMetric}
         />
         {loading && <span className="matrix-loading">Loading…</span>}
       </header>
+      <div className="insight-rangebar">
+        <RangeControl selection={rangeSelection} noun="Usage" />
+      </div>
+      </>
     ),
     card: (
       <section className="insight-card">
@@ -209,12 +245,18 @@ function useTrendBlock() {
                 key={o.key}
                 className={`legend-item${filterKey === o.key ? ' is-active' : ''}`}
                 onClick={() => pickFilter(o.key)}
-                title={filterKey === o.key ? 'Click to clear filter' : `Only ${o.label}`}
+                title={filterKey === o.key ? 'Click to clear filter' : `Only ${dimension === 'project' ? projectTooltip(o.key) : o.label}`}
               >
                 <span className="legend-swatch" style={{ background: colorFor(o.key) }} />
                 {o.label}
               </button>
             ))}
+            {/* S5:项目维图例即项目选择器,末尾放管理入口（打开主窗口内弹出层,不改筛选）*/}
+            {dimension === 'project' && (
+              <button className="legend-item pm-manage-link" onClick={openProjectManager} title="Rename, hide or merge projects">
+                Manage projects…
+              </button>
+            )}
           </div>
         )}
 
@@ -223,15 +265,21 @@ function useTrendBlock() {
         ) : series.length === 0 || series.every((s) => s.values.every((v) => v === 0)) ? (
           <div className="insight-empty">No usage records in this range</div>
         ) : kind === 'line' ? (
-          <LineChart series={series} buckets={buckets} />
+          <LineChart series={series} buckets={buckets} formatValue={timeFmt} />
         ) : (
-          <StackedBarChart series={series} buckets={buckets} />
+          <StackedBarChart series={series} buckets={buckets} formatValue={timeFmt} />
         )}
 
         {/* 占比环:与主图同口径（维度/指标/范围/筛选）*/}
         {dimension !== 'total' && donutItems.length > 0 && (
           <div className="donut-wrap">
-            <DonutChart items={donutItems} centerLabel={RANGE_LABELS[rangeDays] + ' · ' + donutUnit} unitLabel={donutUnit} />
+            <DonutChart
+              items={donutItems}
+              centerLabel={rangeShortLabel(selection.sel) + ' · ' + donutUnit}
+              unitLabel={donutUnit}
+              formatValue={timeFmt}
+              titleFor={dimension === 'project' ? (k) => projectTooltip(k) : undefined}
+            />
           </div>
         )}
       </section>
@@ -284,29 +332,23 @@ function AnomalyBlock() {
     }
   }, [refreshTick])
 
-  const outliers = useMemo<OutlierDay[]>(() => {
-    if (!days) return []
-    const vals = days.map((d) => d.total)
-    if (vals.length < OUTLIER_MIN_SAMPLES) return []
-    const mean = vals.reduce((a, b) => a + b, 0) / vals.length
-    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length)
-    if (sd === 0) return []
-    return days
-      .map((d) => ({ ...d, z: (d.total - mean) / sd }))
-      .filter((d) => Math.abs(d.z) >= OUTLIER_Z)
-      .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))
+  // 逐日 z（热力条上色用）:样本 < 7 或 sd=0 全零窗口不判（起与 Tasks 离群共用 analytics.zScores）。
+  const zByDay = useMemo(() => {
+    const zs = days ? zScores(days.map((d) => d.total)) : null
+    if (!days || !zs) return new Map<string, number>()
+    return new Map(days.map((d, i) => [d.ymd, zs[i]]))
   }, [days])
 
-  // 逐日 z（热力条上色用）:与 outliers 同一 mean/sd;sd=0 全零窗口不判。
-  const zByDay = useMemo(() => {
-    if (!days) return new Map<string, number>()
-    const vals = days.map((d) => d.total)
-    if (vals.length < OUTLIER_MIN_SAMPLES) return new Map<string, number>()
-    const mean = vals.reduce((a, b) => a + b, 0) / vals.length
-    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length)
-    if (sd === 0) return new Map<string, number>()
-    return new Map(days.map((d) => [d.ymd, (d.total - mean) / sd]))
-  }, [days])
+  const outliers = useMemo<OutlierDay[]>(() => {
+    if (!days) return []
+    return days
+      .flatMap((d) => {
+        const z = zByDay.get(d.ymd)
+        return z === undefined ? [] : [{ ...d, z }]
+      })
+      .filter((d) => Math.abs(d.z) >= OUTLIER_Z)
+      .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))
+  }, [days, zByDay])
 
   return (
     <section className="insight-card">

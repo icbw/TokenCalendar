@@ -20,13 +20,20 @@
 //! 模型归属：index.json 无模型字段,按 `requests[].id` 查
 //! request_model 对账表（官网导出导入,见 imports.rs）。未命中 → `unknown`
 //! （等待下一次导入触发失效重扫后归位）。
+//!
+//! 轮与时间：`requests[]` 天然请求级 → 每条带 usage 的 request = 1 轮
+//! （turn_seq = 下标 + 1,model_calls = 1、tool_calls = 0——`messages` 只是 id 列表,
+//! 不猜步数）;会话 = index.json 所在目录名;项目 **unknown**（本地无工作目录,
+//! 不猜）;只有 `startedAt`、无结束时间 → wall / model / tool / gap 一律 NULL;
+//! `state` 非 complete / running 计错。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::store::{Batch, Store};
+use super::store::{Batch, SessionRow, Store, Tokens, TurnPart, TurnRow};
+use super::turns::UNKNOWN_PROJECT;
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, ProbeOutcome, clamp0,
     jsonl, millis_to_local_day_hour,
@@ -111,6 +118,8 @@ struct IndexRequest {
     #[serde(rename = "startedAt", default)]
     started_at: Option<i64>,
     #[serde(default)]
+    state: String,
+    #[serde(default)]
     usage: Option<IndexUsage>,
 }
 
@@ -125,10 +134,13 @@ struct IndexUsage {
     total_tokens: i64,
     #[serde(default)]
     cache_tokens: i64,
+    #[serde(default)]
+    cached_write_tokens: i64,
 }
 
-/// 从一条 request 提取 （day, hour, input, output, total);usage/time 缺失 → None。
-fn parse_request(r: &IndexRequest) -> Option<(String, u8, i64, i64, i64)> {
+/// 从一条 request 提取 （day, hour, token 分项);usage/time 缺失 → None。
+/// cache_read = cacheTokens、cache_write = cachedWriteTokens（input 口径不变,仍含 write）。
+fn parse_request(r: &IndexRequest) -> Option<(String, u8, Tokens)> {
     let usage = r.usage.as_ref()?;
     let started = r.started_at?;
     if started <= 0 {
@@ -145,7 +157,56 @@ fn parse_request(r: &IndexRequest) -> Option<(String, u8, i64, i64, i64)> {
     if total <= 0 && input == 0 && output == 0 {
         return None;
     }
-    Some((day, hour, input, output, total))
+    let tokens = Tokens { input, output, total, cache_read: clamp0(usage.cache_tokens), cache_write: clamp0(usage.cached_write_tokens) };
+    Some((day, hour, tokens))
+}
+
+/// 一条 request = 一轮（与 daily_usage 的 `add_usage（.., turns=1)` 同一份 day / model / tokens）。
+fn push_request_turn(batch: &mut Batch, session_id: &str, idx: usize, r: &IndexRequest, day: &str, model: &str, t: Tokens) {
+    let started = r.started_at.unwrap_or_default();
+    let failed = !r.state.is_empty() && r.state != "complete" && r.state != "running";
+    batch.add_turn(
+        META.id,
+        TurnRow {
+            session_id: session_id.to_string(),
+            turn_seq: idx as i64 + 1,
+            day: day.to_string(),
+            project_key: UNKNOWN_PROJECT.to_string(),
+            model_key: model.to_string(),
+            started_at: started,
+            ended_at: started,
+            wall_ms: None,
+            model_ms: None,
+            tool_ms: None,
+            ttft_ms: None,
+            gap_ms: None,
+            model_calls: 1,
+            tool_calls: 0,
+            error_count: failed as i64,
+            retry_count: 0,
+            aborted: false,
+            parts: vec![TurnPart {
+                day: day.to_string(),
+                model: model.to_string(),
+                input: t.input,
+                output: t.output,
+                total: t.total,
+                model_calls: 1,
+                turn_mark: 1,
+            }],
+        },
+    );
+    batch.upsert_session(
+        META.id,
+        SessionRow {
+            session_id: session_id.to_string(),
+            project_key: Some(UNKNOWN_PROJECT.to_string()),
+            parent_id: None,
+            title: None,
+            started_at: Some(started),
+            ended_at: Some(started),
+        },
+    );
 }
 
 impl Adapter for CodebuddyAdapter {
@@ -202,11 +263,20 @@ impl Adapter for CodebuddyAdapter {
                 .map(|r| r.id.clone())
                 .collect();
             let model_of = store.request_models(META.id, &new_ids);
-            for r in file.requests.iter().skip(cursor.count as usize) {
-                if let Some((day, hour, input, output, total)) = parse_request(r) {
+            let session_id = path
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            for (idx, r) in file.requests.iter().enumerate().skip(cursor.count as usize) {
+                if let Some((day, hour, tokens)) = parse_request(r) {
                     let model = model_of.get(&r.id).cloned().unwrap_or_else(|| "unknown".into());
-                    batch.add_hour(&day, Some(hour), META.id, &model, input, output, total, 1);
+                    batch.add_usage(&day, Some(hour), META.id, &model, tokens, 1);
                     months.insert(day[..7].to_string());
+                    if !session_id.is_empty() {
+                        push_request_turn(&mut batch, &session_id, idx, r, &day, &model, tokens);
+                    }
                 }
             }
             cursor.count = file.requests.len() as u64;
@@ -241,7 +311,9 @@ mod tests {
         // 实证样本:in=293013 out=7631 total=300644 cache=221184 miss=71829 write=0
         let raw = request_json(1_787_914_300_234, &usage_json(293013, 7631, 300644, 221184, 71829, 0));
         let req: IndexRequest = serde_json::from_str(&raw).unwrap();
-        let (day, hour, input, output, total) = parse_request(&req).unwrap();
+        let (day, hour, t) = parse_request(&req).unwrap();
+        let (input, output, total) = (t.input, t.output, t.total);
+        assert_eq!((t.cache_read, t.cache_write), (221184, 0));
         assert_eq!(input, 71829); // = cachedMiss + cachedWrite(cache-exclusive)
         assert_eq!(output, 7631);
         assert_eq!(total, 300644); // provider total(含 cache)
@@ -253,8 +325,8 @@ mod tests {
     fn total_falls_back_to_input_plus_output() {
         let raw = request_json(1_787_914_300_234, &usage_json(1000, 500, 0, 200, 800, 0));
         let req: IndexRequest = serde_json::from_str(&raw).unwrap();
-        let (_, _, input, output, total) = parse_request(&req).unwrap();
-        assert_eq!((input, output, total), (800, 500, 1500));
+        let (_, _, t) = parse_request(&req).unwrap();
+        assert_eq!((t.input, t.output, t.total), (800, 500, 1500));
     }
 
     #[test]
@@ -275,8 +347,34 @@ mod tests {
         let raw = r#"{"messages":[{"role":"user","content":"<list:14> 嵌套任意结构"}],"requests":[{"id":"r1","type":"craft","state":"complete","startedAt":1757000000000,"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15,"cacheTokens":0,"cachedWriteTokens":0,"cachedMissTokens":10}}]}"#;
         let file: IndexFile = serde_json::from_str(raw).unwrap();
         assert_eq!(file.requests.len(), 1);
-        let (_, _, input, _, total) = parse_request(&file.requests[0]).unwrap();
-        assert_eq!((input, total), (10, 15));
+        let (_, _, t) = parse_request(&file.requests[0]).unwrap();
+        assert_eq!((t.input, t.total), (10, 15));
+    }
+
+    /// PHASE12 S2:真实结构 index.json 走完整 collect——一 request 一轮、项目 unknown、时间 NULL、守恒。
+    #[test]
+    fn s2_requests_become_turns() {
+        let dir = std::env::temp_dir().join(format!("tc_cb_s2_{}", std::process::id()));
+        let sess = dir.join("Data").join("p1").join("CodeBuddyIDE").join("p1").join("history").join("wshash").join("sess-1");
+        std::fs::create_dir_all(&sess).unwrap();
+        let reqs = [
+            request_json(1_788_602_400_000, &usage_json(1000, 100, 1100, 600, 400, 0)),
+            request_json(1_788_602_460_000, &usage_json(500, 50, 550, 0, 500, 0)).replace(r#""state":"complete""#, r#""state":"error""#),
+            r#"{"id":"r3","type":"ask","state":"running","messages":["m1"]}"#.to_string(),
+        ];
+        std::fs::write(sess.join("index.json"), format!(r#"{{"messages":["m1","m2"],"requests":[{}]}}"#, reqs.join(","))).unwrap();
+        let adapter = CodebuddyAdapter { data_dir: dir.join("Data") };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok);
+        let turns = store.test_turns(META.id);
+        assert_eq!(turns.len(), 2, "无 usage 的 running request 不成轮");
+        assert!(turns.iter().all(|t| t.model_calls == 1 && t.tool_calls == 0 && t.project_key == "unknown"));
+        assert!(turns.iter().all(|t| t.wall_ms.is_none() && t.model_ms.is_none() && t.tool_ms.is_none() && t.gap_ms.is_none()));
+        assert_eq!((turns[0].error_count, turns[1].error_count), (0, 1));
+        assert_eq!(store.test_task_sessions(META.id), vec!["sess-1".to_string()]);
+        assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
 
     #[test]

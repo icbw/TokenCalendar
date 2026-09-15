@@ -100,6 +100,14 @@
   box-shadow: var(--shadow-1);
 }
 
+/* 不可选项（如非项目维下的时间指标）——淡化 + 禁手型,hover 提示仍可出 */
+.seg.is-disabled,
+.seg.is-disabled:hover {
+  color: var(--text-faint);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .matrix-sort {
   font-size: var(--font-size-xs);
   padding: 4px 6px;

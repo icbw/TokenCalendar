@@ -123,6 +123,22 @@ fn main() {
             commands::get_breakdown,
             commands::get_credit_summary,
             commands::get_range_series,
+            commands::get_project_month_rows,
+            commands::get_project_breakdown,
+            commands::get_task_list,
+            commands::get_task_turns,
+            commands::get_effort_series,
+            commands::get_gap_histogram,
+            commands::get_project_span,
+            commands::list_project_meta,
+            commands::set_project_meta,
+            commands::merge_projects,
+            commands::unmerge_projects,
+            commands::get_scratch_rule,
+            commands::set_scratch_rule,
+            commands::open_project_folder,
+            commands::get_idle_threshold,
+            commands::set_idle_threshold,
             commands::list_sources,
             commands::get_paused,
             commands::set_paused,
@@ -208,6 +224,10 @@ fn main() {
             tray::init(&handle)?;
             // 采集器：先开库（写连接归采集线程,读连接进 AppState 供命令查询）,
             // 再 spawn 后台轮询。库打不开只降级 usage 命令,不阻断应用。
+            // 离开阈值先于采集线程载入（线程启动即按它校验 daily_project）
+            commands::load_idle_threshold(&handle);
+            // 项目自动折叠规则（查询时解析,载入即生效）
+            commands::load_scratch_rule(&handle);
             match collector::open_store(&handle) {
                 Ok(write_store) => {
                     if let Ok(reader) = collector::open_store(&handle) {

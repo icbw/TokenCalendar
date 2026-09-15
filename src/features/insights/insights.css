@@ -86,6 +86,67 @@
   display: none;
 }
 
+/* ---- S4-R 范围条（Insights / Tasks 共用）:工具栏主行下方的独立固定行,承载
+   7d/30d/90d/All/Custom 分段、自定义起止日期、解析后的区间文字与「Project span」按钮。
+   允许换行（日期输入 + 提示在窄窗下放不下时下折,不横向滚动藏掉错误提示）。 ---- */
+
+.insight-rangebar {
+  flex-shrink: 0;
+  padding: 0 2px;
+}
+
+.range-control {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: var(--font-size-xs);
+}
+
+.range-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.range-date {
+  font-size: var(--font-size-xs);
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  color-scheme: light dark;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-date[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.range-dash {
+  color: var(--text-faint);
+}
+
+.range-span {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.range-span.is-project {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.range-error {
+  color: var(--danger);
+}
+
+.range-project-btn {
+  border: 1px solid var(--border);
+}
+
 /* ---- 系列图例（可点击筛选） ---- */
 
 .series-legend {
