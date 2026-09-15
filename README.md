@@ -63,6 +63,9 @@ NSIS 出包会为更新包签名（`src-tauri/tauri.conf.json` 的 `plugins.upda
 
 ## 版本
 
+- **0.5.9** —— 界面打磨：Matrix 的颜色刻度与排序控件从工具栏移到热力图右缘的图标开关
+  （默认全局刻度 / 按 tokens 排序，Model 标签页额外提供模型家族分组），工具栏更窄；
+  修复 Insights 图表纵轴顶端刻度被裁切。
 - **0.5.8** —— CodeBuddy 对话按真实工作目录拆分项目（不再全部归入 Scratch），任务列表显示会话标题；
   CodeBuddy 模型与 CodeBuddy / WorkBuddy 积分改读本机数据，**移除官网账单导入**；设置 → General 新增采集频率
   （30 秒 / 1 / 2 / 3 / 5 分钟）。**升级会一次性清库重扫**，已导入的官网账单不再使用。

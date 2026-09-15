@@ -108,6 +108,28 @@
   cursor: not-allowed;
 }
 
+/* 矩阵主体包裹层——右缘开关图标列（色阶 / 排序 / Family）的定位基准 */
+.matrix-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* 右缘竖排开关:与图表面板图标列同右缘（stage 右缘 6px 内缩 = 抵消 .matrix-view
+   右 padding 12px 后 -6px）,钮样式复用 .matrix-panel-icon。 */
+.matrix-side-icons {
+  position: absolute;
+  top: 2px;
+  right: -6px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* .matrix-sort 仍被项目管理 / 任务视图的下拉框复用 */
 .matrix-sort {
   font-size: var(--font-size-xs);
   padding: 4px 6px;

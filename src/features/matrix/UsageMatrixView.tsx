@@ -18,10 +18,10 @@ export type GroupBy = 'agent' | 'model' | 'project'
 type Bucket = 'day' | 'week' | 'cumulative'
 /** wait / human = 时间成本（毫秒,并列不相加）,仅 project 维可选（其余维度无时间数据）。 */
 type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
-/** 排序策略按视图分账：agent/model 各自记忆互不串扰;
- * 'group'（By family,家族聚合排序）仅 model 视图合法。 */
-type SortBy = 'monthTotal' | 'name' | 'group'
-type ViewSort = Record<GroupBy, SortBy>
+/** 排序策略按视图分账：各视图各自记忆互不串扰。
+ * 工具栏减宽:下拉框改右缘图标开关——byTotal（激活 = 按总量,未激活 = 按名称）;
+ * family（家族聚合,仅 model 视图生效）叠加在 byTotal 之上,排序逻辑本身不变。 */
+type ViewSort = Record<GroupBy, { byTotal: boolean; family: boolean }>
 
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -136,7 +136,11 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     if (onGroupByChange) onGroupByChange(g)
     else setInternalGroupBy(g)
   }
-  const [sortBy, setSortBy] = useState<ViewSort>({ agent: 'monthTotal', model: 'group', project: 'monthTotal' })
+  const [sortBy, setSortBy] = useState<ViewSort>({
+    agent: { byTotal: true, family: true },
+    model: { byTotal: true, family: true },
+    project: { byTotal: true, family: true },
+  })
   const [scaleMode, setScaleMode] = useState<'global' | 'perRow'>('global')
   const [selected, setSelected] = useState<{ rowKey: string; day: number } | null>(null)
   const [internalExpanded, setInternalExpanded] = useState<string | null>(null)
@@ -307,17 +311,25 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     [internalExpanded, effectiveGroupBy, useMock, onRowSelect],
   )
 
-  // bucket 前端聚合 + 排序。group = 综合版：模型按家族
+  // bucket 前端聚合 + 排序。family = 综合版：模型按家族
   // （key 首段）聚合总量,家族间按总量降序;同家族行连续排列,家族内按行总量降序。
+  // 总量开关关闭时家族仍成组,家族间与家族内改按名称。
   // 排序策略随视图分账:sortBy[groupBy],切换视图各用各的策略互不覆盖。
   const viewSort = sortBy[effectiveGroupBy]
+  const byTotal = viewSort.byTotal
+  const familySort = effectiveGroupBy === 'model' && viewSort.family
+  const toggleSort = (field: 'byTotal' | 'family') =>
+    setSortBy((prev) => ({
+      ...prev,
+      [effectiveGroupBy]: { ...prev[effectiveGroupBy], [field]: !prev[effectiveGroupBy][field] },
+    }))
   const matrixRows: MatrixRow[] = useMemo(() => {
     const rows = serverRows.map((r) => ({
       ...r,
       values: applyBucket(r.values, bucket),
       total: bucketTotal(applyBucket(r.values, bucket), bucket),
     }))
-    if (effectiveGroupBy === 'model' && viewSort === 'group') {
+    if (familySort) {
       const familyTotal = new Map<string, number>()
       for (const r of rows) {
         const fam = familyOf(r.key, effectiveGroupBy)
@@ -326,6 +338,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       rows.sort((a, b) => {
         const fa = familyOf(a.key, effectiveGroupBy)
         const fb = familyOf(b.key, effectiveGroupBy)
+        if (!byTotal) return fa.localeCompare(fb) || a.label.localeCompare(b.label)
         return (
           (familyTotal.get(fb) ?? 0) - (familyTotal.get(fa) ?? 0) ||
           b.total - a.total ||
@@ -333,10 +346,10 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
         )
       })
     } else {
-      rows.sort((a, b) => (viewSort === 'name' ? a.label.localeCompare(b.label) : b.total - a.total))
+      rows.sort((a, b) => (byTotal ? b.total - a.total : a.label.localeCompare(b.label)))
     }
     return rows
-  }, [serverRows, bucket, effectiveGroupBy, viewSort])
+  }, [serverRows, bucket, effectiveGroupBy, byTotal, familySort])
 
   // 行数上限截断（排序在前 = 保留 top N;超出行静默隐藏,上限在设置页调）。
   const visibleRows = useMemo(
@@ -447,47 +460,65 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
               </button>
             ))}
           </div>
-          <div className="toolbar-group">
-            <button className={`seg${scaleMode === 'global' ? ' is-active' : ''}`} title="Shared color scale" onClick={() => setScaleMode('global')}>Global</button>
-            <button className={`seg${scaleMode === 'perRow' ? ' is-active' : ''}`} title="Scale each row on its own" onClick={() => setScaleMode('perRow')}>Per Row</button>
-          </div>
-          {/* By family 仅 model 视图提供（家族聚合对 agent 无意义）;排序策略随
-              视图分账:切换 agent/model 各用各的记忆,互不覆盖。*/}
-          <select
-            className="matrix-sort"
-            title="Row ordering"
-            value={viewSort}
-            onChange={(e) =>
-              setSortBy((prev) => ({ ...prev, [effectiveGroupBy]: e.target.value as SortBy }))
-            }
-            aria-label="Sort"
-          >
-            <option value="monthTotal">By total</option>
-            {effectiveGroupBy === 'model' && <option value="group">By family</option>}
-            <option value="name">By name</option>
-          </select>
           {loading && <span className="matrix-loading">Loading…</span>}
         </div>
       </div>
 
-      <UsageMatrix
-        rows={visibleRows}
-        dayLabels={DAY_LABELS}
-        dates={WINDOW_DATES}
-        headerMutedFrom={CURRENT_MONTH_START}
-        scaleMode={scaleMode}
-        selected={selected}
-        selectedRow={effectiveExpanded}
-        onSelectCell={(rowKey, day) =>
-          // Toggle off: re-clicking the same cell clears selection.
-          setSelected((prev) =>
-            prev?.rowKey === rowKey && prev.day === day ? null : { rowKey, day }
-          )
-        }
-        onSelectRow={toggleExpand}
-        formatValue={isTimeMetric(metric) ? formatDuration : undefined}
-        valueUnit={isTimeMetric(metric) ? TIME_METRIC_LABELS[metric].unit : undefined}
-      />
+      <div className="matrix-body">
+        {/* （工具栏过宽）:色阶与排序移出工具栏 → 矩阵区右缘竖排
+            图标开关,与图表面板图标列同风格同右缘。单钮双态,默认态不高亮
+            （高亮碍眼）:色阶默认 = Global / 高亮 = Per row;
+            排序默认 = 按 tokens / 高亮 = 按名称;Family 仅 model 视图提供
+            （家族聚合对 agent/project 无意义）,叠加在排序之上,默认开启即高亮
+            （表示子排序激活）。*/}
+        <div className="matrix-side-icons">
+          <button
+            className={`matrix-panel-icon${scaleMode === 'perRow' ? ' is-active' : ''}`}
+            onClick={() => setScaleMode((m) => (m === 'global' ? 'perRow' : 'global'))}
+            title={scaleMode === 'global' ? 'Color scale: global (click for per row)' : 'Color scale: per row (click for global)'}
+            aria-pressed={scaleMode === 'perRow'}
+          >
+            <ScaleIcon />
+          </button>
+          <button
+            className={`matrix-panel-icon${!byTotal ? ' is-active' : ''}`}
+            onClick={() => toggleSort('byTotal')}
+            title={byTotal ? 'Sort by tokens (click to sort by name)' : 'Sort by name (click to sort by tokens)'}
+            aria-pressed={!byTotal}
+          >
+            <SortTotalIcon />
+          </button>
+          {effectiveGroupBy === 'model' && (
+            <button
+              className={`matrix-panel-icon${viewSort.family ? ' is-active' : ''}`}
+              onClick={() => toggleSort('family')}
+              title={viewSort.family ? 'Grouped by model family (click to ungroup)' : 'Group by model family'}
+              aria-pressed={viewSort.family}
+            >
+              <FamilyIcon />
+            </button>
+          )}
+        </div>
+
+        <UsageMatrix
+          rows={visibleRows}
+          dayLabels={DAY_LABELS}
+          dates={WINDOW_DATES}
+          headerMutedFrom={CURRENT_MONTH_START}
+          scaleMode={scaleMode}
+          selected={selected}
+          selectedRow={effectiveExpanded}
+          onSelectCell={(rowKey, day) =>
+            // Toggle off: re-clicking the same cell clears selection.
+            setSelected((prev) =>
+              prev?.rowKey === rowKey && prev.day === day ? null : { rowKey, day }
+            )
+          }
+          onSelectRow={toggleExpand}
+          formatValue={isTimeMetric(metric) ? formatDuration : undefined}
+          valueUnit={isTimeMetric(metric) ? TIME_METRIC_LABELS[metric].unit : undefined}
+        />
+      </div>
 
       {/* 受控模式（面板联动）不渲染内联展开——构成曲线由 FullWindow 的
           MatrixPanel 绘制;仅独立模式保留内联 RowBreakdown。*/}
@@ -505,5 +536,34 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
         />
       )}
     </div>
+  )
+}
+
+/* 右缘开关图标:12px 线性/实心风格,currentColor,与 MatrixPanel 图标列同尺度。 */
+function ScaleIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+      <rect x="1" y="1" width="4.5" height="4.5" rx="1" fill="currentColor" opacity="0.35" />
+      <rect x="6.5" y="1" width="4.5" height="4.5" rx="1" fill="currentColor" opacity="0.6" />
+      <rect x="1" y="6.5" width="4.5" height="4.5" rx="1" fill="currentColor" opacity="0.8" />
+      <rect x="6.5" y="6.5" width="4.5" height="4.5" rx="1" fill="currentColor" />
+    </svg>
+  )
+}
+
+function SortTotalIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+      <path d="M1.5 3 H10.5 M1.5 6 H7.5 M1.5 9 H4.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function FamilyIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+      <path d="M1.5 1.5 V5 M1.5 7 V10.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M4 2.2 H10.5 M4 4.3 H8 M4 7.7 H10.5 M4 9.8 H7" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
   )
 }

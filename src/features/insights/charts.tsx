@@ -88,7 +88,18 @@ interface Margin {
 
 // top margin 12 → 20——最高档 Y 轴刻度文本（10px,基线在
 // 刻度线 +3）此前顶部被裁。
-const MARGIN: Margin = { top: 20, right: 16, bottom: 22, left: 44 }
+// （顶部刻度 1000.0M 左侧被裁）:left 44 → 52,刻度文本改
+// formatAxis（去尾 .0、≥1000M 进位 B）,7 字符的 1000.0M 收成 1B。
+const MARGIN: Margin = { top: 20, right: 16, bottom: 22, left: 52 }
+
+/** 坐标轴刻度专用紧凑格式:1B / 750M / 187.5M / 12.5K——去掉无意义的 .0。 */
+function formatAxis(n: number): string {
+  const trim = (v: number) => v.toFixed(1).replace(/\.0$/, '')
+  if (n >= 1_000_000_000) return `${trim(n / 1_000_000_000)}B`
+  if (n >= 1_000_000) return `${trim(n / 1_000_000)}M`
+  if (n >= 1_000) return `${trim(n / 1_000)}K`
+  return String(n)
+}
 
 function niceMax(v: number): number {
   if (v <= 0) return 1
@@ -302,7 +313,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
         <g key={i}>
           <line x1={margin.left} x2={margin.left + plot.w} y1={yOf(t)} y2={yOf(t)} stroke="var(--border)" strokeWidth={1} />
           <text x={margin.left - 6} y={yOf(t) + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
-            {(formatValue ?? formatCompact)(t)}
+            {(formatValue ?? formatAxis)(t)}
           </text>
         </g>
       ))}
@@ -385,7 +396,7 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
           <g key={i}>
             <line x1={margin.left} x2={margin.left + plot.w} y1={y} y2={y} stroke="var(--border)" strokeWidth={1} />
             <text x={margin.left - 6} y={y + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
-              {(formatValue ?? formatCompact)(t)}
+              {(formatValue ?? formatAxis)(t)}
             </text>
           </g>
         )
@@ -525,10 +536,10 @@ export function ComboChart({ series, buckets, height = 230 }: {
         <g key={i}>
           <line x1={margin.left} x2={margin.left + plot.w} y1={yTok(t)} y2={yTok(t)} stroke="var(--border)" strokeWidth={1} />
           <text x={margin.left - 6} y={yTok(t) + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
-            {formatCompact(t)}
+            {formatAxis(t)}
           </text>
           <text x={margin.left + plot.w + 6} y={yCredit(t) + 3} textAnchor="start" fontSize={10} fill={COMBO_CREDIT} opacity={0.75}>
-            {formatCompact(t)}
+            {formatAxis(t)}
           </text>
         </g>
       ))}
