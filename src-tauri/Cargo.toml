@@ -1,6 +1,6 @@
 [package]
 name = "tokencalendar"
-version = "0.5.7"
+version = "0.5.8"
 description = "TokenCalendar — desktop widget for AI agent token usage"
 license = "MIT"
 edition = "2021"
@@ -15,8 +15,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-# CodeBuddy 官网用量导出 xlsx（imports 导入）解析;xlsx/zip 自 0.23 起内置,无需 feature。
-calamine = { version = "0.28", default-features = false }
 # DSH 会话日志为多帧 zstd 拼接容器（dsh.rs 帧扫描 + 逐帧解压;只读用途）。
 zstd = "0.13"
 tauri-plugin-dialog = "2.7.3"

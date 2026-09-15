@@ -98,7 +98,7 @@ SOFTWARE.
 
 ### Rust（静态链接进可执行文件）
 
-直接依赖均为 MIT / Apache-2.0 系宽松许可（tauri、serde、chrono、rusqlite、calamine、zstd、ureq、windows-sys、window-vibrancy）。
+直接依赖均为 MIT / Apache-2.0 系宽松许可（tauri、serde、chrono、rusqlite、zstd、ureq、windows-sys、window-vibrancy）。
 间接依赖中需要说明的部分：
 
 | 许可 | 组件 | 说明 |

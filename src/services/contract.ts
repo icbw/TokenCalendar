@@ -70,8 +70,8 @@ export interface ChangedKeys {
 
 // ---- 数据洞察----
 
-/** credit 月报（request_model 对账表聚合;口径见 store.credit_summary）。
- * has_data=false = 该月无导入数据（≠0）,UI 走引导文案不渲染数值。 */
+/** credit 月报（daily_usage 源本地积分聚合;口径见 store.credit_summary）。
+ * has_data=false = 该月无积分数据（≠0）,UI 走空态文案不渲染数值。 */
 export interface CreditModelSliceContract {
   key: string
   label: string

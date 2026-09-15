@@ -2,7 +2,7 @@
 //!
 //! 分层：
 //! - **数据根** = 一切自有运行时数据（collector.db / prefs.json /
-//!   window-state.json / imports / exports）的唯一父目录。
+//!   window-state.json / exports）的唯一父目录。
 //!   默认 `<exe 目录>\data`（安装版即 `D:\Program\TokenCalendar\data`）,
 //!   首次启动时惰性创建;创建/写入失败（只读盘、绿色版放只读目录等）→
 //!   回退 `%LOCALAPPDATA%\com.tokencalendar.app\`。
@@ -52,9 +52,6 @@ impl DataRoot {
     }
     pub fn window_state_path(&self) -> PathBuf {
         self.root.join("window-state.json")
-    }
-    pub fn imports_dir(&self) -> PathBuf {
-        self.root.join("imports")
     }
     pub fn exports_dir(&self) -> PathBuf {
         self.root.join("exports")

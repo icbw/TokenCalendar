@@ -1,7 +1,7 @@
 //! 项目管理:把「采集到的工作目录」与「用户认可的可分析项目」分开。
 //!
-//! 数据:`project_meta`（常驻表,建在 `Store:init` 的常驻批里,**不在 RESET_TABLES**,与 request_model
-//! 一样跨清库保留）。`session` / `turn` / `daily_project` 的原始 project_key 一律不改;改映射不重扫。
+//! 数据:`project_meta`（常驻表,建在 `Store:init` 的常驻批里,**不在 RESET_TABLES**,
+//! 跨清库保留）。`session` / `turn` / `daily_project` 的原始 project_key 一律不改;改映射不重扫。
 //!
 //! 解析层（所有项目维查询统一经 `resolve_cte`,产出 `pmap（raw_key, eff_key)` = 可见原始键 → 有效键）:
 //! 1. **自身归属** `se`:有 meta 行 → 键本身（显式管理过的键不受自动规则影响）;否则 `unknown` 且

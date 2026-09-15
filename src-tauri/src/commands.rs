@@ -180,8 +180,8 @@ pub fn get_breakdown(kind: String, key: String, month: String, state: State<'_, 
 
 // ---------- 数据洞察命令（credit 月报 + 时间范围序列,只读增量扩展） ----------
 
-/// credit 月报（request_model 对账表聚合）。口径见 store.credit_summary:
-/// 总量=全表（含 WorkBuddy 共享池行);模型分布=非 WB 行;无数据≠0（has_data)。
+/// credit 月报（daily_usage 源本地积分聚合）。口径见 store.credit_summary:
+/// 总量=CodeBuddy+WorkBuddy 共享积分池;模型分布=CodeBuddy 行;无数据≠0（has_data)。
 #[derive(Debug, Serialize)]
 pub struct CreditModelSlice {
     pub key: String,
@@ -746,15 +746,16 @@ pub fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceSummary>, St
     let adapters = collector::default_adapters();
     let summaries = with_reader(&state, |store| {
         let now = now_millis();
+        let stale_after_ms = (10 * 60 * 1000).max(3 * collector::poll_interval().as_millis() as i64);
         Ok(adapters
             .iter()
             .map(|ad| {
                 let meta = ad.meta();
                 let probe = ad.probe();
                 let st = store.source_state(meta.id);
-                // stale：采集循环停摆（上次尝试距今 > 10 分钟）且源并非缺失
+                // stale：采集循环停摆（上次尝试距今 > max（10 分钟, 3 × 采集频率)）且源并非缺失
                 let stale = probe.status != "no_source"
-                    && st.last_attempt_at.map(|t| now - t > 10 * 60 * 1000).unwrap_or(false);
+                    && st.last_attempt_at.map(|t| now - t > stale_after_ms).unwrap_or(false);
                 SourceSummary {
                     id: meta.id.to_string(),
                     adapter_id: meta.id.to_string(),
@@ -784,6 +785,50 @@ pub fn get_paused(state: State<'_, AppState>) -> bool {
 #[tauri::command]
 pub fn set_paused(paused: bool, state: State<'_, AppState>) {
     state.paused.store(paused, Ordering::SeqCst);
+}
+
+// ---------- 采集频率（设置·General Collection 组;运行时值 = collector 原子量,持久化 = prefs.json） ----------
+
+#[derive(Debug, Serialize)]
+pub struct CollectIntervalInfo {
+    pub secs: u64,
+    pub default_secs: u64,
+    pub choices: Vec<u64>,
+}
+
+fn collect_interval_info() -> CollectIntervalInfo {
+    CollectIntervalInfo {
+        secs: collector::poll_interval().as_secs(),
+        default_secs: collector::POLL_INTERVAL_DEFAULT_SECS,
+        choices: collector::POLL_INTERVAL_CHOICES_SECS.to_vec(),
+    }
+}
+
+/// 启动时从 prefs.json 载入采集频率（缺键 / 非档位值 → 默认 30s）。须早于采集线程 spawn。
+pub fn load_collect_interval(app: &AppHandle) {
+    let Ok(dr) = crate::data_root::current(app) else { return };
+    if let Some(secs) = std::fs::read_to_string(dr.prefs_path()).ok().as_deref().and_then(collector::poll_interval_from_prefs) {
+        collector::set_poll_interval_secs(secs);
+    }
+}
+
+#[tauri::command]
+pub fn get_collect_interval() -> CollectIntervalInfo {
+    collect_interval_info()
+}
+
+/// 设置采集频率:校验档位 → 合并写 prefs.json `collectIntervalSecs`（其余键原样）→ 下发运行时值。
+/// 采集线程睡眠按秒分片重读频率,改档即时生效（不触发额外一轮采集）。
+#[tauri::command]
+pub fn set_collect_interval(app: AppHandle, secs: u64) -> Result<CollectIntervalInfo, String> {
+    if !collector::POLL_INTERVAL_CHOICES_SECS.contains(&secs) {
+        return Err(format!("interval must be one of {:?} seconds", collector::POLL_INTERVAL_CHOICES_SECS));
+    }
+    let path = crate::data_root::current(&app)?.prefs_path();
+    let raw = std::fs::read_to_string(&path).ok();
+    write_prefs_atomic(&path, &collector::prefs_with_poll_interval(raw.as_deref(), secs))?;
+    collector::set_poll_interval_secs(secs);
+    Ok(collect_interval_info())
 }
 
 // ---------- Snap 开关（状态单一源 = AppState + window-state.json） ----------
@@ -910,7 +955,6 @@ pub struct DataInfo {
     pub fell_back: bool,
     /// 各项占用（字节;粗粒度诊断展示）。
     pub db_bytes: u64,
-    pub imports_count: u64,
     pub exports_count: u64,
 }
 
@@ -929,7 +973,6 @@ pub fn get_data_info(app: AppHandle) -> Result<DataInfo, String> {
         default_root: dr.default_root.display().to_string(),
         fell_back: dr.fell_back,
         db_bytes,
-        imports_count: dir_file_count(&dr.imports_dir()),
         exports_count: dir_file_count(&dr.exports_dir()),
     })
 }
@@ -953,7 +996,7 @@ pub fn migrate_data_root(app: AppHandle, new_root: String) -> Result<String, Str
     if !paused.paused.load(Ordering::SeqCst) {
         return Err("pause collecting before migration".into());
     }
-    // 拷贝数据根下全部条目（db/偏好/窗口态/imports/exports;子目录递归）
+    // 拷贝数据根下全部条目（db/偏好/窗口态/exports 等;子目录递归）
     copy_dir_recursive(&old.root, &dest)?;
     crate::data_root::write_pointer(&app, &dest)?;
     Ok(format!("migrated to {}; restart to take effect", dest.display()))
@@ -996,10 +1039,6 @@ pub fn backup_data(app: AppHandle, dest_dir: String) -> Result<ExportResult, Str
         if from.is_file() {
             let _ = std::fs::copy(&from, dest.join(f));
         }
-    }
-    // imports 里的原始 xlsx/done 一并备份（体积小,保对账能力）
-    if dr.imports_dir().is_dir() {
-        let _ = copy_dir_recursive(&dr.imports_dir(), &dest.join("imports"));
     }
     Ok(ExportResult { path: snapshot.display().to_string(), rows: 0, format: "backup".into() })
 }
@@ -1045,9 +1084,6 @@ pub fn restore_data(app: AppHandle, backup_dir: String, snapshot: Option<String>
         if from.is_file() {
             let _ = std::fs::copy(&from, dr.root.join(f));
         }
-    }
-    if src.join("imports").is_dir() {
-        let _ = copy_dir_recursive(&src.join("imports"), &dr.imports_dir());
     }
     Ok("restored; restart to take effect".into())
 }
@@ -1108,56 +1144,6 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     {
         Err("unsupported platform".into())
     }
-}
-
-// ---------- CodeBuddy 官网导出手动导入 ----------
-
-/// 手动导入一份官网导出 xlsx：解析校验 → 转存 imports 目录（文件名取自源
-/// 文件,同名以 -1/-2 防覆盖,保留原始文件）→ 唤醒采集线程立即走既有
-/// `process_imports` 管道（入库 request_model + 失效重扫 + usage:changed）。
-/// 中间零延迟:唤醒后采集线程毫秒级消化,前端随后重查 credit/矩阵即见新数据。
-/// 返回转存后的文件名（供 UI 展示）。重名内容重复导入由 request_model
-/// upsert + `.xlsx.done` 后缀幂等兜底。
-#[tauri::command]
-pub fn import_codebuddy_file(app: AppHandle, source_path: String) -> Result<String, String> {
-    use crate::collector::imports;
-
-    let src = std::path::PathBuf::from(&source_path);
-    if !src.is_file() {
-        return Err("file not found".into());
-    }
-    if src.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("xlsx")) != Some(true) {
-        return Err("only .xlsx exports are supported".into());
-    }
-    // 解析校验前置:坏文件/非导出表在这里报错给 UI,不落 imports 目录。
-    let rows = imports::parse_export(&src)?;
-    if rows.is_empty() {
-        return Err("no usable rows in file".into());
-    }
-
-    let dr = crate::data_root::current(&app)?;
-    let dir = dr.imports_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = src
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "codebuddy-export.xlsx".into());
-    // 同名共存防覆盖:usage（1).xlsx → usage（1)-1.xlsx（-N 试到空位为止）。
-    let mut dest = dir.join(&name);
-    let mut nth = 0u32;
-    while dest.exists() {
-        nth += 1;
-        let stem = name.strip_suffix(".xlsx").unwrap_or(&name);
-        dest = dir.join(format!("{}-{}.xlsx", stem, nth));
-    }
-    std::fs::copy(&src, &dest).map_err(|e| format!("copy: {}", e))?;
-
-    // 唤醒采集线程立即消化（sleep_interruptible 提前返回 → process_imports）。
-    crate::collector::wake_imports();
-    Ok(dest
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| name.clone()))
 }
 
 // ---------- 用户偏好持久化（prefs.json,数据根内） ----------

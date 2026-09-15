@@ -8,6 +8,8 @@
 //! - total = `rawUsage.total_tokens`（含 cache 与 reasoning,不重复加总）,≤0 时回退 input+output；
 //! - 时间戳：顶层 `timestamp` 数字,> 1e10 视为毫秒否则秒（旧口径）；
 //! - 模型：`providerData.requestModelId` 优先 → `providerData.model` → "unknown"。
+//! - 积分：`rawUsage.credit` 按行入 `daily_usage.credit`（与该行 usage 同格）。本机 2147 行
+//!   全带、`messageId` 无重复行;按 `conversationRequestId` 汇总与旧官网导出 WorkBuddy 行 79 个重叠中 76 个相等。
 //!
 //! 对话轮计数：`type=="message" && role=="user"` 是真实用户输入（function_call
 //! 是模型发起的**工具调用**,不是对话,勿计入）→ 置 pending 标志,下一条带 rawUsage
@@ -49,8 +51,8 @@ static META: AdapterMeta = AdapterMeta {
 enum WbLine {
     /// 真实用户输入行（message role=user,开启新 turn)。
     UserInput,
-    /// 带 rawUsage 的 function_call / assistant message 行:（本地日, 本地小时, 模型, token 分项)。
-    Usage { day: String, hour: u8, model: String, tokens: Tokens },
+    /// 带 rawUsage 的 function_call / assistant message 行:（本地日, 本地小时, 模型, token 分项, 积分)。
+    Usage { day: String, hour: u8, model: String, tokens: Tokens, credit: f64 },
     None,
 }
 
@@ -76,7 +78,8 @@ impl WorkBuddyAdapter {
                 let Some((day, hour, model, tokens)) = Self::parse_usage(v) else {
                     return WbLine::None;
                 };
-                WbLine::Usage { day, hour, model, tokens }
+                let credit = v.pointer("/providerData/rawUsage/credit").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                WbLine::Usage { day, hour, model, tokens, credit }
             }
             _ => WbLine::None,
         }
@@ -146,7 +149,8 @@ impl WorkBuddyAdapter {
                     cursor.pending_turn = true;
                 }
             }
-            WbLine::Usage { day, hour, model, tokens } => {
+            WbLine::Usage { day, hour, model, tokens, credit } => {
+                batch.add_credit(&day, agent, &model, credit);
                 let mark = (cursor.pending_turn && !child) as i64;
                 let id = v.pointer("/providerData/messageId").and_then(|x| x.as_str());
                 if st.response(batch, agent, ts, Some(hour), &model, tokens, id, mark) == 1 {
@@ -243,7 +247,7 @@ mod tests {
 
     fn expect_usage(line: &str) -> (String, u8, String, i64, i64, i64) {
         match WorkBuddyAdapter::parse_line(line) {
-            WbLine::Usage { day, hour, model, tokens: t } => (day, hour, model, t.input, t.output, t.total),
+            WbLine::Usage { day, hour, model, tokens: t, .. } => (day, hour, model, t.input, t.output, t.total),
             _ => panic!("expected usage"),
         }
     }
@@ -367,6 +371,10 @@ mod tests {
         let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
         assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 1, "子代理提示行与无响应轮不计");
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+        // 积分:三条带 usage 行（含子代理）各 0.1 → 积分池合计 0.3;WorkBuddy 不进模型分布
+        let credit = store.credit_summary("2026-09").unwrap();
+        assert!((credit.total_credit - 0.3).abs() < 1e-9, "{}", credit.total_credit);
+        assert!(credit.by_model.is_empty());
     }
 
     #[test]

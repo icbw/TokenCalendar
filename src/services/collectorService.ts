@@ -36,6 +36,36 @@ export async function setPaused(paused: boolean): Promise<void> {
   await tryInvoke<null>('set_paused', { paused })
 }
 
+/** 采集频率（秒;五档,默认 30）。运行时值在 Rust,持久化 = prefs.json `collectIntervalSecs`。 */
+export interface CollectInterval {
+  secs: number
+  defaultSecs: number
+  choices: number[]
+}
+
+interface CollectIntervalContract {
+  secs: number
+  default_secs: number
+  choices: number[]
+}
+
+const toCollectInterval = (r: CollectIntervalContract): CollectInterval => ({
+  secs: r.secs,
+  defaultSecs: r.default_secs,
+  choices: r.choices,
+})
+
+export async function getCollectInterval(): Promise<CollectInterval | null> {
+  const res = await tryInvoke<CollectIntervalContract>('get_collect_interval')
+  return res ? toCollectInterval(res) : null
+}
+
+/** 写 prefs.json 并即时下发;调用方成功后须再 setDesignPrefs（{ collectIntervalSecs })（同 idleThresholdMin）。 */
+export async function setCollectInterval(secs: number): Promise<CollectInterval | null> {
+  const res = await tryInvoke<CollectIntervalContract>('set_collect_interval', { secs })
+  return res ? toCollectInterval(res) : null
+}
+
 // 挂件网格吸附开关（Rust AppState + window-state.json 即时落盘）。
 export async function getSnapEnabled(): Promise<boolean | null> {
   return tryInvoke<boolean>('get_snap_enabled')

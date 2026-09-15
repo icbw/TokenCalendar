@@ -1,6 +1,6 @@
 //! 采集器：把本机四类 AI Agent 的 token 用量聚合进 collector.db。
 //!
-//! 运行模型：setup 时 spawn 一个 daemon 线程——启动首轮采集,之后每 30s 增量轮询。
+//! 运行模型：setup 时 spawn 一个 daemon 线程——启动首轮采集,之后按采集频率增量轮询（默认 30s,设置·General 五档可选）。
 //! 单源失败只降级该源状态（source_state 表）,不拖垮整体（AGENTS.md 容错铁律）。
 //! UI 只读聚合结果（commands.rs）,批次提交后 emit `usage:changed`（预留链路）。
 //!
@@ -10,7 +10,6 @@ pub mod claude_code;
 pub mod codebuddy;
 pub mod codex;
 pub mod dsh;
-pub mod imports;
 pub mod jsonl;
 pub mod project_meta;
 pub mod store;
@@ -27,7 +26,7 @@ mod smoke;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::time::Instant;
 use std::time::Duration;
 
 use chrono::{Local, TimeZone, Timelike};
@@ -39,37 +38,55 @@ use store::Store;
 
 /// 单轮每文件读取字节上限（大文件分多轮推进,防内存峰值）。
 pub const TAIL_MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// 采集轮询间隔。
-pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// 采集频率可选档位（秒;设置·General「Collect every」,前端 designPrefs.sanitize 同域）。
+pub const POLL_INTERVAL_CHOICES_SECS: [u64; 5] = [30, 60, 120, 180, 300];
+/// 默认采集频率（秒）。
+pub const POLL_INTERVAL_DEFAULT_SECS: u64 = 30;
+/// prefs.json 键名。
+pub const POLL_INTERVAL_PREFS_KEY: &str = "collectIntervalSecs";
+/// 睡眠分片:改频率后最迟一个分片即按新值判定（缩短立即生效,不必睡满旧间隔）。
+const POLL_SLEEP_TICK: Duration = Duration::from_secs(1);
 
-/// 手动导入唤醒器：`import_codebuddy_file` 命令把文件放进 imports 目录后置
-/// `reqwake`（reqwake>0 = 目录有待处理文件）并 notify,采集线程从 30s sleep
-/// 立刻醒来走既有 `process_imports` 管道（单写者,与轮询路径零竞态）。
-static WAKE: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+static POLL_INTERVAL_SECS: AtomicU64 = AtomicU64::new(POLL_INTERVAL_DEFAULT_SECS);
 
-/// 唤醒采集线程立即处理 imports 目录（目录有新文件时调用）。
-pub fn wake_imports() {
-    if let Ok(mut pending) = WAKE.0.lock() {
-        *pending += 1;
-        WAKE.1.notify_all();
+/// 当前采集频率。
+pub fn poll_interval() -> Duration {
+    Duration::from_secs(POLL_INTERVAL_SECS.load(Ordering::SeqCst))
+}
+
+/// 下发采集频率;非档位值拒绝（返回 false,运行时值不变）。
+pub fn set_poll_interval_secs(secs: u64) -> bool {
+    let ok = POLL_INTERVAL_CHOICES_SECS.contains(&secs);
+    if ok {
+        POLL_INTERVAL_SECS.store(secs, Ordering::SeqCst);
+    }
+    ok
+}
+
+/// prefs.json 原文 → 采集频率（缺键 / 非档位值 → None,按默认处理）。
+pub fn poll_interval_from_prefs(json: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get(POLL_INTERVAL_PREFS_KEY)?.as_u64().filter(|s| POLL_INTERVAL_CHOICES_SECS.contains(s))
+}
+
+/// 把采集频率合并进 prefs.json 原文（其余键原样保留;原文缺失 / 损坏 → 以空对象起步）。
+pub fn prefs_with_poll_interval(json: Option<&str>, secs: u64) -> String {
+    let mut v = json
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[POLL_INTERVAL_PREFS_KEY] = serde_json::json!(secs);
+    v.to_string()
+}
+
+/// 从 `since`起睡到当前采集频率;每个分片重读频率,改档即时生效。
+fn sleep_until_next_round(since: Instant) {
+    loop {
+        let Some(left) = poll_interval().checked_sub(since.elapsed()).filter(|d| !d.is_zero()) else { return };
+        std::thread::sleep(left.min(POLL_SLEEP_TICK));
     }
 }
 
-/// 采集线程睡眠:正常睡满 POLL_INTERVAL;`wake_imports` 触发时立即返回。
-fn sleep_interruptible() {
-    let (lock, cv) = &WAKE;
-    let Ok(mut guard) = lock.lock() else {
-        std::thread::sleep(POLL_INTERVAL);
-        return;
-    };
-    // 唤醒标记在 wait 之前就已置位（notify 与睡眠竞态）→ 直接消费,不睡。
-    if *guard > 0 {
-        *guard -= 1;
-        return;
-    }
-    // 等待到期 = 常规轮询;提前醒来 = 有待处理导入。
-    let _ = cv.wait_timeout(guard, POLL_INTERVAL);
-}
 
 // ---------- 适配器契约 ----------
 
@@ -301,11 +318,6 @@ pub fn spawn(app: AppHandle, store: Store) {
 fn run(app: AppHandle, mut store: Store) {
     crate::dev_log!("[collector] thread started");
 
-    // 旧版 home 导入目录一次性搬入数据根（失败静默,不阻塞采集）
-    if let Ok(root) = crate::data_root::current(&app) {
-        imports::migrate_legacy_dir(&root.imports_dir());
-    }
-
     // daily_project 套用的离开阈值与运行时值（prefs 载入）不一致 → 全表重算一次
     // （新库 / 迁移清库后标记缺失、上次 set_idle_threshold 重算失败,均在此自愈）。
     let threshold = task_store::idle_threshold_ms();
@@ -325,21 +337,6 @@ fn run(app: AppHandle, mut store: Store) {
             .map(|s| s.paused.load(Ordering::SeqCst))
             .unwrap_or(false);
         if !paused {
-            // 官网导出导入先行：有新映射/模型正 → 失效 codebuddy 聚合,
-            //  adapter.collect 从头重读即按新映射归位（index.json 重读秒级）。
-            let imp = imports::process_imports(&mut store, &app);
-            if imp.files > 0 {
-                crate::dev_log!(
-                    "[collector] imports: {} file(s), +{} models, {} corrected",
-                    imp.files, imp.added, imp.corrected
-                );
-                if imp.added > 0 || imp.corrected > 0 {
-                    match store.invalidate_source("codebuddy") {
-                        Ok(n) => crate::dev_log!("[collector] codebuddy invalidated ({} rows) for remap", n),
-                        Err(e) => crate::dev_log!("[collector] invalidate codebuddy failed: {}", e),
-                    }
-                }
-            }
             for adapter in &adapters {
                 let meta = adapter.meta();
                 match adapter.collect(&mut store) {
@@ -361,7 +358,7 @@ fn run(app: AppHandle, mut store: Store) {
             }
             first_pass = false;
         }
-        sleep_interruptible();
+        sleep_until_next_round(Instant::now());
     }
 }
 
@@ -386,5 +383,23 @@ pub fn notify_usage_changed(app: &AppHandle, months: &BTreeSet<String>) {
     };
     if let Err(e) = app.emit("usage:changed", payload) {
         crate::dev_log!("[collector] emit usage:changed failed: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod poll_interval_tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_prefs_roundtrip_and_choices() {
+        assert_eq!(poll_interval_from_prefs(r#"{"collectIntervalSecs":180,"x":1}"#), Some(180));
+        assert_eq!(poll_interval_from_prefs(r#"{"collectIntervalSecs":45}"#), None, "非档位值按默认");
+        assert_eq!(poll_interval_from_prefs(r#"{"collectIntervalSecs":"60"}"#), None);
+        assert_eq!(poll_interval_from_prefs("bad"), None);
+        let json = prefs_with_poll_interval(Some(r#"{"idleThresholdMin":45}"#), 300);
+        assert!(json.contains("\"idleThresholdMin\":45") && json.contains("\"collectIntervalSecs\":300"), "{json}");
+        assert!(prefs_with_poll_interval(Some("broken"), 60).contains("\"collectIntervalSecs\":60"));
+        assert!(!set_poll_interval_secs(45), "非档位拒绝");
+        assert_eq!(POLL_INTERVAL_CHOICES_SECS[0], POLL_INTERVAL_DEFAULT_SECS);
     }
 }

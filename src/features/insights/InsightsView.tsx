@@ -464,10 +464,8 @@ function CreditBlock() {
         <div className="credit-guide">
           <p className="credit-guide-title">{fullMonthLabel(month)} has no credit data yet</p>
           <p className="credit-guide-body">
-            Credits come from the official website export (no login credentials collected):
-            sign in to the CodeBuddy site → usage page → export monthly xlsx → drop it into
-            the <code>imports\</code> folder of the data root; the collector ingests it on
-            its next round.
+            Credits are read from local CodeBuddy / WorkBuddy session data (shared credit pool);
+            this month has no request with credits yet.
           </p>
         </div>
       ) : (
@@ -482,7 +480,7 @@ function CreditBlock() {
               <span className="credit-total-value">{formatFull(summary.totalRequests)}</span>
             </div>
             <div className="credit-total-item credit-total-note">
-              <span className="credit-total-label">The credit curve only draws up to the last covered day</span>
+              <span className="credit-total-label">Local session credits · may run slightly below the official bill</span>
             </div>
             <label className="credit-mode-toggle" title="Split token bars into per-model groups with one credit curve each">
               <input type="checkbox" checked={byModel} onChange={(e) => setByModel(e.target.checked)} />
@@ -500,9 +498,8 @@ function CreditBlock() {
 /** 双组图装配:tokens 序列（get_range_series 月内 input/output;天/小时粒度可切）
  * + credit 日序列（credit_summary.by_day / by_model_day）。共享横轴:天粒度 =
  * 每日一组柱;小时粒度 = 每日内 24 根小时细柱（横轴仍按天分组,组内并排）。
- * credit 账本只有日粒度（xlsx 按日）,小时档下曲线保持按日对齐。
- * 积分账本按月手动导出,曲线画到覆盖最后一天为止,缺口断线表达
- * （红线:勿伪装成 0）。 */
+ * credit 只有日粒度（daily_usage.credit）,小时档下曲线保持按日对齐。
+ * 无积分的日断线表达（红线:勿伪装成 0）。 */
 function ComboBlock({ month, summary, byModel, bucket }: {
   month: string
   summary: CreditSummary

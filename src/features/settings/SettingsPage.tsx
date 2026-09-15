@@ -115,8 +115,19 @@ export default function SettingsPage({ onBack, initialTab }: { onBack(): void; i
 
 /* ---------------- General：行为类设置（自右缘面板平移） ---------------- */
 
+/** 采集频率五档（与 Rust collector:POLL_INTERVAL_CHOICES_SECS 同域）。 */
+const COLLECT_INTERVAL_CHOICES = [
+  { secs: 30, label: '30s' },
+  { secs: 60, label: '1m' },
+  { secs: 120, label: '2m' },
+  { secs: 180, label: '3m' },
+  { secs: 300, label: '5m' },
+] as const
+
 function GeneralTab() {
   const [paused, setPaused] = useState(false)
+  // 采集频率:运行时值在 Rust,进 tab 现查;未就绪时按偏好 / 默认 30s 显示。
+  const [collectSecs, setCollectSecs] = useState<number>(() => getDesignPrefs().collectIntervalSecs ?? 30)
   const [snapEnabled, setSnapEnabled] = useState(false)
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   // 开机自启：状态单一源 = 系统启动项（Rust 侧插件读写），前端不存镜像——
@@ -128,6 +139,7 @@ function GeneralTab() {
   // checkboxes can change while the page was hidden.
   useEffect(() => {
     collectorService.getPaused().then((p) => p !== null && setPaused(p)).catch(console.error)
+    collectorService.getCollectInterval().then((r) => r && setCollectSecs(r.secs)).catch(console.error)
     collectorService.getSnapEnabled().then((v) => v !== null && setSnapEnabled(v)).catch(console.error)
     autostartService.getAutostart().then((v) => v !== null && setAutostart(v)).catch(console.error)
   }, [])
@@ -146,6 +158,26 @@ function GeneralTab() {
   const togglePause = (next: boolean) => {
     setPaused(next)
     collectorService.setPaused(next).catch(console.error)
+  }
+
+  /** 采集频率:乐观切档 → Rust 写 prefs 并即时下发 → 同步偏好快照;失败回读真实值。 */
+  const changeCollectInterval = (secs: number) => {
+    const prev = collectSecs
+    setCollectSecs(secs)
+    collectorService
+      .setCollectInterval(secs)
+      .then((r) => {
+        if (r) {
+          setCollectSecs(r.secs)
+          setDesignPrefs({ collectIntervalSecs: r.secs })
+        } else {
+          setCollectSecs(prev)
+        }
+      })
+      .catch((e: unknown) => {
+        console.error('[collect interval]', e)
+        setCollectSecs(prev)
+      })
   }
 
   const toggleSnap = (next: boolean) => {
@@ -201,6 +233,23 @@ function GeneralTab() {
           checked={paused}
           onChange={togglePause}
         />
+        <div className="setting-row">
+          <span title="How often local agent data is scanned; a change applies immediately">
+            Collect every
+          </span>
+          <div className="setting-seg">
+            {COLLECT_INTERVAL_CHOICES.map(({ secs, label }) => (
+              <button
+                key={secs}
+                className={`setting-seg-btn${collectSecs === secs ? ' is-active' : ''}`}
+                title={secs === 30 ? `Scan every ${label} (default)` : `Scan every ${label}`}
+                onClick={() => changeCollectInterval(secs)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       <div className="setting-section">Matrix</div>
@@ -663,9 +712,6 @@ function DataTab() {
   const [resTarget, setResTarget] = useState('')
   const [busy, setBusy] = useState<'migrate' | 'backup' | 'restore' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  // CodeBuddy 官网导入手动入口。
-  const [importing, setImporting] = useState(false)
-  const [importNote, setImportNote] = useState<string | null>(null)
   // credit 卡开关（insightsCredit）随区块一并移入本 tab。
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   useEffect(() => subscribeDesignPrefs(setDesign), [])
@@ -725,34 +771,6 @@ function DataTab() {
   }
   const dirPick = { migrate: 'Choose migration target folder', backup: 'Choose backup output folder', restore: 'Choose the folder containing the backup' } as const
 
-  /** CodeBuddy 官网导出手动导入：选 xlsx → 校验+转存 imports → 唤醒采集线程
-   * 即时入库（毫秒级,无 30s 轮询等待）。成功后刷新 storage 概要。 */
-  const doImport = () => {
-    setImporting(true)
-    setImportNote(null)
-    void (async () => {
-      try {
-        const file = await dataService.pickXlsxFile()
-        if (!file) return
-        const r = await dataService.importCodebuddyFile(file)
-        if (!r) {
-          setImportNote('Import failed, see log')
-        } else if ('error' in r) {
-          setImportNote(`Import failed: ${r.error}`)
-        } else {
-          setImportNote(`Imported → stored as ${r.stored_as}. Models map within a second.`)
-          const d = await dataService.getDataInfo()
-          if (d) setInfo(d)
-        }
-      } catch (e) {
-        console.error('[import]', e)
-        setImportNote('Import failed, see log')
-      } finally {
-        setImporting(false)
-      }
-    })()
-  }
-
   return (
     <>
       <div className="setting-section">Storage</div>
@@ -762,7 +780,7 @@ function DataTab() {
             Root: {info.root}
             {info.fell_back ? ' (default root not writable, fell back to AppData)' : ''}
             {info.custom_root ? <><br />Custom: {info.custom_root}</> : null}
-            <br />DB {fmtBytes(info.db_bytes)} · imports {info.imports_count} files · exports {info.exports_count} files
+            <br />DB {fmtBytes(info.db_bytes)} · exports {info.exports_count} files
           </div>
         ) : (
           <div className="setting-note">Storage info unavailable (non-Tauri environment or backend not ready).</div>
@@ -778,22 +796,11 @@ function DataTab() {
         </div>
       </div>
 
-      <div className="setting-section">CodeBuddy credit import</div>
+      <div className="setting-section">Credit card</div>
       <div className="setting-block">
         <div className="setting-note">
-          Import a CodeBuddy credit export (.xlsx) to resolve unknown models. Idempotent.
+          Credits and models are read from local CodeBuddy / WorkBuddy session data; no export import needed.
         </div>
-        <div className="setting-actions">
-          <button
-            className="setting-btn"
-            disabled={importing}
-            onClick={doImport}
-            title="Pick a .xlsx credit export; applied at once"
-          >
-            {importing ? 'Importing…' : 'Import export file…'}
-          </button>
-        </div>
-        {importNote ? <div className="setting-note">{importNote}</div> : null}
         <ToggleRow
           label="Show credit card in Insights"
           title="Tokens × credit card at the bottom of the Chart view"
@@ -805,7 +812,7 @@ function DataTab() {
       <div className="setting-section">Migrate data root</div>
       <div className="setting-block">
         <div className="setting-note">
-          Moves cache, prefs, imports and exports to a new folder (restart to apply).
+          Moves cache, prefs and exports to a new folder (restart to apply).
           Pause collection first.
         </div>
         <div className="setting-actions">

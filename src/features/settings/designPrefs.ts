@@ -124,6 +124,9 @@ export interface DesignPrefs {
    * **写入方是 Rust `set_idle_threshold`**（合并写 prefs.json 并同步重算 daily_project）;
    * 前端改阈值时须同时 setDesignPrefs 本键,否则 persist 的旧快照会把它覆盖回去（S4 接线）。 */
   idleThresholdMin?: number
+  /** 采集频率（秒,30 / 60 / 120 / 180 / 300;undefined = 30）。**写入方是 Rust `set_collect_interval`**
+   * （合并写 prefs.json 并下发运行时值）;前端改档时须同时 setDesignPrefs 本键,否则 persist 的旧快照会覆盖回去。 */
+  collectIntervalSecs?: number
   /** Tasks 列表标签:time（开始时间,默认）⇄ title（会话标题,空时回退 time）。
    * undefined = time。title 是内容列,只在 Tasks 列表渲染。 */
   taskLabelMode?: 'time' | 'title'
@@ -205,6 +208,10 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   // 离开阈值:整数分钟 1〜1440（与 Rust task_store 同域）,越界视为未设置。
   if (p.idleThresholdMin !== undefined && !(typeof p.idleThresholdMin === 'number' && Number.isInteger(p.idleThresholdMin) && p.idleThresholdMin >= 1 && p.idleThresholdMin <= 1440)) {
     delete p.idleThresholdMin
+  }
+  // 采集频率:只认五个档位（与 Rust collector:POLL_INTERVAL_CHOICES_SECS 同域）,其余视为未设置。
+  if (p.collectIntervalSecs !== undefined && ![30, 60, 120, 180, 300].includes(p.collectIntervalSecs as number)) {
+    delete p.collectIntervalSecs
   }
   if (p.taskLabelMode !== undefined && p.taskLabelMode !== 'time' && p.taskLabelMode !== 'title') {
     delete p.taskLabelMode

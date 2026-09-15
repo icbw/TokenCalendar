@@ -135,6 +135,8 @@ fn main() {
             commands::merge_projects,
             commands::unmerge_projects,
             commands::get_scratch_rule,
+            commands::get_collect_interval,
+            commands::set_collect_interval,
             commands::set_scratch_rule,
             commands::open_project_folder,
             commands::get_idle_threshold,
@@ -150,7 +152,6 @@ fn main() {
             commands::restore_data,
             commands::open_data_dir,
             commands::open_external_url,
-            commands::import_codebuddy_file,
             commands::get_prefs_raw,
             commands::set_prefs_raw,
             commands::set_widget_size,
@@ -228,6 +229,8 @@ fn main() {
             commands::load_idle_threshold(&handle);
             // 项目自动折叠规则（查询时解析,载入即生效）
             commands::load_scratch_rule(&handle);
+            // 采集频率（设置·General Collection 组）先于采集线程载入
+            commands::load_collect_interval(&handle);
             match collector::open_store(&handle) {
                 Ok(write_store) => {
                     if let Ok(reader) = collector::open_store(&handle) {

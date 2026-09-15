@@ -4,14 +4,13 @@
 //! 契约所需的最低粒度即 `day × agent × model`（矩阵/钻取/导出全是这个粒度），
 //! 因此只存聚合表。幂等性由「游标与聚合同事务提交、游标严格不重复消费」保证。
 //!
-//! 三张聚合表 + 一张对账表：
-//! - `daily_usage` 聚合表（PRIMARY KEY 去重，upsert += 累加）
+//! 聚合表与常驻表：
+//! - `daily_usage` 聚合表（PRIMARY KEY 去重，upsert += 累加;v11 起含源本地 `credit` 积分）
 //! - `source_cursor` 每源每 scope 的增量游标（JSON）
 //! - `source_state` 每源健康状态（list_sources 的数据源）
-//! - `request_model` 官网导出对账映射（CodeBuddy 请求 ID → 模型，见 collector/imports.rs）
 //! - `project_meta` 项目管理映射（别名 / 隐藏 / 合并,常驻不随迁移清空,见 collector/project_meta.rs）
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::turns::UNKNOWN_PROJECT;
 use std::path::Path;
@@ -29,6 +28,8 @@ pub struct Batch {
     /// （day, hour, agent_key, model_key) → [input, output, total, cache_read, cache_write] 累加量
     /// （小时粒度,与日聚合同事务提交;hour = 本地时 0-23）。
     pub hourly: BTreeMap<(String, u8, String, String), [i64; 5]>,
+    /// （day, agent_key, model_key) → 源本地积分累加量（只由带积分的源写入,须与同格 usage 同批）。
+    pub credits: BTreeMap<(String, String, String), f64>,
     /// （scope, cursor_json) 游标推进（同事务提交，防崩溃重计）。
     pub cursors: Vec<(String, String)>,
     /// 实际采集到的事件数（用于 events_collected 与 usage:changed 判定）。
@@ -93,6 +94,15 @@ impl Batch {
             he[4] += t.cache_write;
         }
         self.events += 1;
+    }
+
+    /// 源本地积分入账（CodeBuddy request / WorkBuddy rawUsage 行级 `credit`）。非正数忽略。
+    /// 只在同一 （day, agent, model) 已有 usage 入账处调用,避免产生零 token 的孤立聚合行。
+    pub fn add_credit(&mut self, day: &str, agent: &str, model: &str, credit: f64) {
+        if !(credit > 0.0) || !credit.is_finite() {
+            return;
+        }
+        *self.credits.entry((day.to_string(), agent.to_string(), model.to_string())).or_insert(0.0) += credit;
     }
 
     /// 写入一轮现状（同键后写覆盖先写:累加器每次 flush 都是整轮快照）。
@@ -243,6 +253,11 @@ pub struct SourceState {
 }
 
 // 数据洞察:credit 月报的查询结果（经 commands.rs 映射为 serde 契约)。
+/// 积分池成员（CodeBuddy / WorkBuddy 共享积分）。通用积分统计（按订阅来源切换）见 ROADMAP 待定项。
+pub const CREDIT_POOL_AGENTS: &[&str] = &["codebuddy", "workbuddy"];
+/// 积分按模型分布的来源 agent。
+pub const CREDIT_MODEL_AGENT: &str = "codebuddy";
+
 pub struct CreditModelRow {
     pub key: String,
     pub label: String,
@@ -269,7 +284,7 @@ pub struct CreditSummary {
     pub total_requests: i64,
     pub by_model: Vec<CreditModelRow>,
     pub by_day: Vec<CreditDayRow>,
-    /// 模型维逐日 credit（非 WB 行口径,与 by_model 同一过滤;双组图按模型曲线用）。
+    /// 模型维逐日 credit（CodeBuddy 行口径,与 by_model 同一过滤;双组图按模型曲线用）。
     pub by_model_day: Vec<CreditModelDayRow>,
 }
 
@@ -295,8 +310,8 @@ pub struct Store {
 /// 当前 schema 版本。
 /// v7 / v8 / v9 均未发布即被取代（补齐轮 / 会话列与原始层;S3 两个轮次;
 /// S4-R 中止与错误分列:turn_raw / turn 加 aborted、daily_project 加 aborted_count）,
-/// 用户 6 → 10 一次清库。
-pub const SCHEMA_VERSION: i64 = 10;
+/// 用户 6 → 10 一次清库。v11 = daily_usage 加 `credit`（源本地积分,取代官网导出导入）→ 清库重扫。
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// 迁移时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
 /// （迁移曾漏重建 source_cursor;由测试 `reset_drop_and_create_lists_match` 守护）。
@@ -322,6 +337,7 @@ CREATE TABLE IF NOT EXISTS daily_usage (
     request_count     INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    credit            REAL    NOT NULL DEFAULT 0,
     PRIMARY KEY (day, agent_key, model_key)
 );
 CREATE TABLE IF NOT EXISTS hourly_usage (
@@ -480,8 +496,10 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self, String> {
-        // 常驻表（迁移不清）：source_state 健康状态、request_model 官网对账账本、
+        // 常驻表（迁移不清）：source_state 健康状态、
         // project_meta 项目管理映射（用户维护的元数据,清库重扫后原样生效）。
+        // request_model（CodeBuddy 官网导出对账账本）随导入功能于 v11 退役:积分 / 模型改由源本地数据提供,
+        // 旧库一次性 DROP（原始 xlsx 仍留在数据根 imports 目录,程序不再读取）。
         // 清库重扫的表统一在 RESET_SCHEMA,由 user_version 迁移 DROP + CREATE。
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -496,15 +514,7 @@ impl Store {
                  last_error_message  TEXT,
                  events_collected    INTEGER NOT NULL DEFAULT 0
              );
-             CREATE TABLE IF NOT EXISTS request_model (
-                 source_id   TEXT NOT NULL,
-                 request_id  TEXT NOT NULL,
-                 model_key   TEXT NOT NULL,
-                 client      TEXT,
-                 day         TEXT,
-                 credit      REAL,
-                 PRIMARY KEY (source_id, request_id)
-             );
+             DROP TABLE IF EXISTS request_model;
              CREATE TABLE IF NOT EXISTS project_meta (
                  project_key  TEXT PRIMARY KEY,
                  alias        TEXT,
@@ -527,6 +537,8 @@ impl Store {
         // （主会话;user_message 保留兼容)→ 清库重扫。
         // v9 = （未发布即取代):Claude 缺 origin 的零调用输入不成轮、
         // ZCode 子会话不计 request_count → 清库重扫。
+        // v11 = daily_usage 加 credit（CodeBuddy / WorkBuddy 源本地积分;官网导出导入与 request_model 退役)
+        // → 清库重扫。
         // v8 = （未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
         // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
         // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
@@ -601,6 +613,18 @@ impl Store {
             for ((day, agent, model), [input, output, total, requests, cache_read, cache_write]) in &batch.entries {
                 stmt.execute(rusqlite::params![day, agent, model, input, output, total, requests, cache_read, cache_write])
                     .map_err(|e| e.to_string())?;
+            }
+        }
+        // 源本地积分:与日聚合同事务累加（行由上面的 usage 入账建出;孤立写入也按零 token 行落库）。
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO daily_usage (day, agent_key, model_key, credit) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(day, agent_key, model_key) DO UPDATE SET credit = credit + excluded.credit",
+                )
+                .map_err(|e| e.to_string())?;
+            for ((day, agent, model), credit) in &batch.credits {
+                stmt.execute(rusqlite::params![day, agent, model, credit]).map_err(|e| e.to_string())?;
             }
         }
         // 小时粒度:与日聚合同事务,守恒关系 hourly（日合计) == daily。
@@ -698,86 +722,9 @@ impl Store {
         }
     }
 
-    // ---------- 官网导出对账（request_model,见 collector/imports.rs） ----------
-
-    /// 批量 upsert 官网导出的 RequestID→模型映射。
-    /// 返回「覆盖性指标」：新 ID 数 + 模型被正的既有 ID 数——用于判断
-    /// 是否需要失效关联源重扫（纯积分刷新不影响矩阵,不算变更）。
-    pub fn import_request_models(&mut self, source_id: &str, rows: &[(String, String, Option<String>, String, Option<f64>)]) -> Result<(usize, usize), String> {
-        let mut added = 0usize;
-        let mut corrected = 0usize;
-        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO request_model (source_id, request_id, model_key, client, day, credit)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(source_id, request_id) DO UPDATE SET
-                        model_key = excluded.model_key, client = excluded.client,
-                        day = excluded.day, credit = excluded.credit",
-                )
-                .map_err(|e| e.to_string())?;
-            for (request_id, model_key, client, day, credit) in rows {
-                let prev: Option<String> = tx
-                    .query_row(
-                        "SELECT model_key FROM request_model WHERE source_id = ?1 AND request_id = ?2",
-                        rusqlite::params![source_id, request_id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                match &prev {
-                    None => added += 1,
-                    Some(old) if old != model_key => corrected += 1,
-                    _ => {}
-                }
-                stmt.execute(rusqlite::params![source_id, request_id, model_key, client, day, credit])
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok((added, corrected))
-    }
-
-    /// 按 ID 批量查模型归属。只返回映射存在的 ID。
-    /// **只认 CodeBuddy 客户端行**：导出账本混入 WorkBuddy 行（共享积分）,
-    /// 其 RequestID 与 CodeBuddy 本地 ID 空间不相交,但防御性排除,
-    /// 避免异常 ID 撞车时把 workbuddy 的模型错配给 codebuddy 请求。
-    pub fn request_models(&self, source_id: &str, request_ids: &[String]) -> HashMap<String, String> {
-        let mut out = HashMap::new();
-        if request_ids.is_empty() {
-            return out;
-        }
-        // 单条 prepared 查询循环即可（每文件 ≤数百条;IN 列表拼接反而引入上限问题）。
-        let mut stmt = match self.conn.prepare_cached(
-            "SELECT model_key FROM request_model
-             WHERE source_id = ?1 AND request_id = ?2
-               AND (client IS NULL OR client NOT LIKE 'WorkBuddy%')",
-        ) {
-            Ok(s) => s,
-            Err(_) => return out,
-        };
-        for id in request_ids {
-            if let Ok(model) = stmt.query_row(rusqlite::params![source_id, id], |r| r.get::<_, String>(0)) {
-                out.insert(id.clone(), model);
-            }
-        }
-        out
-    }
-
-    /// 映射表行数（list_sources 诊断展示）。
-    pub fn request_model_count(&self, source_id: &str) -> i64 {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM request_model WHERE source_id = ?1",
-                [source_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0)
-    }
-
-    /// 失效某源全部聚合（导入带来新映射/正后调用）：清该源 daily_usage、
+    /// 失效某源全部聚合：清该源 daily_usage、
     /// hourly_usage、session / turn_raw / turn_part / turn / daily_project与全部游标,下轮 collect
-    /// 从头重读。request_model 表本身保留（就是对账依据）。同事务:半清状态不落盘。
+    /// 从头重读。同事务:半清状态不落盘。
     pub fn invalidate_source(&mut self, source_id: &str) -> Result<u64, String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let n = tx
@@ -1114,55 +1061,45 @@ impl Store {
         Some(RangeSeries { series_keys, series_labels, points })
     }
 
-    /// credit 月报（数据洞察）：request_model 表按月聚合。
+    /// credit 月报（数据洞察;v11 起读 daily_usage 的源本地积分）。
     ///
-    /// 口径（与对账链路同一事实源）：
-    /// - 月度总量 = **全表**（含 WorkBuddy 行——两家共享积分池,总量就是池消耗）;
-    /// - 按模型分布 = **只认非 WorkBuddy 客户端行**（与 request_models 归属查询
-    ///   同一过滤;WB 的模型归属由其本地适配器提供,官方账本的 WB 模型列不采信）;
-    /// - by_day 按 day 列（官方北京时间,parse_export_day 已归一为 YYYY-MM-DD）;
-    /// - has_data = 该月表内是否有任何行（无导入月份 = 无数据,UI 走引导,不渲染 0）。
+    /// 口径（沿用导入时代的「CodeBuddy 积分池」语义,通用积分统计见 ROADMAP 待定项）：
+    /// - 月度总量 / 按日走势 = `CREDIT_POOL_AGENTS`（CodeBuddy + WorkBuddy 共享积分池）;
+    /// - 按模型分布 / 模型×日 = 只取 `CREDIT_MODEL_AGENT`（CodeBuddy;WorkBuddy 模型维由其矩阵行展示）;
+    /// - requests = 带积分格的 request_count 之和;
+    /// - has_data = 该月池内是否有任何积分（无积分月份 UI 走空态,不渲染 0）。
     pub fn credit_summary(&self, month: &str) -> Option<CreditSummary> {
         parse_month(month)?;
         let prefix = format!("{}-%", month);
+        let pool = CREDIT_POOL_AGENTS.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(", ");
 
-        let mut total_credit = 0f64;
-        let mut total_requests = 0i64;
-        let mut stmt = self
+        let (total_requests, total_credit) = self
             .conn
-            .prepare(
-                "SELECT COUNT(*), COALESCE(SUM(credit), 0) FROM request_model
-                 WHERE day LIKE ?1",
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(request_count), 0), COALESCE(SUM(credit), 0) FROM daily_usage
+                     WHERE day LIKE ?1 AND agent_key IN ({pool}) AND credit > 0"
+                ),
+                [&prefix],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
             )
-            .ok()?;
-        // COUNT 恒产出一行;查询失败按 （0, 0) 处理 = has_data=false
-        if let Ok((n, c)) = stmt.query_row([&prefix], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-        }) {
-            total_requests = n;
-            total_credit = c;
-        }
-        drop(stmt);
-        let has_data = total_requests > 0;
+            .unwrap_or((0, 0.0));
+        let has_data = total_credit > 0.0;
 
-        // 按模型分布:非 WorkBuddy 客户端行;unknown 归组展示不丢弃。
+        // 按模型分布:CodeBuddy 行;unknown 归组展示不丢弃。
         let mut by_model: Vec<CreditModelRow> = Vec::new();
         if has_data {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT model_key, COUNT(*), COALESCE(SUM(credit), 0) FROM request_model
-                     WHERE day LIKE ?1 AND (client IS NULL OR client NOT LIKE 'WorkBuddy%')
+                    "SELECT model_key, COALESCE(SUM(request_count), 0), COALESCE(SUM(credit), 0) FROM daily_usage
+                     WHERE day LIKE ?1 AND agent_key = ?2 AND credit > 0
                      GROUP BY model_key ORDER BY 3 DESC",
                 )
                 .ok()?;
             let rows = stmt
-                .query_map([&prefix], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, f64>(2)?,
-                    ))
+                .query_map(rusqlite::params![&prefix, CREDIT_MODEL_AGENT], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
                 })
                 .ok()?;
             for (k, n, c) in rows.flatten() {
@@ -1170,45 +1107,39 @@ impl Store {
             }
         }
 
-        // 按日走势:全表（与月度总量同口径）。
+        // 按日走势:积分池（与月度总量同口径）。
         let mut by_day: Vec<CreditDayRow> = Vec::new();
         if has_data {
             let mut stmt = self
                 .conn
-                .prepare(
-                    "SELECT day, COALESCE(SUM(credit), 0) FROM request_model
-                     WHERE day LIKE ?1 GROUP BY day ORDER BY day",
-                )
+                .prepare(&format!(
+                    "SELECT day, COALESCE(SUM(credit), 0) FROM daily_usage
+                     WHERE day LIKE ?1 AND agent_key IN ({pool}) AND credit > 0 GROUP BY day ORDER BY day"
+                ))
                 .ok()?;
             let rows = stmt
-                .query_map([&prefix], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-                })
+                .query_map([&prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
                 .ok()?;
             for (d, c) in rows.flatten() {
                 by_day.push(CreditDayRow { day: d, credit: c });
             }
         }
 
-        // 按模型×日（双组图）:非 WB 行口径（与 by_model 同一过滤）。
-        // 请求级数据,只有有行的日;连续日轴由调用方（命令层）补零。
+        // 按模型×日（双组图）:与 by_model 同一口径。
+        // 只有有积分的日;连续日轴由调用方（命令层）补零。
         let mut by_model_day: Vec<CreditModelDayRow> = Vec::new();
         if has_data {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT model_key, day, COALESCE(SUM(credit), 0) FROM request_model
-                     WHERE day LIKE ?1 AND (client IS NULL OR client NOT LIKE 'WorkBuddy%')
+                    "SELECT model_key, day, COALESCE(SUM(credit), 0) FROM daily_usage
+                     WHERE day LIKE ?1 AND agent_key = ?2 AND credit > 0
                      GROUP BY model_key, day ORDER BY model_key, day",
                 )
                 .ok()?;
             let rows = stmt
-                .query_map([&prefix], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, f64>(2)?,
-                    ))
+                .query_map(rusqlite::params![&prefix, CREDIT_MODEL_AGENT], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
                 })
                 .ok()?;
             let mut per_model: BTreeMap<String, Vec<CreditDayRow>> = BTreeMap::new();
@@ -1597,35 +1528,6 @@ mod tests {
     }
 
     #[test]
-    fn request_model_import_and_lookup() {
-        let mut s = Store::open_in_memory().unwrap();
-        let rows = vec![
-            ("r1".to_string(), "glm-5.3-flash".to_string(), Some("CodeBuddyIDE".to_string()), "2026-09-01".to_string(), Some(1.5)),
-            ("r2".to_string(), "deepseek-v4-pro".to_string(), Some("CodeBuddyIDE".to_string()), "2026-09-02".to_string(), None),
-            // WorkBuddy 行也入表（共享积分账本）,但 lookup 不区分——过滤责任在调用方
-            ("r3".to_string(), "hy4-preview".to_string(), Some("WorkBuddy".to_string()), "2026-09-02".to_string(), Some(0.9)),
-        ];
-        let (added, corrected) = s.import_request_models("codebuddy", &rows).unwrap();
-        assert_eq!((added, corrected), (3, 0));
-        // 重导同一批：零新增零修正（幂等,不触发失效）
-        let (added, corrected) = s.import_request_models("codebuddy", &rows).unwrap();
-        assert_eq!((added, corrected), (0, 0));
-        // 模型被修正 → corrected 计数
-        let fix = vec![("r2".to_string(), "deepseek-v4-flash".to_string(), None, "2026-09-02".to_string(), None)];
-        let (added, corrected) = s.import_request_models("codebuddy", &fix).unwrap();
-        assert_eq!((added, corrected), (0, 1));
-
-        let got = s.request_models("codebuddy", &["r1".into(), "r2".into(), "r3".into(), "rX".into()]);
-        assert_eq!(got.get("r1").map(|s| s.as_str()), Some("glm-5.3-flash"));
-        assert_eq!(got.get("r2").map(|s| s.as_str()), Some("deepseek-v4-flash"));
-        assert!(!got.contains_key("r3"), "WorkBuddy 行不参与 codebuddy 归属");
-        assert!(!got.contains_key("rX"));
-        assert_eq!(s.request_model_count("codebuddy"), 3);
-        // 其他 source_id 隔离
-        assert_eq!(s.request_model_count("codex"), 0);
-    }
-
-    #[test]
     fn invalidate_source_clears_usage_and_cursors_only() {
         let mut s = Store::open_in_memory().unwrap();
         insert(&mut s, "2026-09-01", "codebuddy", "unknown", 10, 5, 15);
@@ -1633,23 +1535,21 @@ mod tests {
         let mut b = Batch::default();
         b.cursors.push(("f1".into(), "{\"count\":3}".into()));
         s.commit("codebuddy", &b).unwrap();
-        // 对账行不受失效影响
-        let rows = vec![("r1".to_string(), "glm-5.3-flash".to_string(), None, "2026-09-01".to_string(), None)];
-        s.import_request_models("codebuddy", &rows).unwrap();
 
         let cleared = s.invalidate_source("codebuddy").unwrap();
         assert_eq!(cleared, 1, "只清 codebuddy 的 daily_usage 行");
         assert!(s.get_cursor("codebuddy", "f1").is_none());
-        assert_eq!(s.request_model_count("codebuddy"), 1, "对账表保留");
         // 其他源毫发无损
         let agents = s.month_rows("2026-09", "agent", "total", TODAY).unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].key, "zcode");
     }
 
-    fn import_credit_row(s: &mut Store, id: &str, model: &str, client: Option<&str>, day: &str, credit: Option<f64>) {
-        let rows = vec![(id.to_string(), model.to_string(), client.map(|c| c.to_string()), day.to_string(), credit)];
-        s.import_request_models("codebuddy", &rows).unwrap();
+    fn credit_row(s: &mut Store, agent: &str, model: &str, day: &str, credit: f64) {
+        let mut b = Batch::default();
+        b.add_usage(day, Some(9), agent, model, Tokens { input: 10, output: 0, total: 10, cache_read: 0, cache_write: 0 }, 1);
+        b.add_credit(day, agent, model, credit);
+        s.commit(agent, &b).unwrap();
     }
 
     #[test]
@@ -1669,51 +1569,48 @@ mod tests {
     #[test]
     fn credit_summary_totals_include_workbuddy_model_rows_exclude() {
         let mut s = Store::open_in_memory().unwrap();
-        import_credit_row(&mut s, "r1", "glm-5.3-flash", Some("CodeBuddyIDE"), "2026-09-01", Some(1.5));
-        import_credit_row(&mut s, "r2", "deepseek-v4-pro", Some("CodeBuddyIDE"), "2026-09-01", Some(2.0));
-        // WorkBuddy 行:共享积分池 → 计入总量;模型维度排除
-        import_credit_row(&mut s, "r3", "hy4-preview", Some("WorkBuddy"), "2026-09-02", Some(0.9));
-        // client 为 NULL 的行:模型维度保留(防御过滤只排 WorkBuddy 前缀)
-        import_credit_row(&mut s, "r4", "glm-5.3-flash", None, "2026-09-03", Some(0.6));
+        credit_row(&mut s, "codebuddy", "glm-5.3-flash", "2026-09-01", 1.5);
+        credit_row(&mut s, "codebuddy", "deepseek-v4-pro", "2026-09-01", 2.0);
+        // WorkBuddy:共享积分池 → 计入总量;模型维度排除
+        credit_row(&mut s, "workbuddy", "hy4-preview", "2026-09-02", 0.9);
+        credit_row(&mut s, "codebuddy", "glm-5.3-flash", "2026-09-03", 0.6);
         // unknown 模型:归「Unknown」行,不丢弃
-        import_credit_row(&mut s, "r5", "unknown", Some("CodeBuddyIDE"), "2026-09-03", Some(1.0));
+        credit_row(&mut s, "codebuddy", "unknown", "2026-09-03", 1.0);
+        // 池外 agent 与无积分行不计
+        credit_row(&mut s, "zcode", "glm-5.3", "2026-09-03", 7.0);
+        let mut b = Batch::default();
+        b.add_usage("2026-09-03", Some(9), "codebuddy", "no-credit", Tokens { input: 1, output: 0, total: 1, cache_read: 0, cache_write: 0 }, 1);
+        s.commit("codebuddy", &b).unwrap();
+        // 同格二次入账累加
+        credit_row(&mut s, "codebuddy", "glm-5.3-flash", "2026-09-03", 0.4);
 
         let sum = s.credit_summary("2026-09").unwrap();
         assert!(sum.has_data);
-        assert_eq!(sum.total_requests, 5);
-        assert!((sum.total_credit - 6.0).abs() < 1e-9, "全表求和含 WB 行: 1.5+2+0.9+0.6+1");
+        assert_eq!(sum.total_requests, 6, "带积分格的 request_count 之和（glm 09-03 两次入账各 1 轮）");
+        assert!((sum.total_credit - 6.4).abs() < 1e-9, "池内求和含 WB: 1.5+2+0.9+0.6+1+0.4");
 
         let labels: Vec<&str> = sum.by_model.iter().map(|r| r.label.as_str()).collect();
         assert!(labels.contains(&"Unknown"), "unknown 行归组展示不丢弃");
         assert!(!labels.contains(&"hy4-preview"), "WB 行不进模型分布");
-        // by_model credit 总和 = 总量 − WB 行(0.9)
+        assert!(!labels.iter().any(|l| l.contains("no-credit")), "无积分格不进分布");
         let model_sum: f64 = sum.by_model.iter().map(|r| r.credit).sum();
-        assert!((model_sum - 5.1).abs() < 1e-9);
-        // 排序:credit 降序
+        assert!((model_sum - 5.5).abs() < 1e-9);
         assert!(sum.by_model.windows(2).all(|w| w[0].credit >= w[1].credit));
 
-        // by_day:全表口径,按日排序
         assert_eq!(sum.by_day.len(), 3);
         assert_eq!(sum.by_day[0].day, "2026-09-01");
         assert!((sum.by_day[0].credit - 3.5).abs() < 1e-9);
-        assert!((sum.by_day[2].credit - 1.6).abs() < 1e-9);
+        assert!((sum.by_day[2].credit - 2.0).abs() < 1e-9);
 
-        // 隔离:别的月份不受影响
         let aug = s.credit_summary("2026-08").unwrap();
         assert!(!aug.has_data);
 
-        // by_model_day:v3 双组图——非 WB 行口径,模型×日聚合;WB 行(hy4-preview)排除
         assert_eq!(sum.by_model_day.len(), 3, "glm/deepseek/unknown 三系列");
         let glm = sum.by_model_day.iter().find(|m| m.key == "glm-5.3-flash").unwrap();
         assert_eq!(glm.by_day.len(), 2);
         assert!((glm.by_day[0].credit - 1.5).abs() < 1e-9);
-        assert!((glm.by_day[1].credit - 0.6).abs() < 1e-9);
+        assert!((glm.by_day[1].credit - 1.0).abs() < 1e-9);
         assert!(!sum.by_model_day.iter().any(|m| m.key == "hy4-preview"), "WB 行不进模型×日");
-        // 同一天聚合:deepseek 单行单日
-        let ds = sum.by_model_day.iter().find(|m| m.key == "deepseek-v4-pro").unwrap();
-        assert_eq!(ds.by_day.len(), 1);
-        assert!((ds.by_day[0].credit - 2.0).abs() < 1e-9);
-        // 空月:by_model_day 同步为空
         assert!(aug.by_model_day.is_empty());
     }
 
@@ -1783,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_unreleased_v9_resets_to_v10() {
+    fn migration_from_unreleased_v9_resets_to_current() {
         // v9 仅存在于开发库:turn_raw / turn / daily_project 缺 aborted 列,中止轮混在 error_count 里 → 清库重扫。
         let dir = std::env::temp_dir().join(format!("tc_v10_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1806,7 +1703,7 @@ mod tests {
         {
             let store = Store::open(&db).unwrap();
             let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, 10);
+            assert_eq!(v, SCHEMA_VERSION);
             assert!(store.get_cursor("codex", "files").is_none(), "游标清空 = 全量重扫");
             assert!(store.export_rows("2026-09").unwrap().is_empty());
             for (t, c) in [("turn_raw", "aborted"), ("turn", "aborted"), ("daily_project", "aborted_count")] {
@@ -1814,6 +1711,43 @@ mod tests {
             }
         }
         for f in ["migrate9.db", "migrate9.db-wal", "migrate9.db-shm"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+
+    #[test]
+    fn migration_from_v10_adds_credit_and_drops_request_model() {
+        // v10 = 0.5.7 发布库:daily_usage 无 credit 列、request_model 对账账本有数据 → 清库重扫 + 账本退役。
+        let dir = std::env::temp_dir().join(format!("tc_v11_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("migrate10.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let v10_schema = RESET_SCHEMA.replace("    credit            REAL    NOT NULL DEFAULT 0,
+", "");
+            assert!(!v10_schema.contains("credit"), "构造的 v10 schema 不应含 credit 列");
+            conn.execute_batch(&format!(
+                "{v10_schema}
+                 CREATE TABLE request_model (source_id TEXT NOT NULL, request_id TEXT NOT NULL, model_key TEXT NOT NULL,
+                     client TEXT, day TEXT, credit REAL, PRIMARY KEY (source_id, request_id));
+                 INSERT INTO request_model VALUES ('codebuddy','r1','glm','CodeBuddyIDE','2026-09-01',1.5);
+                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','codebuddy','glm',10,1);
+                 INSERT INTO source_cursor VALUES ('codebuddy','f','{{}}',1);
+                 PRAGMA user_version = 10;"
+            ))
+            .unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(store.get_cursor("codebuddy", "f").is_none(), "游标清空 = 全量重扫");
+            assert!(store.export_rows("2026-09").unwrap().is_empty());
+            assert!(table_columns(&store, "daily_usage").contains(&"credit".to_string()));
+            assert!(table_columns(&store, "request_model").is_empty(), "对账账本退役");
+        }
+        for f in ["migrate10.db", "migrate10.db-wal", "migrate10.db-shm"] {
             let _ = std::fs::remove_file(dir.join(f));
         }
     }
@@ -2001,15 +1935,17 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        for t in RESET_TABLES.iter().chain(["source_state", "request_model"].iter()) {
+        for t in RESET_TABLES.iter().chain(["source_state", "project_meta"].iter()) {
             assert!(!table_columns(&s, t).is_empty(), "缺表 {t}");
         }
+        assert!(table_columns(&s, "request_model").is_empty(), "v11 起不建对账表");
+        assert!(table_columns(&s, "daily_usage").contains(&"credit".to_string()));
     }
 
     #[test]
     fn migration_from_v6_resets_and_adds_phase12_schema() {
         // 模拟 v6 旧库（无 cache 列、无三张新表;对账账本有数据）重开:
-        // init 应 DROP 重建清库表 + 推版本到 7,request_model / source_state 原样保留。
+        // init 应 DROP 重建清库表 + 推版本到当前;request_model（v11 退役）一并删除。
         let dir = std::env::temp_dir().join(format!("tc_v7_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("migrate.db");
@@ -2038,7 +1974,7 @@ mod tests {
         {
             let store = Store::open(&db).unwrap();
             let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, SCHEMA_VERSION, "v6 库重开应一次迁移到当前版本（6 → 10）");
+            assert_eq!(v, SCHEMA_VERSION, "v6 库重开应一次迁移到当前版本");
             // 清库重扫语义:聚合与游标全清
             assert!(store.month_rows("2026-09", "agent", "total", TODAY).unwrap().is_empty());
             assert!(store.get_cursor("codex", "f").is_none());
@@ -2050,8 +1986,8 @@ mod tests {
             for t in ["session", "turn_raw", "turn_part", "turn", "daily_project"] {
                 assert!(!table_columns(&store, t).is_empty(), "缺新表 {t}");
             }
-            // 对账账本不属清库表
-            assert_eq!(store.request_model_count("codebuddy"), 1);
+            // 对账账本随导入功能退役
+            assert!(table_columns(&store, "request_model").is_empty());
         }
         {
             // 二次打开:版本已到位,不再清库
