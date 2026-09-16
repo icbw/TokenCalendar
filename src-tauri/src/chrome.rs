@@ -180,6 +180,22 @@ pub fn apply_orb_chrome(window: &WebviewWindow) {
     set_ncr_disabled(window);
 }
 
+/// 应用 timeline（项目推进时间轴）窗口形态：边缘栈 = 挂件默认态原子组合
+/// （DONOTROUND + BORDER NONE + NCRP_DISABLED + shadow false，圆角由 CSS 独占），
+/// 与 widget 的差异：
+/// - **不置顶**（看板挂第二屏不需要，主屏会挡编辑器；条态置顶在 S4 由
+///   `set_timeline_form` 切换，不在装配期定死）；
+/// - 可缩放（resizable=true 声明侧），min 480×200；初始 900×360 走 tauri.conf.json，
+///   此处不 set_size（几何由 window_state restore 接管）；
+/// - 无材质档（边界：不装配材质 hook，透明度 CSS 化），组合装配后固定。
+pub fn apply_timeline_chrome(window: &WebviewWindow) {
+    let _ = window.set_decorations(false);
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(480.0, 200.0)));
+    set_corner_preference(window, false);
+    set_border_color_none(window);
+    set_ncr_disabled(window);
+}
+
 /// 挂件材质态边缘组合切换（spike；P4 教训：NCR 四属性必须作为
 /// 原子组合切换，勿单独改其一）：
 /// - 默认（Off）= DONOTROUND + BORDER NONE + NCRP_DISABLED + shadow（false)

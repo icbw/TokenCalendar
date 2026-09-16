@@ -40,6 +40,10 @@ pub struct Batch {
     pub sessions: BTreeMap<(String, String), SessionRow>,
     /// 整会话重建（ZCode 按会话重算覆盖）——提交时先清该会话原始轮行。
     pub replaced_sessions: BTreeSet<(String, String)>,
+    /// 已计行 （agent, 行 uuid, 归属会话)——Claude 续聊 / fork 副本文件跨文件去重的键（INSERT OR IGNORE）。
+    pub seen_lines: Vec<(String, String, String)>,
+    /// 会话别名 （agent, 副本文件的 sessionId, 根会话)——子会话 parent 与查询层按别名归根。
+    pub session_aliases: Vec<(String, String, String)>,
 }
 
 impl Batch {
@@ -311,7 +315,8 @@ pub struct Store {
 /// v7 / v8 / v9 均未发布即被取代（补齐轮 / 会话列与原始层;S3 两个轮次;
 /// S4-R 中止与错误分列:turn_raw / turn 加 aborted、daily_project 加 aborted_count）,
 /// 用户 6 → 10 一次清库。v11 = daily_usage 加 `credit`（源本地积分,取代官网导出导入）→ 清库重扫。
-pub const SCHEMA_VERSION: i64 = 11;
+/// v12 = Claude Code 续聊 / fork 副本文件按行 uuid 折进根会话（新表 seen_line / session_alias）→ 清库重扫。
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// 迁移时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
 /// （迁移曾漏重建 source_cursor;由测试 `reset_drop_and_create_lists_match` 守护）。
@@ -324,6 +329,8 @@ const RESET_TABLES: &[&str] = &[
     "turn_part",
     "turn",
     "daily_project",
+    "seen_line",
+    "session_alias",
 ];
 
 const RESET_SCHEMA: &str = "
@@ -464,6 +471,22 @@ CREATE TABLE IF NOT EXISTS daily_project (
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     total_tokens   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, agent_key, model_key, project_key)
+);
+-- v12:已计行（派生数据）。Claude Code 续聊 / fork 把整份历史复制进新会话文件（行 uuid 不变、sessionId 改写）,
+-- 采集器按行 uuid 跨文件去重:首个带 uuid 的行已被别的会话计过 → 整个文件是该根会话的续篇。
+CREATE TABLE IF NOT EXISTS seen_line (
+    agent_key   TEXT NOT NULL,
+    uuid        TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    PRIMARY KEY (agent_key, uuid)
+);
+CREATE INDEX IF NOT EXISTS seen_line_by_session ON seen_line (agent_key, session_id);
+-- v12:会话别名:副本文件自己的 sessionId → 根会话（子会话 parent 归根、查询层按别名归根）。
+CREATE TABLE IF NOT EXISTS session_alias (
+    agent_key   TEXT NOT NULL,
+    alias       TEXT NOT NULL,
+    root        TEXT NOT NULL,
+    PRIMARY KEY (agent_key, alias)
 );";
 
 
@@ -539,6 +562,8 @@ impl Store {
         // ZCode 子会话不计 request_count → 清库重扫。
         // v11 = daily_usage 加 credit（CodeBuddy / WorkBuddy 源本地积分;官网导出导入与 request_model 退役)
         // → 清库重扫。
+        // v12 = Claude Code 续聊 / fork 副本文件折进根会话（seen_line 已计行 + session_alias 别名;
+        // 复轮数 / token 跨文件重复计数)→ 清库重扫。
         // v8 = （未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
         // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
         // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
@@ -668,9 +693,49 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         }
+        // 已计行与会话别名（派生数据,与游标同事务;重复键忽略）。
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO seen_line (agent_key, uuid, session_id) VALUES (?1, ?2, ?3)")
+                .map_err(|e| e.to_string())?;
+            for (agent, uuid, session) in &batch.seen_lines {
+                stmt.execute(rusqlite::params![agent, uuid, session]).map_err(|e| e.to_string())?;
+            }
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO session_alias (agent_key, alias, root) VALUES (?1, ?2, ?3)")
+                .map_err(|e| e.to_string())?;
+            for (agent, alias, root) in &batch.session_aliases {
+                stmt.execute(rusqlite::params![agent, alias, root]).map_err(|e| e.to_string())?;
+            }
+        }
         // 轮 / 会话原始层 + 物化 + 项目维重算,与聚合和游标同一事务。
         super::task_store::apply(&tx, batch)?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// 某行 uuid 已被哪个会话计过（None = 未见过）。
+    pub fn seen_line_session(&self, agent: &str, uuid: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT session_id FROM seen_line WHERE agent_key = ?1 AND uuid = ?2", [agent, uuid], |r| r.get(0))
+            .ok()
+    }
+
+    /// 某会话已计过的全部行 uuid（续篇文件按此跳过复制的历史行;一个会话几千行量级）。
+    pub fn seen_lines_of(&self, agent: &str, session: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        if let Ok(mut stmt) = self.conn.prepare_cached("SELECT uuid FROM seen_line WHERE agent_key = ?1 AND session_id = ?2") {
+            if let Ok(rows) = stmt.query_map([agent, session], |r| r.get::<_, String>(0)) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+
+    /// 副本文件 sessionId → 根会话（无别名 = 自己就是根）。
+    pub fn session_root_alias(&self, agent: &str, alias: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT root FROM session_alias WHERE agent_key = ?1 AND alias = ?2", [agent, alias], |r| r.get(0))
+            .ok()
     }
 
     /// 采集成功后更新源状态（probe_status=ready，清除错误）。
@@ -723,8 +788,8 @@ impl Store {
     }
 
     /// 失效某源全部聚合：清该源 daily_usage、
-    /// hourly_usage、session / turn_raw / turn_part / turn / daily_project与全部游标,下轮 collect
-    /// 从头重读。同事务:半清状态不落盘。
+    /// hourly_usage、session / turn_raw / turn_part / turn / daily_project、seen_line / session_alias
+    /// 与全部游标,下轮 collect 从头重读。同事务:半清状态不落盘。
     pub fn invalidate_source(&mut self, source_id: &str) -> Result<u64, String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let n = tx
@@ -737,6 +802,8 @@ impl Store {
             "DELETE FROM turn_part WHERE agent_key = ?1",
             "DELETE FROM turn WHERE agent_key = ?1",
             "DELETE FROM daily_project WHERE agent_key = ?1",
+            "DELETE FROM seen_line WHERE agent_key = ?1",
+            "DELETE FROM session_alias WHERE agent_key = ?1",
             "DELETE FROM source_cursor WHERE source_id = ?1",
         ] {
             tx.execute(sql, [source_id]).map_err(|e| e.to_string())?;
@@ -1337,6 +1404,15 @@ impl Store {
         )
     }
 
+    /// v12 诊断:（已计行数, 会话别名数 = 被折进根会话的副本文件数)。
+    pub fn test_family_stats(&self, agent: &str) -> (i64, i64) {
+        let q = |sql: &str| self.conn.query_row(sql, [agent], |r| r.get::<_, i64>(0)).unwrap_or(-1);
+        (
+            q("SELECT COUNT(*) FROM seen_line WHERE agent_key = ?1"),
+            q("SELECT COUNT(*) FROM session_alias WHERE agent_key = ?1"),
+        )
+    }
+
     /// 子会话出现在任务列表里的个数（应恒为 0）。
     pub fn test_child_sessions_in_tasks(&self, agent: &str) -> i64 {
         self.conn
@@ -1748,6 +1824,45 @@ mod tests {
             assert!(table_columns(&store, "request_model").is_empty(), "对账账本退役");
         }
         for f in ["migrate10.db", "migrate10.db-wal", "migrate10.db-shm"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+
+    #[test]
+    fn migration_from_v11_adds_seen_line_and_session_alias() {
+        // v11 = 0.5.9 发布库:无 seen_line / session_alias → 清库重扫（Claude fork 副本折进根会话是口径变更）。
+        let dir = std::env::temp_dir().join(format!("tc_v12_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("migrate11.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let v11_schema = RESET_SCHEMA.split("-- v12:").next().unwrap().to_string();
+            assert!(!v11_schema.contains("seen_line") && !v11_schema.contains("session_alias"), "构造的 v11 schema 不应含新表");
+            conn.execute_batch(&format!(
+                "{v11_schema}
+                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-16','claude-code','m',10,1);
+                 INSERT INTO session (agent_key, session_id, project_key, started_at) VALUES ('claude-code','s1','p',1);
+                 INSERT INTO source_cursor VALUES ('claude-code','f','{{}}',1);
+                 CREATE TABLE project_meta (project_key TEXT PRIMARY KEY, alias TEXT, hidden INTEGER NOT NULL DEFAULT 0,
+                     merged_into TEXT, note TEXT, updated_at INTEGER NOT NULL);
+                 INSERT INTO project_meta (project_key, alias, updated_at) VALUES ('e:/p','Alias',1);
+                 PRAGMA user_version = 11;"
+            ))
+            .unwrap();
+        }
+        {
+            let store = Store::open(&db).unwrap();
+            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(store.get_cursor("claude-code", "f").is_none(), "游标清空 = 全量重扫");
+            assert!(store.export_rows("2026-09").unwrap().is_empty());
+            assert!(store.test_sessions("claude-code").is_empty());
+            assert!(!table_columns(&store, "seen_line").is_empty() && !table_columns(&store, "session_alias").is_empty());
+            let alias: String = store.conn.query_row("SELECT alias FROM project_meta WHERE project_key = 'e:/p'", [], |r| r.get(0)).unwrap();
+            assert_eq!(alias, "Alias", "常驻表跨清库保留");
+        }
+        for f in ["migrate11.db", "migrate11.db-wal", "migrate11.db-shm"] {
             let _ = std::fs::remove_file(dir.join(f));
         }
     }

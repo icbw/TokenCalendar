@@ -174,6 +174,69 @@ pub struct DaySpan {
     pub last_day: String,
 }
 
+// ---------- 项目推进时间轴契约（snake_case 直供命令层） ----------
+
+/// Project × Day 看板的一格：当日该有效项目的活动摘要（只含有活动的日,未来日恒不出现）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TimelineCell {
+    pub day: String,
+    pub turns: i64,
+    pub tokens: i64,
+    pub wall_ms: i64,
+    pub idle_ms: i64,
+    /// 当日有轮的根会话数（= items.len;物化层 `turn`,子会话已并入父轮）。
+    pub sessions: i64,
+    /// 当日出现的 agent 展示名（去重,按键排序）。
+    pub agents: Vec<String>,
+    /// 当日各根会话（**最新开始的在前**,前端纵向视图按会话向下拆格;横向取首条 + `+N`）。
+    pub items: Vec<TimelineSession>,
+}
+
+/// 格子内的一条会话。`title` 是内容列,仅本地可视化,禁止进入导出。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TimelineSession {
+    pub agent: String,
+    pub session_id: String,
+    /// 空 / NULL → 前端回退到 `started_at` 的时刻（与 Tasks 视图 `LabelMode='title'` 同口径）。
+    pub title: Option<String>,
+    /// 该会话当日首轮开始时刻（Unix 毫秒）。
+    pub started_at: i64,
+    /// 该会话当日最后活动时刻（末轮 ended_at,缺失时取 started_at：排序依据——「最新活动的
+    /// 会话」而不是「最新创建的会话」,与 Claude app 新消息置顶的原则一致）。
+    pub last_active_at: i64,
+    pub turns: i64,
+    pub tokens: i64,
+    pub wall_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineProject {
+    /// 有效项目键（合并目标 / `__scratch` / 原键）。
+    pub key: String,
+    /// alias 优先;无 alias 的同名末段退回完整路径（与 Matrix 项目维同口径）。
+    pub label: String,
+    /// 该项目全生命周期出现过的 agent 展示名。
+    pub agents: Vec<String>,
+    /// 项目生命周期（daily_project 全量首末日,**不受 from / to 限制**）。
+    pub first_day: Option<String>,
+    pub last_day: Option<String>,
+    /// today − last_day（天;last_day 在未来或缺失 → None）。
+    pub inactive_days: Option<i64>,
+    pub cells: Vec<TimelineCell>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimelineResult {
+    pub today: String,
+    /// from..to 逐日全列（含未来日）。
+    pub days: Vec<String>,
+    /// 可见项目,按 last_day 倒序（不裁剪数量——前端按 pin + 窗口容量裁）。
+    pub projects: Vec<TimelineProject>,
+}
+
+/// `get_project_timeline` 日跨度上限（含端点;看板首期 31 天,留余量防误用）。
+pub const TIMELINE_DAYS_MAX: usize = 366;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GapBucket {
     pub lo_ms: i64,
@@ -626,13 +689,186 @@ impl Store {
             _ => None,
         }
     }
+
+    /// 项目推进时间轴:from..to（含端点,本地日）内每个可见有效项目的逐日格子。
+    /// - 格子读 `daily_project`（token / turns 与 Matrix 项目维逐格守恒）,会话数与标题读物化层 `turn` + `session`;
+    /// - 项目集 = 经解析层的全部可见有效键（合并归目标 / 隐藏剔除 / Scratch 折叠与 Matrix 一致）,
+    ///   生命周期取 daily_project 全量首末日,按 last_day 倒序;
+    /// - 标题 = 当日 Σwall 最大的根会话（并列取先开始者）的 `session.title`;
+    /// - 未来日不产生格子（daily_project 本就没有未来行）;`days` 仍逐日全列。
+    /// 参数非法（日期格式 / from > to / 跨度超上限）→ None。只读,不动 schema。
+    pub fn project_timeline(&self, from: &str, to: &str, today: NaiveDate, rule: &ScratchRule) -> Option<TimelineResult> {
+        let days = day_axis(from, to)?;
+        if days.is_empty() || days.len() > TIMELINE_DAYS_MAX {
+            return None;
+        }
+        let cte = resolve_cte(rule);
+        // 1) 项目行:全生命周期首末日 + 出现过的 agent（不受范围限制）
+        let sql = format!(
+            "WITH {cte}
+             SELECT p.eff_key, MIN(d.day), MAX(d.day), d.agent_key
+             FROM daily_project d JOIN pmap p ON p.raw_key = d.project_key
+             GROUP BY p.eff_key, d.agent_key"
+        );
+        let mut stmt = self.conn().prepare(&sql).ok()?;
+        struct Row {
+            first: String,
+            last: String,
+            agents: Vec<String>,
+        }
+        let mut projects: BTreeMap<String, Row> = BTreeMap::new();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))
+            .ok()?;
+        for (key, first, last, agent) in rows.flatten() {
+            let row = projects.entry(key).or_insert_with(|| Row { first: first.clone(), last: last.clone(), agents: Vec::new() });
+            if first < row.first {
+                row.first = first;
+            }
+            if last > row.last {
+                row.last = last;
+            }
+            row.agents.push(agent);
+        }
+        drop(stmt);
+        // 2) 格子:按 （eff_key, day, agent) 汇总 daily_project
+        let sql = format!(
+            "WITH {cte}
+             SELECT p.eff_key, d.day, d.agent_key, SUM(d.turns), SUM(d.total_tokens), SUM(d.wall_ms), SUM(d.idle_ms)
+             FROM daily_project d JOIN pmap p ON p.raw_key = d.project_key
+             WHERE d.day >= ?1 AND d.day <= ?2
+             GROUP BY p.eff_key, d.day, d.agent_key"
+        );
+        let mut stmt = self.conn().prepare(&sql).ok()?;
+        let mut cells: BTreeMap<(String, String), TimelineCell> = BTreeMap::new();
+        let rows = stmt
+            .query_map([from, to], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .ok()?;
+        for (key, day, agent, turns, tokens, wall_ms, idle_ms) in rows.flatten() {
+            let cell = cells.entry((key, day.clone())).or_insert_with(|| TimelineCell {
+                day,
+                turns: 0,
+                tokens: 0,
+                wall_ms: 0,
+                idle_ms: 0,
+                sessions: 0,
+                agents: Vec::new(),
+                items: Vec::new(),
+            });
+            cell.turns += turns;
+            cell.tokens += tokens;
+            cell.wall_ms += wall_ms;
+            cell.idle_ms += idle_ms;
+            cell.agents.push(agent);
+        }
+        drop(stmt);
+        // 3) 会话列表:按 （eff_key, day, 会话) 汇总物化层 turn,关联 session.title。
+        //    Claude Code 续聊 / fork 会把整份
+        //    历史复制成新 session_id（同标题三个会话 `session.started_at` 逐毫秒相同,轮数 4 / 14 / 15
+        //    递增）。同 （agent, session.started_at) 的会话视为同一对话,只保留**最后活动最新**的那份;
+        //    排序也改按最后活动时刻（末轮 ended_at）而不是创建时刻。
+        let sql = format!(
+            "WITH {cte}
+             SELECT p.eff_key, t.day, t.agent_key, t.session_id, s.title, MIN(t.started_at),
+                    MAX(COALESCE(t.ended_at, t.started_at)), COUNT(*), SUM(t.total_tokens), SUM(COALESCE(t.wall_ms, 0)),
+                    COALESCE(s.started_at, MIN(t.started_at))
+             FROM turn t JOIN pmap p ON p.raw_key = t.project_key
+                  JOIN session s ON s.agent_key = t.agent_key AND s.session_id = t.session_id
+             WHERE t.day >= ?1 AND t.day <= ?2
+             GROUP BY p.eff_key, t.day, t.agent_key, t.session_id"
+        );
+        let mut stmt = self.conn().prepare(&sql).ok()?;
+        let rows = stmt
+            .query_map([from, to], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(10)?,
+                    TimelineSession {
+                        agent: r.get(2)?,
+                        session_id: r.get(3)?,
+                        title: r.get::<_, Option<String>>(4)?.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+                        started_at: r.get(5)?,
+                        last_active_at: r.get(6)?,
+                        turns: r.get(7)?,
+                        tokens: r.get(8)?,
+                        wall_ms: r.get(9)?,
+                    },
+                ))
+            })
+            .ok()?;
+        // 去重键 （eff_key, day, agent, session.started_at) → 保留最后活动最新（并列取轮数多）的一份
+        let mut dedup: BTreeMap<(String, String, String, i64), TimelineSession> = BTreeMap::new();
+        for (key, day, session_started, item) in rows.flatten() {
+            let k = (key, day, item.agent.clone(), session_started);
+            match dedup.get(&k) {
+                Some(cur) if (cur.last_active_at, cur.turns) >= (item.last_active_at, item.turns) => {}
+                _ => {
+                    dedup.insert(k, item);
+                }
+            }
+        }
+        let mut items: Vec<((String, String), TimelineSession)> = dedup.into_iter().map(|((key, day, _, _), it)| ((key, day), it)).collect();
+        // 最新活动在前（并列按 agent / session_id 稳定）
+        items.sort_by(|a, b| b.1.last_active_at.cmp(&a.1.last_active_at).then_with(|| a.1.agent.cmp(&b.1.agent)).then_with(|| a.1.session_id.cmp(&b.1.session_id)));
+        for (k, item) in items {
+            if let Some(cell) = cells.get_mut(&k) {
+                cell.sessions += 1;
+                cell.items.push(item);
+            }
+        }
+        drop(stmt);
+        // 4) 组装:标签、agent 展示名、未动天数、按 last_day 倒序
+        let keys: Vec<String> = projects.keys().cloned().collect();
+        let labels: HashMap<String, String> = keys.iter().cloned().zip(project_labels(&keys, &self.project_aliases())).collect();
+        let mut cells_by_key: BTreeMap<String, Vec<TimelineCell>> = BTreeMap::new();
+        for ((key, _), mut cell) in cells {
+            cell.agents.sort();
+            cell.agents.dedup();
+            cell.agents = cell.agents.iter().map(|a| agent_label(a)).collect();
+            for it in &mut cell.items {
+                it.agent = agent_label(&it.agent);
+            }
+            cells_by_key.entry(key).or_default().push(cell);
+        }
+        let mut out: Vec<TimelineProject> = projects
+            .into_iter()
+            .map(|(key, mut row)| {
+                row.agents.sort();
+                row.agents.dedup();
+                let last = NaiveDate::parse_from_str(&row.last, "%Y-%m-%d").ok();
+                let inactive_days = last.map(|d| (today - d).num_days()).filter(|n| *n >= 0);
+                TimelineProject {
+                    label: labels.get(&key).cloned().unwrap_or_else(|| key.clone()),
+                    agents: row.agents.iter().map(|a| agent_label(a)).collect(),
+                    first_day: Some(row.first),
+                    last_day: Some(row.last),
+                    inactive_days,
+                    cells: cells_by_key.remove(&key).unwrap_or_default(),
+                    key,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.last_day.cmp(&a.last_day).then_with(|| a.key.cmp(&b.key)));
+        Some(TimelineResult { today: today.format("%Y-%m-%d").to_string(), days, projects: out })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collector::store::{Batch, SessionRow, Tokens, TurnPart, TurnRow};
-    use crate::collector::project_meta::ScratchRule;
+    use crate::collector::project_meta::{ProjectMetaInput, ScratchRule};
 
     const OFF: &ScratchRule = &ScratchRule::OFF;
 
@@ -955,6 +1191,119 @@ mod tests {
             .task_list(0, i64::MAX, &TaskFilters::default(), &TaskSort { field: "aborted_count".into(), direction: "desc".into() }, &TaskPageReq::default(), OFF)
             .unwrap();
         assert_eq!(sorted.total, 1);
+    }
+
+    // ---------- PHASE14 S2 项目推进时间轴 ----------
+
+    fn tl(s: &Store, from: &str, to: &str) -> TimelineResult {
+        s.project_timeline(from, to, today(), OFF).unwrap()
+    }
+
+    #[test]
+    fn timeline_cells_conserve_and_future_days_are_empty() {
+        let s = fixture();
+        let d0 = day_of(T);
+        let d1 = day_of(T + 86_400_000);
+        let r = tl(&s, "2026-09-01", "2026-10-01");
+        assert_eq!((r.today.as_str(), r.days.len(), r.days[0].as_str()), ("2026-09-30", 31, "2026-09-01"));
+        assert_eq!(r.projects.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(), vec!["d:/other/app", "e:/work/app"], "按 last_day 倒序");
+        let app = &r.projects[1];
+        assert_eq!((app.first_day.as_deref(), app.last_day.as_deref()), (Some(d0.as_str()), Some(d0.as_str())));
+        assert_eq!(app.cells.len(), 1, "只含有活动的日;未来日与无记录日不出格子");
+        let c = &app.cells[0];
+        // token / turns 与 Matrix 项目维同日守恒（子会话 token 计入其项目,轮只算根会话）
+        assert_eq!((c.day.as_str(), c.tokens, c.turns, c.sessions), (d0.as_str(), 100 + 50 + 10 + 7, 3, 1));
+        assert_eq!(c.agents, vec!["Claude Code"]);
+        assert_eq!(c.items.len(), 1, "子会话不单列");
+        assert_eq!((c.items[0].title.as_deref(), c.items[0].started_at, c.items[0].turns, c.items[0].agent.as_str()), (Some("<title 1>"), T, 3, "Claude Code"));
+        let other = &r.projects[0];
+        assert_eq!((other.cells[0].day.as_str(), other.cells[0].tokens, other.cells[0].items[0].title.as_deref()), (d1.as_str(), 300, None), "无标题会话 title=None,前端回退时刻");
+        assert_eq!(other.cells[0].items[0].started_at, T + 86_400_000);
+        // 范围裁剪:只查 d1 一天 → app 无格子但仍在项目列表（生命周期不受范围限制）
+        let narrow = tl(&s, &d1, &d1);
+        assert_eq!(narrow.projects.iter().map(|p| (p.key.as_str(), p.cells.len())).collect::<Vec<_>>(), vec![("d:/other/app", 1), ("e:/work/app", 0)]);
+        // 非法参数
+        assert!(s.project_timeline("2026-09-10", "2026-09-01", today(), OFF).is_none());
+        assert!(s.project_timeline("2026-09-x", "2026-09-01", today(), OFF).is_none());
+        assert!(s.project_timeline("2020-01-01", "2026-09-01", today(), OFF).is_none(), "跨度超上限");
+        assert!(Store::open_in_memory().unwrap().project_timeline("2026-09-01", "2026-09-02", today(), OFF).unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn timeline_inactive_days_from_today() {
+        let s = fixture();
+        let r = tl(&s, "2026-09-01", "2026-09-30");
+        // today = 2026-09-30;d:/other/app 末日 = T+1 天
+        let d1 = NaiveDate::parse_from_str(&day_of(T + 86_400_000), "%Y-%m-%d").unwrap();
+        assert_eq!(r.projects[0].inactive_days, Some((today() - d1).num_days()));
+        let d0 = NaiveDate::parse_from_str(&day_of(T), "%Y-%m-%d").unwrap();
+        assert_eq!(r.projects[1].inactive_days, Some((today() - d0).num_days()));
+        // today 早于 last_day（时钟回拨）→ None 而不是负数
+        let back = s.project_timeline("2026-09-01", "2026-09-30", NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), OFF).unwrap();
+        assert!(back.projects.iter().all(|p| p.inactive_days.is_none()));
+    }
+
+    #[test]
+    fn timeline_sessions_listed_latest_first() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mut b = Batch::default();
+        // 同项目同日两会话:a 一轮（先开始）,b 两轮（后开始）→ items = [b, a]（最新在前）
+        session(&mut b, "claude-code", "a", "e:/p", None, Some("short one"));
+        add(&mut b, Turn { agent: "claude-code", sid: "a", seq: 1, start: T, gap: None, project: "e:/p", model: "m", tokens: 1, mark: 1 });
+        session(&mut b, "claude-code", "b", "e:/p", None, Some("long one"));
+        add(&mut b, Turn { agent: "claude-code", sid: "b", seq: 1, start: T + 10_000, gap: None, project: "e:/p", model: "m", tokens: 1, mark: 1 });
+        add(&mut b, Turn { agent: "claude-code", sid: "b", seq: 2, start: T + 20_000, gap: Some(8_000), project: "e:/p", model: "m", tokens: 1, mark: 1 });
+        s.commit("claude-code", &b).unwrap();
+        let r = tl(&s, "2026-09-01", "2026-09-30");
+        let c = &r.projects[0].cells[0];
+        assert_eq!((c.sessions, c.turns), (2, 3));
+        assert_eq!(c.items.iter().map(|i| (i.title.as_deref(), i.started_at, i.turns, i.tokens)).collect::<Vec<_>>(), vec![(Some("long one"), T + 10_000, 2, 2), (Some("short one"), T, 1, 1)]);
+        assert_eq!(c.items[0].last_active_at, T + 22_000, "最后活动 = 末轮 ended_at");
+    }
+
+    #[test]
+    fn timeline_forked_sessions_collapse_into_one_item() {
+        // Claude Code 续聊 fork：三个 session_id 复制同一份历史（session.started_at 相同,轮数递增）
+        let mut s = Store::open_in_memory().unwrap();
+        let mut b = Batch::default();
+        for (sid, turns) in [("f1", 1), ("f2", 3), ("f3", 2)] {
+            b.upsert_session("claude-code", SessionRow { session_id: sid.into(), project_key: Some("e:/p".into()), title: Some("same chat".into()), started_at: Some(T), ..SessionRow::default() });
+            for i in 0..turns {
+                add(&mut b, Turn { agent: "claude-code", sid, seq: i + 1, start: T + i * 60_000, gap: None, project: "e:/p", model: "m", tokens: 1, mark: 1 });
+            }
+        }
+        // 另一条真正独立的会话（不同 started_at）
+        session(&mut b, "claude-code", "g", "e:/p", None, Some("other"));
+        add(&mut b, Turn { agent: "claude-code", sid: "g", seq: 1, start: T + 5_000, gap: None, project: "e:/p", model: "m", tokens: 1, mark: 1 });
+        s.commit("claude-code", &b).unwrap();
+        let r = tl(&s, "2026-09-01", "2026-09-30");
+        let c = &r.projects[0].cells[0];
+        assert_eq!(c.sessions, 2, "三份 fork 折成一条 + 一条独立会话");
+        assert_eq!(c.items.iter().map(|i| (i.session_id.as_str(), i.turns)).collect::<Vec<_>>(), vec![("f2", 3), ("g", 1)], "保留最后活动最新的 fork,最新活动在前");
+    }
+
+    #[test]
+    fn timeline_merge_folds_cells_into_target() {
+        let mut s = fixture();
+        let d0 = day_of(T);
+        let d1 = day_of(T + 86_400_000);
+        s.merge_projects(&["d:/other/app".to_string()], "e:/work/app").unwrap();
+        let r = tl(&s, "2026-09-01", "2026-09-30");
+        assert_eq!(r.projects.len(), 1);
+        let p = &r.projects[0];
+        assert_eq!((p.key.as_str(), p.first_day.as_deref(), p.last_day.as_deref()), ("e:/work/app", Some(d0.as_str()), Some(d1.as_str())));
+        assert_eq!(p.agents, vec!["Claude Code", "Codex"]);
+        assert_eq!(p.cells.iter().map(|c| (c.day.as_str(), c.tokens)).collect::<Vec<_>>(), vec![(d0.as_str(), 167), (d1.as_str(), 300)]);
+        assert_eq!(p.cells[1].agents, vec!["Codex"]);
+        assert_eq!(p.label, "app", "合并后无同名冲突,退回末段");
+    }
+
+    #[test]
+    fn timeline_hidden_project_is_absent() {
+        let mut s = fixture();
+        s.set_project_meta(&ProjectMetaInput { project_key: "d:/other/app".into(), hidden: true, ..Default::default() }).unwrap();
+        let r = tl(&s, "2026-09-01", "2026-09-30");
+        assert_eq!(r.projects.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(), vec!["e:/work/app"]);
     }
 
     #[test]

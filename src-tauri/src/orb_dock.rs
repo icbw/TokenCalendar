@@ -317,6 +317,10 @@ mod win {
     /// WM_MOUSEMOVE——「指针让出」的一条低成本触发点：从主体滑入画布时光标没有
     /// 离开本窗口矩形,系统不会重询命中测试,只有本窗口自己的鼠标消息能捕获越界。
     const WM_MOUSEMOVE: u32 = 0x0200;
+    /// WM_SETTINGCHANGE——系统设置广播（本模块只关心「辅助功能 → 文本大小」：
+    /// WebView2 会随之改整体缩放,本模块的物理换算系数要跟着刷,见 `text_scale.rs`）。
+    /// 任一顶层窗口都会收到,orb 常驻且已子类化,就借它接;处理后照常交给 tao。
+    const WM_SETTINGCHANGE: u32 = 0x001A;
     /// 非客户区绘制消息——本窗口的非客户区
     /// 由 tao 的 WM_NCCALCSIZE 声明为零,这些消息一律不许画：
     /// - `WM_NCPAINT`：旧式框架绘制入口（DefWindowProc 按**样式**画标题栏/边框,
@@ -568,6 +572,13 @@ mod win {
             // 激活态变化照常交给 tao（它据 wParam 维护焦点事件）,但 lParam 改成
             // -1：DefWindowProc 据此**只改状态、不重绘**非客户区。
             return DefSubclassProc(hwnd, msg, wparam, -1);
+        } else if msg == WM_SETTINGCHANGE {
+            // 文本大小等系统设置变更：刷新缓存系数;真变了就按新系数重放归位意图
+            // （窗口尺寸 = CSS × DPI × 文本缩放要重写;让出区域由轮询对账自愈）。
+            // 非文本缩放的设置变更也会走到,代价只是一次注册表读。
+            if crate::text_scale::refresh() {
+                schedule_replay(hwnd);
+            }
         } else if msg == WM_ENTERSIZEMOVE {
             set_in_move_loop(true);
             remember_drag_origin();
@@ -652,7 +663,9 @@ mod win {
             };
             // rcWork 走 Win32（tauri 的 Monitor 只有显示器矩形,没有工作区）
             let work = monitor_work_at(p.x + w / 2, p.y + h / 2).unwrap_or(rect);
-            out.push(Screen { rect, work, scale: m.scale_factor() });
+            // 文本缩放乘进屏 scale（text_scale.rs）：WebView 内容按 DPI × 文本缩放渲染,
+            // 本模块的「逻辑像素」= CSS 像素,物理换算必须带上它,否则主体/区域错位。
+            out.push(Screen { rect, work, scale: m.scale_factor() * crate::text_scale::factor() });
         }
         out
     }
@@ -1132,10 +1145,12 @@ mod win {
     fn window_dpi_scale(window: &WebviewWindow) -> f64 {
         let Ok(hwnd) = window.hwnd() else { return 1.0 };
         let dpi = unsafe { GetDpiForWindow(hwnd.0 as HWND) };
+        // 同 `screens`：乘上文本缩放（CSS 像素 = 逻辑像素 × 文本缩放）。
+        let text = crate::text_scale::factor();
         if dpi == 0 {
-            1.0
+            text
         } else {
-            f64::from(dpi) / 96.0
+            f64::from(dpi) / 96.0 * text
         }
     }
 

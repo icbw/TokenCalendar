@@ -23,6 +23,8 @@ const ID_TOGGLE_WIDGET: &str = "toggle_widget";
 const ID_TOGGLE_MAIN: &str = "toggle_main";
 /// 悬浮球显隐（第三勾选项）。
 const ID_TOGGLE_ORB: &str = "toggle_orb";
+/// 项目推进时间轴显隐（第四勾选项）。
+const ID_TOGGLE_TIMELINE: &str = "toggle_timeline";
 const ID_QUIT: &str = "quit";
 
 /// 托盘勾选项句柄：显隐变更时同步勾选态（避免重建菜单）。
@@ -30,6 +32,7 @@ pub struct TrayHandles {
     pub widget: CheckMenuItem<Wry>,
     pub main: CheckMenuItem<Wry>,
     pub orb: CheckMenuItem<Wry>,
+    pub timeline: CheckMenuItem<Wry>,
 }
 
 pub fn init(app: &AppHandle) -> Result<(), tauri::Error> {
@@ -58,15 +61,29 @@ pub fn init(app: &AppHandle) -> Result<(), tauri::Error> {
         state.orb_visible.load(Ordering::SeqCst),
         None::<&str>,
     )?;
+    let toggle_timeline = CheckMenuItem::with_id(
+        app,
+        ID_TOGGLE_TIMELINE,
+        "时间轴 Timeline",
+        true,
+        state.timeline_visible.load(Ordering::SeqCst),
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(app, ID_QUIT, "退出 TokenCalendar", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu =
-        Menu::with_items(app, &[&toggle_widget, &toggle_main, &toggle_orb, &sep, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[&toggle_widget, &toggle_main, &toggle_orb, &toggle_timeline, &sep, &quit_item],
+    )?;
 
     // 句柄存入 AppState，供 sync_checks 在任何显隐路径上更新勾选态
     if let Some(s) = app.try_state::<AppState>() {
-        *s.tray.lock().unwrap() =
-            Some(TrayHandles { widget: toggle_widget, main: toggle_main, orb: toggle_orb });
+        *s.tray.lock().unwrap() = Some(TrayHandles {
+            widget: toggle_widget,
+            main: toggle_main,
+            orb: toggle_orb,
+            timeline: toggle_timeline,
+        });
     }
 
     TrayIconBuilder::with_id(TRAY_ID)
@@ -82,6 +99,7 @@ pub fn init(app: &AppHandle) -> Result<(), tauri::Error> {
             ID_TOGGLE_WIDGET => tray_toggle(app, visibility::WIDGET_LABEL, "挂件"),
             ID_TOGGLE_MAIN => tray_toggle(app, visibility::MAIN_LABEL, "主窗口"),
             ID_TOGGLE_ORB => tray_toggle(app, visibility::ORB_LABEL, "悬浮球"),
+            ID_TOGGLE_TIMELINE => tray_toggle(app, visibility::TIMELINE_LABEL, "时间轴"),
             ID_QUIT => quit_app(app),
             _ => {}
         })
@@ -128,5 +146,8 @@ pub fn sync_checks(state: &tauri::State<'_, AppState>) {
         let _ = handles
             .orb
             .set_checked(state.orb_visible.load(Ordering::SeqCst));
+        let _ = handles
+            .timeline
+            .set_checked(state.timeline_visible.load(Ordering::SeqCst));
     }
 }

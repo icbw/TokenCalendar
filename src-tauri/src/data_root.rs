@@ -1,6 +1,5 @@
 //! 数据根目录解析。
 //!
-//! 分层：
 //! - **数据根** = 一切自有运行时数据（collector.db / prefs.json /
 //!   window-state.json / exports）的唯一父目录。
 //!   默认 `<exe 目录>\data`（安装版即 `D:\Program\TokenCalendar\data`）,

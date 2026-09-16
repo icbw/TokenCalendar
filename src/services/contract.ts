@@ -295,6 +295,55 @@ export interface DaySpanContract {
   last_day: string
 }
 
+// ---- 项目推进时间轴（与 commands.rs / collector/task_query.rs 对齐）----
+
+/** get_project_timeline（from, to):含端点,YYYY-MM-DD 本地日。 */
+export interface TimelineQueryArgs {
+  from: string
+  to: string
+}
+
+export interface TimelineCellContract {
+  day: string
+  turns: number
+  tokens: number
+  wall_ms: number
+  idle_ms: number
+  sessions: number
+  agents: string[]
+  /** 当日各根会话,最新开始的在前。 */
+  items: TimelineSessionContract[]
+}
+
+export interface TimelineSessionContract {
+  agent: string
+  session_id: string
+  /** 【内容列】空 / null 前端回退 started_at 的时刻。 */
+  title: string | null
+  started_at: number
+  /** 当日最后活动时刻（末轮 ended_at）;排序依据。 */
+  last_active_at: number
+  turns: number
+  tokens: number
+  wall_ms: number
+}
+
+export interface TimelineProjectContract {
+  key: string
+  label: string
+  agents: string[]
+  first_day: string | null
+  last_day: string | null
+  inactive_days: number | null
+  cells: TimelineCellContract[]
+}
+
+export interface TimelineResultContract {
+  today: string
+  days: string[]
+  projects: TimelineProjectContract[]
+}
+
 /** get_idle_threshold 返回。 */
 export interface IdleThresholdInfoContract {
   minutes: number

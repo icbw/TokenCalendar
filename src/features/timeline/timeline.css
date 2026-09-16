@@ -1,0 +1,405 @@
+/* 项目推进时间轴窗口样式（空壳 → S2 只读看板）。
+   透明前提：宿主 .timeline-shell 全透明,卡片即窗口（全出血,同挂件「窗口即卡片」
+）;边缘处置 = 挂件默认态原子组合（系统全静默 + CSS 全权,圆角由 CSS 独占,
+   见 chrome.rs apply_timeline_chrome）。
+   颜色：消费挂件派生变量（--widget-card-* 由 widgetTheme hook 写入,scheme 内置值
+   在 tokens.css）与主题 tokens（--accent 等）,选择器独立不复用 .shell / .is-widget。
+   拖动：只有 head 区挂 data-tauri-drag-region="deep"（逐元素挂载——
+   该属性只作用 mousedown target 不继承）;看板区是交互区。
+   看板：CSS Grid,横向 = 列 [项目标签 | 31 日],纵向 = 列 [日标签 | N 项目];
+   转置只换模板与元素顺序（TimelineWindow.tsx 组装）,选择器同一套。 */
+
+.timeline-shell {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  font-family: inherit;
+  color: var(--widget-card-text, var(--text));
+  /* 看板内部间距 / 线色单点定义 */
+  --tl-line: color-mix(in srgb, var(--widget-card-border) 70%, transparent);
+  --tl-line-future: color-mix(in srgb, var(--widget-card-border) 45%, transparent);
+  --tl-today-bg: color-mix(in srgb, var(--accent, #4f7cff) 10%, transparent);
+  --tl-cell-bg: color-mix(in srgb, var(--accent, #4f7cff) 14%, transparent);
+  --tl-cell-bg-hover: color-mix(in srgb, var(--accent, #4f7cff) 24%, transparent);
+}
+
+.timeline-card {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  /* 透明度 CSS 化（不装配材质 hook）;首期定值,条态 alpha 0.6 在 S4 */
+  background: rgba(var(--widget-card-bg) / 0.94);
+  border: 1px solid var(--widget-card-border);
+  border-radius: var(--widget-card-radius, 16px);
+  isolation: isolate;
+  overflow: hidden;
+}
+
+.timeline-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 14px 6px;
+  cursor: default;
+  user-select: none;
+  flex: none;
+}
+
+.timeline-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.timeline-hint {
+  font-size: 11px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+
+.timeline-hint.is-right {
+  margin-left: auto;
+}
+
+.timeline-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  /* 右缘留出图标列位置（SIDE_ICONS_PX） */
+  padding: 0 28px 8px 10px;
+  box-sizing: border-box;
+  /* 格子到最小尺寸后不再缩小 → 超出看板区滚动（纵向行高随内容,天数多时也靠它） */
+  overflow: auto;
+}
+
+/* ---------- 网格 ---------- */
+
+.tl-grid {
+  display: grid;
+  min-width: 100%;
+  gap: 3px 2px;
+  /* 横向：等分高度充满;纵向：行随内容,不拉伸 */
+  align-content: start;
+  box-sizing: border-box;
+  font-size: 11px;
+  line-height: 1.25;
+  user-select: none;
+}
+
+.tl-corner {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 日轴表头 / 日标签列 */
+.tl-day {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  border-bottom: 1px solid var(--tl-line);
+}
+.timeline-body.is-horizontal .tl-grid {
+  height: 100%;
+}
+.timeline-body.is-vertical .tl-day {
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 4px 6px 0 0;
+  border-bottom: none;
+  border-right: 1px solid var(--tl-line);
+}
+.tl-day.is-today {
+  color: var(--accent, #4f7cff);
+  font-weight: 600;
+  background: var(--tl-today-bg);
+  border-radius: 4px 4px 0 0;
+}
+.timeline-body.is-vertical .tl-day.is-today {
+  border-radius: 4px 0 0 4px;
+}
+.tl-day.is-future {
+  opacity: 0.55;
+  border-bottom-style: dashed;
+  border-right-style: dashed;
+}
+
+/* 项目行头（横向 = 行首;纵向 = 列首） */
+.tl-proj {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 22px 0 6px;
+  overflow: hidden;
+  border-right: 1px solid var(--tl-line);
+  cursor: default;
+}
+.timeline-body.is-vertical .tl-proj {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 2px;
+  padding: 0 6px;
+  border-right: none;
+  border-bottom: 1px solid var(--tl-line);
+}
+.tl-proj-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 12px;
+}
+.timeline-body.is-vertical .tl-proj-label {
+  flex: none;
+  text-align: center;
+}
+.tl-badge {
+  flex: none;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: var(--tl-line);
+  white-space: nowrap;
+}
+.timeline-body.is-vertical .tl-badge {
+  align-self: center;
+}
+/* pin 图标:hover 现,已置顶常显 */
+.tl-pin {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity var(--dur-fast, 0.12s) ease, color var(--dur-fast, 0.12s) ease;
+}
+.timeline-body.is-vertical .tl-pin {
+  right: 2px;
+  top: 2px;
+  transform: none;
+}
+.tl-proj:hover .tl-pin,
+.tl-pin.is-active {
+  opacity: 1;
+}
+.tl-pin:hover {
+  color: var(--widget-card-text, var(--text));
+}
+.tl-pin.is-active {
+  color: var(--accent, #4f7cff);
+}
+
+/* 格子。（空格子不画边框、有活动格上热力底）→ ：
+   纵向 = 项目管理视图,每日格按会话向下拆成多格（.tl-item,最新在前）,行高随内容、看板区
+   可滚动;横向 = 日程视图,每格只放最新会话 + `+N`,日列窄于 72px（.is-narrow）只显示轮数。
+   格子尺寸范围见 timelineConfig（模板 minmax）,窗口缩到最小尺寸后不再缩小。 */
+.tl-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.timeline-body.is-horizontal .tl-cell {
+  justify-content: center;
+}
+.tl-cell.is-empty.is-past {
+  background: color-mix(in srgb, var(--widget-card-border) 28%, transparent);
+}
+.tl-cell.is-today {
+  background: var(--tl-today-bg);
+}
+.tl-cell.is-today:not(.is-empty) {
+  box-shadow: inset 0 0 0 1px var(--accent, #4f7cff);
+}
+/* 会话格：一格一会话,热力底由 --tl-heat 与卡片底 color-mix 成实底 */
+.tl-item {
+  --tl-heat: 0.14;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 3px 6px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent, #4f7cff) calc(var(--tl-heat) * 100%), rgb(var(--widget-card-bg)));
+  cursor: default;
+}
+.timeline-body.is-horizontal .tl-item {
+  flex: 1;
+  min-height: 0;
+}
+.tl-item:hover {
+  background: color-mix(in srgb, var(--accent, #4f7cff) calc(var(--tl-heat) * 100% + 14%), rgb(var(--widget-card-bg)));
+}
+.tl-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.tl-item-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+/* 横向紧凑档：只显示轮数 */
+.tl-grid.is-narrow .tl-item {
+  align-items: center;
+  padding: 0 2px;
+}
+.tl-grid.is-narrow .tl-item-title {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tl-grid.is-narrow .tl-item-sub {
+  display: none;
+}
+
+/* ---------- 右缘图标开关（与矩阵 .matrix-side-icons / .matrix-panel-icon 同视觉） ---------- */
+
+.tl-side-icons {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 2;
+}
+.tl-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: transparent;
+  cursor: pointer;
+  transition: background var(--dur-fast, 0.12s) ease, color var(--dur-fast, 0.12s) ease;
+}
+.tl-icon:hover {
+  color: var(--widget-card-text, var(--text));
+  background: var(--tl-line);
+}
+.tl-icon.is-active {
+  color: var(--accent, #4f7cff);
+  background: var(--tl-today-bg);
+}
+
+/* ---------- hover 状态卡（常驻 DOM,只切可见性） ---------- */
+
+.tl-hover {
+  position: absolute;
+  z-index: 3;
+  width: 240px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--widget-card-border);
+  background: rgba(var(--widget-card-bg) / 0.98);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--dur-fast, 0.12s) ease;
+}
+.tl-hover.is-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+.tl-hover-title {
+  font-weight: 600;
+  font-size: 12px;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tl-hover-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.tl-hover-row > span:first-child {
+  flex: none;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+.tl-hover-row > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+.tl-hover-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.tl-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--widget-card-border);
+  background: transparent;
+  color: var(--widget-card-text, var(--text));
+  cursor: pointer;
+}
+.tl-btn:hover:not(:disabled) {
+  background: var(--tl-line);
+}
+.tl-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- 空态 ---------- */
+
+.tl-empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}

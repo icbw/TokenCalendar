@@ -141,6 +141,25 @@ export interface DesignPrefs {
   scratchMinSessions?: number
   scratchMinTurns?: number
   scratchUnknown?: boolean
+  /** 时间轴置顶项目:**原始目录键**列表（读时经 list_project_meta 的 effective_key 解析,
+   * merge 后不孤儿;匹配不到的键静默忽略不删除）。undefined = 无置顶。主窗口 ProjectManager 与
+   * timeline 窗口共享本键,经 storage 桥跨窗口即时同步。 */
+  timelinePinnedKeys?: string[]
+  /** 看板方向:horizontal（时间为 X、项目为行,默认）⇄ vertical（项目为列,时间向下）。 */
+  timelineOrientation?: 'horizontal' | 'vertical'
+  /** ：最多显示的项目数（1〜50,0 = 不限只按窗口容量;undefined = 8）、
+   * 过去 / 未来天数（0〜30;undefined = 7 / 7）。设置·General Timeline 段。 */
+  timelineMaxProjects?: number
+  timelinePastDays?: number
+  timelineFutureDays?: number
+  /** ：过去的日期每天只显示 timelinePastSessions 条会话（1〜10,undefined = 1）,
+   * 今天显示 timelineTodaySessions 条（1〜20,undefined = 5）;选哪几条按 timelinePick：latest = 最新的代表
+   * 一天（默认）/ earliest = 最早的几条代表一天 / longest = tokens 最多的代表一天。
+   * 格内与日期一律按时间从旧到新自上而下;timelineReverse = true 整体反转（最新在上）。 */
+  timelinePastSessions?: number
+  timelineTodaySessions?: number
+  timelinePick?: 'latest' | 'earliest' | 'longest'
+  timelineReverse?: boolean
 }
 
 const KEY = 'tokencalendar.design'
@@ -228,6 +247,39 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   if (p.scratchMinTurns !== undefined && !(typeof p.scratchMinTurns === 'number' && Number.isInteger(p.scratchMinTurns) && p.scratchMinTurns >= 1 && p.scratchMinTurns <= 500)) {
     delete p.scratchMinTurns
+  }
+  // 时间轴:置顶键 = 非空字符串数组（去重,单键 ≤ 1024 字符,最多 200 项）;方向只认两值。
+  if (p.timelinePinnedKeys !== undefined) {
+    if (Array.isArray(p.timelinePinnedKeys)) {
+      const seen = new Set<string>()
+      p.timelinePinnedKeys = p.timelinePinnedKeys
+        .filter((k): k is string => typeof k === 'string' && k.trim().length > 0 && k.length <= 1024)
+        .filter((k) => !seen.has(k) && seen.add(k))
+        .slice(0, 200)
+    } else {
+      delete p.timelinePinnedKeys
+    }
+  }
+  if (p.timelineOrientation !== undefined && p.timelineOrientation !== 'horizontal' && p.timelineOrientation !== 'vertical') {
+    delete p.timelineOrientation
+  }
+  if (p.timelineMaxProjects !== undefined && !(typeof p.timelineMaxProjects === 'number' && Number.isInteger(p.timelineMaxProjects) && p.timelineMaxProjects >= 0 && p.timelineMaxProjects <= 50)) {
+    delete p.timelineMaxProjects
+  }
+  for (const k of ['timelinePastDays', 'timelineFutureDays'] as const) {
+    if (p[k] !== undefined && !(typeof p[k] === 'number' && Number.isInteger(p[k]) && p[k] >= 0 && p[k] <= 30)) delete p[k]
+  }
+  if (p.timelinePastSessions !== undefined && !(typeof p.timelinePastSessions === 'number' && Number.isInteger(p.timelinePastSessions) && p.timelinePastSessions >= 1 && p.timelinePastSessions <= 10)) {
+    delete p.timelinePastSessions
+  }
+  if (p.timelineTodaySessions !== undefined && !(typeof p.timelineTodaySessions === 'number' && Number.isInteger(p.timelineTodaySessions) && p.timelineTodaySessions >= 1 && p.timelineTodaySessions <= 20)) {
+    delete p.timelineTodaySessions
+  }
+  if (p.timelinePick !== undefined && !['latest', 'earliest', 'longest'].includes(p.timelinePick as string)) {
+    delete p.timelinePick
+  }
+  if (p.timelineReverse !== undefined && typeof p.timelineReverse !== 'boolean') {
+    delete p.timelineReverse
   }
   // 应用更新开关：非布尔值视为未设置（回落默认开）。
   if (p.autoUpdate !== undefined && typeof p.autoUpdate !== 'boolean') {

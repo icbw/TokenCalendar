@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, projectService } from '../../services'
 import type { ProjectMetaList, ProjectMetaRow, ProjectStatus, ScratchRuleInfo, WriteResult } from '../../services'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
-import { setDesignPrefs } from '../settings/designPrefs'
+import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import './projects.css'
 
 type StatusFilter = 'all' | ProjectStatus
@@ -76,6 +76,15 @@ export default function ProjectManager({ active }: { active: boolean }) {
   // 规则阈值输入草稿（失焦 / 回车才提交;非法值回退）
   const [sessionsDraft, setSessionsDraft] = useState('')
   const [turnsDraft, setTurnsDraft] = useState('')
+
+  // 时间轴置顶（与 timeline 窗口共享 prefs timelinePinnedKeys,存原始目录键;
+  // storage 桥跨窗口同步——这里改 pin,timeline 窗口即时跟随）。
+  const [pins, setPins] = useState<string[]>(() => getDesignPrefs().timelinePinnedKeys ?? [])
+  useEffect(() => subscribeDesignPrefs((p) => setPins(p.timelinePinnedKeys ?? [])), [])
+  const togglePin = (key: string) => {
+    const cur = getDesignPrefs().timelinePinnedKeys ?? []
+    setDesignPrefs({ timelinePinnedKeys: cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key] })
+  }
 
   useEffect(() => {
     if (!active) return
@@ -505,6 +514,16 @@ export default function ProjectManager({ active }: { active: boolean }) {
                         {r.folderExists && (
                           <button className="pm-act" title="Open in File Explorer" onClick={() => void projectService.openProjectFolder(r.key).then((res) => !res.ok && setError(res.error))}>
                             Open folder
+                          </button>
+                        )}
+                        {r.effectiveKey !== null && (
+                          <button
+                            className={`pm-act${pins.includes(r.key) ? ' is-active' : ''}`}
+                            title={pins.includes(r.key) ? 'Remove from the top of the Timeline window' : 'Keep at the top of the Timeline window'}
+                            aria-pressed={pins.includes(r.key)}
+                            onClick={() => togglePin(r.key)}
+                          >
+                            {pins.includes(r.key) ? 'Unpin' : 'Pin to timeline'}
                           </button>
                         )}
                         {r.managed && (

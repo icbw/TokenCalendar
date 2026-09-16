@@ -197,6 +197,13 @@
   cursor: default;
 }
 
+/* 已置顶到时间轴的行,按钮高亮（同矩阵右缘开关的激活态语义） */
+.pm-act.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-weak);
+}
+
 .pm-act.is-muted {
   color: var(--text-muted);
 }

@@ -62,6 +62,40 @@ pub fn sort_by_mtime(files: &mut [PathBuf]) {
     files.sort_by_key(|p| generation(p).map(|(_, m)| m).unwrap_or(0));
 }
 
+/// v12（Claude 会话族排序）：（首个带 `uuid` 行的顶层 `timestamp`, 尾部最后一条带顶层 `timestamp` 行的时间),
+/// 毫秒;找不到 → 0。只读头 1MB / 尾 256KB（本机 58 个文件:首个 uuid 行偏移最大 57KB,
+/// 头部是 custom-title / mode / file-history-snapshot 等无 uuid 的元数据行）。
+pub fn head_tail_stamp(path: &Path) -> (i64, i64) {
+    const HEAD: u64 = 1024 * 1024;
+    const TAIL: u64 = 256 * 1024;
+    let Ok(mut file) = fs::File::open(path) else { return (0, 0) };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let parse = |line: &[u8]| serde_json::from_slice::<serde_json::Value>(line).ok();
+    let stamp = |v: &serde_json::Value| super::rfc3339_to_millis(v.get("timestamp")?.as_str()?);
+    let mut head = Vec::new();
+    if (&mut file).take(HEAD).read_to_end(&mut head).is_err() {
+        return (0, 0);
+    }
+    let first = head
+        .split(|&b| b == b'\n')
+        .filter(|l| l.windows(6).any(|w| w == b"\"uuid\"")) // 便宜预筛,再按顶层键确认
+        .filter_map(parse)
+        .filter(|v| v.get("uuid").is_some())
+        .find_map(|v| stamp(&v))
+        .unwrap_or(0);
+    let start = size.saturating_sub(TAIL);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut tail).is_err() {
+        return (first, 0);
+    }
+    let mut lines: Vec<&[u8]> = tail.split(|&b| b == b'\n').collect();
+    if start > 0 {
+        lines.remove(0); // 起点落在行中间:首段是残行
+    }
+    let last = lines.iter().rev().filter_map(|l| parse(l)).find_map(|v| stamp(&v)).unwrap_or(0);
+    (first, last)
+}
+
 /// 从 start_offset 续读一个 JSONL 文件到 EOF。
 /// 单轮字节上限保护：超过 max_bytes 停下（offset 停在完整行边界）,下轮续读。
 pub fn tail(path: &Path, start_offset: u64, max_bytes: u64) -> std::io::Result<Tail> {
@@ -174,6 +208,21 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn head_tail_stamp_skips_metadata_and_partial_lines() {
+        let t = TempFile::new("stamp.jsonl");
+        t.write("{\"type\":\"custom-title\",\"customTitle\":\"x\"}\n");
+        t.write("{\"type\":\"queue-operation\",\"timestamp\":\"2026-09-16T09:00:00.000Z\"}\n");
+        t.write("{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-09-16T09:10:52.759Z\"}\n");
+        t.write("{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2026-09-16T09:11:00.000Z\"}\n");
+        t.write("{\"type\":\"file-history-snapshot\",\"snapshot\":{\"timestamp\":\"2026-09-16T12:00:00.000Z\"}}\n");
+        t.write("{\"type\":\"last-prompt\"}\n");
+        let (first, last) = head_tail_stamp(&t.0);
+        assert_eq!(first, super::super::rfc3339_to_millis("2026-09-16T09:10:52.759Z").unwrap(), "首个带 uuid 行,不取 queue-operation");
+        assert_eq!(last, super::super::rfc3339_to_millis("2026-09-16T09:11:00.000Z").unwrap(), "尾部只认顶层 timestamp");
+        assert_eq!(head_tail_stamp(Path::new("definitely/missing.jsonl")), (0, 0));
     }
 
     #[test]

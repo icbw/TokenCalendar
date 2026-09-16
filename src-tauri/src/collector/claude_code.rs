@@ -27,8 +27,18 @@
 //! 会话：主文件 = `sessionId`（文件内首个）;`<session>/subagents/agent-*.jsonl` 为子会话
 //! （行带 `isSidechain` + `agentId`）,session_id = agentId、parent = sessionId,每条提示行开子轮。
 //! 标题（内容列）：`custom-title.customTitle` 优先于 `ai-title.aiTitle`。
+//!
+//! **v12 会话族折叠**：
+//! 桌面应用「续聊 / fork」把整份历史复制进新会话文件——复制行的 `uuid` / `message.id` / 时间戳与原文件
+//! 逐行一致;新版改写 `sessionId`（及用户行 `promptId`）,旧版（2.1.260）连 `sessionId` 都沿用根会话,
+//! 所以判族只看行 uuid;根文件在 fork 之后不再追加带时间戳的行。
+//! 口径：文件内**首个带 uuid 的主会话行**若已被计过 → 整个文件是该根会话的续篇:
+//! session_id 归根（`TurnState:fold_into`）、文件名主干作副本 id 记入 `session_alias`（子会话 parent 归根）、
+//! 只计未见过的 uuid（复制的历史行跳过:不开轮、不入账、不配对）、标题按最新文件覆盖。已计行持久化在
+//! `seen_line`（派生数据,随清库重扫）。文件按 （首个 uuid 行时间, 尾部时间) 升序处理,根文件先占 uuid
+//! （mtime 不可靠:根文件事后会被追加无时间戳的元数据行）。`/compact` 在同一文件内追加,不受影响。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -119,6 +129,38 @@ fn assistant_usage(v: &Value) -> Option<(String, u8, String, Tokens)> {
     Some((day, hour, model, tokens))
 }
 
+/// 一次 collect 内的会话族缓存：根文件与副本文件常在同一批处理,批内新记的行尚未落库,
+/// 库内查询只在「首个 uuid 行判定」与「续篇文件装根会话已计行」两处发生（每文件一次,不逐行查库）。
+#[derive(Default)]
+struct FamilyCache {
+    /// 本批新记的行 uuid → 归属会话。
+    new_seen: HashMap<String, String>,
+    /// 根会话 → 库内已计行（续篇文件按需装入）。
+    root_lines: HashMap<String, HashSet<String>>,
+    /// 副本 sessionId → 根会话（本批新记 + 库内查过的;None = 无别名）。
+    alias: HashMap<String, Option<String>>,
+}
+
+impl FamilyCache {
+    fn seen_session(&self, store: &Store, uuid: &str) -> Option<String> {
+        self.new_seen.get(uuid).cloned().or_else(|| store.seen_line_session(META.id, uuid))
+    }
+
+    fn is_seen(&mut self, store: &Store, root: &str, uuid: &str) -> bool {
+        if self.new_seen.contains_key(uuid) {
+            return true;
+        }
+        self.root_lines
+            .entry(root.to_string())
+            .or_insert_with(|| store.seen_lines_of(META.id, root))
+            .contains(uuid)
+    }
+
+    fn root_of(&mut self, store: &Store, sid: &str) -> Option<String> {
+        self.alias.entry(sid.to_string()).or_insert_with(|| store.session_root_alias(META.id, sid)).clone()
+    }
+}
+
 impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         let base = std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -129,16 +171,50 @@ impl ClaudeCodeAdapter {
     }
 
     /// 单行处理：会话 / 项目 / 标题元数据 + 轮事件 + token 入账（daily_usage 与 turn_part 同源）。
-    fn process_line(line: &str, cursor: &mut FileCursor, batch: &mut Batch, months: &mut BTreeSet<String>) {
+    /// 首个带 uuid 的主会话行判定会话族;续篇文件跳过已计过的行,其余带 uuid 的行记为已计。
+    /// `file_id` = 文件名主干（副本文件自己的会话 id;旧版副本连行内 sessionId 都沿用根会话,不能靠行判别名）。
+    fn process_line(
+        line: &str,
+        file_id: &str,
+        cursor: &mut FileCursor,
+        batch: &mut Batch,
+        months: &mut BTreeSet<String>,
+        store: &Store,
+        fam: &mut FamilyCache,
+    ) {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         let agent = META.id;
-        let st = &mut cursor.turn;
         let sidechain = v.get("isSidechain").and_then(|x| x.as_bool()).unwrap_or(false);
-        if let Some(sid) = v.get("sessionId").and_then(|x| x.as_str()) {
+        let line_sid = v.get("sessionId").and_then(|x| x.as_str());
+        let uuid = v.get("uuid").and_then(|x| x.as_str());
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(rfc3339_to_millis);
+        if let Some(t) = ts {
+            cursor.last_ts = cursor.last_ts.max(t);
+        }
+        // v12 会话族判定:首个带 uuid 的行。主会话行已被计过（不论行内 sessionId 是否改写:前的
+        // 副本沿用根会话的 sessionId,之后的改写成新 id）→ 本文件是该根会话的续篇;截断重读的文件由 collect
+        // 预先置已判定（自身重读不是副本）。子会话文件只置已判定。
+        if let (Some(u), false) = (uuid, cursor.family_resolved) {
+            cursor.family_resolved = true;
+            let root = if sidechain { None } else { fam.seen_session(store, u) };
+            if let Some(root) = root {
+                cursor.turn.fold_into(&root);
+                if file_id != root {
+                    batch.session_aliases.push((agent.to_string(), file_id.to_string(), root.clone()));
+                    fam.alias.insert(file_id.to_string(), Some(root.clone()));
+                    crate::dev_log!("[collector] claude-code fold {} -> {}", file_id, root);
+                }
+                cursor.family_root = Some(root);
+            }
+        }
+        let st = &mut cursor.turn;
+        if let Some(sid) = line_sid {
             match v.get("agentId").and_then(|x| x.as_str()).filter(|_| sidechain) {
                 Some(agent_id) => {
                     st.set_session(agent_id);
-                    st.set_parent(sid);
+                    // 副本文件下的子会话:parent 按别名归根
+                    let parent = fam.root_of(store, sid).unwrap_or_else(|| sid.to_string());
+                    st.set_parent(&parent);
                 }
                 None => st.set_session(sid),
             }
@@ -150,7 +226,18 @@ impl ClaudeCodeAdapter {
         if has_origin {
             st.drop_tentative = true;
         }
-        let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(rfc3339_to_millis);
+        // 续篇文件跳过复制的历史行;其余带 uuid 的行记为已计（归属 = 本文件会话:根 / 子会话）。
+        if let Some(u) = uuid {
+            if let Some(root) = cursor.family_root.as_deref() {
+                if fam.is_seen(store, root, u) {
+                    return;
+                }
+            }
+            if !st.session_id.is_empty() {
+                fam.new_seen.insert(u.to_string(), st.session_id.clone());
+                batch.seen_lines.push((agent.to_string(), u.to_string(), st.session_id.clone()));
+            }
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("custom-title") => {
                 if let Some(t) = v.get("customTitle").and_then(|x| x.as_str()) {
@@ -238,28 +325,50 @@ impl Adapter for ClaudeCodeAdapter {
         }
         let mut files = Vec::new();
         super::jsonl::discover(&self.projects_dir, true, &mut files);
-        super::jsonl::sort_by_mtime(&mut files);
+        // 按 （首个 uuid 行时间, 尾部时间, 路径) 升序——根文件先于其续聊 / fork 副本占 uuid。
+        // 排序键随游标持久化;只对未扫过且有新内容的文件读头尾（迁移清库后的首轮全量扫一次）。
+        let mut entries: Vec<(PathBuf, String, FileCursor)> = files
+            .into_iter()
+            .map(|path| {
+                let scope = path.display().to_string();
+                let mut cursor = load_cursor(store, META.id, &scope);
+                if cursor.first_ts == 0 && !cursor.up_to_date(&path) {
+                    let (first, last) = super::jsonl::head_tail_stamp(&path);
+                    cursor.first_ts = first;
+                    cursor.last_ts = last;
+                }
+                (path, scope, cursor)
+            })
+            .collect();
+        entries.sort_by(|a, b| (a.2.first_ts, a.2.last_ts, &a.0).cmp(&(b.2.first_ts, b.2.last_ts, &b.0)));
 
         let mut batch = Batch::default();
         let mut months = BTreeSet::new();
+        let mut fam = FamilyCache::default();
 
-        for path in files {
-            let scope = path.display().to_string();
-            let mut cursor = load_cursor(store, META.id, &scope);
+        for (path, scope, mut cursor) in entries {
             let Some(consume) = advance_file(&path, &mut cursor) else { continue };
             let mut cursor = if consume.reset {
                 let mut c = FileCursor::fresh();
                 c.model = cursor.model.clone();
+                c.first_ts = cursor.first_ts;
+                c.last_ts = cursor.last_ts;
+                // 截断重写的自身重读:行已在 seen_line 里,但不是副本 → 按根处理（既有限制:重计不回滚）
+                c.family_resolved = true;
                 c
             } else {
                 cursor
             };
             cursor.turn.set_file_scope(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let file_id = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             for line in &consume.lines {
-                Self::process_line(line, &mut cursor, &mut batch, &mut months);
+                Self::process_line(line, &file_id, &mut cursor, &mut batch, &mut months, store, &mut fam);
             }
-            // 文件末尾:落当前轮现状（轮不闭合,下批续累加后整行覆盖）
-            cursor.turn.flush(&mut batch, META.id);
+            // 文件末尾:落当前轮现状（轮不闭合,下批续累加后整行覆盖）。
+            // 会话族未判定（只有 custom-title 等头部元数据行）时不落会话行——副本文件的 sessionId 不能成会话。
+            if cursor.family_resolved {
+                cursor.turn.flush(&mut batch, META.id);
+            }
             cursor.offset = consume.new_offset;
             seal_cursor(&mut cursor, &path, &scope, &mut batch);
         }
@@ -417,6 +526,194 @@ mod tests {
         assert!(assistant_usage(&zero).is_none());
         let no_ts: Value = serde_json::from_str(r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}"#).unwrap();
         assert!(assistant_usage(&no_ts).is_none());
+    }
+
+    // ---------- v12 续聊 / fork 副本（2026-09-16 本机 11 个会话族实证:复制行只改 sessionId / promptId） ----------
+
+    const S2: &str = "0a1b2c3d-0000-4000-8000-000000000002";
+    /// 副本文件的行 = 原行改写 sessionId（uuid / message.id / timestamp 逐字不变）。
+    fn forked(line: &str) -> String {
+        line.replace(S, S2)
+    }
+    const TEXT: &str = r#"{"type":"text","text":"x"}"#;
+
+    /// 根文件:两轮 + 末尾一条未得响应的输入（实证:根文件末尾的 stop_hook / 中断行不被复制）。
+    fn root_lines() -> Vec<String> {
+        vec![
+            TITLE_CUSTOM.to_string(),
+            human("2026-09-05T10:00:00.000Z", Some("human")),
+            assistant("2026-09-05T10:00:05.000Z", "msg_a", TEXT, 100, 10),
+            human("2026-09-05T10:02:00.000Z", Some("human")),
+            assistant("2026-09-05T10:02:03.000Z", "msg_b", TEXT, 200, 20),
+            human("2026-09-05T10:05:00.000Z", Some("human")),
+        ]
+    }
+
+    /// fork 文件:头部元数据（新 sessionId）+ 复制根文件前 4 行 + 续写两轮。
+    fn fork_lines() -> Vec<String> {
+        let mut v = vec![
+            forked(r#"{"type":"custom-title","customTitle":"<fork title>","sessionId":"0a1b2c3d-0000-4000-8000-000000000001"}"#),
+            forked(r#"{"type":"mode","mode":"normal","sessionId":"0a1b2c3d-0000-4000-8000-000000000001"}"#),
+        ];
+        v.extend(root_lines()[1..5].iter().map(|l| forked(l)));
+        v.extend([
+            forked(&human("2026-09-05T10:10:00.000Z", Some("human"))),
+            forked(&assistant("2026-09-05T10:10:04.000Z", "msg_c", TEXT, 300, 30)),
+            forked(&human("2026-09-05T10:12:00.000Z", Some("human"))),
+            forked(&assistant("2026-09-05T10:12:02.000Z", "msg_d", TEXT, 400, 40)),
+        ]);
+        v
+    }
+
+    /// 多文件多批次采集:每批写（覆盖）给定文件后跑一次 collect;返回库与根目录（调用方负责删除）。
+    fn collect_files(tag: &str, batches: &[Vec<(&str, Vec<String>)>]) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tc_claude_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("projects").join("E--Projects-Demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let adapter = ClaudeCodeAdapter { projects_dir: dir.join("projects") };
+        let mut store = Store::open_in_memory().unwrap();
+        for batch in batches {
+            for (rel, lines) in batch {
+                let path = proj.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            }
+            assert!(adapter.collect(&mut store).is_ok());
+        }
+        (store, dir)
+    }
+
+    /// 计数摘要:(任务会话数, 物化轮数, request_count Σ, token Σ, 别名数, 已计行数)。
+    fn family_summary(store: &Store) -> (usize, usize, i64, i64, i64, i64) {
+        let turns = store.test_turns(META.id);
+        let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
+        let (seen, aliases) = store.test_family_stats(META.id);
+        (
+            store.test_task_sessions(META.id).len(),
+            turns.len(),
+            rows[0].message_counts.iter().sum::<i64>(),
+            rows[0].month_total,
+            aliases,
+            seen,
+        )
+    }
+
+    /// 全量重扫:根 + fork 副本 + fork 目录下的子代理同批出现,根文件 mtime 反而更新（实证:根文件事后被
+    /// 追加元数据行）→ 仍按首个 uuid 行时间先处理根;副本折进根会话,轮 / token 只计一份,子会话 parent 归根。
+    #[test]
+    fn fork_copies_fold_into_root_session() {
+        let root_rel = format!("{S}.jsonl");
+        let fork_rel = format!("{S2}.jsonl");
+        let sub_rel = format!("{S2}/subagents/agent-a1b2c3d4e5.jsonl");
+        let subagent = vec![
+            forked(&sub_line("2026-09-05T10:10:01.000Z", "prompt")),
+            forked(&sub_line("2026-09-05T10:10:02.000Z", "reply")),
+        ];
+        // 先写 fork 与子代理,最后写根并把 mtime 推到更晚:mtime 序 = fork 先,内容序 = 根先
+        let dir = std::env::temp_dir().join(format!("tc_claude_fork_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("projects").join("E--Projects-Demo");
+        std::fs::create_dir_all(proj.join(S2).join("subagents")).unwrap();
+        std::fs::write(proj.join(&fork_rel), fork_lines().join("\n") + "\n").unwrap();
+        std::fs::write(proj.join(&sub_rel), subagent.join("\n") + "\n").unwrap();
+        std::fs::write(proj.join(&root_rel), root_lines().join("\n") + "\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(proj.join(&root_rel)).unwrap().set_modified(later).unwrap();
+        let mut by_mtime = Vec::new();
+        super::super::jsonl::discover(&dir.join("projects"), true, &mut by_mtime);
+        super::super::jsonl::sort_by_mtime(&mut by_mtime);
+        assert!(by_mtime.last().unwrap().ends_with(&root_rel), "前提:按 mtime 根文件排最后");
+
+        let adapter = ClaudeCodeAdapter { projects_dir: dir.join("projects") };
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(adapter.collect(&mut store).is_ok());
+        assert!(adapter.collect(&mut store).is_ok(), "二次采集无新内容:幂等");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let sessions = store.test_sessions(META.id);
+        assert!(sessions.iter().all(|s| s.session_id != S2), "副本 sessionId 不成会话: {sessions:?}");
+        assert_eq!(store.test_task_sessions(META.id), vec![S.to_string()], "一个对话 = 一条任务会话");
+        let root = sessions.iter().find(|s| s.session_id == S).unwrap();
+        assert_eq!(root.title.as_deref(), Some("<fork title>"), "标题按最新文件覆盖");
+        assert_eq!((root.subagent_count, root.subagent_calls), (1, 1), "fork 目录下的子代理并入根会话");
+        let child = sessions.iter().find(|s| s.session_id == "a1b2c3d4e5").unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(S), "子会话 parent 按别名归根");
+
+        let turns = store.test_turns(META.id);
+        assert_eq!(turns.len(), 5, "根 3 轮（含末尾未响应的一轮）+ fork 续写 2 轮,复制的 2 轮不重复: {turns:?}");
+        assert!(turns.iter().all(|t| t.session_id == S));
+        let calls: Vec<i64> = turns.iter().map(|t| t.model_calls).collect();
+        assert_eq!(calls, vec![1, 1, 0, 1 + 1, 1], "第 4 轮含子代理调用");
+        assert_eq!(turns[2].aborted, false, "根文件末尾未响应的轮不判中止");
+        assert_eq!(turns.iter().map(|t| t.total_tokens).sum::<i64>(), 110 + 220 + 330 + 440 + 55, "token 只计一份");
+        let (tasks, rows, requests, tokens, aliases, seen) = family_summary(&store);
+        assert_eq!((tasks, rows, requests, tokens), (1, 5, 4, 110 + 220 + 330 + 440 + 55));
+        assert_eq!((aliases, seen), (1, 5 + 4 + 2), "一个别名;已计行 = 根 5 + fork 新 4 + 子代理 2");
+        assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
+    /// 增量采集:「先根后 fork」（真实顺序）与「先 fork 后根」（极端顺序）计数一致——只是根会话 id 不同。
+    #[test]
+    fn fork_incremental_orders_agree() {
+        let root_rel = format!("{S}.jsonl");
+        let fork_rel = format!("{S2}.jsonl");
+        let (a, dir_a) = collect_files(
+            "inc_root_first",
+            &[vec![(root_rel.as_str(), root_lines())], vec![(fork_rel.as_str(), fork_lines())]],
+        );
+        let (b, dir_b) = collect_files(
+            "inc_fork_first",
+            &[vec![(fork_rel.as_str(), fork_lines())], vec![(root_rel.as_str(), root_lines())]],
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let sa = family_summary(&a);
+        let sb = family_summary(&b);
+        assert_eq!(sa, sb, "两种到达顺序计数一致");
+        assert_eq!(sa, (1, 5, 4, 110 + 220 + 330 + 440, 1, 9));
+        assert_eq!(a.test_task_sessions(META.id), vec![S.to_string()], "真实顺序:根文件的 sessionId 是根");
+        assert_eq!(b.test_task_sessions(META.id), vec![S2.to_string()], "极端顺序:先到者为根,根文件成续篇");
+        assert!(a.test_project_conservation().is_empty() && b.test_project_conservation().is_empty());
+        // fork 文件再续写一轮:只计新行,不产生第二条会话
+        let (c, dir_c) = collect_files(
+            "inc_fork_grow",
+            &[
+                vec![(root_rel.as_str(), root_lines())],
+                vec![(fork_rel.as_str(), fork_lines())],
+                vec![(fork_rel.as_str(), {
+                    let mut v = fork_lines();
+                    v.push(forked(&human("2026-09-05T10:20:00.000Z", Some("human"))));
+                    v.push(forked(&assistant("2026-09-05T10:20:02.000Z", "msg_e", TEXT, 500, 50)));
+                    v
+                })],
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&dir_c);
+        assert_eq!(family_summary(&c), (1, 6, 5, 110 + 220 + 330 + 440 + 550, 1, 11));
+    }
+
+    /// 旧版副本（2026-09-09 前的桌面版,实证 2c0e1ae7 / 7494e2a8 族）:复制行连 `sessionId` 都沿用根会话,
+    /// 只有文件名是新 id → 仍按已计行折叠,别名取文件名。
+    #[test]
+    fn fork_copies_keeping_root_session_id_fold_too() {
+        let root_rel = format!("{S}.jsonl");
+        let fork_rel = format!("{S2}.jsonl");
+        let mut old_fork = vec![TITLE_CUSTOM.to_string()];
+        old_fork.extend(root_lines()[1..5].iter().cloned()); // 原样复制,sessionId 仍是 S
+        old_fork.extend([
+            human("2026-09-05T10:10:00.000Z", Some("human")),
+            assistant("2026-09-05T10:10:04.000Z", "msg_c", TEXT, 300, 30),
+        ]);
+        let (store, dir) = collect_files(
+            "old_fork",
+            &[vec![(root_rel.as_str(), root_lines())], vec![(fork_rel.as_str(), old_fork)]],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(family_summary(&store), (1, 4, 3, 110 + 220 + 330, 1, 5 + 2));
+        assert_eq!(store.test_task_sessions(META.id), vec![S.to_string()]);
+        let alias: Option<String> = store.session_root_alias(META.id, S2);
+        assert_eq!(alias.as_deref(), Some(S), "别名取文件名主干");
     }
 
     /// 端到端：主会话 + 子代理文件走真实 collect,断言三层计数、四段时间、去重、守恒。

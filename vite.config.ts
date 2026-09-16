@@ -5,6 +5,7 @@ import react from '@vitejs/plugin-react'
 // 双窗口多入口：main → index.html（主窗口），widget → widget.html（挂件），
 // 与 tauri.conf.json 的 per-window url 一一对应，装配在构建期定型，无运行时嗅探。
 // orb → orb.html（悬浮球第三窗口）。
+// timeline → timeline.html（项目推进时间轴第四窗口）。
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
@@ -19,6 +20,7 @@ export default defineConfig({
         main: 'index.html',
         widget: 'widget.html',
         orb: 'orb.html',
+        timeline: 'timeline.html',
       },
     },
   },

@@ -150,6 +150,14 @@ impl TurnState {
         }
     }
 
+    /// 把本文件折进根会话——Claude 续聊 / fork 副本文件的 `sessionId` 已被改写成新 id,
+    /// 适配器按已计行判定它是某根会话的续篇后强制覆盖归属（不受「只取首个」约束）。
+    pub fn fold_into(&mut self, root: &str) {
+        if !root.is_empty() {
+            self.session_id = root.to_string();
+        }
+    }
+
     /// 以文件名设定轮号命名空间（FNV-1a 低 31 位 × 100000;每文件轮数 < 100000）。
     pub fn set_file_scope(&mut self, file_name: &str) {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;

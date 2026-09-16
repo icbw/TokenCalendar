@@ -134,6 +134,11 @@ function GeneralTab() {
   // 与 paused/snap 同款：每次进 tab 现查，勾选直接写系统。
   const [autostart, setAutostart] = useState<AutostartInfo | null>(null)
   const [autostartNote, setAutostartNote] = useState<string | null>(null)
+  // 时间轴总开关：与 orb 开关同款——状态直接取可见性单一源
+  // （Rust visibility.rs 的 timeline_visible），get_visibility 初查 +
+  // timeline-visibility-changed 广播跟随;托盘勾选、窗口关闭钮都汇入那里，
+  // 前端不存第二份镜像（可见性持久化在 window-state.json）。
+  const [timelineVisible, setTimelineVisible] = useState(false)
 
   // Pull the real backend state every time the tab mounts — the tray
   // checkboxes can change while the page was hidden.
@@ -142,7 +147,20 @@ function GeneralTab() {
     collectorService.getCollectInterval().then((r) => r && setCollectSecs(r.secs)).catch(console.error)
     collectorService.getSnapEnabled().then((v) => v !== null && setSnapEnabled(v)).catch(console.error)
     autostartService.getAutostart().then((v) => v !== null && setAutostart(v)).catch(console.error)
+    windowService.getVisibility().then((v) => v && setTimelineVisible(Boolean(v.timeline))).catch(console.error)
   }, [])
+  useEffect(() => {
+    let off: (() => void) | null = null
+    void events.onTimelineVisibilityChanged(setTimelineVisible).then((unlisten) => {
+      off = unlisten
+    })
+    return () => {
+      off?.()
+    }
+  }, [])
+  const toggleTimeline = (next: boolean) => {
+    windowService[next ? 'showTimeline' : 'hideTimeline']().catch(console.error)
+  }
   useEffect(() => subscribeDesignPrefs(setDesign), [])
 
   const resetWidgetSize = () => {
@@ -284,6 +302,119 @@ function GeneralTab() {
                 onClick={() => setDesignPrefs({ weekStart: d })}
               >
                 {d === 'sunday' ? 'Sunday' : 'Monday'}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* 时间轴窗口设置（显隐 / 项目上限 / 前后天数）,prefs 经 storage 桥即时同步到 timeline 窗口*/}
+      <div className="setting-section">Timeline</div>
+      <div className="setting-block">
+        <ToggleRow
+          label="Show timeline"
+          title="Cross-project board window; togglable from tray"
+          checked={timelineVisible}
+          onChange={toggleTimeline}
+        />
+        <div className="setting-row">
+          <span title="Pinned projects first, then most recent; the window size may show fewer">Max projects</span>
+          <div className="setting-seg">
+            {[4, 6, 8, 12, 0].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelineMaxProjects ?? 8) === n ? ' is-active' : ''}`}
+                title={n === 0 ? 'As many as fit the window' : `Show up to ${n} projects`}
+                onClick={() => setDesignPrefs({ timelineMaxProjects: n })}
+              >
+                {n === 0 ? 'Fit' : n}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
+          <span title="Days before today on the board">Past days</span>
+          <div className="setting-seg">
+            {[3, 7, 15, 30].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelinePastDays ?? 7) === n ? ' is-active' : ''}`}
+                title={`Show ${n} days before today`}
+                onClick={() => setDesignPrefs({ timelinePastDays: n })}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
+          <span title="Sessions shown per past day; the rest are counted as +N">Past sessions</span>
+          <div className="setting-seg">
+            {[1, 2, 3, 5].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelinePastSessions ?? 1) === n ? ' is-active' : ''}`}
+                title={`Show ${n} ${n === 1 ? 'session' : 'sessions'} per past day`}
+                onClick={() => setDesignPrefs({ timelinePastSessions: n })}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
+          <span title="Sessions shown for today">Today sessions</span>
+          <div className="setting-seg">
+            {[3, 5, 8, 12].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelineTodaySessions ?? 5) === n ? ' is-active' : ''}`}
+                title={`Show up to ${n} sessions for today`}
+                onClick={() => setDesignPrefs({ timelineTodaySessions: n })}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
+          <span title="Which sessions represent a day when more happened than shown">Pick by</span>
+          <div className="setting-seg">
+            {(
+              [
+                { v: 'latest', label: 'Latest', hint: 'The newest sessions represent the day' },
+                { v: 'earliest', label: 'Earliest', hint: 'The first sessions represent the day' },
+                { v: 'longest', label: 'Longest', hint: 'The sessions with the most tokens represent the day' },
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.v}
+                className={`setting-seg-btn${(design.timelinePick ?? 'latest') === o.v ? ' is-active' : ''}`}
+                title={o.hint}
+                onClick={() => setDesignPrefs({ timelinePick: o.v })}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <ToggleRow
+          label="Newest first"
+          title="Reverse the order: newest days and sessions at the top (default is oldest at the top)"
+          checked={design.timelineReverse ?? false}
+          onChange={(v) => setDesignPrefs({ timelineReverse: v })}
+        />
+        <div className="setting-row">
+          <span title="Days after today on the board (axis only, no data yet)">Future days</span>
+          <div className="setting-seg">
+            {[0, 3, 7, 15].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelineFutureDays ?? 7) === n ? ' is-active' : ''}`}
+                title={n === 0 ? 'No future days' : `Show ${n} days after today`}
+                onClick={() => setDesignPrefs({ timelineFutureDays: n })}
+              >
+                {n}
               </button>
             ))}
           </div>

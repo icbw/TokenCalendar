@@ -57,6 +57,29 @@ struct WindowStateFile {
     /// 尺寸反推形态）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     orb_expanded: Option<bool>,
+    /// 项目推进时间轴几何（serde default 向后兼容旧文件）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline: Option<WindowGeom>,
+    /// 时间轴可见性（默认 false——新窗口默认不弹）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    timeline_visible: bool,
+    /// 时间轴形态（board 看板 / strip 条态；S1 只声明字段随文件透传，
+    /// 起由 set_timeline_form 写入并在 restore 恢复上次形态——同 orb）。
+    /// 枚举类型化：坏值整体反序列化失败 → 走剥离重试路径回 None（看板态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline_form: Option<TimelineForm>,
+    /// 条态水平位置（物理像素 x；屏归属按看板态所在屏；S4 消费）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline_strip_x: Option<i32>,
+}
+
+/// 时间轴两态（单窗口两态）。S1 仅作持久化字段类型，
+/// 状态机与执行者 `set_timeline_form` 在 S4。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineForm {
+    Board,
+    Strip,
 }
 
 fn is_true(v: &bool) -> bool {
@@ -86,6 +109,10 @@ impl Default for WindowStateFile {
             widget_snap_enabled: true,
             orb_dock: None,
             orb_expanded: None,
+            timeline: None,
+            timeline_visible: false,
+            timeline_form: None,
+            timeline_strip_x: None,
         }
     }
 }
@@ -109,10 +136,12 @@ fn load(app: &AppHandle) -> WindowStateFile {
 
 /// 剥离 `widget_snap*` 字段后重试解析（防坏吸附状态污染几何恢复；曾
 /// 扩到 orb_snap 后又随「悬浮球不吸附」收回，剥离列表保留冗余键无害）。
+/// `timeline_form` 是枚举类型化字段,坏值同样会让整文件反序列化失败,
+/// 一并剥离（连同 `timeline_strip_x`）——否则 S4 写入路径一旦落坏值会拖垮全部几何恢复。
 fn strip_snap_fields_retry(raw: &str) -> Option<WindowStateFile> {
     let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
     if let Some(obj) = value.as_object_mut() {
-        for key in ["widget_snap", "orb_snap", "widget_snap_enabled"] {
+        for key in ["widget_snap", "orb_snap", "widget_snap_enabled", "timeline_form", "timeline_strip_x"] {
             obj.remove(key);
         }
     }
@@ -197,10 +226,12 @@ fn geom_is_maximized_pollution(_geom: &WindowGeom) -> bool {
 /// 启动恢复：几何 + 可见性标志。在 setup 中、托盘创建前调用。
 pub fn restore(app: &AppHandle) {
     let file = load(app);
-    let pairs: [(&str, Option<WindowGeom>); 3] = [
+    let pairs: [(&str, Option<WindowGeom>); 4] = [
         ("widget", file.widget),
         ("main", file.main),
         ("orb", file.orb),
+        // timeline 走通用几何恢复（位置 + 尺寸 + 越界回中）；条态归位 S4 另立
+        ("timeline", file.timeline),
     ];
     // orb 的最终形态（restore_orb 决定）——循环后与其余字段一起写进 AppState
     #[allow(unused_mut)]
@@ -248,6 +279,9 @@ pub fn restore(app: &AppHandle) {
         state.widget_visible.store(file.widget_visible, std::sync::atomic::Ordering::SeqCst);
         state.main_visible.store(file.main_visible, std::sync::atomic::Ordering::SeqCst);
         state.orb_visible.store(file.orb_visible, std::sync::atomic::Ordering::SeqCst);
+        state
+            .timeline_visible
+            .store(file.timeline_visible, std::sync::atomic::Ordering::SeqCst);
         // 吸附状态与开关随文件装载（坏值已在 load 剥离重试中回自由态）
         *state.widget_snap.lock().unwrap() = file.widget_snap;
         state
@@ -285,9 +319,16 @@ pub fn persist(app: &AppHandle, state: &AppState) {
             file.orb = Some(geom);
         }
     }
+    if let Some(w) = app.get_webview_window("timeline") {
+        if let Some(geom) = read_geom(&w) {
+            file.timeline = Some(geom);
+        }
+    }
     file.widget_visible = state.widget_visible.load(std::sync::atomic::Ordering::SeqCst);
     file.main_visible = state.main_visible.load(std::sync::atomic::Ordering::SeqCst);
     file.orb_visible = state.orb_visible.load(std::sync::atomic::Ordering::SeqCst);
+    file.timeline_visible = state.timeline_visible.load(std::sync::atomic::Ordering::SeqCst);
+    // timeline_form / timeline_strip_x：S1 无写者，load 读到什么原样透传（S4 接管）
     file.widget_snap = state.widget_snap.lock().unwrap().clone();
     file.widget_snap_enabled = state
         .widget_snap_enabled

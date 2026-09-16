@@ -5,7 +5,7 @@
 //! show/hide 窗口 → 更新标志 → 落盘 → 同步托盘勾选态 → 广播事件。
 //!
 //! 事件：`widget-visibility-changed` / `main-visibility-changed` /
-//! `orb-visibility-changed`，载荷为 bool。
+//! `orb-visibility-changed`/ `timeline-visibility-changed`，载荷为 bool。
 //! 前端不维护本地真相，按钮状态以 get_visibility 初值 + 事件跟随为准。
 
 use std::sync::atomic::Ordering;
@@ -20,9 +20,11 @@ pub const WIDGET_LABEL: &str = "widget";
 pub const MAIN_LABEL: &str = "main";
 /// 悬浮球（第三窗口；默认隐藏，设置页/托盘开启）。
 pub const ORB_LABEL: &str = "orb";
+/// 项目推进时间轴（第四窗口；默认隐藏，设置页/托盘开启）。
+pub const TIMELINE_LABEL: &str = "timeline";
 
 fn label_ok(label: &str) -> bool {
-    label == WIDGET_LABEL || label == MAIN_LABEL || label == ORB_LABEL
+    label == WIDGET_LABEL || label == MAIN_LABEL || label == ORB_LABEL || label == TIMELINE_LABEL
 }
 
 fn is_visible(state: &AppState, label: &str) -> bool {
@@ -30,6 +32,7 @@ fn is_visible(state: &AppState, label: &str) -> bool {
         WIDGET_LABEL => state.widget_visible.load(Ordering::SeqCst),
         MAIN_LABEL => state.main_visible.load(Ordering::SeqCst),
         ORB_LABEL => state.orb_visible.load(Ordering::SeqCst),
+        TIMELINE_LABEL => state.timeline_visible.load(Ordering::SeqCst),
         _ => false,
     }
 }
@@ -39,6 +42,7 @@ fn store_visible(state: &AppState, label: &str, visible: bool) {
         WIDGET_LABEL => state.widget_visible.store(visible, Ordering::SeqCst),
         MAIN_LABEL => state.main_visible.store(visible, Ordering::SeqCst),
         ORB_LABEL => state.orb_visible.store(visible, Ordering::SeqCst),
+        TIMELINE_LABEL => state.timeline_visible.store(visible, Ordering::SeqCst),
         _ => {}
     }
 }
@@ -48,6 +52,8 @@ fn event_name(label: &str) -> &'static str {
         WIDGET_LABEL => "widget-visibility-changed",
         // orb 走同族命名
         ORB_LABEL => "orb-visibility-changed",
+        // timeline 同族
+        TIMELINE_LABEL => "timeline-visibility-changed",
         _ => "main-visibility-changed",
     }
 }
@@ -115,6 +121,7 @@ pub fn get_visibility(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "widget": state.widget_visible.load(Ordering::SeqCst),
         "main": state.main_visible.load(Ordering::SeqCst),
         "orb": state.orb_visible.load(Ordering::SeqCst),
+        "timeline": state.timeline_visible.load(Ordering::SeqCst),
     })
 }
 
@@ -135,6 +142,15 @@ visibility_command!(hide_main, "main", false);
 // set_visible 只对 main set_focus，orb/widget 天然不聚焦）
 visibility_command!(show_orb, "orb", true);
 visibility_command!(hide_orb, "orb", false);
+// 时间轴显隐（托盘与设置页共用；看板不抢焦点——set_visible 只对 main set_focus）
+visibility_command!(show_timeline, "timeline", true);
+visibility_command!(hide_timeline, "timeline", false);
+
+/// 时间轴显隐切换（托盘勾选走 toggle；返回切换后状态）。
+#[tauri::command]
+pub fn toggle_timeline(app: tauri::AppHandle) -> Result<bool, String> {
+    toggle(&app, TIMELINE_LABEL)
+}
 
 #[tauri::command]
 pub fn toggle_widget(app: tauri::AppHandle) -> Result<(), String> {

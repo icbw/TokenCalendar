@@ -222,6 +222,19 @@ pub struct FileCursor {
     /// 轮累加器（会话 / 当前轮 / 未配对工具 / 响应去重窗口）。
     #[serde(default)]
     pub turn: turns::TurnState,
+    /// v12（Claude）：文件排序键——首个带 uuid 行的时间 / 尾部最后一条带时间戳行的时间（毫秒;0 = 未扫过）。
+    /// 续聊 / fork 副本文件复制了根会话的历史行,按此排序保证根文件先处理（mtime 不可靠:根文件事后
+    /// 会追加无时间戳的元数据行）。
+    #[serde(default)]
+    pub first_ts: i64,
+    #[serde(default)]
+    pub last_ts: i64,
+    /// v12（Claude）：会话族已判定（首个带 uuid 的行已处理）。
+    #[serde(default)]
+    pub family_resolved: bool,
+    /// v12（Claude）：本文件是某根会话的续篇（续聊 / fork 副本）→ 归属该根会话,只计未见过的行。
+    #[serde(default)]
+    pub family_root: Option<String>,
 }
 
 impl FileCursor {
@@ -240,6 +253,10 @@ impl FileCursor {
             subagent: false,
             task_signal: false,
             turn: turns::TurnState::default(),
+            first_ts: 0,
+            last_ts: 0,
+            family_resolved: false,
+            family_root: None,
         }
     }
     /// 文件 generation 与游标一致且已读到 EOF → 无新内容。

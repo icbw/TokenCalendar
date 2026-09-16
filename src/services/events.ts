@@ -25,6 +25,11 @@ export function onOrbVisibilityChanged(cb: (visible: boolean) => void): Promise<
   return listen<boolean>('orb-visibility-changed', (v) => cb(v))
 }
 
+// 项目推进时间轴可见性广播（同族单一源），载荷为 bool。
+export function onTimelineVisibilityChanged(cb: (visible: boolean) => void): Promise<Unlisten> {
+  return listen<boolean>('timeline-visibility-changed', (v) => cb(v))
+}
+
 export function onMainVisibilityChanged(cb: (visible: boolean) => void): Promise<Unlisten> {
   return listen<boolean>('main-visibility-changed', (v) => cb(v))
 }

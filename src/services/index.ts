@@ -10,9 +10,11 @@ import * as updateService from './updateService'
 import * as autostartService from './autostartService'
 import * as taskService from './taskService'
 import * as projectService from './projectService'
+import * as timelineService from './timelineService'
 import * as events from './events'
 
-export { usageService, collectorService, windowService, exportService, dataService, subscriptionService, updateService, autostartService, taskService, projectService, events }
+export { usageService, collectorService, windowService, exportService, dataService, subscriptionService, updateService, autostartService, taskService, projectService, timelineService, events }
+export type { TimelineResult, TimelineProject, TimelineCell, TimelineSession } from './timelineService'
 export { inTauri } from './tauri'
 export type { WindowVisibility, OrbDockState } from './windowService'
 export type { UsageResult, UsageRow, SourceSummary, ExportResult, QueryOptions } from './types'

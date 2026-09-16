@@ -375,7 +375,7 @@ pub fn get_range_series(query: RangeSeriesQuery, state: State<'_, AppState>) -> 
 // 口径见 collector/task_query.rs 文件头。任务类型里的 `title` 是内容列:只随 IPC 回 UI,
 // 任何导出 / 文件序列化路径一律不得引用这些类型（export_month 只读 daily_usage）。
 
-pub use crate::collector::task_query::{DaySpan, GapHistogram, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn};
+pub use crate::collector::task_query::{DaySpan, GapHistogram, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn, TimelineResult};
 use crate::collector::project_meta::{self, ProjectMetaInput, ProjectMetaList, ScratchRule};
 use crate::collector::task_store;
 
@@ -523,6 +523,14 @@ pub fn get_effort_series(
 #[tauri::command]
 pub fn get_project_span(project: Option<String>, state: State<'_, AppState>) -> Result<Option<DaySpan>, String> {
     with_reader(&state, |store| Ok(store.data_span(project.as_deref().filter(|p| !p.is_empty()), &project_meta::scratch_rule())))
+}
+
+/// 项目推进时间轴:from..to 含端点（本地日 YYYY-MM-DD）;项目集 = 全部可见有效项目
+/// （前端按 pin + 窗口容量裁剪）;today = 本地日历日（与 Matrix 同口径）。只读。
+#[tauri::command]
+pub fn get_project_timeline(from: String, to: String, state: State<'_, AppState>) -> Result<TimelineResult, String> {
+    with_reader(&state, |store| Ok(store.project_timeline(&from, &to, today(), &project_meta::scratch_rule())))?
+        .ok_or_else(|| "invalid range".to_string())
 }
 
 /// 轮间空档直方图（gap_ms 对数分桶 + 当前阈值两侧合计;按轮的本地日过滤）。

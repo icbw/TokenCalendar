@@ -13,6 +13,7 @@ mod fixture;
 mod orb_dock;
 mod snap;
 mod subscription;
+mod text_scale;
 mod tray;
 mod visibility;
 mod window_state;
@@ -57,6 +58,8 @@ pub struct AppState {
     pub main_visible: AtomicBool,
     /// 悬浮球可见性（默认 false——新窗口形态默认不弹，托盘/设置页开启）。
     pub orb_visible: AtomicBool,
+    /// 项目推进时间轴可见性（默认 false——第四窗口默认不弹，托盘/设置页开启）。
+    pub timeline_visible: AtomicBool,
     /// Moved/Resized 事件节流持久化的上次写盘时刻（None = 从未写过）。
     pub last_persist: Mutex<Option<Instant>>,
     /// 主窗口最大化状态去重缓存（Resized 高频事件里只在真变时广播）。
@@ -109,6 +112,7 @@ fn main() {
             widget_visible: AtomicBool::new(true),
             main_visible: AtomicBool::new(false),
             orb_visible: AtomicBool::new(false),
+            timeline_visible: AtomicBool::new(false),
             last_persist: Mutex::new(None),
             last_maximized: Mutex::new(false),
             tray: Mutex::new(None),
@@ -130,6 +134,7 @@ fn main() {
             commands::get_effort_series,
             commands::get_gap_histogram,
             commands::get_project_span,
+            commands::get_project_timeline,
             commands::list_project_meta,
             commands::set_project_meta,
             commands::merge_projects,
@@ -177,6 +182,9 @@ fn main() {
             visibility::show_orb,
             visibility::hide_orb,
             visibility::toggle_orb,
+            visibility::show_timeline,
+            visibility::hide_timeline,
+            visibility::toggle_timeline,
             subscription::get_subscription_snapshots,
             subscription::scan_subscription_credentials,
             subscription::bind_subscription,
@@ -209,6 +217,16 @@ fn main() {
             if let Some(w) = handle.get_webview_window("orb") {
                 chrome::apply_orb_chrome(&w);
             }
+            // 时间轴：边缘栈 = 挂件默认态组合（不置顶、可缩放、无材质档）
+            if let Some(w) = handle.get_webview_window("timeline") {
+                chrome::apply_timeline_chrome(&w);
+            }
+            // Windows「文本大小」感知：WebView2 把辅助功能文本缩放绑在 DPI 上
+            // 整体放大内容,Win32 DPI 不知情 ⇒ 固定尺寸的悬浮球主体/让出区域与实际表盘
+            // 错位（只剩左上角一道弧）。启动先读一次缓存系数,orb_dock 的物理换算乘上它
+            // （必须早于 restore_orb 的归位写入）;运行时改设置由 orb 子类化的
+            // WM_SETTINGCHANGE 刷新并重放（text_scale.rs）。
+            text_scale::refresh();
             // 悬浮球贴边停靠：子类化 orb 窗口拦 WM_EXITSIZEMOVE
             // （松手贴缘→dock 收起/离缘→undock 展开;与 snap.rs 同通道模式,
             // 各自子类化各自窗口互不干扰）

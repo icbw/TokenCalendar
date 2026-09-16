@@ -10,6 +10,8 @@ export interface WindowVisibility {
   main: boolean
   /** 悬浮球（get_visibility 载荷三键齐发）。 */
   orb: boolean
+  /** 项目推进时间轴（第四键）。 */
+  timeline: boolean
 }
 
 /** 首帧提交后调用（useShowOnLoad）：后端按可见性单一源裁决是否 show 本窗口。 */
@@ -22,7 +24,7 @@ export async function getVisibility(): Promise<WindowVisibility | null> {
 }
 
 async function apply(
-  label: 'widget' | 'main' | 'orb',
+  label: 'widget' | 'main' | 'orb' | 'timeline',
   action: 'show' | 'hide' | 'toggle',
 ): Promise<void> {
   await tryInvoke<null>(`${action}_${label}`)
@@ -56,6 +58,17 @@ export function hideOrb(): Promise<void> {
 /** 顶栏 Orbit 按钮（与 toggleWidget 同语义）；按钮态以 orb-visibility-changed 事件为准。 */
 export function toggleOrb(): Promise<void> {
   return apply('orb', 'toggle')
+}
+
+// ---- 项目推进时间轴（第四窗口；托盘/设置页共用，状态以 timeline-visibility-changed 为准） ----
+export function showTimeline(): Promise<void> {
+  return apply('timeline', 'show')
+}
+export function hideTimeline(): Promise<void> {
+  return apply('timeline', 'hide')
+}
+export function toggleTimeline(): Promise<void> {
+  return apply('timeline', 'toggle')
 }
 
 /** 悬浮球两态尺寸切换（窗口 resizable=false,程序化是唯一入口）。 */
