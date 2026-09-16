@@ -9,7 +9,7 @@
  * designPrefs 只存档位名；档位切换即 set_widget_size，几何落盘兜底。 */
 export type SizePreset = 'large' | 'medium' | 'small'
 
-import type { BoostConfig } from '../../services/subscriptionService'
+import type { BoostConfig, SubscriptionPlatform } from '../../services/subscriptionService'
 
 /** 毛玻璃材质档（undefined = 关闭）。两窗口各自独立一个键。
  * 版本门槛：Mica 仅 Win11（22000+，apply 失败自动回退关闭）；Acrylic
@@ -115,6 +115,10 @@ export interface DesignPrefs {
    * 显式授权」的口径相反。运行时经 set_subscription_idle_enabled 下发,orb 窗口
    * 装载时恢复;档位状态本身不持久化（重启回基础档重评）。 */
   orbIdleEnabled?: boolean
+  /** 悬浮球上次显示的订阅平台（启动恢复上次的平台,而非固定第一个）。
+   * 按平台 id 记（绑定集合变化时下标会错位）;该平台未绑定 → 回落第一个已绑定平台,
+   * 键保持不动直到用户再切换。undefined = 第一个。 */
+  orbPlatform?: SubscriptionPlatform
   /** 应用更新：启动后自动检查并安装新版本（**默认关**——联网自动装包属显式
    * 授权行为,由用户在设置·About 主动开启）。关闭时主窗口加载不自动检查,
    * 仅「Check for updates」手动触发。更新源与签名校验
@@ -160,6 +164,8 @@ export interface DesignPrefs {
   timelineTodaySessions?: number
   timelinePick?: 'latest' | 'earliest' | 'longest'
   timelineReverse?: boolean
+  /** ：看板失焦 N 秒后自动折成条态（0〜3600;undefined / 0 = 关）。第二屏挂着不获焦就不触发。 */
+  timelineAutoStripSecs?: number
 }
 
 const KEY = 'tokencalendar.design'
@@ -214,6 +220,9 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   // 与 Rust clamp_cfg 同域,双端兜底）。orbIdleEnabled 同族（待机退档开关）。
   for (const k of ['orbBoostEnabled', 'orbBoostSpikeEnabled', 'orbBoostLowEnabled', 'orbIdleEnabled'] as const) {
     if (p[k] !== undefined && typeof p[k] !== 'boolean') delete p[k]
+  }
+  if (p.orbPlatform !== undefined && p.orbPlatform !== 'codex' && p.orbPlatform !== 'claude') {
+    delete p.orbPlatform
   }
   if (p.orbBoostSpikePct !== undefined && !(typeof p.orbBoostSpikePct === 'number' && Number.isInteger(p.orbBoostSpikePct) && p.orbBoostSpikePct >= 5 && p.orbBoostSpikePct <= 50)) {
     delete p.orbBoostSpikePct
@@ -280,6 +289,9 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   if (p.timelineReverse !== undefined && typeof p.timelineReverse !== 'boolean') {
     delete p.timelineReverse
+  }
+  if (p.timelineAutoStripSecs !== undefined && !(typeof p.timelineAutoStripSecs === 'number' && Number.isInteger(p.timelineAutoStripSecs) && p.timelineAutoStripSecs >= 0 && p.timelineAutoStripSecs <= 3600)) {
+    delete p.timelineAutoStripSecs
   }
   // 应用更新开关：非布尔值视为未设置（回落默认开）。
   if (p.autoUpdate !== undefined && typeof p.autoUpdate !== 'boolean') {

@@ -24,8 +24,8 @@
 // hook 不装配（orb 首期无毛玻璃材质档）。
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
-import { events, subscriptionService, windowService, type OrbDockState, type PlatformIdleState, type SubscriptionSnapshot } from '../../services'
-import { getDesignPrefs, orbBoostConfig, orbIdleEnabled, subscribeDesignPrefs } from '../settings/designPrefs'
+import { events, subscriptionService, windowService, type OrbDockState, type PlatformIdleState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
+import { getDesignPrefs, orbBoostConfig, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
@@ -358,6 +358,9 @@ export default function OrbWindow() {
         setDock(null)
         setExpanded(true)
         windowService.orbUndock(p.edge, EXPANDED_SIZE.w, EXPANDED_SIZE.h).catch(console.error)
+        // 拖离边缘展开 = 用户主动操作 → 退出待机（noteAttention 在下方定义,
+        // 回调在挂载后才执行,不撞 TDZ;依赖为空的稳定回调,闭包不陈旧）
+        noteAttention()
       }
     }).then((unlisten) => {
       if (disposed) unlisten()
@@ -377,8 +380,13 @@ export default function OrbWindow() {
     windowService.setOrbSize(size.w, size.h).catch(console.error)
   }, [])
   const [snapshots, setSnapshots] = useState<SubscriptionSnapshot[]>([])
-  // 本窗口 = orb；绑定多平台时首期显示第一个有数据的平台（单平台起步）
-  const [activePlatform, setActivePlatform] = useState(0)
+  // 本窗口 = orb；绑定多平台时显示上次选中的平台（启动恢复
+  // 上次,不再固定第一个）。按平台 id 记——绑定集合变化时下标会错位;持久化在
+  // designPrefs.orbPlatform,跟随订阅（prefs.json 异步校准 / 跨窗口广播）。
+  const [activePlatformId, setActivePlatformId] = useState<SubscriptionPlatform | undefined>(
+    () => getDesignPrefs().orbPlatform,
+  )
+  useEffect(() => subscribeDesignPrefs((p) => setActivePlatformId(p.orbPlatform)), [])
 
   // 数据消费：初查 + subscription:changed 即时重查 + 30s 兜底节流
   const refresh = useCallback(() => {
@@ -477,12 +485,21 @@ export default function OrbWindow() {
   useEffect(() => {
     subscriptionService.applyIdleEnabled(idleOn)
   }, [idleOn])
+  // 用户注意（手动刷新 / 展开 / 切换平台 = 用户注意到悬浮球
+  // → 退出待机）。本地先摘掉待机态立即恢复亮度,不等 Rust 翻转事件往返;Rust 侧
+  // 清零安静计数后广播 subscription:idle,重查结果为权威。
+  const clearStandbyLocally = useCallback(() => {
+    setIdleStates((s) => (s.some((x) => x.idle) ? s.map((x) => ({ ...x, idle: false })) : s))
+  }, [])
+  const noteAttention = useCallback(() => {
+    clearStandbyLocally()
+    subscriptionService.noteAttention().catch(() => {})
+  }, [clearStandbyLocally])
 
   // 有快照的平台序列（未绑定平台 idle 占位跳过——orb 只显示已绑定平台）
   const boundSnaps = snapshots.filter((s) => s.status !== 'idle')
-  useEffect(() => {
-    if (activePlatform >= boundSnaps.length) setActivePlatform(0)
-  }, [activePlatform, boundSnaps.length])
+  // 记住的平台未绑定 → 回落第一个（键不动,重绑后仍恢复该平台）
+  const activePlatform = Math.max(0, boundSnaps.findIndex((s) => s.platform === activePlatformId))
 
   const snap = boundSnaps[activePlatform]
   // boost 补充路由：该平台 boost 快照比主快照新 → 5h/7d 读数走
@@ -494,8 +511,8 @@ export default function OrbWindow() {
     boosting && boostSnap && snap
       ? { ...snap, windows: boostSnap.windows, fetched_at: boostSnap.fetched_at }
       : snap
-  // 待机（standby）：所有已绑定平台都退过基础档（读数长期无变化）
-  // 且没有任何平台在 boost 高频监控中 → 整体待机,悬浮球减淡 50%（.is-standby,
+  // 待机（standby）：所有已绑定平台都已进入待机（连续 3 轮无变化且安静
+  // ≥ 10 分钟,期间无本地 agent 活动与用户注意）且没有任何平台在 boost 高频监控中 → 整体待机,悬浮球减淡 50%（.is-standby,
   // orb.css）。取「全局安静态」而非按显示中平台判定——单平台显示下切换平台
   // 不会亮度跳变;任一平台有变化/在 boost 中 = 用户在用,恢复全亮。
   const idleMap = new Map(idleStates.map((s) => [s.platform, s.idle]))
@@ -528,6 +545,7 @@ export default function OrbWindow() {
 
   const expand = useCallback(() => {
     setExpanded(true)
+    noteAttention()
     if (dock) {
       // dock 态双击（无拖动）：竖条贴在缘上,直接 set_size（240) 会把卡片推出屏外
       // ——展开尺寸 + 屏内归位由 orb_undock 原子完成（工作区/DPI 物理像素只在
@@ -539,7 +557,7 @@ export default function OrbWindow() {
     }
     // 自由态（含「自由收起」的竖条）：纯形态切换,内容锚定在 Rust 的 set_orb_size
     applySize('expanded')
-  }, [applySize, dock])
+  }, [applySize, dock, noteAttention])
 
   const collapse = useCallback(() => {
     setExpanded(false)
@@ -620,10 +638,12 @@ export default function OrbWindow() {
   const refreshTimer = useRef<number>(0)
   const refreshStart = useRef(0) // 点击时刻（ms;与 fetched_at×1000 同尺度比较）
   const refreshNow = useCallback(() => {
+    // 手动刷新 = 用户注意:Rust refresh 命令先退出待机再取数,这里只做本地即时恢复亮度
+    clearStandbyLocally()
     subscriptionService.refreshNow().catch(console.error)
     refreshStart.current = Date.now()
     setPhase('waiting')
-  }, [])
+  }, [clearStandbyLocally])
   useEffect(() => () => window.clearTimeout(refreshTimer.current), [])
   // 三态推进。所有截止时刻都从 refreshStart 绝对推算（而非相对上一次定时器）,
   // 所以快照频繁更新引起的重排不会累积漂移;判据用「≥ 点击时刻」而非严格大于：
@@ -663,10 +683,15 @@ export default function OrbWindow() {
     [expanded, refreshNow],
   )
 
-  // 周期切换（多绑定时点击竖条底部标记循环;单平台无感）
+  // 周期切换（多绑定时点击竖条底部标记循环;单平台无感）。选中平台落 designPrefs
+  // （启动恢复）;点击本身 = 用户注意,退出待机。
   const cyclePlatform = useCallback(() => {
-    setActivePlatform((i) => (boundSnaps.length ? (i + 1) % boundSnaps.length : 0))
-  }, [boundSnaps.length])
+    noteAttention()
+    if (!boundSnaps.length) return
+    const next = boundSnaps[(activePlatform + 1) % boundSnaps.length].platform
+    setActivePlatformId(next)
+    setDesignPrefs({ orbPlatform: next })
+  }, [boundSnaps, activePlatform, noteAttention])
 
   // ---- hover 提示浮层（㉕：替代原生 title,DOM 常驻遵铁律） ----
   // 位置：环/表盘这类大面积区域跟光标（12px 偏移,越界翻转+钳制）;16px 悬挂

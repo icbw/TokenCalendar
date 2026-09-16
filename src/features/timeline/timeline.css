@@ -181,6 +181,47 @@
 .timeline-body.is-vertical .tl-badge {
   align-self: center;
 }
+/* S3 注意力：弱提示（「弱于订阅悬浮球失效色,强于常态一档」）。
+   waiting = 淡底 + 缓慢呼吸点;pending（工具久未回）= 次色静态点。点击行头确认。 */
+.tl-proj.is-waiting,
+.tl-proj.is-pending {
+  cursor: pointer;
+}
+.tl-proj.is-waiting {
+  background: color-mix(in srgb, var(--accent, #4f7cff) 12%, transparent);
+}
+.tl-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent, #4f7cff);
+}
+.tl-proj.is-waiting .tl-dot {
+  animation: tl-breathe 2.4s ease-in-out infinite;
+}
+.tl-proj.is-pending .tl-dot {
+  background: color-mix(in srgb, var(--accent, #4f7cff) 45%, var(--widget-card-text-muted, #888));
+}
+.timeline-body.is-vertical .tl-dot {
+  position: absolute;
+  left: 5px;
+  top: 5px;
+}
+@keyframes tl-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tl-proj.is-waiting .tl-dot {
+    animation: none;
+  }
+}
 /* pin 图标:hover 现,已置顶常显 */
 .tl-pin {
   position: absolute;
@@ -371,6 +412,13 @@
   white-space: nowrap;
   text-align: right;
 }
+.tl-hover-accent {
+  color: var(--accent, #4f7cff);
+  font-weight: 600;
+}
+.tl-hover-session.is-acked {
+  opacity: 0.6;
+}
 .tl-hover-actions {
   display: flex;
   justify-content: flex-end;
@@ -402,4 +450,117 @@
   justify-content: center;
   font-size: 12px;
   color: var(--widget-card-text-muted, var(--text-muted));
+}
+
+/* ---------- S4 条态（/） ----------
+   形态单一源在 Rust（set_timeline_form 原子执行尺寸 / 位置 / 置顶）;这里只按 .is-strip / .is-board
+   切换两层可见性。条态层常驻 DOM：看板态 visibility:hidden 仍参与布局,ResizeObserver 才量得到
+   .tl-strip-inner 的 max-content 宽（传给 Rust 定窗口宽）——勿改成 display:none / 条件渲染。
+   条贴屏幕顶缘：上缘直角、下缘圆角;半透明 alpha 0.6。 */
+
+.tl-fold {
+  flex: none;
+  align-self: center;
+}
+.tl-fold.is-right {
+  margin-left: auto;
+}
+
+.timeline-shell.is-strip .timeline-card,
+.timeline-shell.is-board .tl-strip {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.tl-strip {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: rgba(var(--widget-card-bg) / 0.6);
+  border: 1px solid var(--widget-card-border);
+  border-top: none;
+  border-radius: 0 0 var(--radius-sm, 8px) var(--radius-sm, 8px);
+  isolation: isolate;
+  user-select: none;
+  cursor: default;
+}
+
+.tl-strip-inner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: max-content;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px 0 10px;
+  white-space: nowrap;
+}
+
+.tl-strip-name {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--widget-card-text, var(--text));
+  white-space: nowrap;
+}
+.tl-strip-name.is-muted {
+  color: var(--widget-card-text-muted, var(--text-muted));
+  font-weight: 500;
+}
+/* 亮起：淡强调底 + 缓慢呼吸（弱提示,与看板行头同一 2.4s 节拍）;tool_pending = 次色静态 */
+.tl-strip-name.is-waiting,
+.tl-strip-name.is-pending {
+  cursor: pointer;
+}
+.tl-strip-name.is-waiting {
+  color: var(--accent, #4f7cff);
+  background: color-mix(in srgb, var(--accent, #4f7cff) 18%, transparent);
+  animation: tl-strip-pulse 2.4s ease-in-out infinite;
+}
+.tl-strip-name.is-pending {
+  color: color-mix(in srgb, var(--accent, #4f7cff) 55%, var(--widget-card-text-muted, #888));
+  background: color-mix(in srgb, var(--accent, #4f7cff) 8%, transparent);
+}
+@keyframes tl-strip-pulse {
+  0%,
+  100% {
+    background: color-mix(in srgb, var(--accent, #4f7cff) 22%, transparent);
+  }
+  50% {
+    background: color-mix(in srgb, var(--accent, #4f7cff) 4%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tl-strip-name.is-waiting {
+    animation: none;
+  }
+}
+
+.tl-strip-expand {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  cursor: pointer;
+}
+.tl-strip-expand:hover {
+  color: var(--widget-card-text, var(--text));
+  background: var(--tl-line);
 }

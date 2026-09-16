@@ -23,12 +23,26 @@
 //   （容量减少 / 出滚动条）,超过最大尺寸留白。
 // - 项目行 hover 状态卡：常驻 DOM 只切可见性（浮层铁律：透明 WebView2 条件卸载留残影）。
 // - 拖动只在 head 区（data-tauri-drag-region="deep" 逐元素挂载）;看板区是交互区。
-// 注意力亮起/ 条态/ [Focus] 聚焦后续接入。
+//
+// S3 注意力:get_attention 会话级快照,挂载查一次 + timeline:attention 事件重查
+// （Rust 采集线程每轮派生,有变化才发）。按原始目录键 → effective_key 折叠到项目行:任一未确认
+// waiting → 亮起（缓慢呼吸点 + 淡底,弱提示不弹窗）;仅未确认 tool_pending → 弱亮（次色静态点）;
+// 点击项目行头 = 确认该项目全部未确认等待（同一会话下一段等待自动复位）。running 不提示,只进 hover 卡。
+//
+// S4 条态:形态单一源在 Rust（get_timeline_form + timeline-form-changed）,前端只发意图
+// set_timeline_form——尺寸 / 位置 / 置顶由 Rust 原子执行,这里不补偿位置。条态层常驻 DOM（看板态
+// visibility:hidden,仍参与布局）,ResizeObserver 量出条内容的 CSS 宽随意图传给 Rust。条上 = 项目名
+// （看板同序取前 maxProjects 个,另补上亮起但不在其中的项目）;亮起项目名呼吸闪烁、可点击确认,
+// 其余区域可拖动（Rust 钉顶缘横向滑动）;双击 / 末端按钮展开。看板失焦 timelineAutoStripSecs 秒后
+// 自动折条（0 = 关;指针仍在窗口上时不计时）。
+// [Focus] 聚焦后续接入。
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import {
   events,
   projectService,
   timelineService,
+  windowService,
+  type AttentionItem,
   type ProjectMetaRow,
   type TimelineCell,
   type TimelineProject,
@@ -38,6 +52,7 @@ import {
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, type DesignPrefs } from '../settings/designPrefs'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
 import { useShowOnLoad } from '../window/useShowOnLoad'
+import { useWindowFocus } from '../settings/materialTheme'
 import { useWidgetThemeSync } from '../settings/widgetTheme'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
 import {
@@ -68,6 +83,7 @@ import {
   localDay,
   shortDay,
 } from './timelineConfig'
+import type { TimelineForm } from '../../services/windowService'
 import './timeline.css'
 
 type Orientation = 'horizontal' | 'vertical'
@@ -114,6 +130,26 @@ function OrientationIcon() {
   )
 }
 
+/** 折条：内容收向上缘。 */
+function FoldIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M2.5 2.5h9" />
+      <path d="M7 12V5.5M4.5 8 7 5.5 9.5 8" />
+    </svg>
+  )
+}
+
+/** 展开：内容自上缘放下。 */
+function ExpandIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M2.5 2.5h9" />
+      <path d="M7 5.5V12M4.5 9.5 7 12l2.5-2.5" />
+    </svg>
+  )
+}
+
 function PinIcon() {
   return (
     <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
@@ -130,6 +166,32 @@ interface HoverState {
 
 const HOVER_CARD_W = 240
 const HOVER_CARD_H = 150
+/** hover 卡每条注意力行的高度（卡片钳位用）。 */
+const HOVER_ROW_H = 16
+/** hover 卡最多列出的等待会话数。 */
+const HOVER_ATTENTION_MAX = 3
+
+type AttentionLevel = 'waiting' | 'pending' | 'running' | null
+
+interface ProjectAttention {
+  level: AttentionLevel
+  /** 未确认的 waiting / tool_pending（点击确认的对象）。 */
+  unacked: AttentionItem[]
+  /** 非 running 的全部条目（hover 卡列出,含已确认）。 */
+  waiting: AttentionItem[]
+  running: number
+}
+
+/** 距今时长：<1m / Nm / Nh。 */
+function ago(ms: number, now: number): string {
+  const m = Math.floor(Math.max(0, now - ms) / 60_000)
+  if (m < 1) return '<1m'
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h`
+}
+
+function itemKey(it: AttentionItem): string {
+  return `${it.agent}|${it.sessionId}`
+}
 
 interface TimelinePrefs {
   pins: string[]
@@ -141,6 +203,7 @@ interface TimelinePrefs {
   todaySessions: number
   pick: PickRule
   reverse: boolean
+  autoStripSecs: number
 }
 
 function readPrefs(p: DesignPrefs): TimelinePrefs {
@@ -154,6 +217,7 @@ function readPrefs(p: DesignPrefs): TimelinePrefs {
     todaySessions: p.timelineTodaySessions ?? TIMELINE_TODAY_SESSIONS,
     pick: p.timelinePick ?? 'latest',
     reverse: p.timelineReverse ?? false,
+    autoStripSecs: p.timelineAutoStripSecs ?? 0,
   }
 }
 
@@ -170,7 +234,26 @@ export default function TimelineWindow() {
   // ---- prefs（置顶 / 方向 / 上限 / 天数）:storage 桥跨窗口同步,主窗口改设置这里即时跟随 ----
   const [prefs, setPrefs] = useState<TimelinePrefs>(() => readPrefs(getDesignPrefs()))
   useEffect(() => subscribeDesignPrefs((p) => setPrefs(readPrefs(p))), [])
-  const { pins, orientation, maxProjects, pastDays, futureDays, pastSessions, todaySessions, pick, reverse } = prefs
+  const { pins, orientation, maxProjects, pastDays, futureDays, pastSessions, todaySessions, pick, reverse, autoStripSecs } = prefs
+
+  // ---- S4 形态：Rust 单一源,挂载查一次 + 事件跟随 ----
+  const [form, setForm] = useState<TimelineForm>('board')
+  useEffect(() => {
+    let disposed = false
+    let off: (() => void) | null = null
+    void windowService.getTimelineForm().then((f) => {
+      if (f && !disposed) setForm(f)
+    })
+    void events.onTimelineFormChanged((f) => setForm(f)).then((unlisten) => {
+      if (disposed) unlisten()
+      else off = unlisten
+    })
+    return () => {
+      disposed = true
+      off?.()
+    }
+  }, [])
+  const strip = form === 'strip'
 
   // ---- 数据 ----
   const [today, setToday] = useState(() => localDay())
@@ -215,6 +298,26 @@ export default function TimelineWindow() {
     }, 60_000)
     return () => window.clearInterval(id)
   }, [])
+
+  // ---- S3 注意力：挂载查一次 + timeline:attention 事件重查 ----
+  const [attention, setAttention] = useState<AttentionItem[]>([])
+  const loadAttention = useCallback(async () => {
+    const items = await timelineService.getAttention()
+    if (items) setAttention(items)
+  }, [])
+  useEffect(() => {
+    void loadAttention()
+    let off: (() => void) | null = null
+    let disposed = false
+    void events.onTimelineAttention(() => void loadAttention()).then((unlisten) => {
+      if (disposed) unlisten()
+      else off = unlisten
+    })
+    return () => {
+      disposed = true
+      off?.()
+    }
+  }, [loadAttention])
 
   // ---- 容量：ResizeObserver 量看板区（contentRect 已扣 padding）,按最小尺寸算能放下的项目数 ----
   const bodyRef = useRef<HTMLDivElement | null>(null)
@@ -265,6 +368,34 @@ export default function TimelineWindow() {
     return [...pinned, ...rest]
   }, [data, pinnedEff])
   const visible = useMemo(() => ordered.slice(0, capacity), [ordered, capacity])
+  // 注意力按有效键折叠（原始键经 effective_key 解析,与 pin 同口径）
+  const attentionByProject = useMemo(() => {
+    const m = new Map<string, ProjectAttention>()
+    for (const it of attention) {
+      const eff = rawToEff.get(it.projectKey) ?? it.projectKey
+      const pa = m.get(eff) ?? { level: null, unacked: [], waiting: [], running: 0 }
+      if (it.state === 'running') pa.running += 1
+      else {
+        pa.waiting.push(it)
+        if (!it.acked) pa.unacked.push(it)
+      }
+      m.set(eff, pa)
+    }
+    for (const pa of m.values()) {
+      if (pa.unacked.some((i) => i.state === 'waiting')) pa.level = 'waiting'
+      else if (pa.unacked.length > 0) pa.level = 'pending'
+      else if (pa.running > 0) pa.level = 'running'
+    }
+    return m
+  }, [attention, rawToEff])
+  const ackProject = (key: string) => {
+    const pa = attentionByProject.get(key)
+    if (!pa || pa.unacked.length === 0) return
+    // 乐观更新：本地先熄灭,Rust 确认后事件重查兜底
+    const acked = new Set(pa.unacked.map(itemKey))
+    setAttention((prev) => prev.map((i) => (acked.has(itemKey(i)) ? { ...i, acked: true } : i)))
+    for (const it of pa.unacked) void timelineService.ackAttention(it.agent, it.sessionId)
+  }
   const isPinned = useCallback((key: string) => pinnedEff.includes(key), [pinnedEff])
   const togglePin = (key: string) => {
     const cur = getDesignPrefs().timelinePinnedKeys ?? []
@@ -273,6 +404,79 @@ export default function TimelineWindow() {
     setDesignPrefs({ timelinePinnedKeys: next })
   }
   const toggleOrientation = () => setDesignPrefs({ timelineOrientation: horizontal ? 'vertical' : 'horizontal' })
+
+  // ---- S4 条态：项目名列表（看板同序取前 maxProjects 个 + 补上亮起的）/ 量宽 / 折叠 ----
+  const stripProjects = useMemo(() => {
+    const head = maxProjects > 0 ? ordered.slice(0, maxProjects) : ordered
+    const lit = ordered.filter((p) => {
+      const lv = attentionByProject.get(p.key)?.level
+      return (lv === 'waiting' || lv === 'pending') && !head.includes(p)
+    })
+    return [...head, ...lit]
+  }, [ordered, maxProjects, attentionByProject])
+  const stripInnerRef = useRef<HTMLDivElement | null>(null)
+  const stripWidth = useRef(0)
+  const sentWidth = useRef(0)
+  const formRef = useRef(form)
+  formRef.current = form
+  const foldToStrip = useCallback(() => {
+    sentWidth.current = stripWidth.current
+    void windowService.setTimelineForm('strip', stripWidth.current || undefined)
+  }, [])
+  const expandToBoard = useCallback(() => {
+    void windowService.setTimelineForm('board')
+  }, [])
+  useLayoutEffect(() => {
+    const el = stripInnerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      // + 左右 1px 边框（inner 绝对定位在 padding box 内,窗口宽要含边框）
+      const w = Math.ceil(el.getBoundingClientRect().width) + 2
+      stripWidth.current = w
+      // 条态下内容变宽 / 变窄（项目增减、亮起补位、字体加载）→ 重发意图,Rust 保持左缘重施
+      if (formRef.current === 'strip' && w > 0 && Math.abs(w - sentWidth.current) >= 1) {
+        sentWidth.current = w
+        void windowService.setTimelineForm('strip', w)
+      }
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  // 切入条态时补发一次当前宽度（启动恢复条态 / 事件驱动的折条,Rust 手里可能是旧宽）
+  useEffect(() => {
+    if (strip && stripWidth.current > 0 && stripWidth.current !== sentWidth.current) {
+      sentWidth.current = stripWidth.current
+      void windowService.setTimelineForm('strip', stripWidth.current)
+    }
+  }, [strip])
+
+  // 焦点丢失自动折：只在看板态「获过焦点后失焦」计时;指针仍在窗口上不计时
+  const focused = useWindowFocus()
+  const everFocused = useRef(false)
+  if (focused) everFocused.current = true
+  const [pointerInside, setPointerInside] = useState(false)
+  // 托盘隐藏看板也会失焦——隐藏期间不计时,否则下次显示莫名成了条
+  const [shown, setShown] = useState(true)
+  useEffect(() => {
+    let disposed = false
+    let off: (() => void) | null = null
+    void events.onTimelineVisibilityChanged((v) => setShown(v)).then((unlisten) => {
+      if (disposed) unlisten()
+      else off = unlisten
+    })
+    return () => {
+      disposed = true
+      off?.()
+    }
+  }, [])
+  useEffect(() => {
+    if (strip || !shown || focused || pointerInside || autoStripSecs <= 0 || !everFocused.current) return
+    const id = window.setTimeout(() => {
+      everFocused.current = false
+      foldToStrip()
+    }, autoStripSecs * 1000)
+    return () => window.clearTimeout(id)
+  }, [strip, shown, focused, pointerInside, autoStripSecs, foldToStrip])
 
   // ---- 格子索引 / 热力 / 紧凑档 ----
   const cellIndex = useMemo(() => {
@@ -307,8 +511,9 @@ export default function TimelineWindow() {
       const r = el.getBoundingClientRect()
       let left = r.left - b.left + (horizontal ? 8 : 0)
       let top = r.bottom - b.top + 4
+      const rows = Math.min(HOVER_ATTENTION_MAX, attentionByProject.get(key)?.waiting.length ?? 0) + 1
       left = Math.max(4, Math.min(left, b.width - HOVER_CARD_W - 4))
-      top = Math.max(4, Math.min(top, b.height - HOVER_CARD_H - 4))
+      top = Math.max(4, Math.min(top, b.height - HOVER_CARD_H - rows * HOVER_ROW_H - 4))
       setHover({ key, left, top })
     }, HOVER_DELAY_MS)
   }
@@ -322,6 +527,16 @@ export default function TimelineWindow() {
   const hoverTodayCell = hoverProject ? cellIndex.get(hoverProject.key)?.get(todayKey) ?? null : null
   const hoverWindowSessions = hoverProject ? hoverProject.cells.reduce((s, c) => s + c.sessions, 0) : 0
   const hoverFolder = hoverProject ? folderByKey.get(hoverProject.key) ?? false : false
+  const hoverAttention = hoverProject ? attentionByProject.get(hoverProject.key) ?? null : null
+  const hoverStatus = !hoverAttention
+    ? 'Idle'
+    : [
+        hoverAttention.waiting.length > 0 ? `${hoverAttention.waiting.length} waiting` : '',
+        hoverAttention.running > 0 ? `${hoverAttention.running} running` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ') || 'Idle'
+  const nowMs = Date.now()
   const openFolder = () => {
     if (hoverProject && hoverFolder) void projectService.openProjectFolder(hoverProject.key)
   }
@@ -343,14 +558,24 @@ export default function TimelineWindow() {
   const projectHead = (p: TimelineProject) => {
     const badge = p.inactiveDays != null && p.inactiveDays >= INACTIVE_BADGE_DAYS ? `${p.inactiveDays}d` : null
     const pinned = isPinned(p.key)
+    const level = attentionByProject.get(p.key)?.level ?? null
+    const lit = level === 'waiting' || level === 'pending'
+    const tip =
+      level === 'waiting'
+        ? `${p.key}\nAn agent is waiting for your reply (click to dismiss)`
+        : level === 'pending'
+          ? `${p.key}\nA tool call has been pending for a while, maybe an approval (click to dismiss)`
+          : p.key
     return (
       <div
         key={`h:${p.key}`}
-        className={`tl-proj${pinned ? ' is-pinned' : ''}`}
-        title={p.key}
+        className={`tl-proj${pinned ? ' is-pinned' : ''}${lit ? ` is-${level}` : ''}`}
+        title={tip}
         onMouseEnter={(e) => onProjectEnter(p.key, e.currentTarget)}
         onMouseLeave={onProjectLeave}
+        onClick={lit ? () => ackProject(p.key) : undefined}
       >
+        {lit && <span className="tl-dot" aria-label={level === 'waiting' ? 'Waiting for reply' : 'Tool pending'} />}
         <span className="tl-proj-label">{p.label}</span>
         {badge && (
           <span className="tl-badge" title={`No activity for ${p.inactiveDays} days`}>
@@ -425,8 +650,8 @@ export default function TimelineWindow() {
   const hiddenCount = ordered.length - visible.length
 
   return (
-    <div className="timeline-shell">
-      <div className="timeline-card">
+    <div className={`timeline-shell${strip ? ' is-strip' : ' is-board'}`} onMouseEnter={() => setPointerInside(true)} onMouseLeave={() => setPointerInside(false)}>
+      <div className="timeline-card" aria-hidden={strip}>
         <div className="timeline-head" data-tauri-drag-region="deep">
           <span className="timeline-title" data-tauri-drag-region="deep">
             Timeline
@@ -439,6 +664,9 @@ export default function TimelineWindow() {
               +{hiddenCount} more
             </span>
           )}
+          <button type="button" className={`tl-icon tl-fold${hiddenCount > 0 ? '' : ' is-right'}`} onClick={foldToStrip} title="Fold into a strip at the top of the screen (double-click the strip to expand)">
+            <FoldIcon />
+          </button>
         </div>
         <div className={`timeline-body${horizontal ? ' is-horizontal' : ' is-vertical'}`} ref={bodyRef}>
           {empty ? (
@@ -474,6 +702,21 @@ export default function TimelineWindow() {
                   {hoverProject.label}
                 </div>
                 <div className="tl-hover-row">
+                  <span>Status</span>
+                  <span className={hoverAttention && hoverAttention.unacked.length > 0 ? 'tl-hover-accent' : undefined}>{hoverStatus}</span>
+                </div>
+                {hoverAttention?.waiting.slice(0, HOVER_ATTENTION_MAX).map((it) => {
+                  const label = `${it.title?.trim() || clockLabel(it.since)} · ${it.agentLabel}`
+                  return (
+                    <div key={itemKey(it)} className={`tl-hover-row tl-hover-session${it.acked ? ' is-acked' : ''}`}>
+                      <span>
+                        {it.state === 'waiting' ? 'Reply' : 'Tool'} · {ago(it.since, nowMs)}
+                      </span>
+                      <span title={label}>{label}</span>
+                    </div>
+                  )
+                })}
+                <div className="tl-hover-row">
                   <span>Today</span>
                   <span>{hoverTodayCell ? `${hoverTodayCell.turns} turns · ${formatCompact(hoverTodayCell.tokens)}` : 'No activity'}</span>
                 </div>
@@ -506,6 +749,38 @@ export default function TimelineWindow() {
               </>
             )}
           </div>
+        </div>
+      </div>
+      {/* S4 条态层：常驻 DOM（看板态 visibility:hidden 仍参与布局,供量宽）。整条可拖动,亮起项目名是按钮
+          （按钮天然豁免 drag-region,点击 = 确认）;双击展开（条态不可缩放,tauri 双击最大化不生效）。*/}
+      <div className="tl-strip" aria-hidden={!strip} data-tauri-drag-region="deep" onDoubleClick={expandToBoard}>
+        <div className="tl-strip-inner" ref={stripInnerRef}>
+          {stripProjects.length === 0 && <span className="tl-strip-name is-muted">Timeline</span>}
+          {stripProjects.map((p) => {
+            const level = attentionByProject.get(p.key)?.level ?? null
+            if (level === 'waiting' || level === 'pending') {
+              return (
+                <button
+                  key={p.key}
+                  type="button"
+                  className={`tl-strip-name is-${level}`}
+                  title={`${p.key}\n${level === 'waiting' ? 'An agent is waiting for your reply' : 'A tool call has been pending for a while'} (click to dismiss)`}
+                  onClick={() => ackProject(p.key)}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                >
+                  {p.label}
+                </button>
+              )
+            }
+            return (
+              <span key={p.key} className="tl-strip-name" title={p.key}>
+                {p.label}
+              </span>
+            )
+          })}
+          <button type="button" className="tl-strip-expand" onClick={expandToBoard} onDoubleClick={(e) => e.stopPropagation()} title="Expand the board">
+            <ExpandIcon />
+          </button>
         </div>
       </div>
     </div>

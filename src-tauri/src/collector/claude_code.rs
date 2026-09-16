@@ -27,6 +27,8 @@
 //! 会话：主文件 = `sessionId`（文件内首个）;`<session>/subagents/agent-*.jsonl` 为子会话
 //! （行带 `isSidechain` + `agentId`）,session_id = agentId、parent = sessionId,每条提示行开子轮。
 //! 标题（内容列）：`custom-title.customTitle` 优先于 `ai-title.aiTitle`。
+//! 项目：= 文件所在文件夹 `projects/<编码启动目录>/`（源自己的分组,`project_dir`）;行内 `cwd` 只用来
+//! 还原可读路径——它是 Bash 当前目录,随 `cd` 漂进子目录,不能当身份。
 //!
 //! **v12 会话族折叠**：
 //! 桌面应用「续聊 / fork」把整份历史复制进新会话文件——复制行的 `uuid` / `message.id` / 时间戳与原文件
@@ -43,7 +45,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use super::project_dir::{first_cwd, folder_of, FolderProjects};
 use super::store::{Batch, Store, Tokens};
+use super::turns::normalize_project;
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, FileCursor, ProbeOutcome,
     advance_file, clamp0, load_cursor, rfc3339_to_local_day_hour, rfc3339_to_millis, seal_cursor,
@@ -219,9 +223,7 @@ impl ClaudeCodeAdapter {
                 None => st.set_session(sid),
             }
         }
-        if let Some(cwd) = v.get("cwd").and_then(|x| x.as_str()) {
-            st.set_project(cwd);
-        }
+        // 行内 cwd 不再参与项目归属（它是 Bash 当前目录,`cd` 后漂进子目录）;项目由文件所在文件夹决定,collect 里设定。
         let has_origin = v.get("origin").is_some();
         if has_origin {
             st.drop_tentative = true;
@@ -293,6 +295,14 @@ impl ClaudeCodeAdapter {
                 if v.get("isApiErrorMessage").and_then(|x| x.as_bool()).unwrap_or(false) {
                     st.error(batch, agent, ts);
                 }
+                // stop_reason 每行都带（同一响应的 thinking / text 分块行一致）;
+                // 非 tool_use（end_turn / stop_sequence / max_tokens）= 答完在等用户。
+                // 子会话（sidechain）答完只是回到父会话,不算等用户——子会话本就不单独亮起。
+                if let Some(reason) = v.pointer("/message/stop_reason").and_then(|x| x.as_str()) {
+                    if reason != "tool_use" {
+                        st.mark_done(ts, true);
+                    }
+                }
             }
             Some("system") => {
                 if let Some(ts) = ts {
@@ -345,6 +355,7 @@ impl Adapter for ClaudeCodeAdapter {
         let mut batch = Batch::default();
         let mut months = BTreeSet::new();
         let mut fam = FamilyCache::default();
+        let mut folders = FolderProjects::new(META.id);
 
         for (path, scope, mut cursor) in entries {
             let Some(consume) = advance_file(&path, &mut cursor) else { continue };
@@ -360,6 +371,13 @@ impl Adapter for ClaudeCodeAdapter {
                 cursor
             };
             cursor.turn.set_file_scope(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            // 项目 = 文件所在文件夹（`projects/<编码启动目录>/`,续篇 / fork / 子代理都在同一文件夹）;
+            // 每次采集重设,旧游标里按行漂移过的目录一并纠正。
+            let project = match folder_of(&self.projects_dir, &path) {
+                Some(folder) => folders.resolve(store, &folder, &consume.lines, &cursor.turn.project_key),
+                None => first_cwd(&consume.lines).map(|c| normalize_project(&c)).unwrap_or_default(),
+            };
+            cursor.turn.set_project(&project);
             let file_id = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             for line in &consume.lines {
                 Self::process_line(line, &file_id, &mut cursor, &mut batch, &mut months, store, &mut fam);
@@ -372,6 +390,7 @@ impl Adapter for ClaudeCodeAdapter {
             cursor.offset = consume.new_offset;
             seal_cursor(&mut cursor, &path, &scope, &mut batch);
         }
+        folders.persist(&mut batch);
 
         store.commit(META.id, &batch).map_err(|e| AdapterError::new("error", e))?;
         Ok(CollectOutcome { events: batch.events, months })
@@ -417,7 +436,7 @@ mod tests {
 
     fn collect_lines(tag: &str, batches: &[Vec<String>]) -> Store {
         let dir = std::env::temp_dir().join(format!("tc_claude_{tag}_{}", std::process::id()));
-        let proj = dir.join("projects").join("E--Projects-Demo");
+        let proj = dir.join("projects").join("E--Work-Demo");
         std::fs::create_dir_all(&proj).unwrap();
         let file = proj.join(format!("{S}.jsonl"));
         let adapter = ClaudeCodeAdapter { projects_dir: dir.join("projects") };
@@ -435,6 +454,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok);
         store
+    }
+
+    /// v13:行内 cwd 是 Bash 当前目录——`cd` 进子目录后工具结果、助手行乃至下一条真实提问都带子目录
+    /// （2026-09-16 本机实证）。项目恒为文件首个 cwd:轮、会话行、daily_project 都不出现子目录键。
+    #[test]
+    fn project_stays_at_launch_dir_after_cd() {
+        let cd = |line: String| line.replace(r"E:\\Work\\Demo", r"E:\\Work\\Demo\\src-tauri\\src");
+        let tool = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}"#;
+        let text = r#"{"type":"text","text":"x"}"#;
+        let store = collect_lines(
+            "cd_drift",
+            &[
+                vec![
+                    human("2026-09-05T10:00:00.000Z", Some("human")),
+                    assistant("2026-09-05T10:00:03.000Z", "msg_a", tool, 100, 10),
+                    // `cd src-tauri/src && …` 之后:本轮余下行都在子目录,轮在子目录里结束
+                    cd(tool_result("2026-09-05T10:00:05.000Z", "toolu_1")),
+                    cd(assistant("2026-09-05T10:00:08.000Z", "msg_b", text, 200, 20)),
+                ],
+                vec![
+                    // 跨批次:下一条真实提问仍带子目录
+                    cd(human("2026-09-05T10:05:00.000Z", Some("human"))),
+                    cd(assistant("2026-09-05T10:05:03.000Z", "msg_c", text, 300, 30)),
+                ],
+            ],
+        );
+        let turns = store.test_turns(META.id);
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|t| t.project_key == "e:/Work/Demo"), "{:?}", turns.iter().map(|t| &t.project_key).collect::<Vec<_>>());
+        assert_eq!(store.test_sessions(META.id)[0].project_key, "e:/Work/Demo");
+        let keys: Vec<String> = {
+            let mut stmt = store.conn().prepare("SELECT DISTINCT project_key FROM daily_project").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect()
+        };
+        assert_eq!(keys, vec!["e:/Work/Demo".to_string()]);
+        assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
+    /// v13:身份 = 文件夹。同一文件夹下另一个文件每一行都已漂进子目录（首个 cwd 也是子目录）,仍归该文件夹的项目;
+    /// 可读路径来自同批已解析的兄弟文件,并持久化为 `folder:` 映射供下次采集复用。
+    #[test]
+    fn folder_decides_project_even_if_every_line_drifted() {
+        const S2: &str = "0a1b2c3d-0000-4000-8000-000000000002";
+        let dir = std::env::temp_dir().join(format!("tc_claude_folder_{}", std::process::id()));
+        let proj = dir.join("projects").join("E--Work-Demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let text = r#"{"type":"text","text":"x"}"#;
+        let drift = |line: String| line.replace(r"E:\\Work\\Demo", r"E:\\Work\\Demo\\src").replace(S, S2);
+        let clean = [human("2026-09-05T10:00:00.000Z", Some("human")), assistant("2026-09-05T10:00:03.000Z", "msg_a", text, 100, 10)];
+        let drifted = [drift(human("2026-09-06T10:00:00.000Z", Some("human"))), drift(assistant("2026-09-06T10:00:03.000Z", "msg_b", text, 100, 10))];
+        std::fs::write(proj.join(format!("{S}.jsonl")), clean.join("\n") + "\n").unwrap();
+        std::fs::write(proj.join(format!("{S2}.jsonl")), drifted.join("\n") + "\n").unwrap();
+        let adapter = ClaudeCodeAdapter { projects_dir: dir.join("projects") };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok);
+        let sessions = store.test_sessions(META.id);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|s| s.project_key == "e:/Work/Demo"), "{:?}", sessions.iter().map(|s| &s.project_key).collect::<Vec<_>>());
+        assert!(store.test_turns(META.id).iter().all(|t| t.project_key == "e:/Work/Demo"));
+        assert_eq!(store.get_cursor(META.id, "folder:E--Work-Demo").as_deref(), Some("e:/Work/Demo"), "映射持久化");
+    }
+
+    /// PHASE14 S3:stop_reason 驱动注意力观测——tool_use 未回 = 工具中;非 tool_use = 答完等用户;
+    /// 答完后的中断标记（待定零调用轮）= 无状态。
+    #[test]
+    fn stop_reason_drives_live_phase() {
+        use crate::collector::attention::LivePhase;
+        let stop = |line: String, reason: &str| line.replace(r#""stop_reason":null"#, &format!(r#""stop_reason":"{reason}""#));
+        let tool = r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}"#;
+        let text = r#"{"type":"text","text":"x"}"#;
+        let phase = |tag: &str, lines: Vec<String>| {
+            let mut store = collect_lines(tag, &[lines]);
+            store.take_live().get(&("claude-code".to_string(), S.to_string())).map(|o| o.phase)
+        };
+        let head = || {
+            vec![
+                human("2026-09-05T10:00:00.000Z", Some("human")),
+                stop(assistant("2026-09-05T10:00:03.000Z", "msg_a", r#"{"type":"thinking","thinking":""}"#, 100, 10), "tool_use"),
+                stop(assistant("2026-09-05T10:00:04.000Z", "msg_a", tool, 100, 20), "tool_use"),
+            ]
+        };
+        assert_eq!(phase("live_tools", head()), Some(LivePhase::Tools));
+        let mut done = head();
+        done.push(tool_result("2026-09-05T10:00:10.000Z", "toolu_1"));
+        assert_eq!(phase("live_busy", done.clone()), Some(LivePhase::Busy), "工具结果已回、模型未续");
+        done.push(stop(assistant("2026-09-05T10:00:20.000Z", "msg_b", text, 100, 30), "end_turn"));
+        assert_eq!(phase("live_done", done.clone()), Some(LivePhase::Done { exact: true }));
+        done.push(no_origin("2026-09-05T10:01:00.000Z", INTERRUPTED));
+        assert_eq!(phase("live_interrupt", done), Some(LivePhase::Idle));
     }
 
     /// S3 定案:同文件出现过 origin → 缺 origin 的零调用行不成轮;拿到响应的照常成轮;跨批次正确。
@@ -569,7 +679,7 @@ mod tests {
     fn collect_files(tag: &str, batches: &[Vec<(&str, Vec<String>)>]) -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("tc_claude_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let proj = dir.join("projects").join("E--Projects-Demo");
+        let proj = dir.join("projects").join("E--Work-Demo");
         std::fs::create_dir_all(&proj).unwrap();
         let adapter = ClaudeCodeAdapter { projects_dir: dir.join("projects") };
         let mut store = Store::open_in_memory().unwrap();
@@ -613,7 +723,7 @@ mod tests {
         // 先写 fork 与子代理,最后写根并把 mtime 推到更晚:mtime 序 = fork 先,内容序 = 根先
         let dir = std::env::temp_dir().join(format!("tc_claude_fork_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let proj = dir.join("projects").join("E--Projects-Demo");
+        let proj = dir.join("projects").join("E--Work-Demo");
         std::fs::create_dir_all(proj.join(S2).join("subagents")).unwrap();
         std::fs::write(proj.join(&fork_rel), fork_lines().join("\n") + "\n").unwrap();
         std::fs::write(proj.join(&sub_rel), subagent.join("\n") + "\n").unwrap();
@@ -720,7 +830,7 @@ mod tests {
     #[test]
     fn end_to_end_session_turns_and_subagent_merge() {
         let dir = std::env::temp_dir().join(format!("tc_claude_turns_{}", std::process::id()));
-        let proj = dir.join("projects").join("E--Projects-Demo");
+        let proj = dir.join("projects").join("E--Work-Demo");
         let sub = proj.join(S).join("subagents");
         std::fs::create_dir_all(&sub).unwrap();
         let tool_block = r#"{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}"#;

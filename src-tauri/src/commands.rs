@@ -533,6 +533,28 @@ pub fn get_project_timeline(from: String, to: String, state: State<'_, AppState>
         .ok_or_else(|| "invalid range".to_string())
 }
 
+/// 注意力快照:会话级 running / waiting / tool_pending,项目键为原始目录键
+/// （前端经 effective_key 折叠到项目行）。只读内存表,不碰库。
+#[tauri::command]
+pub fn get_attention(state: State<'_, AppState>) -> Result<Vec<collector::attention::AttentionItem>, String> {
+    let table = state.attention.lock().map_err(|_| "attention lock poisoned".to_string())?;
+    Ok(table.items(collector::store::now_millis(), task_store::idle_threshold_ms()))
+}
+
+/// 确认一个会话当前这一段等待（同一会话下一次进入等待自动复位）。有变化才广播。
+#[tauri::command(rename_all = "snake_case")]
+pub fn ack_attention(agent: String, session_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    let changed = state
+        .attention
+        .lock()
+        .map_err(|_| "attention lock poisoned".to_string())?
+        .ack(&agent, &session_id, collector::store::now_millis(), task_store::idle_threshold_ms());
+    if changed {
+        collector::notify_attention(&app);
+    }
+    Ok(changed)
+}
+
 /// 轮间空档直方图（gap_ms 对数分桶 + 当前阈值两侧合计;按轮的本地日过滤）。
 #[tauri::command]
 pub fn get_gap_histogram(range: DayRange, state: State<'_, AppState>) -> Result<GapHistogram, String> {

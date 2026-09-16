@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::attention::{LivePhase, LiveTurn};
 use super::store::{Batch, SessionRow, Tokens, TurnPart, TurnRow};
 
 /// 未知项目 / 缺目录源的 project_key（不猜）。
@@ -96,6 +97,10 @@ pub struct TurnAcc {
     /// 用户中止（S4-R,与 error_count 分列）。
     #[serde(default)]
     pub aborted: bool,
+    /// 模型已答完、在等用户（0 = 否;1 = 启发式,源无显式信号;2 = 源显式信号,
+    /// 如 Claude `stop_reason` 非 tool_use）。任何后续响应 / 工具 / 错误事件清零。
+    #[serde(default)]
+    pub model_done: u8,
     #[serde(default)]
     pub model_ms: i64,
     #[serde(default)]
@@ -138,6 +143,12 @@ pub struct TurnState {
     /// 待定输入的丢弃开关（适配器置位;Claude = 本文件出现过 `origin` 字段）。
     #[serde(default)]
     pub drop_tentative: bool,
+    /// 最近闭合的一轮是否为用户中止（Codex / DSH 显式闭轮后据此判断是否在等用户）。
+    #[serde(default)]
+    pub last_aborted: bool,
+    /// 源自己记录的会话项目（见 `set_session_project`;None = 会话行取当前轮目录、首写胜）。
+    #[serde(default)]
+    pub session_project: Option<String>,
     #[serde(default)]
     recent: Vec<RecentResponse>,
 }
@@ -184,6 +195,15 @@ impl TurnState {
             open.project_key = key.clone();
         }
         self.project_key = key;
+    }
+
+    /// 源自己记录的会话项目（Codex `threads.cwd` = 当前工作区）。会话行以它为准、后写胜;
+    /// 轮仍按各自目录归属。
+    pub fn set_session_project(&mut self, dir: &str) {
+        let key = normalize_project(dir);
+        if key != UNKNOWN_PROJECT {
+            self.session_project = Some(key);
+        }
     }
 
     pub fn set_title(&mut self, title: &str, rank: u8) {
@@ -315,6 +335,7 @@ impl TurnState {
         {
             let open = self.ensure(batch, agent, ts);
             open.model_ms += (ts - open.anchor).max(0);
+            open.model_done = 0;
         }
         if !has_tokens {
             self.touch(ts);
@@ -365,6 +386,7 @@ impl TurnState {
 
     pub fn tool_start(&mut self, batch: &mut Batch, agent: &str, ts: i64, id: &str) {
         let open = self.ensure(batch, agent, ts);
+        open.model_done = 0;
         if !open.open_tools.contains_key(id) {
             open.tool_calls += 1;
             open.open_tools.insert(id.to_string(), ts);
@@ -375,6 +397,7 @@ impl TurnState {
     /// 工具结果：配对到起始时间则累加 tool_ms;未配对（跨轮 / 丢行）只推进时间。
     pub fn tool_end(&mut self, ts: i64, id: &str) {
         if let Some(open) = self.open.as_mut() {
+            open.model_done = 0;
             if let Some(start) = open.open_tools.remove(id) {
                 open.tool_ms += (ts - start).max(0);
             }
@@ -384,6 +407,7 @@ impl TurnState {
 
     pub fn error(&mut self, batch: &mut Batch, agent: &str, ts: i64) {
         self.ensure(batch, agent, ts).error_count += 1;
+        self.mark_done(ts, true);
         self.touch(ts);
     }
 
@@ -394,8 +418,43 @@ impl TurnState {
     }
 
     pub fn retry(&mut self, batch: &mut Batch, agent: &str, ts: i64) {
-        self.ensure(batch, agent, ts).retry_count += 1;
+        let open = self.ensure(batch, agent, ts);
+        open.retry_count += 1;
+        open.model_done = 0;
         self.touch(ts);
+    }
+
+    /// 模型本次答完、轮停在等用户（`exact` = 源显式信号;false = 启发式,见 attention）。
+    /// 未配对工具仍在时不生效（模型在等工具结果,不是在等用户）。
+    pub fn mark_done(&mut self, ts: i64, exact: bool) {
+        self.touch(ts);
+        if let Some(open) = self.open.as_mut().filter(|o| o.open_tools.is_empty()) {
+            open.model_done = if exact { 2 } else { 1 };
+        }
+    }
+
+    /// 注意力观测——文件末尾（flush）的会话现状,供 attention 表派生 running / waiting。
+    /// 开着的轮看 `open_tools` / `model_done`;已显式闭轮（Codex task_complete、DSH turn/end）
+    /// = 模型答完在等用户（用户中止的除外）;应丢弃的待定轮（Claude 中断标记 / 斜杠命令）= 无状态。
+    pub fn observe(&self) -> LiveTurn {
+        let (phase, last_event, project_key) = match self.open.as_ref() {
+            Some(_) if self.open_is_dropped() => (LivePhase::Idle, self.prev_end.unwrap_or(0), self.project()),
+            Some(o) => {
+                let phase = if !o.open_tools.is_empty() {
+                    LivePhase::Tools
+                } else if o.model_done > 0 {
+                    LivePhase::Done { exact: o.model_done >= 2 }
+                } else {
+                    LivePhase::Busy
+                };
+                (phase, o.last_event, o.project_key.clone())
+            }
+            None => match self.prev_end {
+                Some(end) if !self.last_aborted => (LivePhase::Done { exact: true }, end, self.project()),
+                other => (LivePhase::Idle, other.unwrap_or(0), self.project()),
+            },
+        };
+        LiveTurn { project_key, parent_id: self.parent_id.clone(), title: self.title.clone(), phase, last_event }
     }
 
     pub fn set_explicit_wall(&mut self, ms: i64) {
@@ -416,6 +475,7 @@ impl TurnState {
         self.flush(batch, agent);
         if let Some(open) = self.open.take() {
             self.prev_end = Some(open.last_event);
+            self.last_aborted = open.aborted;
         }
     }
 
@@ -424,16 +484,21 @@ impl TurnState {
         if self.session_id.is_empty() {
             return;
         }
+        // 同一会话以文件末尾最后一次 flush 为准（close 内的 flush 被后续覆盖）
+        batch.live.insert((agent.to_string(), self.session_id.clone()), self.observe());
         let mut session = SessionRow {
             session_id: self.session_id.clone(),
-            project_key: None,
+            project_key: self.session_project.clone(),
+            project_authoritative: self.session_project.is_some(),
             parent_id: self.parent_id.clone(),
             title: self.title.clone(),
             started_at: None,
             ended_at: None,
         };
         if let Some(open) = self.open.as_ref().filter(|_| !self.open_is_dropped()) {
-            session.project_key = Some(open.project_key.clone());
+            if session.project_key.is_none() {
+                session.project_key = Some(open.project_key.clone());
+            }
             session.started_at = Some(open.started_at);
             session.ended_at = Some(open.last_event);
             let wall = open.explicit_wall.unwrap_or((open.wall_end - open.started_at).max(0));
@@ -464,7 +529,7 @@ impl TurnState {
                     parts: open.parts.clone(),
                 },
             );
-        } else if self.title.is_none() {
+        } else if self.title.is_none() && self.session_project.is_none() {
             return;
         }
         batch.upsert_session(agent, session);
@@ -584,6 +649,35 @@ mod tests {
         // 旧游标（无 aborted 字段）反序列化为 false
         let old: TurnAcc = serde_json::from_str(r#"{"seq":1,"started_at":0,"start_day":"","project_key":"","last_event":0,"wall_end":0,"anchor":0}"#).unwrap();
         assert!(!old.aborted);
+    }
+
+    /// PHASE14 S3:显式闭轮 = 答完等用户;中止闭轮 = 无状态;有未配对工具时 mark_done 不生效;
+    /// flush 以最后一次为准。
+    #[test]
+    fn observe_live_phase() {
+        let mut b = Batch::default();
+        let mut st = TurnState::default();
+        st.set_session("s");
+        st.set_project(r"E:\p");
+        assert_eq!(st.observe().phase, LivePhase::Idle, "空会话");
+        st.begin(&mut b, "a", T0, true);
+        assert_eq!(st.observe().phase, LivePhase::Busy);
+        st.response(&mut b, "a", T0 + 1_000, None, "m", tok(1, 1), None, 1);
+        st.tool_start(&mut b, "a", T0 + 1_000, "c");
+        st.mark_done(T0 + 1_500, true);
+        assert_eq!(st.observe().phase, LivePhase::Tools, "工具未回不算答完");
+        st.tool_end(T0 + 2_000, "c");
+        st.response(&mut b, "a", T0 + 3_000, None, "m", tok(1, 1), None, 0);
+        st.mark_done(T0 + 3_000, false);
+        assert_eq!(st.observe().phase, LivePhase::Done { exact: false });
+        st.close(&mut b, "a"); // 显式闭轮（Codex task_complete）
+        st.flush(&mut b, "a");
+        let live = &b.live[&("a".to_string(), "s".to_string())];
+        assert_eq!((live.phase, live.last_event, live.project_key.as_str()), (LivePhase::Done { exact: true }, T0 + 3_000, "e:/p"));
+        st.begin(&mut b, "a", T0 + 10_000, true);
+        st.abort(&mut b, "a", T0 + 11_000);
+        st.close(&mut b, "a");
+        assert_eq!(st.observe().phase, LivePhase::Idle, "用户中止后不亮起");
     }
 
     #[test]

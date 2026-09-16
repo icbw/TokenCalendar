@@ -28,6 +28,15 @@ impl Platform {
             _ => None,
         }
     }
+    /// collector 采集源 id → 其用量计入的订阅平台（待机退出的本地活动信号用;
+    /// 其余源不对应订阅,返回 None）。
+    pub fn of_collector_source(source_id: &str) -> Option<Self> {
+        match source_id {
+            "codex" => Some(Platform::Codex),
+            "claude-code" => Some(Platform::Claude),
+            _ => None,
+        }
+    }
 }
 
 /// 额度窗口种类（kind 语义跨平台对齐：5h 滚动 / 7d 滚动 / 附加窗口）。

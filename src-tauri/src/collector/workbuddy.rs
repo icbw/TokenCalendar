@@ -31,7 +31,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use super::project_dir::{first_cwd, folder_of, FolderProjects};
 use super::store::{Batch, Store, Tokens};
+use super::turns::normalize_project;
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, FileCursor, ProbeOutcome,
     advance_file, clamp0, epoch_number_to_millis, load_cursor, millis_to_local_day_hour, seal_cursor,
@@ -130,9 +132,7 @@ impl WorkBuddyAdapter {
         if let Some(p) = parent {
             st.set_parent(p);
         }
-        if let Some(cwd) = v.get("cwd").and_then(|x| x.as_str()) {
-            st.set_project(cwd);
-        }
+        // 项目由文件所在文件夹决定（collect 里设定）,行内 cwd 只用于还原可读路径。
         let ts = v.get("timestamp").and_then(|t| t.as_f64()).and_then(epoch_number_to_millis);
         let ty = v.get("type").and_then(|t| t.as_str());
         if ty == Some("ai-title") {
@@ -174,6 +174,11 @@ impl WorkBuddyAdapter {
             Some("message") if v.get("status").and_then(|x| x.as_str()) == Some("incomplete") => {
                 st.error(batch, agent, ts);
             }
+            // 无显式答完信号 → assistant message 记启发式答完（其后工具调用即清零,
+            // attention 侧再要求静默 HEURISTIC_SETTLE_MS 才亮起）
+            Some("message") if v.get("role").and_then(|x| x.as_str()) == Some("assistant") => {
+                st.mark_done(ts, false);
+            }
             _ => {}
         }
     }
@@ -202,12 +207,19 @@ impl Adapter for WorkBuddyAdapter {
 
         let mut batch = Batch::default();
         let mut months = BTreeSet::new();
+        let mut folders = FolderProjects::new(META.id);
 
         for path in files {
             let scope = path.display().to_string();
             let mut cursor = load_cursor(store, META.id, &scope);
             let Some(consume) = advance_file(&path, &mut cursor) else { continue };
             let mut cursor = if consume.reset { FileCursor::fresh() } else { cursor };
+            // 项目 = 文件所在文件夹 `projects/<编码启动目录>/`（与 Claude Code 同构,见 project_dir）
+            let project = match folder_of(&self.projects_dir, &path) {
+                Some(folder) => folders.resolve(store, &folder, &consume.lines, &cursor.turn.project_key),
+                None => first_cwd(&consume.lines).map(|c| normalize_project(&c)).unwrap_or_default(),
+            };
+            cursor.turn.set_project(&project);
 
             // 子代理文件:<projects>/<proj>/<session>/subagents/agent-*.jsonl → parent = <session>
             let parent_dir = path
@@ -225,6 +237,7 @@ impl Adapter for WorkBuddyAdapter {
             cursor.offset = consume.new_offset;
             seal_cursor(&mut cursor, &path, &scope, &mut batch);
         }
+        folders.persist(&mut batch);
 
         store.commit(META.id, &batch).map_err(|e| AdapterError::new("error", e))?;
         Ok(CollectOutcome { events: batch.events, months })
@@ -343,7 +356,7 @@ mod tests {
                 .replace(r#""sessionId":"s1""#, r#""sessionId":"sub1""#),
         ];
         let dir = std::env::temp_dir().join(format!("tc_wb_s2_{}", std::process::id()));
-        let proj = dir.join("projects").join("E--Projects-Demo");
+        let proj = dir.join("projects").join("E--Work-Demo");
         let subdir = proj.join("s1").join("subagents");
         std::fs::create_dir_all(&subdir).unwrap();
         std::fs::write(proj.join("s1.jsonl"), main.join("\n") + "\n").unwrap();

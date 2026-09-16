@@ -71,10 +71,14 @@ struct WindowStateFile {
     /// 条态水平位置（物理像素 x；屏归属按看板态所在屏；S4 消费）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline_strip_x: Option<i32>,
+    /// 条态内容宽（CSS 像素，前端量出）——启动恢复条态时首帧即用上次宽度，
+    /// 不等前端数据加载再跳一次宽。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline_strip_w: Option<f64>,
 }
 
-/// 时间轴两态（单窗口两态）。S1 仅作持久化字段类型，
-/// 状态机与执行者 `set_timeline_form` 在 S4。
+/// 时间轴两态（单窗口两态）。运行时单一源 = `AppState.timeline_form`，
+/// 执行者 = `timeline_form:set_form`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineForm {
@@ -113,6 +117,7 @@ impl Default for WindowStateFile {
             timeline_visible: false,
             timeline_form: None,
             timeline_strip_x: None,
+            timeline_strip_w: None,
         }
     }
 }
@@ -141,7 +146,7 @@ fn load(app: &AppHandle) -> WindowStateFile {
 fn strip_snap_fields_retry(raw: &str) -> Option<WindowStateFile> {
     let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
     if let Some(obj) = value.as_object_mut() {
-        for key in ["widget_snap", "orb_snap", "widget_snap_enabled", "timeline_form", "timeline_strip_x"] {
+        for key in ["widget_snap", "orb_snap", "widget_snap_enabled", "timeline_form", "timeline_strip_x", "timeline_strip_w"] {
             obj.remove(key);
         }
     }
@@ -230,7 +235,8 @@ pub fn restore(app: &AppHandle) {
         ("widget", file.widget),
         ("main", file.main),
         ("orb", file.orb),
-        // timeline 走通用几何恢复（位置 + 尺寸 + 越界回中）；条态归位 S4 另立
+        // timeline 先按看板几何走通用恢复（位置 + 尺寸 + 越界回中）——条态落盘时
+        // 这里存的也是看板几何；上次是条态则 setup 里 timeline_form:restore 再折条
         ("timeline", file.timeline),
     ];
     // orb 的最终形态（restore_orb 决定）——循环后与其余字段一起写进 AppState
@@ -290,6 +296,21 @@ pub fn restore(app: &AppHandle) {
         // 贴边停靠状态随文件装载（重启后 OrbWindow 挂载查询回
         // 收起态;几何归位在前端按当前工作区重算——restore 只归位 orb 位置）
         *state.orb_dock.lock().unwrap() = file.orb_dock;
+        // 时间轴形态状态装载。看板几何取恢复后的窗口值（越界回中已生效）；
+        // 窗口拿不到时退回记录值
+        {
+            let board = app
+                .get_webview_window("timeline")
+                .and_then(|w| read_geom(&w))
+                .or(file.timeline)
+                .map(|g| crate::timeline_form::Rect { x: g.x, y: g.y, width: g.width, height: g.height });
+            *state.timeline_form.lock().unwrap() = crate::timeline_form::FormState {
+                form: file.timeline_form.unwrap_or(TimelineForm::Board),
+                board,
+                strip_x: file.timeline_strip_x,
+                strip_w: file.timeline_strip_w,
+            };
+        }
         // 启动形态（restore_orb 结果:贴边/自由竖条 = false、表盘/首次 = true）
         // ——前端挂载按它对齐（Rust 侧几何已先按此恢复）。
         if let Some(e) = orb_expanded {
@@ -319,16 +340,29 @@ pub fn persist(app: &AppHandle, state: &AppState) {
             file.orb = Some(geom);
         }
     }
-    if let Some(w) = app.get_webview_window("timeline") {
-        if let Some(geom) = read_geom(&w) {
-            file.timeline = Some(geom);
+    // 条态时窗口几何是细条，不能写进看板几何——改写折条时记下的看板矩形
+    {
+        let tl = *state.timeline_form.lock().unwrap();
+        match tl.form {
+            TimelineForm::Board => {
+                if let Some(geom) = app.get_webview_window("timeline").as_ref().and_then(read_geom) {
+                    file.timeline = Some(geom);
+                }
+            }
+            TimelineForm::Strip => {
+                if let Some(b) = tl.board {
+                    file.timeline = Some(WindowGeom { x: b.x, y: b.y, width: b.width, height: b.height });
+                }
+            }
         }
+        file.timeline_form = Some(tl.form);
+        file.timeline_strip_x = tl.strip_x;
+        file.timeline_strip_w = tl.strip_w;
     }
     file.widget_visible = state.widget_visible.load(std::sync::atomic::Ordering::SeqCst);
     file.main_visible = state.main_visible.load(std::sync::atomic::Ordering::SeqCst);
     file.orb_visible = state.orb_visible.load(std::sync::atomic::Ordering::SeqCst);
     file.timeline_visible = state.timeline_visible.load(std::sync::atomic::Ordering::SeqCst);
-    // timeline_form / timeline_strip_x：S1 无写者，load 读到什么原样透传（S4 接管）
     file.widget_snap = state.widget_snap.lock().unwrap().clone();
     file.widget_snap_enabled = state
         .widget_snap_enabled

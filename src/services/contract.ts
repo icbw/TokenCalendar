@@ -344,6 +344,31 @@ export interface TimelineResultContract {
   projects: TimelineProjectContract[]
 }
 
+// ---- 注意力状态机（与 collector/attention.rs 对齐）----
+
+/** get_attention 数组元素:会话级现状,子会话不列出,按 since 先后。 */
+export interface AttentionItemContract {
+  agent: string
+  agent_label: string
+  session_id: string
+  /** 原始目录键（前端经 effective_key 折叠到项目行）。 */
+  project_key: string
+  /** 【内容列】只供 timeline 窗口本地渲染。 */
+  title: string | null
+  state: 'running' | 'waiting' | 'tool_pending'
+  /** running = 最近事件;waiting = 模型答完时刻;tool_pending = 工具静默开始时刻（ms）。 */
+  since: number
+  last_event: number
+  /** 已确认（仅 waiting / tool_pending;同一会话进入新一段等待自动复位）。 */
+  acked: boolean
+}
+
+/** ack_attention（agent, session_id) → 是否有变化。 */
+export interface AckAttentionArgs {
+  agent: string
+  session_id: string
+}
+
 /** get_idle_threshold 返回。 */
 export interface IdleThresholdInfoContract {
   minutes: number

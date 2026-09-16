@@ -71,6 +71,19 @@ export function toggleTimeline(): Promise<void> {
   return apply('timeline', 'toggle')
 }
 
+/** 时间轴两态（看板 / 条态）。 */
+export type TimelineForm = 'board' | 'strip'
+
+export async function getTimelineForm(): Promise<TimelineForm | null> {
+  return tryInvoke<TimelineForm>('get_timeline_form')
+}
+
+/** 形态切换一个执行者：Rust 原子完成尺寸 + 位置 + 置顶;条态下重复调用只更新宽度。
+ * stripWidth = 条态内容 CSS 宽（前端量出,Rust 按该屏 scale × 文本大小换算并钳到工作区）。 */
+export async function setTimelineForm(form: TimelineForm, stripWidth?: number): Promise<TimelineForm | null> {
+  return tryInvoke<TimelineForm>('set_timeline_form', { form, stripWidth })
+}
+
 /** 悬浮球两态尺寸切换（窗口 resizable=false,程序化是唯一入口）。 */
 export async function setOrbSize(width: number, height: number): Promise<void> {
   await tryInvoke<null>('set_orb_size', { width, height })

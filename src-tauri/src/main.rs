@@ -14,6 +14,7 @@ mod orb_dock;
 mod snap;
 mod subscription;
 mod text_scale;
+mod timeline_form;
 mod tray;
 mod visibility;
 mod window_state;
@@ -81,6 +82,11 @@ pub struct AppState {
     /// 点击穿透命中不再从窗口尺寸反推（跨屏 DPI 重排会让物理尺寸推不出逻辑尺寸）。
     /// 写者 = set_orb_size 命令与 orb_dock 归位路径。
     pub orb_expanded: AtomicBool,
+    /// 注意力表（内存,不落库;写者 = 采集线程每轮 tick + ack 命令）。
+    pub attention: Mutex<collector::attention::AttentionTable>,
+    /// 时间轴形态（看板 / 条态 + 看板几何 + 条态位置宽度;写者 = set_timeline_form
+    /// 与条态拖动落定,restore 装载,persist 消费）。
+    pub timeline_form: Mutex<timeline_form::FormState>,
 }
 
 fn main() {
@@ -121,6 +127,8 @@ fn main() {
             widget_snap_enabled: AtomicBool::new(true),
             orb_dock: Mutex::new(None),
             orb_expanded: AtomicBool::new(false),
+            attention: Mutex::new(Default::default()),
+            timeline_form: Mutex::new(Default::default()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_monthly_matrix,
@@ -135,6 +143,8 @@ fn main() {
             commands::get_gap_histogram,
             commands::get_project_span,
             commands::get_project_timeline,
+            commands::get_attention,
+            commands::ack_attention,
             commands::list_project_meta,
             commands::set_project_meta,
             commands::merge_projects,
@@ -185,6 +195,8 @@ fn main() {
             visibility::show_timeline,
             visibility::hide_timeline,
             visibility::toggle_timeline,
+            timeline_form::get_timeline_form,
+            timeline_form::set_timeline_form,
             subscription::get_subscription_snapshots,
             subscription::scan_subscription_credentials,
             subscription::bind_subscription,
@@ -195,6 +207,7 @@ fn main() {
             subscription::boost::set_subscription_boost,
             subscription::idle::get_subscription_idle,
             subscription::idle::set_subscription_idle_enabled,
+            subscription::idle::note_subscription_attention,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -236,6 +249,10 @@ fn main() {
             // 恢复上次会话的窗口位置/尺寸与可见性标志（不直接 show，
             // 显示统一由前端首帧后的 window_ready 裁决）
             window_state::restore(&handle);
+            // 时间轴上次是条态则折条（依赖 restore 装载的形态状态与 text_scale 系数）;
+            // 子类化约束条态拖动（钉顶缘横向滑动）并在显示器 / 文本大小变化时重施
+            timeline_form::restore(&handle);
+            timeline_form::install(&handle);
             // 边缘吸附：子类化 widget 窗口拦 WM_ENTERSIZEMOVE/
             // EXITSIZEMOVE/MOVING（S1 通道探针零行为变更，无条件转发消息链）
             snap::install(&handle);

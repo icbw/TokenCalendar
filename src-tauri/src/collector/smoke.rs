@@ -241,3 +241,26 @@ fn real_sources_smoke() {
     assert_eq!(sum_agents, sum_models, "agent/model 行和必须守恒");
     assert!(sum_agents > 0, "本机四源应有真实数据");
 }
+
+/// 真实六源注意力派生（只读扫描 → 内存库 → 注意力表）,打印会话级状态核对各源信号。
+/// 只打 agent / 状态 / 距今分钟 / 项目尾段,不打标题。
+#[test]
+#[ignore]
+fn attention_live_smoke() {
+    use super::attention::AttentionTable;
+    let mut store = Store::open_in_memory().expect("in-memory store");
+    let mut table = AttentionTable::default();
+    for adapter in default_adapters() {
+        let _ = adapter.collect(&mut store);
+        table.apply(store.take_live());
+    }
+    let now = super::store::now_millis();
+    let idle = 24 * 3_600_000; // 放宽到 24h,看到更多样本
+    table.prune(now, idle);
+    let mut out = String::from("=== attention (last 24h) ===\n");
+    for it in table.items(now, idle) {
+        let tail = it.project_key.rsplit('/').next().unwrap_or("");
+        out.push_str(&format!("{:<12} {:<12} {:>5}m  {}\n", it.agent, it.state, (now - it.since) / 60_000, tail));
+    }
+    println!("{out}");
+}

@@ -53,6 +53,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 
 use super::store::{Batch, SessionRow, Store, Tokens, TurnPart, TurnRow};
+use super::attention::{LivePhase, LiveTurn};
 use super::turns::{UNKNOWN_PROJECT, normalize_project};
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, ProbeOutcome, clamp0,
@@ -370,6 +371,7 @@ fn push_request_turn(batch: &mut Batch, target: &TurnTarget, idx: usize, r: &Ind
         SessionRow {
             session_id: session_id.to_string(),
             project_key: Some(target.project.to_string()),
+            project_authoritative: false,
             parent_id: None,
             title: target.title.map(str::to_string),
             started_at: Some(started),
@@ -457,6 +459,26 @@ impl Adapter for CodebuddyAdapter {
                         push_request_turn(&mut batch, &target, idx, r, &day, &model, tokens);
                     }
                 }
+            }
+            // 末条 request 现状（running = 在处理;complete = 答完在等用户;其余 = 失败 / 取消,
+            // 不亮起）。无结束时间 → 以文件 mtime（请求完成时 index.json 重写）作最近事件。
+            if let (false, Some(last)) = (session_id.is_empty(), file.requests.iter().rev().find(|r| r.started_at.is_some())) {
+                let phase = match last.state.as_str() {
+                    "running" => LivePhase::Busy,
+                    "complete" => LivePhase::Done { exact: true },
+                    _ => LivePhase::Idle,
+                };
+                let mtime = jsonl::generation(&path).map(|(_, m)| m).unwrap_or(0);
+                batch.live.insert(
+                    (META.id.to_string(), session_id.clone()),
+                    LiveTurn {
+                        project_key: project.clone(),
+                        parent_id: None,
+                        title: target.title.map(str::to_string),
+                        phase,
+                        last_event: mtime.max(last.started_at.unwrap_or(0)),
+                    },
+                );
             }
             cursor.count = file.requests.len() as u64;
             cursor.project = Some(project);

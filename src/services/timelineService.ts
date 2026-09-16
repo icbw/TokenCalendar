@@ -2,7 +2,7 @@
 // snake_case 契约（contract.ts）→ 驼峰内部形状一次映射;失败返回 null（tryInvoke 口径）。
 // TimelineCell.title 是内容列:只供 timeline 窗口本地渲染,不得进入导出 / 日志 / 其它视图。
 
-import type { TimelineQueryArgs, TimelineResultContract } from './contract'
+import type { AckAttentionArgs, AttentionItemContract, TimelineQueryArgs, TimelineResultContract } from './contract'
 import { tryInvoke } from './tauri'
 import { rememberProjectLabels } from './projectLabels'
 
@@ -86,4 +86,43 @@ export async function getProjectTimeline(from: string, to: string): Promise<Time
   }))
   rememberProjectLabels(projects.map((p) => [p.key, p.label]))
   return { today: res.today, days: res.days ?? [], projects }
+}
+
+// ---- 注意力:内存表快照 + 确认。事件 timeline:attention 到达后重查。 ----
+
+export type AttentionState = 'running' | 'waiting' | 'tool_pending'
+
+export interface AttentionItem {
+  agent: string
+  agentLabel: string
+  sessionId: string
+  /** 原始目录键。 */
+  projectKey: string
+  /** 【内容列】 */
+  title: string | null
+  state: AttentionState
+  since: number
+  lastEvent: number
+  acked: boolean
+}
+
+export async function getAttention(): Promise<AttentionItem[] | null> {
+  const res = await tryInvoke<AttentionItemContract[]>('get_attention')
+  if (!res) return null
+  return res.map((i) => ({
+    agent: i.agent,
+    agentLabel: i.agent_label,
+    sessionId: i.session_id,
+    projectKey: i.project_key,
+    title: i.title,
+    state: i.state,
+    since: i.since,
+    lastEvent: i.last_event,
+    acked: i.acked,
+  }))
+}
+
+export async function ackAttention(agent: string, sessionId: string): Promise<boolean> {
+  const args: AckAttentionArgs = { agent, session_id: sessionId }
+  return (await tryInvoke<boolean>('ack_attention', { ...args })) ?? false
 }

@@ -2,8 +2,8 @@
 //!
 //! - 数据源：各 agent CLI 的**本机凭据文件**（只读）+ 平台 usage 端点（逆向）;
 //! - 存储：`<数据根>/subscriptions.db`（快照 + 绑定开关;凭据永不落库）;
-//! - 轮询：独立 daemon 线程（对齐 collector 模式）——默认 5 分钟,读数无变化
-//!   时自适应退档待机（idle.rs,封顶 30 分钟,变化即回档）;
+//! - 轮询：独立 daemon 线程（对齐 collector 模式）——默认 5 分钟,长期安静时
+//!   待机放慢（idle.rs,封顶 30 分钟;变化 / 本地 agent 活动 / 用户注意即退出）;
 //!   绑定前零网络,凭据判死后零网络（mtime 自愈探针复活）;
 //! - 红线：凭据文件只读不写,刷新 token 只存内存;单平台失败不拖垮整体。
 
@@ -40,6 +40,28 @@ pub fn wake() {
     let mut gen = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
     *gen += 1;
     WAKE.1.notify_all();
+}
+
+/// 重算睡眠（不推进代际 = 不触发全量轮）：待机应检时刻被提前后,让主轮询醒来
+/// 按 `idle:due` 只检到期平台。持 WAKE.0 再 notify——主线程读代际→算时长→
+/// 进等待全程持锁,通知不会落进解锁间隙（同审计 P1-）。
+pub fn reschedule() {
+    let _g = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+    WAKE.1.notify_all();
+}
+
+/// 待机退出入口（用户注意 / 本地 agent 活动,语义见 `idle:note_attention`）:
+/// 翻转广播 `subscription:idle`,应检时刻提前则唤醒主轮询重算睡眠。
+pub fn nudge_standby(app: &AppHandle, fetch_now: Option<Platform>) {
+    let now = chrono::Utc::now().timestamp();
+    let a = idle::note_attention(now, fetch_now);
+    if a.flipped {
+        idle::emit_idle(app);
+        crate::dev_log!("[subscription] standby exited (attention, fetch_now={:?})", fetch_now);
+    }
+    if a.rescheduled {
+        reschedule();
+    }
 }
 
 pub fn poll_secs() -> u64 {
@@ -206,7 +228,8 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     let mut last_mtime: std::collections::HashMap<Platform, Option<i64>> =
         std::collections::HashMap::new();
     // wake 代际：wait 返回后代际有变 = 手动刷新/bind/间隔调整唤醒 → 全量一轮
-    //（绕过待机退档的应检时刻;初始 true = 启动先全量一轮）
+    //（绕过待机退档的应检时刻;初始 true = 启动先全量一轮）。代际未变的醒来
+    //（`reschedule` / 虚假唤醒）只检到期平台。
     let mut woke = true;
 
     loop {
@@ -218,7 +241,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         if !bound.is_empty() {
             let base = poll_secs();
             for platform in &bound {
-                // 待机退档（idle.rs）：未到该平台应检时刻就跳过;唤醒轮不受限
+                // 待机放慢（idle.rs）：未到该平台应检时刻就跳过;唤醒轮不受限
                 if !woke && !idle::due(*platform, now) {
                     continue;
                 }
@@ -251,7 +274,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     fetch_one(&adapters, *platform)
                 };
                 let _ = write_store.save_snapshot(&snap);
-                // 退档评估：变化回基础档 / 无变化退一档;翻转即广播待机态
+                // 待机评估：变化退出待机 / 无变化计安静轮（达标进入待机后退档）;翻转即广播
                 if idle::observe(*platform, &snap, base, now) {
                     idle_flipped = true;
                     crate::dev_log!("[subscription] {} standby toggled", platform.as_str());
@@ -274,11 +297,11 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
         let gen_before = *guard;
         let wait = idle::next_wait_secs(now, poll_secs());
-        let (guard, timed_out) = WAKE
+        let (guard, _) = WAKE
             .1
             .wait_timeout(guard, Duration::from_secs(wait))
-            .unwrap();
-        woke = !timed_out.timed_out() || *guard != gen_before;
+            .unwrap_or_else(|e| e.into_inner());
+        woke = *guard != gen_before;
     }
 }
 
@@ -407,9 +430,11 @@ pub fn unbind_subscription(
     Ok(())
 }
 
-/// 手动立即刷新（右键菜单/设置页按钮）。
+/// 手动立即刷新（右键菜单/设置页按钮）。手动刷新 = 用户注意到额度 → 先退出待机
+///再全量取数;注意在前,唤醒轮的无变化只计第 1 轮安静。
 #[tauri::command]
 pub fn refresh_subscriptions_now(app: AppHandle) -> Result<(), String> {
+    nudge_standby(&app, None);
     wake();
     emit_changed(&app);
     Ok(())

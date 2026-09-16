@@ -929,6 +929,7 @@ mod tests {
             SessionRow {
                 session_id: sid.into(),
                 project_key: Some(project.into()),
+                project_authoritative: false,
                 parent_id: parent.map(str::to_string),
                 title: title.map(str::to_string),
                 ..SessionRow::default()

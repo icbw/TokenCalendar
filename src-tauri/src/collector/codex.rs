@@ -30,8 +30,8 @@
 //! reasoning 397)）：input = raw.input - cached（cache-exclusive）；output 保持
 //! provider 口径（含 reasoning）；total = raw.total_tokens（回退 input+output）。
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -44,6 +44,8 @@ use super::{
 pub struct CodexAdapter {
     sessions_dir: PathBuf,
     archived_dir: PathBuf,
+    /// Codex 自己的线程库 `state_<N>.sqlite`（`threads.cwd` = 线程当前工作区);缺失 / 结构漂移 → 会话行退回首轮目录。
+    state_db: Option<PathBuf>,
 }
 
 static META: AdapterMeta = AdapterMeta {
@@ -97,6 +99,20 @@ enum Parsed {
     TurnAborted { ts: Option<i64>, duration: Option<i64> },
 }
 
+/// `~/.codex/state_<N>.sqlite` 取 N 最大者（Codex 随 schema 版本换文件名;本机 2026-09 为 state_5）。
+fn latest_state_db(base: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(base).ok()?;
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let n: u32 = name.strip_prefix("state_")?.strip_suffix(".sqlite")?.parse().ok()?;
+            Some((n, e.path()))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, p)| p)
+}
+
 impl CodexAdapter {
     pub fn new() -> Self {
         let base = std::env::var_os("CODEX_HOME")
@@ -106,7 +122,22 @@ impl CodexAdapter {
         CodexAdapter {
             sessions_dir: base.join("sessions"),
             archived_dir: base.join("archived_sessions"),
+            state_db: latest_state_db(&base),
         }
+    }
+
+    /// 线程 id → `threads.cwd`（只读打开;库缺失 / 忙 / 列缺失 → 空表,会话行退回首轮目录）。
+    fn thread_cwds(&self) -> HashMap<String, String> {
+        let Some(db) = self.state_db.as_ref().filter(|p| p.is_file()) else { return HashMap::new() };
+        let opened = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| c.busy_timeout(std::time::Duration::from_secs(2)).map(|_| c));
+        let Ok(conn) = opened else { return HashMap::new() };
+        let Ok(mut stmt) = conn.prepare("SELECT id, cwd FROM threads WHERE cwd IS NOT NULL AND cwd <> ''") else {
+            crate::dev_log!("[collector] codex threads table unreadable, session project falls back to first turn");
+            return HashMap::new();
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+        rows.map(|it| it.flatten().collect()).unwrap_or_default()
     }
 
     /// 从一行提取模型更新与用量。info 路径双兼容：`payload.info`（新）/
@@ -209,6 +240,7 @@ impl Adapter for CodexAdapter {
 
         let mut batch = Batch::default();
         let mut months = BTreeSet::new();
+        let thread_cwds = self.thread_cwds();
 
         for path in files {
             let scope = path.display().to_string();
@@ -356,6 +388,10 @@ impl Adapter for CodexAdapter {
                     cursor.turn.set_session(stem);
                 }
             }
+            // 会话行的项目以 Codex 自己的线程记录为准（用户在应用里切换工作区后 threads.cwd 跟着变;轮仍逐轮归属）
+            if let Some(cwd) = thread_cwds.get(&cursor.turn.session_id) {
+                cursor.turn.set_session_project(cwd);
+            }
             cursor.turn.flush(&mut batch, META.id);
             cursor.offset = consume.new_offset;
             seal_cursor(&mut cursor, &path, &scope, &mut batch);
@@ -479,7 +515,7 @@ mod tests {
         let sessions = dir.join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("rollout.jsonl"), lines.join("\n") + "\n").unwrap();
-        let adapter = CodexAdapter { sessions_dir: sessions, archived_dir: dir.join("archived") };
+        let adapter = CodexAdapter { sessions_dir: sessions, archived_dir: dir.join("archived"), state_db: None };
         let mut store = Store::open_in_memory().unwrap();
         let collected = adapter.collect(&mut store).is_ok();
         let _ = std::fs::remove_dir_all(&dir);
@@ -565,7 +601,7 @@ mod tests {
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("rollout-main.jsonl"), main.join("\n") + "\n").unwrap();
         std::fs::write(day_dir.join("rollout-guardian.jsonl"), guardian.join("\n") + "\n").unwrap();
-        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived") };
+        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived"), state_db: None };
         let mut store = Store::open_in_memory().unwrap();
         let ok = adapter.collect(&mut store).is_ok();
         let _ = std::fs::remove_dir_all(&dir);
@@ -594,6 +630,48 @@ mod tests {
         let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
         assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 1, "中止轮不计 request_count");
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
+    /// v13:会话行的项目 = Codex `threads.cwd`（用户在应用里把线程切到别的工作区）;轮仍按各自 turn_context 归属;
+    /// 线程库缺该线程 → 退回首轮目录。
+    #[test]
+    fn session_project_follows_codex_thread_record() {
+        let rollout = |id: &str| {
+            vec![
+                ev("2026-09-05T09:59:00.000Z", "session_meta", &format!(r#"{{"id":"{id}","session_id":"{id}","cwd":"E:\\Work\\Chat\\bang","source":"vscode"}}"#)),
+                ev("2026-09-05T10:00:00.100Z", "event_msg", r#"{"type":"task_started","turn_id":"t1"}"#),
+                ev("2026-09-05T10:00:00.200Z", "turn_context", r#"{"turn_id":"t1","cwd":"E:\\Work\\Chat\\bang","model":"gpt-5.6-sol"}"#),
+                new_line("2026-09-05T10:00:05.100Z", 100, 10, 0, 0),
+                ev("2026-09-05T10:00:06.000Z", "event_msg", r#"{"type":"task_complete","turn_id":"t1","duration_ms":6000,"error":null}"#),
+                ev("2026-09-05T10:30:00.100Z", "event_msg", r#"{"type":"task_started","turn_id":"t2"}"#),
+                ev("2026-09-05T10:30:00.200Z", "turn_context", r#"{"turn_id":"t2","cwd":"E:\\Work\\Spring","model":"gpt-5.6-sol"}"#),
+                new_line("2026-09-05T10:30:05.100Z", 200, 20, 0, 0),
+                ev("2026-09-05T10:30:06.000Z", "event_msg", r#"{"type":"task_complete","turn_id":"t2","duration_ms":6000,"error":null}"#),
+            ]
+        };
+        let dir = std::env::temp_dir().join(format!("tc_codex_thread_cwd_{}", std::process::id()));
+        let day_dir = dir.join("sessions").join("2026").join("09").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("rollout-a.jsonl"), rollout("th_a").join("\n") + "\n").unwrap();
+        std::fs::write(day_dir.join("rollout-b.jsonl"), rollout("th_b").join("\n") + "\n").unwrap();
+        let state = dir.join("state_5.sqlite");
+        {
+            let c = rusqlite::Connection::open(&state).unwrap();
+            c.execute_batch(r"CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT);
+                              INSERT INTO threads (id, cwd) VALUES ('th_a', 'E:\Work\Spring');").unwrap();
+        }
+        assert_eq!(latest_state_db(&dir).as_deref(), Some(state.as_path()));
+        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived"), state_db: Some(state) };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok);
+        let sessions = store.test_sessions(META.id);
+        let get = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap().project_key.clone();
+        assert_eq!(get("th_a"), "e:/Work/Spring", "会话行 = threads.cwd");
+        assert_eq!(get("th_b"), "e:/Work/Chat/bang", "线程库无记录 → 首轮目录");
+        let keys: Vec<String> = store.test_turns(META.id).iter().filter(|t| t.session_id == "th_a").map(|t| t.project_key.clone()).collect();
+        assert_eq!(keys, vec!["e:/Work/Chat/bang".to_string(), "e:/Work/Spring".to_string()], "轮仍逐轮归属");
     }
 
     /// S4-R 缺陷 A 冻结样本:同一中文目录分别以 UTF-8 与 GBK 字节写进 session_meta / turn_context 的 cwd,
@@ -625,7 +703,7 @@ mod tests {
         gbk.extend_from_slice(br"\\knowledge");
         std::fs::write(day_dir.join("rollout-gbk.jsonl"), rollout("g1", &gbk)).unwrap();
 
-        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived") };
+        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived"), state_db: None };
         let mut store = Store::open_in_memory().unwrap();
         let ok = adapter.collect(&mut store).is_ok();
         let _ = std::fs::remove_dir_all(&dir);

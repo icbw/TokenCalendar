@@ -6,11 +6,14 @@
 //!
 //! 口径与容错设计。
 
+pub mod attention;
 pub mod claude_code;
 pub mod codebuddy;
 pub mod codex;
 pub mod dsh;
 pub mod jsonl;
+pub mod migrations;
+pub mod project_dir;
 pub mod project_meta;
 pub mod store;
 pub mod task_query;
@@ -347,6 +350,7 @@ fn run(app: AppHandle, mut store: Store) {
 
     let adapters = default_adapters();
     let mut first_pass = true;
+    seed_attention(&app, &store);
 
     loop {
         let paused = app
@@ -372,10 +376,66 @@ fn run(app: AppHandle, mut store: Store) {
                         store.record_failure(meta.id, &e.code, &e.message);
                     }
                 }
+                // 订阅待机的本地活动信号：本源刚提交的轮里有**最近**事件
+                // = 用户正在 agent 工作 → 悬浮球退出待机;源对应的订阅平台原在待机时
+                // 立即补取一轮。首轮回填 / 新源补导的历史轮不在窗口内,不算活动。
+                if let Some(end) = store.take_latest_turn_end() {
+                    if end >= store::now_millis() - activity_window_ms() {
+                        crate::subscription::nudge_standby(
+                            &app,
+                            crate::subscription::model::Platform::of_collector_source(meta.id),
+                        );
+                    }
+                }
             }
             first_pass = false;
         }
+        // 暂停采集时也照常派生（等待超时 / 过期剔除只依赖时间）
+        tick_attention(&app, &mut store);
         sleep_until_next_round(Instant::now());
+    }
+}
+
+/// 「最近活动」窗口（毫秒）：max（5 分钟, 2 × 采集频率)——事件落盘到被扫到最多
+/// 滞后一个采集周期,窗口须覆盖最慢档（5 分钟）并留余量。
+fn activity_window_ms() -> i64 {
+    (poll_interval().as_millis() as i64 * 2).max(5 * 60_000)
+}
+
+/// 启动播种：离开阈值内更新过的会话游标 → 注意力表（表在内存,重启即空）。
+fn seed_attention(app: &AppHandle, store: &Store) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let since = store::now_millis() - task_store::idle_threshold_ms();
+    let seeds = store.recent_turn_states(since);
+    let n = seeds.len();
+    if let Ok(mut table) = state.attention.lock() {
+        for (source, st) in seeds {
+            table.seed((source, st.session_id.clone()), st.observe());
+        }
+    }
+    crate::dev_log!("[collector] attention seeded from {} recent session(s)", n);
+}
+
+/// 合入观测 → 派生 → 有变化才 emit `timeline:attention`（载荷恒 true,前端重查）。
+fn tick_attention(app: &AppHandle, store: &mut Store) {
+    let live = store.take_live();
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let changed = match state.attention.lock() {
+        Ok(mut table) => {
+            table.apply(live);
+            table.tick(store::now_millis(), task_store::idle_threshold_ms())
+        }
+        Err(_) => false,
+    };
+    if changed {
+        notify_attention(app);
+    }
+}
+
+/// 广播 `timeline:attention`（采集线程派生变化 / ack 命令后）。
+pub fn notify_attention(app: &AppHandle) {
+    if let Err(e) = app.emit("timeline:attention", true) {
+        crate::dev_log!("[collector] emit timeline:attention failed: {}", e);
     }
 }
 

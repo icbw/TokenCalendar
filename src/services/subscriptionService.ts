@@ -92,7 +92,8 @@ export async function applyBoostConfig(config: BoostConfig): Promise<void> {
 }
 
 /** 待机监控状态（Rust subscription/idle.rs 出口形状,snake_case 契约）。
- * idle = 该平台已退过基础档（读数无变化,检测放慢中）;interval_secs = 当前档位。 */
+ * idle = 该平台已进入待机（连续 3 轮无变化且安静 ≥ 10 分钟,检测放慢中）;
+ * interval_secs = 当前档位。 */
 export interface PlatformIdleState {
   platform: SubscriptionPlatform
   idle: boolean
@@ -108,6 +109,12 @@ export async function getIdle(): Promise<PlatformIdleState[] | null> {
  * Rust 侧会唤醒主轮询——调用方应只在值变化时调用）。 */
 export async function setIdleEnabled(enabled: boolean): Promise<void> {
   await tryInvoke<null>('set_subscription_idle_enabled', { enabled })
+}
+
+/** 用户注意到悬浮球（展开 / 切换平台）：Rust 侧全部平台退出待机、清零安静计数,
+ * 不额外取数（手动刷新走 refreshNow,同样先退出待机）。 */
+export async function noteAttention(): Promise<void> {
+  await tryInvoke<null>('note_subscription_attention')
 }
 
 /** 恢复待机开关运行时值（orb 窗口装载时调用;非 Tauri 环境静默跳过）。 */

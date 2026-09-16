@@ -44,6 +44,8 @@ pub struct Batch {
     pub seen_lines: Vec<(String, String, String)>,
     /// 会话别名 （agent, 副本文件的 sessionId, 根会话)——子会话 parent 与查询层按别名归根。
     pub session_aliases: Vec<(String, String, String)>,
+    /// （agent, session) → 会话现状观测（不落库;commit 后暂存进 Store 供采集线程取走）。
+    pub live: BTreeMap<(String, String), super::attention::LiveTurn>,
 }
 
 impl Batch {
@@ -122,10 +124,11 @@ impl Batch {
                 self.sessions.insert(key, row);
             }
             Some(cur) => {
-                if cur.project_key.as_deref().map_or(true, |p| p == UNKNOWN_PROJECT) {
-                    if row.project_key.is_some() {
-                        cur.project_key = row.project_key;
-                    }
+                let replace = row.project_key.is_some()
+                    && (row.project_authoritative || cur.project_key.as_deref().map_or(true, |p| p == UNKNOWN_PROJECT));
+                if replace {
+                    cur.project_key = row.project_key;
+                    cur.project_authoritative |= row.project_authoritative;
                 }
                 if cur.parent_id.is_none() {
                     cur.parent_id = row.parent_id;
@@ -199,6 +202,9 @@ pub struct TurnRow {
 pub struct SessionRow {
     pub session_id: String,
     pub project_key: Option<String>,
+    /// project_key 来自源自己的会话记录（Codex `threads.cwd`）→ 合并与落库都后写胜;
+    /// 否则沿用「首个非 unknown 胜」（轮目录推断）。
+    pub project_authoritative: bool,
     pub parent_id: Option<String>,
     /// 【内容列】见 `CONTENT_COLUMNS`。
     pub title: Option<String>,
@@ -309,6 +315,11 @@ pub struct RangeSeries {
 
 pub struct Store {
     conn: Connection,
+    /// 已提交批次的会话现状观测,等采集线程 `take_live` 合入注意力表。
+    live: BTreeMap<(String, String), super::attention::LiveTurn>,
+    /// 已提交批次里最晚的轮结束时刻（毫秒;采集线程每源 collect 后 `take_latest_turn_end`
+    /// 取走——订阅待机的本地活动信号,见 subscription/idle.rs）。
+    latest_turn_end: Option<i64>,
 }
 
 /// 当前 schema 版本。
@@ -316,7 +327,11 @@ pub struct Store {
 /// S4-R 中止与错误分列:turn_raw / turn 加 aborted、daily_project 加 aborted_count）,
 /// 用户 6 → 10 一次清库。v11 = daily_usage 加 `credit`（源本地积分,取代官网导出导入）→ 清库重扫。
 /// v12 = Claude Code 续聊 / fork 副本文件按行 uuid 折进根会话（新表 seen_line / session_alias）→ 清库重扫。
-pub const SCHEMA_VERSION: i64 = 12;
+/// v13 = 项目归属口径:Claude Code 按会话文件所在文件夹（源自己的分组）、ZCode 子会话继承根会话、
+/// Codex 会话行取源 `threads.cwd` → **就地升级**（migrations.rs,备份后重算已有行,不清库）。
+pub const SCHEMA_VERSION: i64 = 13;
+/// 低于此版本的库仍走清库重建（结构差异逐版累积,已发布用户最低 v10 = 0.5.7）;v12 起只就地迁移。
+const LEGACY_RESET_VERSION: i64 = 12;
 
 /// 迁移时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
 /// （迁移曾漏重建 source_cursor;由测试 `reset_drop_and_create_lists_match` 守护）。
@@ -333,7 +348,7 @@ const RESET_TABLES: &[&str] = &[
     "session_alias",
 ];
 
-const RESET_SCHEMA: &str = "
+pub(super) const RESET_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS daily_usage (
     day               TEXT    NOT NULL,
     agent_key         TEXT    NOT NULL,
@@ -509,6 +524,7 @@ pub(super) fn parse_month(month: &str) -> Option<(i32, u32)> {
 impl Store {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        Self::backup_before_migration(&conn, path)?;
         Self::init(conn)
     }
 
@@ -518,7 +534,7 @@ impl Store {
         Self::init(conn)
     }
 
-    fn init(conn: Connection) -> Result<Self, String> {
+    fn init(mut conn: Connection) -> Result<Self, String> {
         // 常驻表（迁移不清）：source_state 健康状态、
         // project_meta 项目管理映射（用户维护的元数据,清库重扫后原样生效）。
         // request_model（CodeBuddy 官网导出对账账本）随导入功能于 v11 退役:积分 / 模型改由源本地数据提供,
@@ -564,19 +580,55 @@ impl Store {
         // → 清库重扫。
         // v12 = Claude Code 续聊 / fork 副本文件折进根会话（seen_line 已计行 + session_alias 别名;
         // 复轮数 / token 跨文件重复计数)→ 清库重扫。
-        // v8 = （未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
+        // v13 = 项目归属（无表结构变化):Claude Code 按会话文件所在文件夹、ZCode 子会话继承根会话、
+        // Codex 会话行取 threads.cwd（旧口径把 `cd` 后的轮 / 子目录里的子代理拆成子目录伪项目并折进 Scratch)
+        // → 就地升级已有行,不清库（migrations.rs)。
+        // v8 =（未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
         // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
         // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
         // 口径语义与实现模式见 §对话轮。
+        // v13 起迁移纪律（migrations.rs）:结构用 CREATE IF NOT EXISTS / ALTER 补齐,口径用库内原始层就地重算,
+        // 不再清库重扫。v12 之前的库结构与现行差异太大（原始层 / credit / seen_line 逐版新增）,仍走一次清库到 v12。
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-        if version < SCHEMA_VERSION {
+        if version < LEGACY_RESET_VERSION {
             let drops: String = RESET_TABLES.iter().map(|t| format!("DROP TABLE IF EXISTS {t};\n")).collect();
             conn.execute_batch(&format!(
-                "BEGIN;\n{drops}{RESET_SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+                "BEGIN;\n{drops}{RESET_SCHEMA}\nPRAGMA user_version = {LEGACY_RESET_VERSION};\nCOMMIT;"
             ))
             .map_err(|e| e.to_string())?;
         }
-        Ok(Store { conn })
+        conn.execute_batch(RESET_SCHEMA).map_err(|e| e.to_string())?;
+        if version == 0 {
+            // 全新库:建表即当前版本,无历史行可升级
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).map_err(|e| e.to_string())?;
+        } else if version < 13 {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            let report = super::migrations::upgrade_v13(&tx)?;
+            tx.execute_batch("PRAGMA user_version = 13").map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            crate::dev_log!("[collector] schema {} -> 13 in place: {:?}", version, report);
+        }
+        Ok(Store { conn, live: BTreeMap::new(), latest_turn_end: None })
+    }
+
+    /// 迁移前备份：`<库目录>/backups/collector-v<旧版本>-<时间>.db`（`VACUUM INTO`,含 WAL 里未落盘的内容）。
+    /// 备份失败 → 拒绝打开（不迁移、不写库;用量命令降级,数据原样）。
+    fn backup_before_migration(conn: &Connection, path: &Path) -> Result<(), String> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        if version == 0 || version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let dir = path.parent().map(|d| d.join("backups")).ok_or("db path has no parent")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let dest = dir.join(format!("collector-v{version}-{stamp}.db"));
+        if dest.exists() {
+            return Ok(());
+        }
+        let sql = format!("VACUUM INTO '{}'", dest.display().to_string().replace('\'', "''"));
+        conn.execute(&sql, []).map_err(|e| format!("pre-migration backup failed ({}): {e}", dest.display()))?;
+        crate::dev_log!("[collector] schema v{} backed up to {}", version, dest.display());
+        Ok(())
     }
 
     /// 同 crate 采集子模块的只读查询入口（`task_query`;写路径仍只走 commit）。
@@ -604,6 +656,40 @@ impl Store {
     /// daily_project 当前套用的离开阈值（None = 从未全表重算过,如迁移后的新库）。
     pub fn project_threshold_marker(&self) -> Option<i64> {
         super::task_store::threshold_marker(&self.conn)
+    }
+
+    /// 取走自上次调用以来已提交批次的最晚轮结束时刻（None = 期间无轮数据）。
+    pub fn take_latest_turn_end(&mut self) -> Option<i64> {
+        self.latest_turn_end.take()
+    }
+
+    /// 取走已提交批次的会话现状观测。
+    pub fn take_live(&mut self) -> BTreeMap<(String, String), super::attention::LiveTurn> {
+        std::mem::take(&mut self.live)
+    }
+
+    /// 启动播种：游标在 `since` 之后更新过、且带轮状态的会话文件（JSONL 族 + DSH）。
+    /// Claude 会话族未判定的文件（只有头部元数据行）跳过——其 sessionId 不能成会话。
+    pub fn recent_turn_states(&self, since: i64) -> Vec<(String, super::turns::TurnState)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT source_id, cursor_json FROM source_cursor WHERE updated_at >= ?1 AND cursor_json LIKE '%\"turn\"%'",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
+            return Vec::new();
+        };
+        rows.flatten()
+            .filter_map(|(source, json)| {
+                let mut v: serde_json::Value = serde_json::from_str(&json).ok()?;
+                let resolved = v.get("family_resolved").and_then(|x| x.as_bool()).unwrap_or(false);
+                if source == "claude-code" && !resolved {
+                    return None;
+                }
+                let st: super::turns::TurnState = serde_json::from_value(v.get_mut("turn")?.take()).ok()?;
+                (!st.session_id.is_empty()).then_some((source, st))
+            })
+            .collect()
     }
 
     pub fn get_cursor(&self, source_id: &str, scope: &str) -> Option<String> {
@@ -710,7 +796,13 @@ impl Store {
         }
         // 轮 / 会话原始层 + 物化 + 项目维重算,与聚合和游标同一事务。
         super::task_store::apply(&tx, batch)?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        // 提交成功才暂存观测（失败的批次下轮重读,观测随之重发）
+        self.live.extend(batch.live.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(end) = batch.turns.values().map(|t| t.ended_at).max() {
+            self.latest_turn_end = Some(self.latest_turn_end.map_or(end, |cur| cur.max(end)));
+        }
+        Ok(())
     }
 
     /// 某行 uuid 已被哪个会话计过（None = 未见过）。
@@ -1954,6 +2046,24 @@ mod tests {
             aborted: false,
             parts,
         }
+    }
+
+    /// 订阅待机的本地活动信号:已提交批次的最晚轮结束时刻跨批累积取最大,取走即清;无轮批次不产生信号。
+    #[test]
+    fn latest_turn_end_accumulates_and_takes() {
+        let mut s = Store::open_in_memory().unwrap();
+        assert_eq!(s.take_latest_turn_end(), None);
+        let mut b = Batch::default();
+        b.add_turn("a", raw_turn("s", 1, "2026-09-01", 9_000_000, None, vec![]));
+        b.add_turn("a", raw_turn("s", 2, "2026-09-01", 5_000_000, None, vec![]));
+        s.commit("a", &b).unwrap();
+        let mut b = Batch::default();
+        b.add_turn("b", raw_turn("t", 1, "2026-09-01", 2_000_000, None, vec![]));
+        s.commit("b", &b).unwrap();
+        assert_eq!(s.take_latest_turn_end(), Some(9_001_000), "两批取最大");
+        assert_eq!(s.take_latest_turn_end(), None, "取走即清");
+        s.commit("a", &Batch::default()).unwrap();
+        assert_eq!(s.take_latest_turn_end(), None, "无轮批次不产生信号");
     }
 
     /// 跨午夜 / 多模型的轮:token 与 turns 按切片的日与模型落账,daily_project 仍逐格守恒;

@@ -20,6 +20,8 @@
 //!
 //! 子会话不计轮：`session.parent_id` 非空的会话,其轮不进
 //! request_count / turn_mark,token 照常计入。session 表缺 parent_id 列（schema 漂移）时退回全计。
+//!
+//! 子会话项目：继承根会话的 `directory`（子代理可在子目录运行,自身目录不代表项目）。
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -31,6 +33,7 @@ use rusqlite::{OpenFlags, Connection};
 use serde_json::json;
 
 use super::store::{Batch, SessionRow, Store, Tokens, TurnPart, TurnRow};
+use super::attention::{LivePhase, LiveTurn};
 use super::turns::{normalize_project, UNKNOWN_PROJECT};
 use super::{
     Adapter, AdapterError, AdapterMeta, CollectOutcome, CollectResult, ProbeOutcome, clamp0,
@@ -329,6 +332,29 @@ fn text_col(r: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String
     })
 }
 
+/// 子会话的项目目录 = 根会话目录（沿 parent_id 上溯取最上层非空 directory;深度上限防环）。
+/// 子代理常在子目录运行,按自身目录
+/// 会拆出一个没有根会话轮次的伪项目,Scratch 规则按 0 会话 0 轮把它整个折进 Scratch。
+fn root_directory(conn: &Connection, parent: &str) -> Option<String> {
+    let mut cur = parent.to_string();
+    let mut dir = None;
+    for _ in 0..16 {
+        let Ok((next, d)) = conn.query_row("SELECT parent_id, directory FROM session WHERE id = ?1", [&cur], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, text_col(r, 1)?))
+        }) else {
+            break;
+        };
+        if d.as_deref().map_or(false, |d| !d.trim().is_empty()) {
+            dir = d;
+        }
+        match next.filter(|p| !p.is_empty() && *p != cur) {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    dir
+}
+
 /// 表的列名集合（表不存在 = 空）。
 fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
     let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else { return Vec::new() };
@@ -457,6 +483,7 @@ impl ZcodeAdapter {
             .ok();
         let (parent, directory, title) = meta.unwrap_or((None, None, None));
         let parent = parent.filter(|p| !p.is_empty());
+        let directory = parent.as_deref().and_then(|p| root_directory(conn, p)).or(directory);
         let project = directory.as_deref().map(normalize_project).unwrap_or_else(|| UNKNOWN_PROJECT.to_string());
 
         let mut turns: BTreeMap<String, TurnBuild> = BTreeMap::new();
@@ -581,6 +608,10 @@ impl ZcodeAdapter {
         batch.replace_session(META.id, sid);
         let mut prev_end: Option<i64> = None;
         let mut span: (Option<i64>, Option<i64>) = (None, None);
+        // 末轮现状——turn_usage 已写 completed_at = 答完在等用户（用户中止除外）;
+        // 缺 turn_usage 行 / 未完成 = 模型在处理（工具明细不分,tool_pending 不适用）。
+        let mut live_phase = LivePhase::Idle;
+        let mut live_last = 0;
         for (seq, (start, _key, b)) in ordered.into_iter().enumerate() {
             let end = b
                 .completed_at
@@ -616,17 +647,31 @@ impl ZcodeAdapter {
                     parts: b.parts,
                 },
             );
+            live_phase = if b.aborted {
+                LivePhase::Idle
+            } else if b.completed_at.is_some() {
+                LivePhase::Done { exact: true }
+            } else {
+                LivePhase::Busy
+            };
+            live_last = end;
             prev_end = Some(end);
             span.0 = Some(span.0.map_or(start, |x| x.min(start)));
             span.1 = Some(span.1.map_or(end, |x| x.max(end)));
         }
+        let title = title.filter(|t| !t.trim().is_empty());
+        batch.live.insert(
+            (META.id.to_string(), sid.to_string()),
+            LiveTurn { project_key: project.clone(), parent_id: parent.clone(), title: title.clone(), phase: live_phase, last_event: live_last },
+        );
         batch.upsert_session(
             META.id,
             SessionRow {
                 session_id: sid.to_string(),
                 project_key: Some(project),
+                project_authoritative: false,
                 parent_id: parent,
-                title: title.filter(|t| !t.trim().is_empty()),
+                title,
                 started_at: span.0,
                 ended_at: span.1,
             },
@@ -736,7 +781,7 @@ mod tests {
                  CREATE TABLE tool_usage (id TEXT, session_id TEXT, turn_id TEXT, tool_name TEXT, status TEXT, started_at INTEGER, completed_at INTEGER, duration_ms INTEGER);",
             )
             .unwrap();
-            c.execute(r"INSERT INTO session (id, parent_id, directory, title) VALUES ('ses_p', NULL, 'E:\Work\Demo', '<title>'), ('ses_c', 'ses_p', 'E:\Work\Demo', '<sub title>')", []).unwrap();
+            c.execute(r"INSERT INTO session (id, parent_id, directory, title) VALUES ('ses_p', NULL, 'E:\Work\Demo', '<title>'), ('ses_c', 'ses_p', 'E:\Work\Demo\tools\indexer', '<sub title>')", []).unwrap();
             let tu = |sid: &str, tid: &str, st: &str, s: i64, d: i64, ttft: Option<i64>, retry: i64, tools: Option<i64>, err: Option<&str>| {
                 c.execute(
                     "INSERT INTO turn_usage VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, 0, ?10)",
@@ -787,7 +832,15 @@ mod tests {
         let sessions = store.test_sessions(META.id);
         let p = sessions.iter().find(|s| s.session_id == "ses_p").unwrap();
         assert_eq!((p.title.as_deref(), p.subagent_count, p.subagent_calls), (Some("<title>"), 1, 1));
-        assert_eq!(sessions.iter().find(|s| s.session_id == "ses_c").unwrap().parent_id.as_deref(), Some("ses_p"));
+        let c = sessions.iter().find(|s| s.session_id == "ses_c").unwrap();
+        assert_eq!(c.parent_id.as_deref(), Some("ses_p"));
+        // v13:子代理在子目录运行 → 继承根会话目录（否则子目录伪项目 0 会话 0 轮,被 Scratch 整个吞掉）
+        assert_eq!(c.project_key, "e:/Work/Demo");
+        let keys: Vec<String> = {
+            let mut stmt = store.conn().prepare("SELECT DISTINCT project_key FROM daily_project").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect()
+        };
+        assert_eq!(keys, vec!["e:/Work/Demo".to_string()], "子会话 token 不落子目录键");
         assert_eq!(store.test_task_sessions(META.id), vec!["ses_p".to_string()]);
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
         // S3 定案:子会话轮不计 request_count,token 照常计入

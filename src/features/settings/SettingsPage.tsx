@@ -405,6 +405,21 @@ function GeneralTab() {
           onChange={(v) => setDesignPrefs({ timelineReverse: v })}
         />
         <div className="setting-row">
+          <span title="Fold the board into a strip at the top of the screen after it loses focus">Auto fold</span>
+          <div className="setting-seg">
+            {[0, 5, 30, 60, 300].map((n) => (
+              <button
+                key={n}
+                className={`setting-seg-btn${(design.timelineAutoStripSecs ?? 0) === n ? ' is-active' : ''}`}
+                title={n === 0 ? 'Never fold automatically' : `Fold ${n < 60 ? `${n} seconds` : `${n / 60} ${n === 60 ? 'minute' : 'minutes'}`} after the board loses focus`}
+                onClick={() => setDesignPrefs({ timelineAutoStripSecs: n })}
+              >
+                {n === 0 ? 'Off' : n < 60 ? `${n}s` : `${n / 60}m`}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
           <span title="Days after today on the board (axis only, no data yet)">Future days</span>
           <div className="setting-seg">
             {[0, 3, 7, 15].map((n) => (
@@ -1179,12 +1194,13 @@ function SubscriptionsTab() {
             ))}
           </div>
         </div>
-        {/* Standby monitoring：主轮询自适应退档——读数无变化逐档
-            放慢（封顶 30 分钟）,任何变化立即回设置档;待机中悬浮球整体减淡。
-            默认开（退档是收敛行为,与 boost 提频需显式授权相反口径）。*/}
+        {/* Standby monitoring：全部平台连续 3 轮无变化且
+            安静 ≥ 10 分钟 → 悬浮球减淡并逐档放慢（封顶 30 分钟）;读数变化 / 本地
+            agent 活动 / 手动刷新·展开·切换平台立即退出。默认开（退档是收敛行为,
+            与 boost 提频需显式授权相反口径）。*/}
         <ToggleRow
           label="Standby monitoring"
-          title="Slow polling (max 30 min) while unchanged; dims the orb"
+          title="Dims the orb and slows polling (max 30 min) after 10+ min without usage changes or agent activity"
           checked={design.orbIdleEnabled ?? true}
           onChange={(v) => {
             setDesignPrefs({ orbIdleEnabled: v })

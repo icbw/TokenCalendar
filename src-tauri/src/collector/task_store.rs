@@ -169,7 +169,8 @@ fn upsert_session(conn: &Connection, agent: &str, row: &SessionRow) -> Res<()> {
         "INSERT INTO session (agent_key, session_id, project_key, parent_id, title, started_at, ended_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(agent_key, session_id) DO UPDATE SET
-            project_key = CASE WHEN session.project_key = 'unknown' THEN excluded.project_key ELSE session.project_key END,
+            project_key = CASE WHEN (?8 = 1 AND excluded.project_key <> 'unknown') OR session.project_key = 'unknown'
+                               THEN excluded.project_key ELSE session.project_key END,
             parent_id   = COALESCE(session.parent_id, excluded.parent_id),
             title       = COALESCE(excluded.title, session.title),
             started_at  = MIN(session.started_at, excluded.started_at),
@@ -183,7 +184,8 @@ fn upsert_session(conn: &Connection, agent: &str, row: &SessionRow) -> Res<()> {
         row.parent_id,
         row.title,
         row.started_at.unwrap_or(i64::MAX),
-        row.ended_at
+        row.ended_at,
+        row.project_authoritative as i64
     ])
     .map_err(err)?;
     Ok(())
