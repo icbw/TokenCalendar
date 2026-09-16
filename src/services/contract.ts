@@ -355,6 +355,8 @@ export interface AttentionItemContract {
   project_key: string
   /** 【内容列】只供 timeline 窗口本地渲染。 */
   title: string | null
+  /** 桌面宿主线索（Claude Code 的 entrypoint;其余源 null）,前端只透传。 */
+  host: string | null
   state: 'running' | 'waiting' | 'tool_pending'
   /** running = 最近事件;waiting = 模型答完时刻;tool_pending = 工具静默开始时刻（ms）。 */
   since: number
@@ -367,6 +369,16 @@ export interface AttentionItemContract {
 export interface AckAttentionArgs {
   agent: string
   session_id: string
+}
+
+/** focus_agent_window（agent, session_id)（agent_focus.rs）:找到 → 前置 + 确认;
+ * 找不到 → 条目已从注意力表移除（伪等待）,前端降级为「上次停在这里」。 */
+export interface FocusAgentWindowArgs {
+  agent: string
+  session_id: string
+}
+export interface FocusResultContract {
+  found: boolean
 }
 
 /** get_idle_threshold 返回。 */

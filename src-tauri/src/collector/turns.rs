@@ -43,6 +43,14 @@ pub fn normalize_project(dir: &str) -> String {
     if s.len() == 3 && s.ends_with(":/") {
         s.pop();
     }
+    // Git Bash 工具把 cwd 写成 `/e/Work/X`（同一会话里与 `E:\Work\X` 混用）,
+    // 折成盘符形式,否则同一项目会裂出第三个键。只在 Windows 上做:类 Unix 系统 `/e/...` 是真实路径。
+    if cfg!(windows) {
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'/') {
+            s = format!("{}:{}", (b[1] as char).to_ascii_lowercase(), &s[2..]);
+        }
+    }
     let b = s.as_bytes();
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         s = format!("{}{}", (b[0] as char).to_ascii_lowercase(), &s[1..]);
@@ -149,6 +157,10 @@ pub struct TurnState {
     /// 源自己记录的会话项目（见 `set_session_project`;None = 会话行取当前轮目录、首写胜）。
     #[serde(default)]
     pub session_project: Option<String>,
+    /// 桌面宿主线索（Claude Code = 行内 `entrypoint`,最近一次见到的值;其余源 None = 宿主固定
+    /// 由 agent 决定）。只供 `focus_agent_window` 选目标进程,不进任何口径。
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     recent: Vec<RecentResponse>,
 }
@@ -182,6 +194,13 @@ impl TurnState {
     pub fn set_parent(&mut self, parent: &str) {
         if !parent.is_empty() && parent != self.session_id {
             self.parent_id = Some(parent.to_string());
+        }
+    }
+
+    /// 记宿主线索（最近一次见到的值胜;空串忽略）。
+    pub fn set_host(&mut self, host: &str) {
+        if !host.is_empty() && self.host.as_deref() != Some(host) {
+            self.host = Some(host.to_string());
         }
     }
 
@@ -454,7 +473,7 @@ impl TurnState {
                 other => (LivePhase::Idle, other.unwrap_or(0), self.project()),
             },
         };
-        LiveTurn { project_key, parent_id: self.parent_id.clone(), title: self.title.clone(), phase, last_event }
+        LiveTurn { project_key, parent_id: self.parent_id.clone(), title: self.title.clone(), host: self.host.clone(), phase, last_event }
     }
 
     pub fn set_explicit_wall(&mut self, ms: i64) {
@@ -555,6 +574,11 @@ mod tests {
         assert_eq!(normalize_project("/home/u/proj/"), "/home/u/proj");
         assert_eq!(normalize_project("/"), "/");
         assert_eq!(normalize_project("  "), UNKNOWN_PROJECT);
+        if cfg!(windows) {
+            assert_eq!(normalize_project("/e/Work/Demo"), "e:/Work/Demo", "Git Bash 形式");
+            assert_eq!(normalize_project("/e"), "e:");
+            assert_eq!(normalize_project("/etc/x"), "/etc/x", "非单字母段不折");
+        }
     }
 
     #[test]

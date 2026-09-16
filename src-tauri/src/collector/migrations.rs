@@ -13,12 +13,18 @@
 //! - ZCode:子会话项目 = 根会话项目（沿 `session.parent_id`）。
 //! - Codex:会话行项目 = 最后一轮的项目（近似 Codex `threads.cwd` = 当前工作区;采集器下次读到该线程时以库内值覆盖）。
 //! - 然后 `daily_project` 全表重算（只读原始层）。
+//!
+//! v14 = 正 v13 解析器漏洞留下的「文件夹名当项目键」（looks_like_path`）:
+//! - 凡 Claude Code / WorkBuddy 会话的键不像路径（无盘符、无分隔符）,且库内存在编码后与之一致的真实路径键 →
+//!   会话 / 轮 / 原始轮 / 文件游标提示 / `project_meta` 一并改到真实键;`folder:` 映射写成真实键。
+//! - 顺带按文件游标为每个文件夹补种 `folder:` 映射,后续采集不再从零解析（从零解析正是踩坑的入口）。
+//! - 找不到真实键的（源里从未出现过 cwd 行）原样保留。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{params, Connection};
 
-use super::project_dir::folder_matches;
+use super::project_dir::{folder_matches, looks_like_path};
 use super::turns::UNKNOWN_PROJECT;
 
 type Res<T> = Result<T, String>;
@@ -167,6 +173,163 @@ pub fn upgrade_v13(conn: &Connection) -> Res<V13Report> {
     Ok(report)
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct V14Report {
+    /// 改到真实键的会话数
+    pub sessions_rekeyed: usize,
+    /// 正的 `folder:` 映射数
+    pub mappings_fixed: usize,
+    /// 补种的 `folder:` 映射数
+    pub mappings_seeded: usize,
+}
+
+const FOLDER_AGENTS: [&str; 2] = ["claude-code", "workbuddy"];
+const FOLDER_SCOPE: &str = "folder:";
+
+/// 该代理下所有会话的项目键（去重）。
+fn session_keys(conn: &Connection, agent: &str) -> Res<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT project_key FROM session WHERE agent_key = ?1").map_err(err)?;
+    let rows = stmt.query_map([agent], |r| r.get::<_, String>(0)).map_err(err)?;
+    Ok(rows.flatten().collect())
+}
+
+/// 在真实路径键里找编码后与文件夹一致者;多个（不应发生）取最短。
+fn real_key_for<'a>(keys: &'a [String], folder: &str) -> Option<&'a String> {
+    keys.iter().filter(|k| looks_like_path(k) && folder_matches(k, folder)).min_by_key(|k| (k.len(), (*k).clone()))
+}
+
+fn upsert_cursor(conn: &Connection, agent: &str, scope: &str, value: &str, now: i64) -> Res<()> {
+    conn.execute(
+        "INSERT INTO source_cursor (source_id, scope, cursor_json, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(source_id, scope) DO UPDATE SET cursor_json = excluded.cursor_json, updated_at = excluded.updated_at",
+        params![agent, scope, value, now],
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// 把文件游标 JSON 里的 `turn.project_key`（下次采集的提示值）从 bad 改成 good。
+fn fix_cursor_hints(conn: &Connection, agent: &str, bad: &str, good: &str) -> Res<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT scope, cursor_json FROM source_cursor WHERE source_id = ?1 AND scope NOT LIKE 'folder:%' AND cursor_json LIKE '%' || ?2 || '%'")
+            .map_err(err)?;
+        let it = stmt.query_map(params![agent, bad], |r| Ok((r.get(0)?, r.get(1)?))).map_err(err)?;
+        it.flatten().collect()
+    };
+    for (scope, json) in rows {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&json) else { continue };
+        let Some(pk) = v.pointer_mut("/turn/project_key") else { continue };
+        if pk.as_str() != Some(bad) {
+            continue;
+        }
+        *pk = serde_json::Value::String(good.to_string());
+        conn.execute("UPDATE source_cursor SET cursor_json = ?3 WHERE source_id = ?1 AND scope = ?2", params![agent, scope, v.to_string()])
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
+fn rekey_project(conn: &Connection, agent: &str, bad: &str, good: &str) -> Res<usize> {
+    let sessions = conn
+        .execute("UPDATE session SET project_key = ?3 WHERE agent_key = ?1 AND project_key = ?2", params![agent, bad, good])
+        .map_err(err)?;
+    for t in ["turn_raw", "turn"] {
+        conn.execute(&format!("UPDATE {t} SET project_key = ?3 WHERE agent_key = ?1 AND project_key = ?2"), params![agent, bad, good])
+            .map_err(err)?;
+    }
+    fix_cursor_hints(conn, agent, bad, good)?;
+    // 用户在坏键上做过的别名 / 隐藏:真实键无记录则整行改键,否则丢弃坏键那份（真实键上的设置优先）
+    let good_has: bool = conn
+        .query_row("SELECT COUNT(*) FROM project_meta WHERE project_key = ?1", [good], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if good_has {
+        conn.execute("DELETE FROM project_meta WHERE project_key = ?1", [bad]).map_err(err)?;
+    } else {
+        conn.execute("UPDATE project_meta SET project_key = ?2 WHERE project_key = ?1", [bad, good]).map_err(err)?;
+    }
+    Ok(sessions)
+}
+
+/// v13 → v14 就地升级（调用方包在同一事务里）。幂等。
+pub fn upgrade_v14(conn: &Connection) -> Res<V14Report> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let mut report = V14Report::default();
+    let mut touched = false;
+    for agent in FOLDER_AGENTS {
+        let keys = session_keys(conn, agent)?;
+        //  坏键 → 真实键
+        for bad in keys.iter().filter(|k| !looks_like_path(k) && k.as_str() != UNKNOWN_PROJECT) {
+            let Some(good) = real_key_for(&keys, bad).cloned() else { continue };
+            let n = rekey_project(conn, agent, bad, &good)?;
+            report.sessions_rekeyed += n;
+            touched |= n > 0;
+            let scope = format!("{FOLDER_SCOPE}{bad}");
+            let cur: Option<String> = conn
+                .query_row("SELECT cursor_json FROM source_cursor WHERE source_id = ?1 AND scope = ?2", params![agent, scope], |r| r.get(0))
+                .ok();
+            if cur.as_deref() != Some(good.as_str()) {
+                upsert_cursor(conn, agent, &scope, &good, now)?;
+                report.mappings_fixed += 1;
+            }
+        }
+        //  映射值本身不像路径（坏键会话已被源覆盖走、只剩映射的情况）
+        let bad_maps: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT scope, cursor_json FROM source_cursor WHERE source_id = ?1 AND scope LIKE 'folder:%'")
+                .map_err(err)?;
+            let it = stmt.query_map([agent], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(err)?;
+            it.flatten().filter(|(_, v)| !looks_like_path(v)).map(|(s, _)| s).collect()
+        };
+        let keys = session_keys(conn, agent)?;
+        for scope in bad_maps {
+            let folder = &scope[FOLDER_SCOPE.len()..];
+            if let Some(good) = real_key_for(&keys, folder) {
+                upsert_cursor(conn, agent, &scope, good, now)?;
+                report.mappings_fixed += 1;
+            }
+        }
+        //  补种:按文件游标 `…/<folder>/<sid>.jsonl` + 该会话的真实键
+        let files: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT scope FROM source_cursor WHERE source_id = ?1 AND scope NOT LIKE 'folder:%' AND scope LIKE '%.jsonl'")
+                .map_err(err)?;
+            let it = stmt.query_map([agent], |r| r.get::<_, String>(0)).map_err(err)?;
+            it.flatten().collect()
+        };
+        let mut seeded: BTreeSet<String> = BTreeSet::new();
+        for scope in files {
+            let parts: Vec<&str> = scope.split(['\\', '/']).collect();
+            let (Some(file), Some(folder)) = (parts.iter().rev().next(), parts.iter().rev().nth(1)) else { continue };
+            let sid = file.trim_end_matches(".jsonl");
+            let map_scope = format!("{FOLDER_SCOPE}{folder}");
+            if seeded.contains(&map_scope) {
+                continue;
+            }
+            let existing: Option<String> = conn
+                .query_row("SELECT cursor_json FROM source_cursor WHERE source_id = ?1 AND scope = ?2", params![agent, map_scope], |r| r.get(0))
+                .ok();
+            if existing.as_deref().is_some_and(looks_like_path) {
+                seeded.insert(map_scope);
+                continue;
+            }
+            let key: Option<String> = conn
+                .query_row("SELECT project_key FROM session WHERE agent_key = ?1 AND session_id = ?2", params![agent, sid], |r| r.get(0))
+                .ok();
+            if let Some(k) = key.filter(|k| looks_like_path(k) && folder_matches(k, folder)) {
+                upsert_cursor(conn, agent, &map_scope, &k, now)?;
+                report.mappings_seeded += 1;
+                seeded.insert(map_scope);
+            }
+        }
+    }
+    if touched {
+        super::task_store::recompute_all(conn, super::task_store::idle_threshold_ms())?;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +396,55 @@ mod tests {
         };
         assert_eq!(dp, vec![("e:/W/Demo".to_string(), 10)], "daily_project 按新键重算");
         assert!(upgrade_v13(&conn).unwrap() == V13Report::default(), "幂等");
+    }
+
+    #[test]
+    fn v14_rekeys_folder_name_projects_and_seeds_mappings() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed(&conn);
+        upgrade_v13(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO session (agent_key, session_id, project_key, parent_id, started_at) VALUES ('claude-code','B','E--W-Demo',NULL,20);
+             INSERT INTO turn_raw (agent_key, session_id, turn_seq, day, project_key, model_key, started_at, ended_at, total_tokens) VALUES
+                ('claude-code','B',1,'2026-09-17','E--W-Demo','m',20,21,7);
+             INSERT INTO turn (agent_key, session_id, turn_seq, day, project_key, model_key, started_at, ended_at, total_tokens) VALUES
+                ('claude-code','B',1,'2026-09-17','E--W-Demo','m',20,21,7);
+             INSERT INTO source_cursor VALUES ('claude-code','folder:E--W-Demo','E--W-Demo',1);
+             INSERT INTO source_cursor VALUES ('claude-code','C:\\\\u\\\\.claude\\\\projects\\\\E--W-Demo\\\\B.jsonl','{\"offset\":1,\"turn\":{\"session_id\":\"B\",\"project_key\":\"E--W-Demo\"}}',1);
+             INSERT INTO project_meta (project_key, alias, updated_at) VALUES ('E--W-Demo','Bad',1);
+             -- 无真实键可对应的坏键:原样保留
+             INSERT INTO session (agent_key, session_id, project_key, parent_id, started_at) VALUES ('claude-code','N','D--Nowhere',NULL,30);",
+        )
+        .unwrap();
+        let r = upgrade_v14(&conn).unwrap();
+        assert_eq!(r, V14Report { sessions_rekeyed: 1, mappings_fixed: 1, mappings_seeded: 0 }, "映射已由 ① 修正,③ 无需补种");
+        for t in ["session", "turn_raw", "turn"] {
+            assert_eq!(keys(&conn, t, "claude-code", "B"), vec!["e:/W/Demo".to_string()], "{t}");
+        }
+        assert_eq!(keys(&conn, "session", "claude-code", "N"), vec!["D--Nowhere".to_string()]);
+        let map: String = conn.query_row("SELECT cursor_json FROM source_cursor WHERE scope = 'folder:E--W-Demo'", [], |r| r.get(0)).unwrap();
+        assert_eq!(map, "e:/W/Demo");
+        let hint: String = conn.query_row("SELECT cursor_json FROM source_cursor WHERE scope LIKE '%B.jsonl'", [], |r| r.get(0)).unwrap();
+        assert!(hint.contains("\"project_key\":\"e:/W/Demo\"") && hint.contains("\"offset\":1"), "{hint}");
+        let metas: Vec<(String, String)> = {
+            let mut s = conn.prepare("SELECT project_key, alias FROM project_meta ORDER BY 1").unwrap();
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect()
+        };
+        assert_eq!(metas, vec![("e:/W/Demo".to_string(), "Alias".to_string())], "真实键已有设置 → 坏键那份丢弃");
+        let dp: i64 = conn.query_row("SELECT COALESCE(SUM(total_tokens),0) FROM daily_project WHERE project_key = 'E--W-Demo'", [], |r| r.get(0)).unwrap();
+        assert_eq!(dp, 0, "daily_project 重算后无坏键");
+        assert_eq!(upgrade_v14(&conn).unwrap(), V14Report::default(), "幂等");
+    }
+
+    #[test]
+    fn v14_seeds_mapping_from_file_cursor_when_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed(&conn);
+        upgrade_v13(&conn).unwrap();
+        let r = upgrade_v14(&conn).unwrap();
+        assert_eq!(r, V14Report { sessions_rekeyed: 0, mappings_fixed: 0, mappings_seeded: 1 });
+        let map: String = conn.query_row("SELECT cursor_json FROM source_cursor WHERE scope = 'folder:E--W-Demo'", [], |r| r.get(0)).unwrap();
+        assert_eq!(map, "e:/W/Demo");
     }
 
     /// 手动:对一份真实库副本跑迁移（`TC_MIGRATE_DB=<路径>`,只动该副本;`cargo test migrate_real_db_copy -- --ignored --nocapture`）。

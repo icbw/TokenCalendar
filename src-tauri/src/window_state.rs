@@ -244,11 +244,9 @@ pub fn restore(app: &AppHandle) {
     let mut orb_expanded: Option<bool> = None;
     for (label, geom) in pairs {
         let Some(window) = app.get_webview_window(label) else { continue };
-        // orb 走专用恢复（启动恢复上次退出前的形态与位置,
-        // **首次默认表盘**）——几何为 None（首次启动）也要进,不能按「无记录跳过」。
-        // 旧逻辑（㉝ 的「换算到收起态」+ S4 的「尺寸不恢复」）已由
-        // 形态一致恢复取代:记录是展开态就恢复展开态（同位置）,不会再出现
-        // 「表盘位置冒出一个不贴边的竖条」。
+        // orb 走专用恢复（启动恢复上次退出前的贴边位置,
+        // **首次默认表盘**;订：未贴边一律表盘,竖条只属于贴边）——
+        // 几何为 None（首次启动）也要进,不能按「无记录跳过」。
         if label == "orb" {
             #[cfg(windows)]
             {
@@ -311,11 +309,13 @@ pub fn restore(app: &AppHandle) {
                 strip_w: file.timeline_strip_w,
             };
         }
-        // 启动形态（restore_orb 结果:贴边/自由竖条 = false、表盘/首次 = true）
+        // 启动形态（restore_orb 结果:贴边 = 竖条 false、未贴边/首次 = 表盘 true）
         // ——前端挂载按它对齐（Rust 侧几何已先按此恢复）。
         if let Some(e) = orb_expanded {
             state.orb_expanded.store(e, std::sync::atomic::Ordering::SeqCst);
         }
+        // 装载完成 → 放开 persist
+        state.window_state_restored.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -324,6 +324,12 @@ pub fn restore(app: &AppHandle) {
 /// snap 字段走 AppState 内存值（子类化线程经 set_widget_snap 更新），
 /// 不从窗口读——吸附语义不属于几何采样。
 pub fn persist(app: &AppHandle, state: &AppState) {
+    // 装载前拒写：restore 途中的归位写入 / 抢跑的事件与命令都可能走到这里,
+    // 此刻 AppState 还是初值,写下去就把上次的可见性、贴边态、形态全抹成默认值
+    if !state.window_state_restored.load(std::sync::atomic::Ordering::SeqCst) {
+        crate::dev_log!("[window-state] persist skipped: state not restored yet");
+        return;
+    }
     let mut file = load(app);
     if let Some(w) = app.get_webview_window("widget") {
         if let Some(geom) = read_geom(&w) {

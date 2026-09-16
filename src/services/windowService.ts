@@ -89,7 +89,7 @@ export async function setOrbSize(width: number, height: number): Promise<void> {
   await tryInvoke<null>('set_orb_size', { width, height })
 }
 
-/** 悬浮球停靠状态查询（OrbWindow 挂载时恢复 dock 态）。
+/** 悬浮球停靠状态。
  * edge: "left" | "right";anchor_y_ratio = 竖条中心相对工作区顶部比例。 */
 export interface OrbDockState {
   edge: 'left' | 'right'
@@ -97,8 +97,15 @@ export interface OrbDockState {
   work: [number, number, number, number]
 }
 
-export async function getOrbDock(): Promise<OrbDockState | null> {
-  return tryInvoke<OrbDockState | null>('get_orb_dock')
+/** 悬浮球启动形态（Rust 权威:restore 后的停靠态 + 形态;OrbWindow 挂载时恢复）。
+ * 不要按 window.innerWidth 猜形态——页面可能早于 Rust 归位加载,窗口还是配置初始尺寸。 */
+export interface OrbForm {
+  dock: OrbDockState | null
+  expanded: boolean
+}
+
+export async function getOrbForm(): Promise<OrbForm | null> {
+  return tryInvoke<OrbForm>('get_orb_form')
 }
 
 /** 前端发起的 undock（双击展开/拖离边缘展开）：清 Rust 侧停靠状态,并**原子**

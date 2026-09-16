@@ -44,6 +44,8 @@ pub struct LiveTurn {
     pub parent_id: Option<String>,
     /// 【内容列】会话标题,只供 timeline 窗口本地渲染。
     pub title: Option<String>,
+    /// 桌面宿主线索（Claude Code 的 `entrypoint`;其余源 None）。
+    pub host: Option<String>,
     pub phase: LivePhase,
     /// 会话最近事件时刻（毫秒）。
     pub last_event: i64,
@@ -60,6 +62,8 @@ pub struct AttentionItem {
     pub session_id: String,
     pub project_key: String,
     pub title: Option<String>,
+    /// 桌面宿主线索（`focus_agent_window` 选目标进程用;前端只透传）。
+    pub host: Option<String>,
     /// running | waiting | tool_pending
     pub state: &'static str,
     /// running = 最近事件;waiting = 模型答完时刻;tool_pending = 工具静默开始时刻。
@@ -149,6 +153,7 @@ impl AttentionTable {
                     session_id: key.1.clone(),
                     project_key: e.obs.project_key.clone(),
                     title: e.obs.title.clone(),
+                    host: e.obs.host.clone(),
                     state,
                     since,
                     last_event: e.obs.last_event,
@@ -170,6 +175,23 @@ impl AttentionTable {
     /// 每轮采集后调用：剔除过期 → 派生 → 与上次签名比较。返回 true = 需要 emit。
     pub fn tick(&mut self, now: i64, idle_ms: i64) -> bool {
         self.prune(now, idle_ms);
+        let sig = Self::signature(&self.items(now, idle_ms));
+        let changed = sig != self.last_sig;
+        self.last_sig = sig;
+        changed
+    }
+
+    /// 聚焦前查会话的宿主线索与原始项目键（找目标进程 / 同进程多窗口按项目目录名消歧）。
+    pub fn lookup(&self, agent: &str, session: &str) -> Option<(Option<String>, String)> {
+        self.entries.get(&(agent.to_string(), session.to_string())).map(|e| (e.obs.host.clone(), e.obs.project_key.clone()))
+    }
+
+    /// 移除一个会话条目（聚焦时找不到宿主窗口 = agent 已关、文件停在答完之后的伪等待）。
+    /// 返回 true = 表有变（需要 emit）。源再写入时 `apply` 会重新建立条目。
+    pub fn remove(&mut self, agent: &str, session: &str, now: i64, idle_ms: i64) -> bool {
+        if self.entries.remove(&(agent.to_string(), session.to_string())).is_none() {
+            return false;
+        }
         let sig = Self::signature(&self.items(now, idle_ms));
         let changed = sig != self.last_sig;
         self.last_sig = sig;
@@ -206,7 +228,7 @@ mod tests {
     const IDLE: i64 = 30 * 60_000;
 
     fn obs(phase: LivePhase, last: i64) -> LiveTurn {
-        LiveTurn { project_key: "e:/p".into(), parent_id: None, title: Some("t".into()), phase, last_event: last }
+        LiveTurn { project_key: "e:/p".into(), parent_id: None, title: Some("t".into()), host: None, phase, last_event: last }
     }
 
     fn key(s: &str) -> LiveKey {
@@ -280,6 +302,24 @@ mod tests {
         assert!(t.tick(NOW, IDLE));
         t.apply(BTreeMap::from([(key("s"), obs(LivePhase::Busy, NOW + 30_000))]));
         assert!(!t.tick(NOW + 30_000, IDLE));
+    }
+
+    #[test]
+    fn remove_drops_entry_until_source_writes_again() {
+        let mut t = AttentionTable::default();
+        let mut o = obs(LivePhase::Done { exact: true }, NOW);
+        o.host = Some("claude-vscode".into());
+        t.apply(BTreeMap::from([(key("s"), o)]));
+        assert!(t.tick(NOW, IDLE));
+        assert_eq!(t.lookup("claude-code", "s"), Some((Some("claude-vscode".into()), "e:/p".into())));
+        assert!(t.remove("claude-code", "s", NOW, IDLE), "移除亮着的条目 = 有变");
+        assert!(t.items(NOW, IDLE).is_empty());
+        assert_eq!(t.lookup("claude-code", "s"), None);
+        assert!(!t.remove("claude-code", "s", NOW, IDLE), "重复移除无变");
+        assert!(!t.tick(NOW + 1_000, IDLE), "remove 已同步签名");
+        // 源再写入 → 重新建立
+        t.apply(BTreeMap::from([(key("s"), obs(LivePhase::Done { exact: true }, NOW + 5_000))]));
+        assert_eq!(one(&t, NOW + 6_000).map(|x| x.0), Some("waiting"));
     }
 
     #[test]

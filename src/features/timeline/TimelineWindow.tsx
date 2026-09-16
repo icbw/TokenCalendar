@@ -35,7 +35,11 @@
 // （看板同序取前 maxProjects 个,另补上亮起但不在其中的项目）;亮起项目名呼吸闪烁、可点击确认,
 // 其余区域可拖动（Rust 钉顶缘横向滑动）;双击 / 末端按钮展开。看板失焦 timelineAutoStripSecs 秒后
 // 自动折条（0 = 关;指针仍在窗口上时不计时）。
-// [Focus] 聚焦后续接入。
+//
+// S5 桌面窗口聚焦:亮起的项目行头 / 条上项目名点击 = focus_agent_window（该项目最早的未确认
+// waiting,没有则 tool_pending）→ Rust 按 agent（+ host）登记表找进程的可见顶层窗口前置并确认;同项目其余
+// 未确认条目随之确认。found=false（agent 已关,条目已被 Rust 移除）→ 该项目本地标记 stale:灰色「上次停在
+// 这里」,点击回退打开目录并清标记;项目再次亮起也清标记。
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import {
   events,
@@ -388,13 +392,47 @@ export default function TimelineWindow() {
     }
     return m
   }, [attention, rawToEff])
-  const ackProject = (key: string) => {
+  // S5:聚焦失败（宿主窗口不存在）的项目,灰色降级直到点击回退或再次亮起
+  const [stale, setStale] = useState<Set<string>>(() => new Set())
+  useEffect(() => {
+    setStale((prev) => {
+      if (prev.size === 0) return prev
+      const next = new Set([...prev].filter((k) => attentionByProject.get(k)?.level == null || attentionByProject.get(k)?.level === 'running'))
+      return next.size === prev.size ? prev : next
+    })
+  }, [attentionByProject])
+  const activateProject = (key: string) => {
     const pa = attentionByProject.get(key)
     if (!pa || pa.unacked.length === 0) return
+    // 聚焦对象 = 最早的未确认 waiting（unacked 已按 since 先后）,没有则 tool_pending
+    const target = pa.unacked.find((i) => i.state === 'waiting') ?? pa.unacked[0]
     // 乐观更新：本地先熄灭,Rust 确认后事件重查兜底
     const acked = new Set(pa.unacked.map(itemKey))
     setAttention((prev) => prev.map((i) => (acked.has(itemKey(i)) ? { ...i, acked: true } : i)))
-    for (const it of pa.unacked) void timelineService.ackAttention(it.agent, it.sessionId)
+    for (const it of pa.unacked) {
+      if (it !== target) void timelineService.ackAttention(it.agent, it.sessionId)
+    }
+    void timelineService.focusAgentWindow(target.agent, target.sessionId).then((found) => {
+      if (found === null) {
+        // 命令不可用（非 Tauri / IPC 失败）→ 退回 S3 行为:只确认
+        void timelineService.ackAttention(target.agent, target.sessionId)
+        return
+      }
+      if (!found) {
+        // Rust 已移除该条目（伪等待）;本地同步去掉,项目标 stale
+        const gone = itemKey(target)
+        setAttention((prev) => prev.filter((i) => itemKey(i) !== gone))
+        setStale((prev) => new Set(prev).add(key))
+      }
+    })
+  }
+  const openStaleProject = (key: string) => {
+    setStale((prev) => {
+      const next = new Set(prev)
+      next.delete(key)
+      return next
+    })
+    if (folderByKey.get(key)) void projectService.openProjectFolder(key)
   }
   const isPinned = useCallback((key: string) => pinnedEff.includes(key), [pinnedEff])
   const togglePin = (key: string) => {
@@ -410,10 +448,10 @@ export default function TimelineWindow() {
     const head = maxProjects > 0 ? ordered.slice(0, maxProjects) : ordered
     const lit = ordered.filter((p) => {
       const lv = attentionByProject.get(p.key)?.level
-      return (lv === 'waiting' || lv === 'pending') && !head.includes(p)
+      return (lv === 'waiting' || lv === 'pending' || stale.has(p.key)) && !head.includes(p)
     })
     return [...head, ...lit]
-  }, [ordered, maxProjects, attentionByProject])
+  }, [ordered, maxProjects, attentionByProject, stale])
   const stripInnerRef = useRef<HTMLDivElement | null>(null)
   const stripWidth = useRef(0)
   const sentWidth = useRef(0)
@@ -560,22 +598,25 @@ export default function TimelineWindow() {
     const pinned = isPinned(p.key)
     const level = attentionByProject.get(p.key)?.level ?? null
     const lit = level === 'waiting' || level === 'pending'
+    const isStale = !lit && stale.has(p.key)
     const tip =
       level === 'waiting'
-        ? `${p.key}\nAn agent is waiting for your reply (click to dismiss)`
+        ? `${p.key}\nAn agent is waiting for your reply (click to bring its window to the front)`
         : level === 'pending'
-          ? `${p.key}\nA tool call has been pending for a while, maybe an approval (click to dismiss)`
-          : p.key
+          ? `${p.key}\nA tool call has been pending for a while, maybe an approval (click to bring its window to the front)`
+          : isStale
+            ? `${p.key}\nLast stopped here: the agent window is gone (click to open the folder)`
+            : p.key
     return (
       <div
         key={`h:${p.key}`}
-        className={`tl-proj${pinned ? ' is-pinned' : ''}${lit ? ` is-${level}` : ''}`}
+        className={`tl-proj${pinned ? ' is-pinned' : ''}${lit ? ` is-${level}` : ''}${isStale ? ' is-stale' : ''}`}
         title={tip}
         onMouseEnter={(e) => onProjectEnter(p.key, e.currentTarget)}
         onMouseLeave={onProjectLeave}
-        onClick={lit ? () => ackProject(p.key) : undefined}
+        onClick={lit ? () => activateProject(p.key) : isStale ? () => openStaleProject(p.key) : undefined}
       >
-        {lit && <span className="tl-dot" aria-label={level === 'waiting' ? 'Waiting for reply' : 'Tool pending'} />}
+        {(lit || isStale) && <span className="tl-dot" aria-label={level === 'waiting' ? 'Waiting for reply' : level === 'pending' ? 'Tool pending' : 'Last stopped here'} />}
         <span className="tl-proj-label">{p.label}</span>
         {badge && (
           <span className="tl-badge" title={`No activity for ${p.inactiveDays} days`}>
@@ -764,8 +805,22 @@ export default function TimelineWindow() {
                   key={p.key}
                   type="button"
                   className={`tl-strip-name is-${level}`}
-                  title={`${p.key}\n${level === 'waiting' ? 'An agent is waiting for your reply' : 'A tool call has been pending for a while'} (click to dismiss)`}
-                  onClick={() => ackProject(p.key)}
+                  title={`${p.key}\n${level === 'waiting' ? 'An agent is waiting for your reply' : 'A tool call has been pending for a while'} (click to bring its window to the front)`}
+                  onClick={() => activateProject(p.key)}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                >
+                  {p.label}
+                </button>
+              )
+            }
+            if (stale.has(p.key)) {
+              return (
+                <button
+                  key={p.key}
+                  type="button"
+                  className="tl-strip-name is-stale"
+                  title={`${p.key}\nLast stopped here: the agent window is gone (click to open the folder)`}
+                  onClick={() => openStaleProject(p.key)}
                   onDoubleClick={(e) => e.stopPropagation()}
                 >
                   {p.label}

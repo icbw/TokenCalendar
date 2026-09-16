@@ -329,7 +329,7 @@ pub struct Store {
 /// v12 = Claude Code 续聊 / fork 副本文件按行 uuid 折进根会话（新表 seen_line / session_alias）→ 清库重扫。
 /// v13 = 项目归属口径:Claude Code 按会话文件所在文件夹（源自己的分组）、ZCode 子会话继承根会话、
 /// Codex 会话行取源 `threads.cwd` → **就地升级**（migrations.rs,备份后重算已有行,不清库）。
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 /// 低于此版本的库仍走清库重建（结构差异逐版累积,已发布用户最低 v10 = 0.5.7）;v12 起只就地迁移。
 const LEGACY_RESET_VERSION: i64 = 12;
 
@@ -601,12 +601,21 @@ impl Store {
         if version == 0 {
             // 全新库:建表即当前版本,无历史行可升级
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).map_err(|e| e.to_string())?;
-        } else if version < 13 {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-            let report = super::migrations::upgrade_v13(&tx)?;
-            tx.execute_batch("PRAGMA user_version = 13").map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-            crate::dev_log!("[collector] schema {} -> 13 in place: {:?}", version, report);
+        } else {
+            if version < 13 {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let report = super::migrations::upgrade_v13(&tx)?;
+                tx.execute_batch("PRAGMA user_version = 13").map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                crate::dev_log!("[collector] schema {} -> 13 in place: {:?}", version, report);
+            }
+            if version < 14 {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let report = super::migrations::upgrade_v14(&tx)?;
+                tx.execute_batch("PRAGMA user_version = 14").map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                crate::dev_log!("[collector] schema -> 14 in place: {:?}", report);
+            }
         }
         Ok(Store { conn, live: BTreeMap::new(), latest_turn_end: None })
     }

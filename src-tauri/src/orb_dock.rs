@@ -217,10 +217,20 @@ pub fn orb_undock(
     Ok(())
 }
 
-/// 前端启动恢复查询（OrbWindow 挂载时):有 dock 态 → 回收起态+贴边位置。
+/// 前端启动恢复查询（OrbWindow 挂载时）：Rust 侧权威的停靠态 + 形态。
+/// 前端**不再按 window.innerWidth 猜形态**：页面可能在 restore 归位之前
+/// 就已加载,那时窗口还是配置初始尺寸（56×116 竖条）——猜错后挂载对齐会把刚恢复的
+/// 表盘缩回竖条。IPC 经启动闸门,此查询必在 restore 之后执行。
 #[tauri::command]
-pub fn get_orb_dock(app: AppHandle) -> Result<Option<OrbDockState>, String> {
-    Ok(dock_state_for(&app))
+pub fn get_orb_form(app: AppHandle) -> Result<OrbForm, String> {
+    Ok(OrbForm { dock: dock_state_for(&app), expanded: expanded_state(&app) })
+}
+
+/// `get_orb_form` 载荷。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct OrbForm {
+    pub dock: Option<OrbDockState>,
+    pub expanded: bool,
 }
 
 /// dock/undock 广播载荷（前端消费:收起/展开形态切换）。
@@ -1433,19 +1443,27 @@ mod win {
     }
 
     /// 启动形态决策（纯函数,单测覆盖;「启动恢复上次退出前的
-    /// 形态与位置,首次默认表盘」）：
-    /// - 显式字段（`orb_expanded`）优先——旧格式（无该字段）按落盘尺寸反推;
-    /// - 首次启动（无任何记录）⇒ **展开（表盘）**。
-    fn startup_form(
-        recorded_expanded: Option<bool>,
-        recorded_size: Option<(u32, u32)>,
-        scale: f64,
-    ) -> bool {
-        match (recorded_expanded, recorded_size) {
-            (Some(e), _) => e,
-            (None, Some((w, h))) => looks_expanded(w as f64 / scale, h as f64 / scale),
-            (None, None) => true,
+    /// 形态与位置,首次默认表盘」;订：竖条只属于贴边,未贴边一律表盘）：
+    /// **记录窗口当时的形态**（只用于从记录窗口位置换算内容原点,不决定启动形态）——
+    /// 显式字段（`orb_expanded`）优先,旧格式（无该字段）按落盘尺寸反推。
+    fn recorded_form(recorded_expanded: Option<bool>, recorded_size: (u32, u32), scale: f64) -> bool {
+        match recorded_expanded {
+            Some(e) => e,
+            None => looks_expanded(recorded_size.0 as f64 / scale, recorded_size.1 as f64 / scale),
         }
+    }
+
+    /// 未贴边启动的表盘内容矩形（物理像素）：内容原点 = 记录窗口位置 + **记录形态**的
+    /// 内容偏移（与手动展开的内容锚定同一口径——自由竖条原地长成表盘,不按表盘偏移
+    /// 硬套竖条窗口位置,否则表盘会向左上窜出 219/84 逻辑像素）。
+    fn startup_dial_content(pos: (i32, i32), scale: f64, recorded_expanded: bool) -> (i32, i32, i32, i32) {
+        let (rec_l, rec_t) = content_pad(recorded_expanded);
+        let (exp_l, exp_t) = content_pad(true);
+        let dial_pos = (
+            pos.0 + (rec_l * scale).round() as i32 - (exp_l * scale).round() as i32,
+            pos.1 + (rec_t * scale).round() as i32 - (exp_t * scale).round() as i32,
+        );
+        content_rect(dial_pos, scale, true)
     }
 
     /// 启动恢复（`window_state:restore` 调用;无子类化上下文也安全）：按**上次退出
@@ -1455,8 +1473,9 @@ mod win {
     /// - **贴边停靠**（`dock` 有值）⇒ 按 anchor 重算贴边位置（出屏补偿是 place_docked
     ///   的专属语义,通用 clamp 会把窗口拉回屏内、贴边观感丢失）;目标屏优先按记录的
     ///   工作区匹配当前显示器（显示器拔插/DPI 变更后自适应）;
-    /// - **自由态**（有几何记录）⇒ 按记录形态恢复窗口尺寸,位置 = 记录窗口位置
-    ///   （形态与记录一致 ⇒ 不做偏移换算）,内容 + 阴影余量钳进工作区后精确写入;
+    /// - **未贴边**（有几何记录）⇒ **一律表盘**（竖条形态只属于
+    ///   贴边;上次退出是自由竖条也回表盘,在竖条原位长大）,内容 + 阴影余量钳进工作区
+    ///   后精确写入;
     /// - **首次启动**（无记录）⇒ **展开态（表盘）** + 居中。
     pub fn restore_orb(
         window: &WebviewWindow,
@@ -1491,25 +1510,26 @@ mod win {
             return false;
         }
 
-        //  自由态 / 首次：形态决策
+        //  未贴边 / 首次：一律表盘（竖条只属于贴边——自由竖条不作为启动形态）
         let scale = recorded.map_or_else(|| window_dpi_scale(window), |(x, y, _, _)| scale_of(x, y));
-        let expanded = startup_form(recorded_expanded, recorded.map(|(_, _, w, h)| (w, h)), scale);
+        let expanded = true;
         crate::dev_log!(
-            "[orb-dock] restore_orb free expanded={expanded} recorded={recorded:?} scale={scale}"
+            "[orb-dock] restore_orb free expanded={expanded} recorded={recorded:?} recorded_expanded={recorded_expanded:?} scale={scale}"
         );
         // 只写内存不落盘（几何归位途中,落盘会记中间态——见 store_expanded_state）
         super::store_expanded_state(window.app_handle(), expanded);
 
         match recorded {
-            Some((x, y, _, _)) => {
-                // 位置 = 记录窗口位置（形态与记录一致,不需要偏移换算——㉝ 的
-                // 「换算到收起态」旧逻辑已删）;钳进工作区后精确写入（clamp_into_work
+            Some((x, y, w, h)) => {
+                // 内容原点 = 记录窗口位置 + 记录形态的内容偏移（记录是表盘 ⇒ 原位;记录是
+                // 自由竖条 ⇒ 在竖条原位长成表盘）;钳进工作区后精确写入（clamp_into_work
                 // 内含 apply_desired（force) 与意图记账,DPI 变更后可重放）。
                 if screens.is_empty() {
                     return expanded;
                 }
                 let screen = screens[screen_index_at(&screens, x, y)];
-                let content = content_rect((x, y), screen.scale, expanded);
+                let was_expanded = recorded_form(recorded_expanded, (w, h), screen.scale);
+                let content = startup_dial_content((x, y), screen.scale, was_expanded);
                 clamp_into_work(window, &screen, content, expanded);
             }
             None => {
@@ -2130,18 +2150,28 @@ mod win {
             assert!((dial_cy - ewcy).abs() <= 1.0, "expanded y: {dial_cy} vs {ewcy}");
         }
 
-        /// 启动形态决策（2026-09-13 用户定案「启动恢复上次退出形态,首次默认表盘」）：
-        /// 显式字段优先;旧格式（无字段）按落盘尺寸反推;首次（无记录）⇒ 展开。
+        /// 记录形态判定（只用于换算内容原点）：显式字段优先;旧格式（无字段）按落盘尺寸反推。
         #[test]
-        fn startup_form_prefers_field_then_size_then_expanded() {
+        fn recorded_form_prefers_field_then_size() {
             // 显式字段优先（即使与尺寸矛盾——字段是形态的权威记录）
-            assert!(startup_form(Some(true), Some((112, 232)), 2.0));
-            assert!(!startup_form(Some(false), Some((1160, 620)), 2.0));
+            assert!(recorded_form(Some(true), (112, 232), 2.0));
+            assert!(!recorded_form(Some(false), (1160, 620), 2.0));
             // 旧格式（无字段）按记录尺寸反推 @scale 2.0（112×232 = 竖条;1160×620 = 表盘）
-            assert!(!startup_form(None, Some((112, 232)), 2.0));
-            assert!(startup_form(None, Some((1160, 620)), 2.0));
-            // 首次启动：默认展开（表盘）
-            assert!(startup_form(None, None, 2.0));
+            assert!(!recorded_form(None, (112, 232), 2.0));
+            assert!(recorded_form(None, (1160, 620), 2.0));
+        }
+
+        /// 未贴边启动一律表盘（2026-09-17 用户定案）：记录是表盘 ⇒ 内容原位;记录是自由
+        /// 竖条 ⇒ 表盘内容原点落在竖条内容原点（原地长大,不按表盘偏移硬套竖条窗口位置）。
+        #[test]
+        fn startup_dial_grows_from_recorded_content_origin() {
+            let scale = 1.5;
+            let pos = (1000, 600);
+            assert_eq!(startup_dial_content(pos, scale, true), content_rect(pos, scale, true));
+            let pill = content_rect(pos, scale, false);
+            let dial = startup_dial_content(pos, scale, false);
+            assert!((dial.0 - pill.0).abs() <= 1 && (dial.1 - pill.1).abs() <= 1, "{dial:?} vs {pill:?}");
+            assert_eq!((dial.2, dial.3), (content_rect(pos, scale, true).2, content_rect(pos, scale, true).3));
         }
 
         /// 形态定性：外部传入的逻辑尺寸按最近的常量归属（收起 ↔ 展开）。

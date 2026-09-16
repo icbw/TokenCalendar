@@ -1,6 +1,7 @@
 // Prevents an extra console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_focus;
 mod chrome;
 mod collector;
 mod commands;
@@ -12,6 +13,7 @@ mod effects;
 mod fixture;
 mod orb_dock;
 mod snap;
+mod startup_gate;
 mod subscription;
 mod text_scale;
 mod timeline_form;
@@ -61,6 +63,10 @@ pub struct AppState {
     pub orb_visible: AtomicBool,
     /// 项目推进时间轴可见性（默认 false——第四窗口默认不弹，托盘/设置页开启）。
     pub timeline_visible: AtomicBool,
+    /// 落盘状态是否已由 `window_state:restore` 装载（false 期间 persist 拒写——
+    /// 否则会把 AppState 初值当作「当前状态」覆盖 window-state.json,下次启动悬浮球
+    /// 变成「不可见 + 未贴边 + 默认位置竖条」）。
+    pub window_state_restored: AtomicBool,
     /// Moved/Resized 事件节流持久化的上次写盘时刻（None = 从未写过）。
     pub last_persist: Mutex<Option<Instant>>,
     /// 主窗口最大化状态去重缓存（Resized 高频事件里只在真变时广播）。
@@ -76,7 +82,7 @@ pub struct AppState {
     /// 吸附开关（应急停用杠杆,P3 设置页接线;文件缺省 = 开）。
     pub widget_snap_enabled: AtomicBool,
     /// 悬浮球贴边停靠状态（None = 自由态;写者 = orb_dock 子类化
-    /// 线程与 restore/命令,persist/get_orb_dock 消费）。
+    /// 线程与 restore/命令,persist/get_orb_form 消费）。
     pub orb_dock: Mutex<Option<orb_dock::OrbDockState>>,
     /// 悬浮球当前形态（true = 展开卡片）。Rust 侧权威副本：几何判定与
     /// 点击穿透命中不再从窗口尺寸反推（跨屏 DPI 重排会让物理尺寸推不出逻辑尺寸）。
@@ -90,6 +96,9 @@ pub struct AppState {
 }
 
 fn main() {
+    // 启动闸门：setup 完成前到达的前端 IPC 暂存、setup 末尾重放（见 startup_gate.rs）
+    let startup_gate = startup_gate::StartupGate::new();
+    let setup_gate = startup_gate.clone();
     tauri::Builder::default()
         // 单实例守卫：挂件常驻 + close=hide 场景下重复启动会堆出双份托盘/挂件；
         // 二次启动转发到首实例（把挂件唤回可）后立即退出。必须最先注册。
@@ -119,6 +128,7 @@ fn main() {
             main_visible: AtomicBool::new(false),
             orb_visible: AtomicBool::new(false),
             timeline_visible: AtomicBool::new(false),
+            window_state_restored: AtomicBool::new(false),
             last_persist: Mutex::new(None),
             last_maximized: Mutex::new(false),
             tray: Mutex::new(None),
@@ -130,7 +140,7 @@ fn main() {
             attention: Mutex::new(Default::default()),
             timeline_form: Mutex::new(Default::default()),
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(startup_gate.wrap(tauri::generate_handler![
             commands::get_monthly_matrix,
             commands::get_breakdown,
             commands::get_credit_summary,
@@ -145,6 +155,7 @@ fn main() {
             commands::get_project_timeline,
             commands::get_attention,
             commands::ack_attention,
+            agent_focus::focus_agent_window,
             commands::list_project_meta,
             commands::set_project_meta,
             commands::merge_projects,
@@ -172,7 +183,7 @@ fn main() {
             commands::set_widget_size,
             commands::set_orb_size,
             orb_dock::orb_undock,
-            orb_dock::get_orb_dock,
+            orb_dock::get_orb_form,
             commands::get_snap_enabled,
             commands::set_snap_enabled,
             commands::get_autostart,
@@ -208,8 +219,8 @@ fn main() {
             subscription::idle::get_subscription_idle,
             subscription::idle::set_subscription_idle_enabled,
             subscription::idle::note_subscription_attention,
-        ])
-        .setup(|app| {
+        ]))
+        .setup(move |app| {
             let handle = app.handle().clone();
             // dev 文件日志最先初始化（仅 dev 构建;落 %TEMP%\tokencalendar-dev-logs\,
             // Agent 诊断可读;release 不编译此模块——零写入）
@@ -279,6 +290,9 @@ fn main() {
             if let Err(e) = subscription::spawn(handle.clone()) {
                 crate::dev_log!("[subscription] init failed, quota commands will error: {}", e);
             }
+            // 状态全部就位（窗口状态 / 采集读连接 / 订阅）后才放行前端 IPC——早到的调用
+            // 此刻按序重放,读到的是恢复后的状态而非 AppState 初值
+            setup_gate.open();
             Ok(())
         })
         .on_window_event(|window, event| match event {

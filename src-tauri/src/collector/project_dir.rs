@@ -33,6 +33,12 @@ pub fn folder_matches(dir: &str, folder: &str) -> bool {
     !folder.is_empty() && alnum_key(dir) == alnum_key(folder)
 }
 
+/// 是否像一条真实路径（含盘符或分隔符）。文件夹名兜底值（`E--Work-Demo`）不含二者——
+/// 它编码后与自己的文件夹「匹配」,不加此判据会被当成路径持久化。
+pub fn looks_like_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.contains(':')
+}
+
 /// 文件相对源根目录的第一层文件夹名（直接放在根目录下的文件 → None）。
 pub fn folder_of(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
@@ -66,14 +72,15 @@ impl FolderProjects {
         if let Some(k) = self.resolved.get(folder) {
             return k.clone();
         }
-        if let Some(k) = store.get_cursor(self.agent, &format!("{SCOPE_PREFIX}{folder}")) {
+        // 库内映射与旧游标提示都只在「像路径」时采纳:兜底写回的文件夹名不能自我印证（迁移会正旧值）。
+        if let Some(k) = store.get_cursor(self.agent, &format!("{SCOPE_PREFIX}{folder}")).filter(|k| looks_like_path(k)) {
             self.resolved.insert(folder.to_string(), k.clone());
             return k;
         }
         let candidate = first_cwd(lines)
             .filter(|c| folder_matches(c, folder))
             .map(|c| normalize_project(&c))
-            .or_else(|| (!hint.is_empty() && folder_matches(hint, folder)).then(|| hint.to_string()));
+            .or_else(|| (looks_like_path(hint) && folder_matches(hint, folder)).then(|| hint.to_string()));
         match candidate {
             Some(k) => {
                 self.resolved.insert(folder.to_string(), k.clone());
@@ -102,6 +109,29 @@ mod tests {
         assert!(folder_matches(r"D:\Space\WorkBuddy\通用对话空间", "d-Space-WorkBuddy-通用对话空间"), "WorkBuddy 折叠 --");
         assert!(!folder_matches(r"E:\Work\Demo\src-tauri", "E--Work-Demo"), "子目录不匹配");
         assert!(!folder_matches(r"E:\Work\Demo", ""));
+        assert!(folder_matches("/e/Work/Demo", "e--Work-Demo"), "Git Bash 形式 cwd");
+    }
+
+    #[test]
+    fn folder_name_never_self_certifies() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut fp = FolderProjects::new("claude-code");
+        let drifted = vec![r#"{"cwd":"E:\\W\\Demo\\src"}"#.to_string()];
+        // 旧游标里是上次兜底写回的文件夹名:编码后与文件夹一致,但不是路径 → 仍兜底、不持久化
+        assert_eq!(fp.resolve(&store, "E--W-Demo", &drifted, "E--W-Demo"), "E--W-Demo");
+        let mut batch = Batch::default();
+        fp.persist(&mut batch);
+        assert!(batch.cursors.is_empty(), "文件夹名不得持久化为映射");
+        // 库里已被写坏的映射（v13 漏洞遗留）视为不存在,由真实 cwd 覆盖
+        let mut b2 = Batch::default();
+        b2.cursors.push(("folder:E--W-Demo".to_string(), "E--W-Demo".to_string()));
+        store.commit("claude-code", &b2).unwrap();
+        let mut fp = FolderProjects::new("claude-code");
+        let good = vec![r#"{"cwd":"E:\\W\\Demo"}"#.to_string()];
+        assert_eq!(fp.resolve(&store, "E--W-Demo", &good, ""), "e:/W/Demo");
+        let mut batch = Batch::default();
+        fp.persist(&mut batch);
+        assert_eq!(batch.cursors, vec![("folder:E--W-Demo".to_string(), "e:/W/Demo".to_string())], "覆盖坏映射");
     }
 
     #[test]

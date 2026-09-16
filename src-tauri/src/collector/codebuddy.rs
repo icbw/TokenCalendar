@@ -475,6 +475,7 @@ impl Adapter for CodebuddyAdapter {
                         project_key: project.clone(),
                         parent_id: None,
                         title: target.title.map(str::to_string),
+                        host: None,
                         phase,
                         last_event: mtime.max(last.started_at.unwrap_or(0)),
                     },

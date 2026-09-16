@@ -203,6 +203,17 @@
 .tl-proj.is-pending .tl-dot {
   background: color-mix(in srgb, var(--accent, #4f7cff) 45%, var(--widget-card-text-muted, #888));
 }
+/* S5 降级：聚焦时宿主窗口不存在 → 灰色「上次停在这里」,点击回退打开目录 */
+.tl-proj.is-stale {
+  cursor: pointer;
+}
+.tl-proj.is-stale .tl-proj-label {
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+.tl-proj.is-stale .tl-dot {
+  background: var(--widget-card-text-muted, #888);
+  opacity: 0.55;
+}
 .timeline-body.is-vertical .tl-dot {
   position: absolute;
   left: 5px;
@@ -530,6 +541,12 @@
 .tl-strip-name.is-pending {
   color: color-mix(in srgb, var(--accent, #4f7cff) 55%, var(--widget-card-text-muted, #888));
   background: color-mix(in srgb, var(--accent, #4f7cff) 8%, transparent);
+}
+.tl-strip-name.is-stale {
+  cursor: pointer;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: color-mix(in srgb, var(--widget-card-text-muted, #888) 12%, transparent);
+  font-weight: 500;
 }
 @keyframes tl-strip-pulse {
   0%,

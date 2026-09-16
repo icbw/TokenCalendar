@@ -224,6 +224,10 @@ impl ClaudeCodeAdapter {
             }
         }
         // 行内 cwd 不再参与项目归属（它是 Bash 当前目录,`cd` 后漂进子目录）;项目由文件所在文件夹决定,collect 里设定。
+        // 宿主线索,供聚焦选目标进程。
+        if let Some(ep) = v.get("entrypoint").and_then(|x| x.as_str()) {
+            st.set_host(ep);
+        }
         let has_origin = v.get("origin").is_some();
         if has_origin {
             st.drop_tentative = true;

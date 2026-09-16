@@ -662,7 +662,7 @@ impl ZcodeAdapter {
         let title = title.filter(|t| !t.trim().is_empty());
         batch.live.insert(
             (META.id.to_string(), sid.to_string()),
-            LiveTurn { project_key: project.clone(), parent_id: parent.clone(), title: title.clone(), phase: live_phase, last_event: live_last },
+            LiveTurn { project_key: project.clone(), parent_id: parent.clone(), title: title.clone(), host: None, phase: live_phase, last_event: live_last },
         );
         batch.upsert_session(
             META.id,

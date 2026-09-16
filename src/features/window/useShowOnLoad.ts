@@ -5,9 +5,10 @@
 import { useEffect } from 'react'
 import { inTauri, windowService } from '../../services'
 
-export function useShowOnLoad() {
+// `ready`（默认 true）：窗口自身状态就位前传 false,就位后才请求显示（orb 等启动形态）。
+export function useShowOnLoad(ready = true) {
   useEffect(() => {
-    if (!inTauri) return
+    if (!inTauri || !ready) return
     let innerRaf = 0
     const outerRaf = requestAnimationFrame(() => {
       innerRaf = requestAnimationFrame(() => {
@@ -18,5 +19,5 @@ export function useShowOnLoad() {
       cancelAnimationFrame(outerRaf)
       cancelAnimationFrame(innerRaf)
     }
-  }, [])
+  }, [ready])
 }

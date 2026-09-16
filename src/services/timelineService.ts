@@ -2,7 +2,7 @@
 // snake_case 契约（contract.ts）→ 驼峰内部形状一次映射;失败返回 null（tryInvoke 口径）。
 // TimelineCell.title 是内容列:只供 timeline 窗口本地渲染,不得进入导出 / 日志 / 其它视图。
 
-import type { AckAttentionArgs, AttentionItemContract, TimelineQueryArgs, TimelineResultContract } from './contract'
+import type { AckAttentionArgs, AttentionItemContract, FocusAgentWindowArgs, FocusResultContract, TimelineQueryArgs, TimelineResultContract } from './contract'
 import { tryInvoke } from './tauri'
 import { rememberProjectLabels } from './projectLabels'
 
@@ -100,6 +100,8 @@ export interface AttentionItem {
   projectKey: string
   /** 【内容列】 */
   title: string | null
+  /** 桌面宿主线索（S5;只透传,聚焦目标由 Rust 登记表决定）。 */
+  host: string | null
   state: AttentionState
   since: number
   lastEvent: number
@@ -115,6 +117,7 @@ export async function getAttention(): Promise<AttentionItem[] | null> {
     sessionId: i.session_id,
     projectKey: i.project_key,
     title: i.title,
+    host: i.host ?? null,
     state: i.state,
     since: i.since,
     lastEvent: i.last_event,
@@ -125,4 +128,12 @@ export async function getAttention(): Promise<AttentionItem[] | null> {
 export async function ackAttention(agent: string, sessionId: string): Promise<boolean> {
   const args: AckAttentionArgs = { agent, session_id: sessionId }
   return (await tryInvoke<boolean>('ack_attention', { ...args })) ?? false
+}
+
+// ---- 桌面窗口聚焦:true = 已前置并确认;false = 宿主窗口不存在（条目已移除）;
+// null = 命令本身失败（非 Tauri 环境 / IPC 错误）,调用方按「未处理」对待。 ----
+export async function focusAgentWindow(agent: string, sessionId: string): Promise<boolean | null> {
+  const args: FocusAgentWindowArgs = { agent, session_id: sessionId }
+  const res = await tryInvoke<FocusResultContract>('focus_agent_window', { ...args })
+  return res ? res.found : null
 }

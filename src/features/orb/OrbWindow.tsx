@@ -312,7 +312,9 @@ function placeTip(x: number, y: number, w: number, h: number): { left: number; t
 }
 
 export default function OrbWindow() {
-  useShowOnLoad()
+  // 启动形态就位（get_orb_form 返回）前不请求显示——否则首帧可能是猜测形态
+  const [formReady, setFormReady] = useState(false)
+  useShowOnLoad(formReady)
   useOrbThemeSync()
   // 圆角方案档（与挂件/主面板同档对齐 → --widget-card-radius，orb 卡片复用该档位值）。
   useRadiusSchemeSync('widget')
@@ -322,19 +324,29 @@ export default function OrbWindow() {
     document.documentElement.classList.add('mode-widget')
   }, [])
 
-  // 两态（启动恢复上次退出前的形态与位置,首次默认表盘——
-  // Rust restore_orb 已按落盘形态设好窗口尺寸（展开 580 / 收起 56），据此初始化，
-  // 避免首帧形态与窗口尺寸错位;几何/可见性由 window-state 承担）
-  const [expanded, setExpanded] = useState(() => window.innerWidth > 200)
+  // 两态（启动恢复上次退出前的贴边位置,首次默认表盘;
+  // 订：未贴边一律表盘）。初值 = 表盘占位,挂载即以 Rust 权威形态（get_orb_form）
+  // 校准——**不按 window.innerWidth 猜**：页面可能早于 Rust restore 归位加载,那时窗口
+  // 还是配置初始尺寸 56×116,猜成竖条后挂载对齐会把刚恢复的表盘缩回竖条（复发根因之一）。
+  const [expanded, setExpanded] = useState(true)
   // 贴边停靠：docked = Rust 侧判定结果（拖动松手
   // 贴缘 dock / 离缘 undock 广播,重启由 get_orb_dock 恢复）;边缘自位置承担,
   // 前端只跟形态。
   const [dock, setDock] = useState<OrbDockState | null>(null)
-  // 挂载恢复：有 dock 态 → 回收起态（几何 Rust restore 已按 anchor 归位）
+  // 挂载恢复：停靠态 + 形态取 Rust 权威值（几何 Rust restore 已归位;IPC 经启动闸门,
+  // 必在 restore 之后应答）,再按该形态做一次幂等尺寸对齐（内容锚定,位置不动）。
+  // dock 广播先到（用户已拖动）则以广播为准,不拿启动快照覆盖。
+  const formTouched = useRef(false)
   useLayoutEffect(() => {
-    windowService.getOrbDock().then((d) => {
-      if (d) setDock(d)
-    }).catch(() => {})
+    void windowService.getOrbForm().then((f) => {
+      if (f && !formTouched.current) {
+        setDock(f.dock)
+        setExpanded(f.expanded)
+        const size = f.expanded ? EXPANDED_SIZE : COLLAPSED_SIZE
+        windowService.setOrbSize(size.w, size.h).catch(console.error)
+      }
+      setFormReady(true)
+    })
   }, [])
   // 拖动松手的 dock/undock 广播（Rust orb_dock 子类化线程发）。
   // 形态切换的**几何**（尺寸 + 位置 + 内容锚定 + 显示器选择）全部在 Rust：
@@ -347,6 +359,7 @@ export default function OrbWindow() {
     // 标记兜住：卸载后才到达的 unlisten 立即执行。
     let disposed = false
     void events.onOrbDockChanged((p) => {
+      formTouched.current = true
       if (p.docked && p.edge) {
         // dock：形态收到竖条。贴边几何（含收起态尺寸）Rust place_docked 已归位;
         // 此处 work 只是占位（Rust 侧停靠状态才是权威）。
@@ -372,13 +385,6 @@ export default function OrbWindow() {
     }
   }, [])
 
-  // S4 ：挂载按**当前形态**校准窗口尺寸——Rust restore_orb
-  // 已按落盘形态设好尺寸（首次启动 = 展开表盘）,这里只做一次幂等对齐（内容锚定
-  // 保证位置不动）;dock 态两态同为收起尺寸,同样安全。仅挂载时执行一次。
-  useLayoutEffect(() => {
-    const size = expanded ? EXPANDED_SIZE : COLLAPSED_SIZE
-    windowService.setOrbSize(size.w, size.h).catch(console.error)
-  }, [])
   const [snapshots, setSnapshots] = useState<SubscriptionSnapshot[]>([])
   // 本窗口 = orb；绑定多平台时显示上次选中的平台（启动恢复
   // 上次,不再固定第一个）。按平台 id 记——绑定集合变化时下标会错位;持久化在
