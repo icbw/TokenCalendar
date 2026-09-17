@@ -1,0 +1,54 @@
+/* 行展开面板 v2:SVG 曲线/堆叠双模式 */
+.breakdown {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.breakdown-empty {
+  font-size: var(--font-size-sm);
+  color: var(--text-faint);
+  padding: 8px 0;
+}
+
+.breakdown-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.breakdown-title {
+  font-weight: 600;
+  font-size: var(--font-size-md);
+}
+
+.breakdown-month-total {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+/* 曲线/堆叠切换（复用主矩阵 .seg 分段样式） */
+.breakdown-kind {
+  margin-left: auto;
+}
+
+.breakdown-close {
+  font-size: 16px;
+  color: var(--text-muted);
+  padding: 0 6px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.breakdown-close:hover {
+  background: var(--accent-weak);
+  color: var(--text);
+}
+
+.breakdown-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}

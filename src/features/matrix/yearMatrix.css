@@ -1,0 +1,253 @@
+/* YearMatrix: tokscale-style card widget .
+   Transparent window → rounded card → 53x7 heatmap fills the card; header
+   （title + segmented control + actions) is a hover overlay; month
+   labels sit under the grid （hidden in the small preset). Cells sized via JS. */
+
+.year-matrix {
+  height: 100%;
+  padding: 0; /* 贴边方案：窗口即卡片，无空气层*/
+  background: transparent; /* 窗口透明由卡片圆角外的四角保证 */
+  /* Tauri 拖动：data-tauri-drag-region 属性只作用于 mousedown 的 target 元素
+     本身（子元素无属性即无拖动），由 JSX 挂在卡片各容器上。 */
+  user-select: none;
+  overflow: hidden;
+}
+
+.year-card {
+  position: relative; /* chrome/月标签浮层的定位基准 */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* 上下 12 / 左右 8：月标签浮层化后不再占布局
+     位，垂直边距首次可严格对称（此前底部被标签带隐性占据 18px——静止态
+     「上窄下宽」观感的根源）。窗口三档高度同步重算（SIZE_PRESETS）。 */
+  padding: 12px 8px;
+  /* Background transparency = alpha in the card's background COLOR.
+     Title/buttons/labels keep full opacity; cells are NOT children of any
+     semi-transparent-opacity ancestor （only of the alpha-colored card).
+     NOTE: dev 模式开 DevTools 时 WebView2 会强制锁定背景不透明（白底），
+     属调试器限制——验证透明必须用生产 exe（pnpm tauri build --no-bundle）。 */
+  background: rgba(var(--widget-card-bg) / var(--widget-card-alpha, 1));
+  border: 1px solid var(--widget-card-border);
+  /* 圆角方案档（radiusTheme 覆写 --widget-card-radius；默认 large=16px）。
+     材质态由 DWM 裁切窗口（下方 material-on 规则归零交单源）。 */
+  border-radius: var(--widget-card-radius, 16px);
+  /* 合成层加固（纯 CSS 模式下最后的像素级防线）：热力图格子高频刷新，
+     GPU 分层合成可能让子元素像素从父容器抗锯齿圆角带里溢出——
+     isolation 强制独立层叠上下文，translateZ（0) 提升为独立合成层，
+     把裁剪边界死死锁在卡片自身的渲染层内。 */
+  isolation: isolate;
+  transform: translateZ(0);
+  /* 阴影策略：可缩放 frameless 窗口必须保留 WS_THICKFRAME，
+     Win11 会对其施加 DWM 阴影且无法跨拖动/贴靠状态压制——
+     因此删掉 CSS 自有投影，让系统阴影就地充当卡片的悬浮投影，避免双重阴影。
+     系统 1px 边框已用 DWMWA_BORDER_COLOR=NONE 移除。圆角单源：DONOTROUND
+     + CSS 16px（System ROUND 模式有平台级毛边/强调色边框，已移除）。 */
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* ---- 吸附落定动效：widget-snap-landed 事件（Rust 仅在量化位移
+   真变时发）驱动的一次性 ~150ms 微动效。transform 微缩放 + 边框高亮闪一下，
+   animationend 后由 JSX 摘 class；不触碰基础态其余属性（边缘处置原子组合
+   零关联——纯 CSS 状态类，材质态叠加时 border 高亮被 DWM 裁切吸收属可接受
+   降级，动画本身无副作用）。 ---- */
+@keyframes snap-land {
+  0% {
+    transform: translateZ(0) scale(0.992);
+  }
+  60% {
+    transform: translateZ(0) scale(1.002);
+  }
+  100% {
+    transform: translateZ(0) scale(1);
+  }
+}
+.year-card.snap-landed {
+  animation: snap-land 150ms ease-out;
+}
+
+/* ---- spike：挂件材质态（html.material-on 由 materialTheme 挂载，
+   DWM 侧同步切 ROUND + 撤销 NCRP_DISABLED，见 chrome.rs 原子组合）。
+   窗口即卡片（全出血），材质背板填满方角窗口矩形——CSS 16px 圆角外四角
+   会露方角背板，圆角/描边退出交 DWM 单源
+。 ---- */
+html.material-on .year-card {
+  border-radius: 0;
+  border-color: transparent;
+}
+
+/* 网格占满卡片（chrome/标签为浮层不再挤压）：垂直居中，浮层唤出时覆盖其上。
+   drag region 挂在网格与格间空隙（data-tauri-drag-region 由 JSX 控）。 */
+.year-grid {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+}
+
+/* Chrome 浮层：右上角一排图标钮（粒度循环 / 锁定 / 展开 / 重置），hover 卡片
+   即唤出。三轮： 撤掉 32px 全宽渐变遮罩带； 删掉
+   「Token activity」标题与三档分段控制（粒度合并为单钮循环）； **把整条压进
+   卡片自身的内边距带** —— padding 上下归零、按钮高度收到 12px（= 卡片 padding
+   12），与底部月标签带（bottom:0 / height:14）同构：两条浮层的可见内容都只占
+   padding 带，**不压任何格子**（第一行格子起点 y=13，恒在条带之下）。
+   浮层不带任何常驻底色，命中只给按钮自身。静止时 opacity 0 且不可交互。 */
+.year-chrome {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 10px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.year-card:hover .year-chrome {
+  opacity: 1;
+  /* pointer-events 保持 none：浮层不拦截鼠标，
+     第一行格子的 hover/tooltip 不被 chrome 挡住；拖动由下层 drag region
+     承担（穿透后落在格子间隙的 .year-rows/.year-col 上）。命中只给按钮
+     自身（下一条规则）——容器 padding 与按钮间隙一并穿透；锁定态仍按
+     下方规则禁点。 */
+}
+
+/* 命中只开在按钮自身（仅 hover 态——pointer-events 子元素可重新开启父级的
+   none，若不限 hover，静止透明态按钮会被盲点）：容器恒穿透，第一行格子只在
+   按钮正下方才不可及。 */
+.year-card:hover .year-chrome .year-action {
+  pointer-events: auto;
+}
+
+.year-actions {
+  display: flex;
+  gap: 2px;
+  /* 无底色：只留图标本身 + hover 反馈（见下一条）。 */
+}
+
+.year-action {
+  font-size: 11px;
+  line-height: 1;
+  /* inline-flex：图标居中且消掉 inline 基线留白——按钮高度严格 = 内边距 +
+     12px 图标 = 12px，正好落在卡片顶部内边距带内（与底部月标签带同构，
+     完全不压格子）。命中盒 12×18，是「不可 hover 的
+     格子面积」的下界。常驻底色不画，只有 hover/态反馈铺底。 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+/* hover 反馈：浅强调底 + 图标提亮（同日曾试改为与格子同款的
+   1px 描边，用户否决并要求改回——勿再动）。 */
+.year-action:hover {
+  background: var(--accent-weak);
+  color: var(--text);
+}
+
+/* 锁定态（锁钮常亮）：浅强调底 + 强调色图标。 */
+.year-action.is-active {
+  background: var(--accent-weak);
+  color: var(--accent);
+}
+
+/* 粒度钮在重载期间禁用（旧分段控制的 disabled 语义）。 */
+.year-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 53 columns; centered when narrower than the card.
+   Foreground transparency: element opacity on the rows container only. */
+.year-rows {
+  display: flex;
+  justify-content: center;
+  opacity: var(--widget-fg-opacity, 1);
+}
+
+.year-col {
+  display: flex;
+  flex-direction: column;
+}
+
+.year-cell {
+  border-radius: 4px;
+  /* Distinct from the card background （else empty days vanish — the "invisible
+     grid" effect) yet clearly lighter than any activity color. */
+  background: var(--widget-zero-bg);
+  flex-shrink: 0;
+  transition: transform 0.05s ease;
+}
+
+.year-cell:hover {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  z-index: 1;
+}
+
+/* 未来日（本行仅语义标记）：年矩阵里未来格与零值格同款灰色显示（
+   当前周剩余六天可见、hover 与其他灰格一致），不再透明——原
+   `background: transparent !important` 规则已删。月视图（monthMatrix.css）
+   的未来格样式独立，不受此影响。 */
+
+/* today 描边强调已删：挂件最右列恒为今天所在周,
+   位置本身已表达"当前",描边反而破坏画面。主矩阵同步删除。 */
+
+/* Month labels: one slot per column, below the grid。
+   原为布局内标签带（占 18px 常驻空间）——静止态底部被隐性占据导致上下
+   边距永远不对称，且热力图面积缩水；改为与 chrome 同款的 hover 浮层
+   （absolute 底部渐变带），格子占满卡片，静止/hover 均不跳动。
+   Small preset 整段不渲染（SIZE_PRESETS[].labels=false）。 */
+.year-month-labels {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  justify-content: center;
+  height: 14px;
+  padding: 0 0 5px;
+  flex-shrink: 0;
+  overflow: visible;
+  background: linear-gradient(
+    to top,
+    rgba(var(--widget-card-bg) / calc(var(--widget-card-alpha, 1) * 1.15)) 45%,
+    rgba(var(--widget-card-bg) / 0)
+  );
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.year-matrix:hover .year-month-labels {
+  opacity: 1;
+}
+
+.year-month-label {
+  flex-shrink: 0;
+  font-size: 9px;
+  line-height: 14px;
+  /* 可派生变量：随自定义卡片底色自动切换深浅（widgetTheme.ts 派生） */
+  color: var(--widget-card-text-muted);
+  white-space: nowrap;
+  overflow: visible;
+}
+
+/* ----- 锁定极简态 -----
+   锁定 = 只读极简：静止时仅热力图（chrome 浮层本就隐藏），hover 唤出 chrome
+   但只读——除解锁钮外全部禁点（含拖动把手，JSX 已移除 drag-region）。
+   任何像素级调整先过生产构建验证（教训）。 */
+.year-matrix.is-locked .year-chrome .year-action:not(.is-lock) {
+  pointer-events: none;
+  opacity: 0.45;
+}

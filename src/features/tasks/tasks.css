@@ -1,0 +1,359 @@
+/* Tasks 视图。骨架复用洞察页（.insights-view / .insight-toolbar / .insight-card /
+   .seg / .legend-*）,本文件只补列表、逐轮条形与空档直方图;颜色一律取 tokens v2 变量。 */
+
+/* 列表 12 列,放宽洞察页 900px 上限 */
+.tasks-view {
+  max-width: 1180px;
+}
+
+.tasks-project-select {
+  max-width: 200px;
+}
+
+/* ---- 任务列表 ---- */
+
+.task-table-wrap {
+  overflow-x: auto;
+}
+
+.task-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-table th,
+.task-table td {
+  padding: 4px 6px;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-table th {
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.task-table .is-left {
+  text-align: left;
+}
+
+.task-th {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  padding: 0;
+}
+
+button.task-th:hover,
+.task-th.is-active {
+  color: var(--text);
+}
+
+.task-th-arrow {
+  display: inline-block;
+  width: 8px;
+  font-size: 8px;
+}
+
+.task-row {
+  cursor: pointer;
+  color: var(--text);
+}
+
+.task-row:hover td {
+  background: color-mix(in srgb, var(--zero-bg) 55%, transparent);
+}
+
+.task-row.is-expanded td {
+  background: var(--accent-weak);
+  border-bottom-color: transparent;
+}
+
+.task-col-flag {
+  width: 30px;
+  text-align: left !important;
+  padding-right: 0 !important;
+}
+
+.task-chevron {
+  display: inline-block;
+  width: 10px;
+  color: var(--text-faint);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.task-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+/* 离群标记:行首竖条 + 「!」徽标（hover 说明哪一项偏高）+ 偏高的数值加粗着色 */
+.task-row.is-outlier td:first-child {
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+.task-flag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 2px;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  cursor: help;
+}
+
+.task-table td.is-outlier-value {
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.task-ellipsis {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-label {
+  max-width: 240px;
+}
+
+.task-muted {
+  color: var(--text-muted);
+}
+
+.task-table td.task-errors {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.task-detail td {
+  text-align: left;
+  white-space: normal;
+  padding: 0;
+  background: color-mix(in srgb, var(--accent-weak) 45%, transparent);
+}
+
+.task-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.task-pager-page {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 逐轮条形（行展开） ---- */
+
+.turns {
+  padding: 8px 10px 10px 36px;
+}
+
+.turns-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-bottom: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.turns-legend {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.turns-legend .legend-item:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.turns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.turn-row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 176px 56px;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.turn-seq {
+  text-align: right;
+  color: var(--text-faint);
+}
+
+.turn-track {
+  height: 10px;
+  min-width: 0;
+}
+
+.turn-bar {
+  display: flex;
+  height: 100%;
+  min-width: 2px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--zero-bg); /* model / tool 之外的剩余 = Other */
+}
+
+.turn-seg-model {
+  background: var(--accent);
+}
+
+.turn-seg-tool {
+  background: color-mix(in srgb, var(--accent) 42%, var(--panel));
+}
+
+.turn-seg-rest {
+  background: var(--zero-bg);
+}
+
+.turn-swatch-error {
+  background: var(--danger);
+}
+
+.turn-row.is-aborted .turn-seq {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.turn-row.is-aborted .turn-bar {
+  box-shadow: inset 0 0 0 1.5px var(--danger);
+  background: color-mix(in srgb, var(--danger) 22%, var(--zero-bg));
+}
+
+.turn-errors {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.turn-na {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.turn-meta {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.turn-wall {
+  text-align: right;
+}
+
+/* ---- 离开阈值 + 空档直方图 ---- */
+
+.gap-card-header {
+  flex-wrap: wrap;
+}
+
+.gap-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.gap-threshold {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gap-threshold input {
+  width: 64px;
+  font-size: var(--font-size-xs);
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.gap-threshold input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.gap-apply {
+  border: 1px solid var(--border);
+}
+
+.gap-status {
+  color: var(--text-faint);
+}
+
+.gap-status.is-error {
+  color: var(--danger);
+}
+
+.gap-bar.is-within {
+  fill: var(--accent);
+}
+
+.gap-bar.is-beyond {
+  fill: var(--border-strong);
+}
+
+.gap-swatch-within {
+  background: var(--accent);
+}
+
+.gap-swatch-beyond {
+  background: var(--border-strong);
+}
+
+.gap-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin-top: 4px;
+  font-size: var(--font-size-xs);
+}
+
+.gap-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gap-stat-label {
+  color: var(--text-muted);
+}
+
+.gap-stat-value {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}

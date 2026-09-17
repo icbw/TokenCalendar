@@ -1,0 +1,572 @@
+/* 项目推进时间轴窗口样式（空壳 → S2 只读看板）。
+   透明前提：宿主 .timeline-shell 全透明。起看板 = 两张独立卡片（顶栏 .tl-bar + 面板
+   .timeline-body,中间透明间隙,对齐主界面 titlebar / shell-main）。窗口风格两档（chrome.rs
+   apply_timeline_style_chrome）：
+   - .is-floating（Shadow,默认）= 主窗口组合：DWM 阴影 + ROUND,外缘 8px 全透明呼吸位
+     （错开 DWM 圆角与 CSS 卡片圆角,勿取消）;
+   - .is-flat = 挂件默认态组合（系统全静默 + CSS 全权）,卡片全出血。
+   条态恒 flat（Rust 施加),呼吸位只挂 .is-board。
+   颜色：消费挂件派生变量（--widget-card-* 由 widgetTheme hook 写入,scheme 内置值
+   在 tokens.css）与主题 tokens（--accent 等）,选择器独立不复用 .shell / .is-widget。
+   拖动：只有顶栏 .tl-bar 挂 data-tauri-drag-region="deep"（逐元素挂载——
+   该属性只作用 mousedown target 不继承）;看板区是交互区。
+   层次：面板 / 顶栏 / 会话格三档背景 alpha 可调;左侧日期标签全透明悬挂在
+   面板背景上;今天的大格不画强调描边。
+   看板：CSS Grid,列 [日标签 | N 项目]、日期向下。 */
+
+.timeline-shell {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  padding: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  font-family: inherit;
+  color: var(--widget-card-text, var(--text));
+  /* 看板内部间距 / 线色单点定义。--tl-accent = 时间轴主题色（会话格热力 / 今天 / 亮起 / pin 等全部强调色）,
+     默认跟随全局 --accent;设置里选了预设或自定义色时由 TimelineWindow 内联覆盖。顶栏 / 面板底色不受影响。 */
+  --tl-accent: var(--accent, #4f7cff);
+  /* 条态 / 窥视把手共用的贴边窄阴影与留边（留边与 timelineConfig STRIP_SHADOW_PAD_PX 同源） */
+  --tl-edge-pad: 5px;
+  --tl-edge-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+  --tl-line: color-mix(in srgb, var(--widget-card-border) 70%, transparent);
+  --tl-line-future: color-mix(in srgb, var(--widget-card-border) 45%, transparent);
+  --tl-today-bg: color-mix(in srgb, var(--tl-accent) 10%, transparent);
+  --tl-cell-bg: color-mix(in srgb, var(--tl-accent) 14%, transparent);
+  --tl-cell-bg-hover: color-mix(in srgb, var(--tl-accent) 24%, transparent);
+}
+
+.timeline-card {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0;
+  box-sizing: border-box;
+  background: transparent;
+}
+/* Shadow 风格看板态：外缘全透明呼吸位（DWM 阴影落点,同 .shell.is-expanded 的 8px） */
+.timeline-shell.is-floating.is-board .timeline-card {
+  padding: 8px;
+}
+
+/* ---------- 顶栏（独立卡片,对齐主界面 .titlebar） ----------
+   表头网格在 .tl-bar-scroll 内（overflow:hidden,scrollLeft 由面板同步）;右侧按钮区宽
+   = --tl-actions-w,面板右侧 padding 同宽;两卡片同为 1px 边框、两边 stable gutter → 两张网格
+   容器等宽、列对齐。 */
+.tl-bar {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  /* 高度 = 表头网格行高 BAR_HEAD_PX（timelineConfig）+ 边框 */
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  border-radius: var(--widget-card-radius, 16px);
+  background: rgba(var(--widget-card-bg) / var(--tl-bar-alpha, 0.85));
+  isolation: isolate;
+  overflow: hidden;
+  cursor: default;
+  user-select: none;
+}
+.tl-bar-scroll {
+  flex: 1;
+  min-width: 0;
+  padding-left: 4px;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+}
+.tl-bar-actions {
+  flex: none;
+  width: var(--tl-actions-w, 36px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* ---------- 面板（独立卡片,对齐主界面 .shell-main;背景 alpha 可调） ---------- */
+.timeline-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  /* 右侧留出顶栏按钮区同宽,左侧与顶栏同 4px → 表头与看板列对齐 */
+  padding: 6px var(--tl-actions-w, 36px) 6px 4px;
+  box-sizing: border-box;
+  background: rgba(var(--widget-card-bg) / var(--tl-bg-alpha, 0.55));
+  border: 1px solid var(--widget-card-border);
+  border-radius: var(--widget-card-radius, 16px);
+  isolation: isolate;
+  /* 格子到最小尺寸后不再缩小 → 超出面板滚动（行高随内容,天数多时也靠它） */
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+/* ---------- 网格 ---------- */
+
+.tl-grid {
+  display: grid;
+  min-width: 100%;
+  gap: 3px 2px;
+  /* 行随内容,不拉伸 */
+  align-content: start;
+  box-sizing: border-box;
+  font-size: 11px;
+  line-height: 1.25;
+  user-select: none;
+}
+.tl-head-grid {
+  height: 100%;
+  align-content: center;
+}
+
+.tl-corner {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 日标签：左侧悬挂列,底色全透明 */
+.tl-day {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  min-width: 0;
+  min-height: 0;
+  padding: 4px 6px 0 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10px;
+  /* 悬挂在半透明面板上,次色偏浅不易读:取正文色 80% */
+  color: color-mix(in srgb, var(--widget-card-text, var(--text)) 80%, transparent);
+  background: transparent;
+}
+.tl-day.is-today {
+  color: var(--tl-accent);
+  font-weight: 600;
+}
+.tl-day.is-future {
+  opacity: 0.55;
+}
+
+/* 项目列头（顶栏内） */
+.tl-proj {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 6px;
+  overflow: hidden;
+  border-radius: 6px;
+  cursor: default;
+}
+.tl-proj-label {
+  min-width: 0;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-weight: 600;
+  font-size: 12px;
+}
+.tl-badge {
+  flex: none;
+  align-self: center;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: var(--tl-line);
+  white-space: nowrap;
+}
+/* S3 注意力：弱提示（「弱于订阅悬浮球失效色,强于常态一档」）。
+   waiting = 淡底 + 缓慢呼吸点;pending（工具久未回）= 次色静态点。点击行头确认。 */
+.tl-proj.is-waiting,
+.tl-proj.is-pending {
+  cursor: pointer;
+}
+.tl-proj.is-waiting {
+  background: color-mix(in srgb, var(--tl-accent) 12%, transparent);
+}
+.tl-dot {
+  position: absolute;
+  left: 5px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tl-accent);
+}
+.tl-proj.is-waiting .tl-dot {
+  animation: tl-breathe 2.4s ease-in-out infinite;
+}
+.tl-proj.is-pending .tl-dot {
+  background: color-mix(in srgb, var(--tl-accent) 45%, var(--widget-card-text-muted, #888));
+}
+/* S5 降级：聚焦时宿主窗口不存在 → 灰色「上次停在这里」,点击回退打开目录 */
+.tl-proj.is-stale {
+  cursor: pointer;
+}
+.tl-proj.is-stale .tl-proj-label {
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+.tl-proj.is-stale .tl-dot {
+  background: var(--widget-card-text-muted, #888);
+  opacity: 0.55;
+}
+@keyframes tl-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tl-proj.is-waiting .tl-dot {
+    animation: none;
+  }
+}
+/* 格子。（空格子不画边框、有活动格上热力底）→ ：
+   每日格按会话向下拆成多格（.tl-item）,行高随内容、面板可滚动。
+   格子尺寸范围见 timelineConfig（模板 minmax）,窗口缩到最小尺寸后不再缩小。 */
+.tl-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+/* 空格子：今天与过去同一浅底（今天的空格不再染主题色）;未来空格不画 */
+.tl-cell.is-empty:not(.is-future) {
+  background: color-mix(in srgb, var(--widget-card-border) 28%, transparent);
+}
+.tl-cell.is-today:not(.is-empty) {
+  background: var(--tl-today-bg);
+}
+/* 格内滚动：会话数超过设置值的格子——今天直接可滚,过去日点击展开后可滚;
+   格高由 SessionCell 按行高写 max-height。滚动态会话格不参与 flex 收缩。 */
+.tl-cell.is-scroll {
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.tl-cell.is-scroll > .tl-item {
+  flex: none;
+}
+.tl-cell.is-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.tl-cell[tabindex] {
+  outline: none;
+}
+.tl-cell.is-expandable,
+.tl-cell.is-expandable > .tl-item {
+  cursor: pointer;
+}
+/* 展开态：描一圈主题色,滚到头不带动看板滚动 */
+.tl-cell.is-expanded {
+  overscroll-behavior: contain;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--tl-accent) 55%, transparent);
+}
+/* 会话格：一格一会话,热力底由 --tl-heat 与卡片底 color-mix,再按 --tl-cell-alpha 混透明（背景半透明,文字不受影响） */
+.tl-item {
+  --tl-heat: 0.14;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 3px 6px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--tl-accent) calc(var(--tl-heat) * 100%), rgb(var(--widget-card-bg))) calc(var(--tl-cell-alpha, 0.8) * 100%),
+    transparent
+  );
+  cursor: default;
+}
+.tl-item:hover {
+  background: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--tl-accent) calc(var(--tl-heat) * 100% + 14%), rgb(var(--widget-card-bg))) calc(var(--tl-cell-alpha, 0.8) * 100%),
+    transparent
+  );
+}
+/* 双击跳转已受理（启动宿主要几秒）：短暂描边 */
+.tl-item.is-opening {
+  box-shadow: inset 0 0 0 1px var(--tl-accent);
+}
+.tl-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.tl-item-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+
+/* ---------- 顶栏图标按钮（与矩阵 .matrix-panel-icon 同视觉;底色透明,hover 才显底） ---------- */
+
+.tl-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: transparent;
+  cursor: pointer;
+  transition: background var(--dur-fast, 0.12s) ease, color var(--dur-fast, 0.12s) ease;
+}
+.tl-icon:hover {
+  color: var(--widget-card-text, var(--text));
+  background: var(--tl-line);
+}
+.tl-icon.is-active {
+  color: var(--tl-accent);
+  background: var(--tl-today-bg);
+}
+
+/* ---------- hover 状态卡（常驻 DOM,只切可见性） ---------- */
+
+.tl-hover {
+  position: absolute;
+  z-index: 3;
+  width: 240px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--widget-card-border);
+  background: rgba(var(--widget-card-bg) / 0.98);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--dur-fast, 0.12s) ease;
+}
+.tl-hover.is-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+.tl-hover-title {
+  font-weight: 600;
+  font-size: 12px;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tl-hover-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.tl-hover-row > span:first-child {
+  flex: none;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+.tl-hover-row > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+.tl-hover-accent {
+  color: var(--tl-accent);
+  font-weight: 600;
+}
+.tl-hover-session.is-acked {
+  opacity: 0.6;
+}
+.tl-hover-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.tl-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--widget-card-border);
+  background: transparent;
+  color: var(--widget-card-text, var(--text));
+  cursor: pointer;
+}
+.tl-btn:hover:not(:disabled) {
+  background: var(--tl-line);
+}
+.tl-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- 空态 ---------- */
+
+.tl-empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--widget-card-text-muted, var(--text-muted));
+}
+
+/* ---------- S4 条态（/） ----------
+   形态单一源在 Rust（set_timeline_form 原子执行尺寸 / 位置 / 置顶）;这里只按 .is-strip / .is-board
+   切换两层可见性。条态层常驻 DOM：看板态 visibility:hidden 仍参与布局,ResizeObserver 才量得到
+   .tl-strip-inner 的 max-content 宽（传给 Rust 定窗口宽）——勿改成 display:none / 条件渲染。
+   条贴屏幕顶缘：上缘直角、下缘圆角;半透明 alpha 0.6。 */
+
+.timeline-shell.is-strip .timeline-card,
+.timeline-shell.is-board .tl-strip {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 条贴顶,左右下留 --tl-edge-pad 透明边给窄阴影（窗口尺寸已含,Rust STRIP_H_LOGICAL = 36 + 5） */
+.tl-strip {
+  position: absolute;
+  inset: 0 var(--tl-edge-pad) var(--tl-edge-pad);
+  box-sizing: border-box;
+  box-shadow: var(--tl-edge-shadow);
+  overflow: hidden;
+  background: rgba(var(--widget-card-bg) / 0.6);
+  border: 1px solid var(--widget-card-border);
+  border-top: none;
+  border-radius: 0 0 var(--radius-sm, 8px) var(--radius-sm, 8px);
+  isolation: isolate;
+  user-select: none;
+  cursor: default;
+}
+
+.tl-strip-inner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: max-content;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px 0 10px;
+  white-space: nowrap;
+}
+
+.tl-strip-name {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--widget-card-text, var(--text));
+  white-space: nowrap;
+}
+.tl-strip-name.is-muted {
+  color: var(--widget-card-text-muted, var(--text-muted));
+  font-weight: 500;
+}
+/* 亮起：淡强调底 + 缓慢呼吸（弱提示,与看板行头同一 2.4s 节拍）;tool_pending = 次色静态 */
+.tl-strip-name.is-waiting,
+.tl-strip-name.is-pending {
+  cursor: pointer;
+}
+.tl-strip-name.is-waiting {
+  color: var(--tl-accent);
+  background: color-mix(in srgb, var(--tl-accent) 18%, transparent);
+  animation: tl-strip-pulse 2.4s ease-in-out infinite;
+}
+.tl-strip-name.is-pending {
+  color: color-mix(in srgb, var(--tl-accent) 55%, var(--widget-card-text-muted, #888));
+  background: color-mix(in srgb, var(--tl-accent) 8%, transparent);
+}
+.tl-strip-name.is-stale {
+  cursor: pointer;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  background: color-mix(in srgb, var(--widget-card-text-muted, #888) 12%, transparent);
+  font-weight: 500;
+}
+@keyframes tl-strip-pulse {
+  0%,
+  100% {
+    background: color-mix(in srgb, var(--tl-accent) 22%, transparent);
+  }
+  50% {
+    background: color-mix(in srgb, var(--tl-accent) 4%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tl-strip-name.is-waiting {
+    animation: none;
+  }
+}
+
+/* 窥视态（白底下看不见 + 整条宽易误触 → 短把手 + 窄阴影）：窗口 = Rust PEEK_W × PEEK_H
+   （88 × 9,居中于原条）,条内容隐藏（visibility 保留布局,量宽不断）:after 画贴顶 4px 半透明把手,
+   两侧 / 下方透明边留给 3px 阴影。几何与 timeline_form.rs PEEK_*_LOGICAL 同源。指针移入即回完整条态。 */
+.timeline-shell.is-peek .tl-strip {
+  inset: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+.timeline-shell.is-peek .tl-strip::after {
+  content: '';
+  position: absolute;
+  left: var(--tl-edge-pad);
+  right: var(--tl-edge-pad);
+  top: 0;
+  height: 4px;
+  border-radius: 0 0 3px 3px;
+  background: rgba(var(--widget-card-bg) / 0.7);
+  box-shadow: var(--tl-edge-shadow);
+}
+.timeline-shell.is-peek .tl-strip-inner {
+  visibility: hidden;
+}
+
+.tl-strip-expand {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--widget-card-text-muted, var(--text-muted));
+  cursor: pointer;
+}
+.tl-strip-expand:hover {
+  color: var(--widget-card-text, var(--text));
+  background: var(--tl-line);
+}
