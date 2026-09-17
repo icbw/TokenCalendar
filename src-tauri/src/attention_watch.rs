@@ -3,7 +3,7 @@
 //! **没有未确认提示时挂起（`park`,零唤醒）**;采集线程每轮派生后发现有未确认提示才 `unpark`,
 //! 提示全部确认 / 熄灭后下一拍重新挂起（判据 `AttentionTable:watch_needs`）。醒着时：
 //! - **前台采样**（有未确认 waiting 时 1s 一拍）:前台根窗口 + 映像名（同窗口缓存）+ 标题;键鼠闲置
-//!   ≥ `INPUT_IDLE_MS` 视为人不在,喂 None。进前台时刻来自 `agent_focus` 的前台切换事件钩子
+//!   ≥ `INPUT_IDLE_MS` 视为人不在,喂 None;人在时带上最近键鼠输入时刻（暂压的等待据此确认）。进前台时刻来自 `agent_focus` 的前台切换事件钩子
 //!   （只在切换窗口时回调,不轮询）,所以挂起期间切窗口也不丢「什么时候进的前台」。
 //! - **快速探针**（每 3s）：未确认提示的源文件 mtime 与采集时不同 → `collector:wake` 提前跑一轮增量
 //!   采集。同一 mtime 只唤醒一次,防「文件变了但没有新整行」时反复空转。只剩 tool_pending 时只探针、3s 一拍。
@@ -41,8 +41,11 @@ pub fn unpark() {
 
 /// 采样前台窗口;人不在（键鼠闲置 ≥ `INPUT_IDLE_MS`）→ None。
 pub fn sample() -> Option<ForegroundWindow> {
-    let present = crate::agent_focus::input_idle_ms().map_or(true, |ms| ms < INPUT_IDLE_MS);
-    present.then(crate::agent_focus::foreground_window).flatten()
+    let idle = crate::agent_focus::input_idle_ms();
+    let present = idle.map_or(true, |ms| ms < INPUT_IDLE_MS);
+    let mut win = present.then(crate::agent_focus::foreground_window).flatten()?;
+    win.input_at = idle.map_or(0, |ms| now_millis() - ms as i64);
+    Some(win)
 }
 
 fn run(app: AppHandle) {

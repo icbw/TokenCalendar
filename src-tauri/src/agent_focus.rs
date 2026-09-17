@@ -387,7 +387,7 @@ mod platform {
             let mut buf = [0u16; 512];
             let n = GetWindowTextW(root, buf.as_mut_ptr(), buf.len() as i32).max(0);
             let since = if FG_ROOT.load(Ordering::SeqCst) == key { FG_SINCE.load(Ordering::SeqCst) } else { 0 };
-            Some(ForegroundWindow { window: key, exe, title: String::from_utf16_lossy(&buf[..n as usize]), since })
+            Some(ForegroundWindow { window: key, exe, title: String::from_utf16_lossy(&buf[..n as usize]), since, input_at: 0 })
         }
     }
 

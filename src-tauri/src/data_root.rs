@@ -52,6 +52,10 @@ impl DataRoot {
     pub fn window_state_path(&self) -> PathBuf {
         self.root.join("window-state.json")
     }
+    /// 等待提醒的已确认标记（注意力表在内存,重启靠它不重复提醒;丢了只是多亮一次）。
+    pub fn attention_acks_path(&self) -> PathBuf {
+        self.root.join("attention-acks.json")
+    }
     pub fn exports_dir(&self) -> PathBuf {
         self.root.join("exports")
     }

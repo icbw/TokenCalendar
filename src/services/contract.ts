@@ -366,7 +366,7 @@ export interface AttentionItemContract {
   last_event: number
   /** 已确认（仅 waiting / tool_pending;同一会话进入新一段等待自动复位）。 */
   acked: boolean
-  /** 暂压（仅 waiting）:宿主窗口在前台期间新答完的当前会话,不亮;离开窗口即恢复亮起。 */
+  /** 暂压（仅 waiting）:宿主窗口在前台期间新答完的会话,先不亮;留在窗口里继续操作 → 确认,离开窗口 → 亮起。 */
   held: boolean
 }
 

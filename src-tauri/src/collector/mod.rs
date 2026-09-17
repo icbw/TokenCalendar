@@ -426,8 +426,46 @@ fn seed_attention(app: &AppHandle, store: &Store) {
             obs.watch = watch;
             table.seed((source, st.session_id.clone()), obs);
         }
+        // 上次运行已确认过的等待不再亮起（标记随 `notify_attention` 落盘）
+        let acks = load_acks(app);
+        if let Ok(mut saved) = SAVED_ACKS.lock() {
+            *saved = Some(acks.clone());
+        }
+        table.restore_acks(acks);
     }
     crate::dev_log!("[collector] attention seeded from {} recent session(s)", n);
+}
+
+/// 最近一次落盘的确认标记（与表内一致时不重写文件）。
+static SAVED_ACKS: std::sync::Mutex<Option<Vec<(String, String, i64)>>> = std::sync::Mutex::new(None);
+
+fn load_acks(app: &AppHandle) -> Vec<(String, String, i64)> {
+    crate::data_root::current(app)
+        .ok()
+        .and_then(|root| std::fs::read(root.attention_acks_path()).ok())
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 确认标记有变才写文件。调用方不得持有注意力表锁。
+fn persist_acks(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let acks = match state.attention.lock() {
+        Ok(table) => table.acks(),
+        Err(_) => return,
+    };
+    let Ok(mut saved) = SAVED_ACKS.lock() else { return };
+    if saved.as_ref() == Some(&acks) {
+        return;
+    }
+    let written = crate::data_root::current(app).and_then(|root| {
+        let raw = serde_json::to_vec(&acks).map_err(|e| e.to_string())?;
+        std::fs::write(root.attention_acks_path(), raw).map_err(|e| e.to_string())
+    });
+    match written {
+        Ok(()) => *saved = Some(acks),
+        Err(e) => crate::dev_log!("[collector] persist attention acks failed: {}", e),
+    }
 }
 
 /// 合入观测 → 派生 → 有变化才 emit `timeline:attention`（载荷恒 true,前端重查）。
@@ -444,10 +482,11 @@ fn tick_attention(app: &AppHandle, store: &mut Store) {
         }
         Err(_) => return,
     };
-    let fg = if need_fg { crate::attention_watch::sample() } else { None };
+    // 不需要采样时不喂（喂 None = 「人不在」,会重置停留计时）
+    let fg = need_fg.then(crate::attention_watch::sample);
     let (changed, needs) = match state.attention.lock() {
         Ok(mut table) => {
-            let a = table.set_foreground(fg, now, idle);
+            let a = fg.is_some_and(|fg| table.set_foreground(fg, now, idle));
             let b = table.tick(now, idle);
             (a || b, table.watch_needs(now, idle))
         }
@@ -464,6 +503,7 @@ fn tick_attention(app: &AppHandle, store: &mut Store) {
 
 /// 广播 `timeline:attention`（采集线程派生变化 / ack 命令后）。
 pub fn notify_attention(app: &AppHandle) {
+    persist_acks(app);
     if let Err(e) = app.emit("timeline:attention", true) {
         crate::dev_log!("[collector] emit timeline:attention failed: {}", e);
     }
