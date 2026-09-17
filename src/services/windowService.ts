@@ -72,7 +72,8 @@ export function toggleTimeline(): Promise<void> {
 }
 
 /** 时间轴两态（看板 / 条态）。 */
-export type TimelineForm = 'board' | 'strip'
+/** board = 看板;strip = 贴顶条;peek = 条态收成几像素细边。 */
+export type TimelineForm = 'board' | 'strip' | 'peek'
 
 export async function getTimelineForm(): Promise<TimelineForm | null> {
   return tryInvoke<TimelineForm>('get_timeline_form')
@@ -82,6 +83,11 @@ export async function getTimelineForm(): Promise<TimelineForm | null> {
  * stripWidth = 条态内容 CSS 宽（前端量出,Rust 按该屏 scale × 文本大小换算并钳到工作区）。 */
 export async function setTimelineForm(form: TimelineForm, stripWidth?: number): Promise<TimelineForm | null> {
   return tryInvoke<TimelineForm>('set_timeline_form', { form, stripWidth })
+}
+
+/** 时间轴看板窗口风格：true = Shadow（DWM 阴影 + 透明呼吸位,同主窗口）/ false = Flat。条态恒 Flat。 */
+export async function setTimelineStyle(floating: boolean): Promise<void> {
+  await tryInvoke<null>('set_timeline_style', { floating })
 }
 
 /** 悬浮球两态尺寸切换（窗口 resizable=false,程序化是唯一入口）。 */

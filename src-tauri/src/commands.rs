@@ -105,7 +105,7 @@ fn millis_to_rfc3339(m: Option<i64>) -> Option<String> {
 }
 
 /// 命令线程经 AppState 上的**读连接**查询采集库（写连接归采集线程,WAL 不互相阻塞）。
-fn with_reader<T>(state: &State<'_, AppState>, f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn with_reader<T>(state: &State<'_, AppState>, f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
     let reader = state
         .collector_reader
         .get()
@@ -657,7 +657,7 @@ fn write_project_meta<T>(app: &AppHandle, f: impl Fn(&mut Store) -> Result<T, St
 }
 
 /// 目录键 → 本机路径（只对形如盘符路径 / 绝对路径的键;unknown / Scratch → None）。
-fn project_folder(key: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn project_folder(key: &str) -> Option<std::path::PathBuf> {
     let b = key.as_bytes();
     let is_drive = b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic();
     if !(is_drive || key.starts_with('/')) {

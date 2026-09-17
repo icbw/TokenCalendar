@@ -145,15 +145,12 @@ export interface DesignPrefs {
   scratchMinSessions?: number
   scratchMinTurns?: number
   scratchUnknown?: boolean
-  /** 时间轴置顶项目:**原始目录键**列表（读时经 list_project_meta 的 effective_key 解析,
+  /** 时间轴监测项目组:**原始目录键**列表（读时经 list_project_meta 的 effective_key 解析,
    * merge 后不孤儿;匹配不到的键静默忽略不删除）。undefined = 无置顶。主窗口 ProjectManager 与
    * timeline 窗口共享本键,经 storage 桥跨窗口即时同步。 */
   timelinePinnedKeys?: string[]
-  /** 看板方向:horizontal（时间为 X、项目为行,默认）⇄ vertical（项目为列,时间向下）。 */
-  timelineOrientation?: 'horizontal' | 'vertical'
-  /** ：最多显示的项目数（1〜50,0 = 不限只按窗口容量;undefined = 8）、
+  /** ：
    * 过去 / 未来天数（0〜30;undefined = 7 / 7）。设置·General Timeline 段。 */
-  timelineMaxProjects?: number
   timelinePastDays?: number
   timelineFutureDays?: number
   /** ：过去的日期每天只显示 timelinePastSessions 条会话（1〜10,undefined = 1）,
@@ -166,6 +163,19 @@ export interface DesignPrefs {
   timelineReverse?: boolean
   /** ：看板失焦 N 秒后自动折成条态（0〜3600;undefined / 0 = 关）。第二屏挂着不获焦就不触发。 */
   timelineAutoStripSecs?: number
+  /** 时间轴外观：面板背景 alpha（0〜1,undefined = 0.55）、
+   * 顶栏 alpha（0.2〜1,undefined = 0.85）、会话格 alpha（0.2〜1,undefined = 0.8）。都是背景色 alpha,
+   * 不是元素 opacity——文字与按钮始终全不透明。与挂件 bgOpacity / 主界面 titlebarAlpha 零关联。 */
+  timelineBgAlpha?: number
+  /** 时间轴看板窗口风格：shadow = 主窗口同款 DWM 阴影 + 外缘透明呼吸位（undefined 即此档）/ flat = 无阴影全出血。
+   * Rust set_timeline_style 施加边缘组合,条态恒 flat。 */
+  timelineWindowStyle?: 'shadow' | 'flat'
+  /** 时间轴主题色（#rrggbb;undefined = 跟随全局 accent）：会话格热力、今天、亮起、pin 等强调色,不影响顶栏 / 面板底色。 */
+  timelineAccent?: string
+  /** 时间轴会话格按用量（tokens）着色深浅（undefined = 开）;关 = 所有会话格统一浅色。 */
+  timelineHeat?: boolean
+  timelineBarAlpha?: number
+  timelineCellAlpha?: number
 }
 
 const KEY = 'tokencalendar.design'
@@ -187,7 +197,7 @@ const DEFAULTS: DesignPrefs = {
 // 载入清洗：未知键（如已退役字段）不落 prefs；非法色值/越界 alpha 视为未自定义
 // （P1 主界面三色 + 顶栏 alpha 与 P0 卡片色同口径）。
 function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
-  const hexKeys = ['widgetCardBg', 'titlebarBg', 'panelBg', 'borderColor'] as const
+  const hexKeys = ['widgetCardBg', 'titlebarBg', 'panelBg', 'borderColor', 'timelineAccent'] as const
   for (const k of hexKeys) {
     if (p[k] !== undefined && !/^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(p[k] as string)) {
       delete p[k]
@@ -269,12 +279,14 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
       delete p.timelinePinnedKeys
     }
   }
-  if (p.timelineOrientation !== undefined && p.timelineOrientation !== 'horizontal' && p.timelineOrientation !== 'vertical') {
-    delete p.timelineOrientation
+  // 看板方向键 timelineOrientation 已退役:旧 prefs 残值清掉
+  delete (p as Record<string, unknown>).timelineOrientation
+  if (p.timelineHeat !== undefined && typeof p.timelineHeat !== 'boolean') delete p.timelineHeat
+  if (p.timelineWindowStyle !== undefined && p.timelineWindowStyle !== 'shadow' && p.timelineWindowStyle !== 'flat') {
+    delete p.timelineWindowStyle
   }
-  if (p.timelineMaxProjects !== undefined && !(typeof p.timelineMaxProjects === 'number' && Number.isInteger(p.timelineMaxProjects) && p.timelineMaxProjects >= 0 && p.timelineMaxProjects <= 50)) {
-    delete p.timelineMaxProjects
-  }
+  // 最多显示项目数 timelineMaxProjects 已退役:清残值
+  delete (p as Record<string, unknown>).timelineMaxProjects
   for (const k of ['timelinePastDays', 'timelineFutureDays'] as const) {
     if (p[k] !== undefined && !(typeof p[k] === 'number' && Number.isInteger(p[k]) && p[k] >= 0 && p[k] <= 30)) delete p[k]
   }
@@ -289,6 +301,10 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   if (p.timelineReverse !== undefined && typeof p.timelineReverse !== 'boolean') {
     delete p.timelineReverse
+  }
+  for (const [k, min] of [['timelineBgAlpha', 0], ['timelineBarAlpha', 0.2], ['timelineCellAlpha', 0.2]] as const) {
+    const v = p[k]
+    if (v !== undefined && !(typeof v === 'number' && v >= min && v <= 1)) delete p[k]
   }
   if (p.timelineAutoStripSecs !== undefined && !(typeof p.timelineAutoStripSecs === 'number' && Number.isInteger(p.timelineAutoStripSecs) && p.timelineAutoStripSecs >= 0 && p.timelineAutoStripSecs <= 3600)) {
     delete p.timelineAutoStripSecs

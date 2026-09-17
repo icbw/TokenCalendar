@@ -49,6 +49,18 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// 快速探针：给本批该会话的观测挂上源文件与采集时 mtime（文件再变 = 会话有新动静）。
+    pub fn watch_live(&mut self, session_id: &str, path: &std::path::Path, mtime: i64) {
+        if session_id.is_empty() || mtime <= 0 {
+            return;
+        }
+        for ((_, s), obs) in self.live.iter_mut() {
+            if s == session_id {
+                obs.watch = Some((path.display().to_string(), mtime));
+            }
+        }
+    }
+
     /// `turns`：该事件是否开启一个新对话轮（0/1）。turn 由「真实用户输入后的
     /// 第一条带 usage 的行」判定（pending 标志,游标持久化）,无该概念的源传 1
     /// （zcode 走按日重算覆盖,粗值不影响权威值;codebuddy 的 request 行天然=轮）。
@@ -679,24 +691,32 @@ impl Store {
 
     /// 启动播种：游标在 `since` 之后更新过、且带轮状态的会话文件（JSONL 族 + DSH）。
     /// Claude 会话族未判定的文件（只有头部元数据行）跳过——其 sessionId 不能成会话。
-    pub fn recent_turn_states(&self, since: i64) -> Vec<(String, super::turns::TurnState)> {
+    /// 附带快速探针目标（游标 scope 是文件路径;DSH scope 是会话目录 + `file`）与游标记下的 mtime。
+    pub fn recent_turn_states(&self, since: i64) -> Vec<(String, Option<(String, i64)>, super::turns::TurnState)> {
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT source_id, cursor_json FROM source_cursor WHERE updated_at >= ?1 AND cursor_json LIKE '%\"turn\"%'",
+            "SELECT source_id, scope, cursor_json FROM source_cursor WHERE updated_at >= ?1 AND cursor_json LIKE '%\"turn\"%'",
         ) else {
             return Vec::new();
         };
-        let Ok(rows) = stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
+        let Ok(rows) =
+            stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        else {
             return Vec::new();
         };
         rows.flatten()
-            .filter_map(|(source, json)| {
+            .filter_map(|(source, scope, json)| {
                 let mut v: serde_json::Value = serde_json::from_str(&json).ok()?;
                 let resolved = v.get("family_resolved").and_then(|x| x.as_bool()).unwrap_or(false);
                 if source == "claude-code" && !resolved {
                     return None;
                 }
                 let st: super::turns::TurnState = serde_json::from_value(v.get_mut("turn")?.take()).ok()?;
-                (!st.session_id.is_empty()).then_some((source, st))
+                let mtime = v.get("mtime").and_then(|x| x.as_i64()).filter(|m| *m > 0);
+                let path = match v.get("file").and_then(|x| x.as_str()) {
+                    Some(f) => std::path::Path::new(&scope).join(f).display().to_string(),
+                    None => scope,
+                };
+                (!st.session_id.is_empty()).then(|| (source, mtime.map(|m| (path, m)), st))
             })
             .collect()
     }

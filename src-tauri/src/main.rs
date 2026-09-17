@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent_focus;
+mod attention_watch;
 mod chrome;
 mod collector;
 mod commands;
@@ -156,6 +157,7 @@ fn main() {
             commands::get_attention,
             commands::ack_attention,
             agent_focus::focus_agent_window,
+            agent_focus::open_agent_session,
             commands::list_project_meta,
             commands::set_project_meta,
             commands::merge_projects,
@@ -208,6 +210,7 @@ fn main() {
             visibility::toggle_timeline,
             timeline_form::get_timeline_form,
             timeline_form::set_timeline_form,
+            timeline_form::set_timeline_style,
             subscription::get_subscription_snapshots,
             subscription::scan_subscription_credentials,
             subscription::bind_subscription,
@@ -283,6 +286,8 @@ fn main() {
                         let _ = app.state::<AppState>().collector_reader.set(Arc::new(Mutex::new(reader)));
                     }
                     collector::spawn(handle.clone(), write_store);
+                    // 注意力自动退出：前台自动确认 + 快速探针（只读采样,1s 一拍）
+                    attention_watch::spawn(handle.clone());
                 }
                 Err(e) => crate::dev_log!("[collector] init failed, usage commands will error: {}", e),
             }

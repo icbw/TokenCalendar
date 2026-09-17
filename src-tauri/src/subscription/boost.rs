@@ -12,12 +12,19 @@
 //! 触发条件（每平台独立,OR 关系,任一命中即进入）:
 //! - A 消耗激增:相邻两轮**主轮询**快照的 used_5h 差值 ≥ 阈值
 //!   （语义 = 「一个常规轮询周期内的消耗增速」）;
-//! - B 低余量:5h 剩余（100 − used_5h）≤ 阈值。
+//! - B 低余量:5h 剩余（100 − used_5h）≤ 阈值,**且仍在消耗**（相邻两轮主轮询
+//!   used_5h 有增长）。
 //!
 //! 退出:激活后先积累 5 个**成功**
 //! 样本（失败轮不计,窗口顺延）,此后每轮重评——A 以「最近 5 样本累计消耗
-//! （最新 − 最旧）」为判据,B 以当前剩余为判据;**所有已启用条件均不再成立
-//! → 退出**。5h 窗口重置（used 骤降）时差值为负,自然满足退出。
+//! （最新 − 最旧）≥ 阈值」为判据,B 以「当前剩余仍低且 5 样本内仍有消耗」为判据;
+//! **所有已启用条件均不再成立 → 退出**。5h 窗口重置（used 骤降）时差值为负,自然满足退出。
+//!
+//! B 的「仍在消耗」:原 B 只看剩余,低余量期间人走了也每
+//! interval 打一次 usage 端点直到 5h 重置（可达数小时）,且退出后下一轮主快照
+//! 剩余仍低会立刻再进入。现改为低余量只是「放低保持门槛」——任何增长都保持,停止
+//! 增长即退出,交还主轮询;主轮询无变化后按 idle.rs 进入待机放慢,再由本地 agent
+//! 活动（零网络的本地检测）唤醒——降低 API 访问频次。
 //!
 //! 节奏:激活期间按 `interval_secs`（默认 60s,可 2/3 分钟或自定义）取数;
 //! 进入即首取一次。总开关关闭时清空全部激活态与内存槽。
@@ -105,6 +112,9 @@ fn snap_slot() -> std::sync::MutexGuard<'static, HashMap<Platform, SubscriptionS
 /// 间隔改 2/3 分钟时窗口随之拉长——判据始终是「最近 5 个成功样本」）。
 const SAMPLE_WINDOW: usize = 5;
 
+/// 「仍在消耗」判据的最小增长（百分点;与 idle.rs 读数容差同量级,滤掉浮点抖动）。
+const CONSUMING_EPS: f64 = 0.01;
+
 /// 单平台 boost 状态机（纯逻辑,不含 IO——单测直接覆盖）。
 #[derive(Debug, Default, Clone)]
 struct PlatformBoost {
@@ -140,9 +150,14 @@ impl PlatformBoost {
                 enter = true;
             }
         }
-        // 条件 B:低余量（不依赖 diff,首轮即可评）
-        if cfg.low_enabled && 100.0 - used <= f64::from(cfg.low_threshold_pct) {
-            enter = true;
+        // 条件 B:低余量且 仍在消耗（首轮无基线不评——剩余低但没人在用不值得加速）
+        if let Some(prev) = self.last_used {
+            if cfg.low_enabled
+                && 100.0 - used <= f64::from(cfg.low_threshold_pct)
+                && used - prev > CONSUMING_EPS
+            {
+                enter = true;
+            }
         }
         self.last_used = Some(used);
         enter
@@ -158,15 +173,17 @@ impl PlatformBoost {
             return false; // 防抖:窗口未满不评退出
         }
         let mut keep = false;
-        // A 保持判据:最近 5 样本累计消耗（最新 − 最旧;窗口重置时为负 → 不保持）
-        if cfg.spike_enabled {
-            let gain = self.samples[SAMPLE_WINDOW - 1] - self.samples[0];
-            if gain >= f64::from(cfg.spike_threshold_pct) {
-                keep = true;
-            }
+        // 最近 5 样本累计消耗（最新 − 最旧;窗口重置时为负 → 两条件都不保持）
+        let gain = self.samples[SAMPLE_WINDOW - 1] - self.samples[0];
+        // A 保持判据:累计消耗仍达激增阈值
+        if cfg.spike_enabled && gain >= f64::from(cfg.spike_threshold_pct) {
+            keep = true;
         }
-        // B 保持判据:当前剩余仍低（低余量闲消耗也保持监控,重置后才退）
-        if cfg.low_enabled && 100.0 - used <= f64::from(cfg.low_threshold_pct) {
+        // B 保持判据:剩余仍低且 窗口内仍有消耗（停止消耗即退出,交还主轮询 / 待机）
+        if cfg.low_enabled
+            && 100.0 - used <= f64::from(cfg.low_threshold_pct)
+            && gain > CONSUMING_EPS
+        {
             keep = true;
         }
         !keep
@@ -260,7 +277,7 @@ fn run(app: AppHandle, reader: SubscriptionReader, adapters: std::sync::Arc<Adap
                         crate::dev_log!("[boost] {} yield (main fetch in flight)", platform.as_str());
                         continue;
                     };
-                    let snap = fetch_one(&adapters, platform);
+                    let snap = fetch_one(&adapters, platform, "boost");
                     drop(lease); // 互斥只覆盖取数本身;后续落槽/清场不占锁
 
                     if snap.fetched_at.is_some() {
@@ -370,12 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn low_enter_on_first_snapshot() {
+    fn low_enter_requires_consumption() {
         let mut c = cfg();
         c.spike_enabled = false;
         c.low_enabled = true; // 阈值 30
         let mut pb = PlatformBoost::default();
-        assert!(pb.observe_main(&c, &snap(100, 85.0)), "剩余 15% ≤ 30% → 进入");
+        assert!(!pb.observe_main(&c, &snap(100, 85.0)), "首轮无基线:剩余低但不知是否在用 → 不进入");
+        assert!(!pb.observe_main(&c, &snap(400, 85.0)), "剩余 15% 但无增长 → 不进入");
+        assert!(pb.observe_main(&c, &snap(700, 86.0)), "剩余低 且 +1% → 进入");
     }
 
     #[test]
@@ -460,19 +479,53 @@ mod tests {
     }
 
     #[test]
-    fn low_trigger_keeps_even_when_gain_low() {
+    fn low_trigger_keeps_while_consuming_and_exits_when_flat() {
         let mut c = cfg();
         c.spike_enabled = false;
         c.low_enabled = true;
         c.low_threshold_pct = 30;
         let mut pb = PlatformBoost::default();
         pb.active = true;
-        // 剩余 20%（used 80）低消耗:gain 不够,但 low 仍成立 → 保持
+        // 剩余 20%（used 80）小幅消耗:不到激增阈值,但低余量下仍在涨 → 保持
         for i in 0..SAMPLE_WINDOW + 1 {
-            assert!(!pb.on_sample(&c, 80.0 + 0.1 * i as f64));
+            assert!(!pb.on_sample(&c, 80.0 + 0.5 * i as f64));
         }
-        // 重置后剩余高:low 不再成立 → 退出
-        assert!(pb.on_sample(&c, 2.0));
+        // 停止消耗:5 样本持平（窗口最旧样本滚出前 gain 仍 > 0,需滚满持平窗口）
+        let flat = 80.0 + 0.5 * SAMPLE_WINDOW as f64;
+        let mut exited = false;
+        for _ in 0..SAMPLE_WINDOW {
+            exited = pb.on_sample(&c, flat);
+            if exited {
+                break;
+            }
+        }
+        assert!(exited, "剩余仍低但不再消耗 → 退出,交还主轮询 / 待机");
+    }
+
+    #[test]
+    fn low_trigger_exits_on_reset() {
+        let mut c = cfg();
+        c.spike_enabled = false;
+        c.low_enabled = true;
+        let mut pb = PlatformBoost::default();
+        pb.active = true;
+        for i in 0..SAMPLE_WINDOW {
+            pb.on_sample(&c, 80.0 + i as f64);
+        }
+        assert!(pb.on_sample(&c, 2.0), "5h 重置:剩余高 + gain 负 → 退出");
+    }
+
+    #[test]
+    fn low_does_not_reenter_after_flat_exit() {
+        // 退出后主快照剩余仍低但持平 → 不再进入（原实现会立刻复入,形成常驻加速）
+        let mut c = cfg();
+        c.spike_enabled = false;
+        c.low_enabled = true;
+        let mut pb = PlatformBoost::default();
+        pb.observe_main(&c, &snap(100, 84.0));
+        assert!(pb.observe_main(&c, &snap(400, 85.0)));
+        assert!(!pb.observe_main(&c, &snap(700, 85.0)), "持平 → 不复入");
+        assert!(!pb.observe_main(&c, &snap(1000, 85.0)));
     }
 
     #[test]

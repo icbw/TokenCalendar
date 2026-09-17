@@ -28,7 +28,7 @@ mod smoke;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use std::time::Duration;
 
@@ -82,9 +82,19 @@ pub fn prefs_with_poll_interval(json: Option<&str>, secs: u64) -> String {
     v.to_string()
 }
 
-/// 从 `since`起睡到当前采集频率;每个分片重读频率,改档即时生效。
+/// 提前唤醒下一轮采集（`attention_watch` 探针发现亮着的会话文件被写入;下一个睡眠分片内生效）。
+static WAKE: AtomicBool = AtomicBool::new(false);
+
+pub fn wake() {
+    WAKE.store(true, Ordering::SeqCst);
+}
+
+/// 从 `since`起睡到当前采集频率;每个分片重读频率,改档即时生效;被 `wake` 提前结束。
 fn sleep_until_next_round(since: Instant) {
     loop {
+        if WAKE.swap(false, Ordering::SeqCst) {
+            return;
+        }
         let Some(left) = poll_interval().checked_sub(since.elapsed()).filter(|d| !d.is_zero()) else { return };
         std::thread::sleep(left.min(POLL_SLEEP_TICK));
     }
@@ -317,6 +327,8 @@ pub fn seal_cursor(cursor: &mut FileCursor, path: &Path, scope: &str, batch: &mu
         cursor.mtime = mtime;
     }
     batch.cursors.push((scope.to_string(), cursor.to_json()));
+    // 快速探针：本批该会话的观测挂上源文件 + mtime
+    batch.watch_live(&cursor.turn.session_id, path, cursor.mtime);
 }
 
 // ---------- 后台编排 ----------
@@ -409,8 +421,10 @@ fn seed_attention(app: &AppHandle, store: &Store) {
     let seeds = store.recent_turn_states(since);
     let n = seeds.len();
     if let Ok(mut table) = state.attention.lock() {
-        for (source, st) in seeds {
-            table.seed((source, st.session_id.clone()), st.observe());
+        for (source, watch, st) in seeds {
+            let mut obs = st.observe();
+            obs.watch = watch;
+            table.seed((source, st.session_id.clone()), obs);
         }
     }
     crate::dev_log!("[collector] attention seeded from {} recent session(s)", n);
@@ -420,15 +434,31 @@ fn seed_attention(app: &AppHandle, store: &Store) {
 fn tick_attention(app: &AppHandle, store: &mut Store) {
     let live = store.take_live();
     let Some(state) = app.try_state::<AppState>() else { return };
-    let changed = match state.attention.lock() {
+    let (now, idle) = (store::now_millis(), task_store::idle_threshold_ms());
+    // 新亮的等待要先带上前台窗口再派生（否则「看着它答完」会先闪亮一下再被暂压）;
+    // 只在有未确认 waiting 时采样,表锁不跨 Win32 调用持有
+    let need_fg = match state.attention.lock() {
         Ok(mut table) => {
             table.apply(live);
-            table.tick(store::now_millis(), task_store::idle_threshold_ms())
+            table.watch_needs(now, idle).0
         }
-        Err(_) => false,
+        Err(_) => return,
+    };
+    let fg = if need_fg { crate::attention_watch::sample() } else { None };
+    let (changed, needs) = match state.attention.lock() {
+        Ok(mut table) => {
+            let a = table.set_foreground(fg, now, idle);
+            let b = table.tick(now, idle);
+            (a || b, table.watch_needs(now, idle))
+        }
+        Err(_) => return,
     };
     if changed {
         notify_attention(app);
+    }
+    // 有未确认提示 → 唤醒挂起中的守护线程（前台自动确认 / 快速探针）
+    if needs.0 || needs.1 {
+        crate::attention_watch::unpark();
     }
 }
 

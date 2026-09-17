@@ -134,6 +134,7 @@ pub fn fetch(adapter: &ClaudeAdapter, cred: RawCredential) -> SubscriptionSnapsh
         .set("User-Agent", &ua_usage())
         .timeout(std::time::Duration::from_secs(15))
         .call();
+    super::note_http(&resp);
 
     match resp {
         Ok(r) => {

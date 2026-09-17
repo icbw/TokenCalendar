@@ -1,6 +1,6 @@
 [package]
 name = "tokencalendar"
-version = "0.6.3"
+version = "0.6.4"
 description = "TokenCalendar — desktop widget for AI agent token usage"
 license = "MIT"
 edition = "2021"
@@ -34,7 +34,7 @@ tauri-plugin-autostart = "2"
 # 窗口 DPI——tao 的 scale_factor() 是缓存，跨屏瞬间会拿到旧值。
 # Globalization（PHASE12 S4-R）：collector/text.rs 源文本非 UTF-8 段按 CP_ACP 回退解码（MultiByteToWideChar）。
 # System_Threading（PHASE14 S5）：agent_focus.rs 按窗口所属进程取映像名（OpenProcess + QueryFullProcessImageNameW,只读）。
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # PHASE07 P2 毛玻璃 spike：tauri 2 依赖树已自带 0.6.0（传递依赖），显式声明直绑
 # ——apply_mica/apply_acrylic 的 Win32 路径与版本门槛（17763/22000/22523）已按
 # 该版本源码核实（设计文档 §4.1），不走 tauri set_effects 的间接映射层。

@@ -478,6 +478,9 @@ impl Adapter for CodebuddyAdapter {
                         host: None,
                         phase,
                         last_event: mtime.max(last.started_at.unwrap_or(0)),
+                        // request 行 = 用户发起的一轮
+                        last_input: last.started_at,
+                        watch: (mtime > 0).then(|| (path.display().to_string(), mtime)),
                     },
                 );
             }

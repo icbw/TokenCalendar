@@ -195,7 +195,10 @@ pub struct TimelineCell {
 /// 格子内的一条会话。`title` 是内容列,仅本地可视化,禁止进入导出。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TimelineSession {
+    /// agent 展示名。
     pub agent: String,
+    /// agent 键（双击跳转 `open_agent_session` 的入参;展示一律用 `agent`）。
+    pub agent_key: String,
     pub session_id: String,
     /// 空 / NULL → 前端回退到 `started_at` 的时刻（与 Tasks 视图 `LabelMode='title'` 同口径）。
     pub title: Option<String>,
@@ -796,6 +799,7 @@ impl Store {
                     r.get::<_, i64>(10)?,
                     TimelineSession {
                         agent: r.get(2)?,
+                        agent_key: String::new(),
                         session_id: r.get(3)?,
                         title: r.get::<_, Option<String>>(4)?.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
                         started_at: r.get(5)?,
@@ -837,7 +841,8 @@ impl Store {
             cell.agents.dedup();
             cell.agents = cell.agents.iter().map(|a| agent_label(a)).collect();
             for it in &mut cell.items {
-                it.agent = agent_label(&it.agent);
+                it.agent_key = std::mem::take(&mut it.agent);
+                it.agent = agent_label(&it.agent_key);
             }
             cells_by_key.entry(key).or_default().push(cell);
         }
@@ -861,6 +866,33 @@ impl Store {
             .collect();
         out.sort_by(|a, b| b.last_day.cmp(&a.last_day).then_with(|| a.key.cmp(&b.key)));
         Some(TimelineResult { today: today.format("%Y-%m-%d").to_string(), days, projects: out })
+    }
+
+    /// 会话最近一轮所在的**原始**目录键（双击跳转用;物化层没有该会话 → None）。
+    pub fn session_project_key(&self, agent: &str, session_id: &str) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT project_key FROM turn WHERE agent_key = ?1 AND session_id = ?2 ORDER BY started_at DESC LIMIT 1",
+                [agent, session_id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// 会话的桌面宿主线索（采集游标里的 `turn.host`,见 `TurnState.host`;目前只有 Claude Code 写）。
+    /// 游标已不在（源文件被清理）→ None,调用方按「宿主未知」处理。
+    pub fn session_host(&self, agent: &str, session_id: &str) -> Option<String> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT cursor_json FROM source_cursor WHERE source_id = ?1 AND instr(cursor_json, ?2) > 0 ORDER BY updated_at DESC")
+            .ok()?;
+        let rows = stmt.query_map([agent, session_id], |r| r.get::<_, String>(0)).ok()?;
+        let host = rows.flatten().find_map(|json| {
+            let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+            let turn = v.get("turn")?;
+            (turn.get("session_id")?.as_str()? == session_id).then(|| turn.get("host")?.as_str().map(str::to_string)).flatten()
+        });
+        host
     }
 }
 

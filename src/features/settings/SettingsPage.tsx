@@ -12,6 +12,7 @@ import { autostartService, collectorService, dataService, events, exportService,
 import { currentMonth } from '../../lib/time'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, orbBoostConfig, SIZE_PRESETS, RADIUS_PRESETS, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
+import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
 import './settings.css'
 
@@ -52,6 +53,20 @@ const MAIN_SWATCHES: { label: string; hex: string | null }[] = [
   { label: 'Slate', hex: '#2b3648' },
   { label: 'Navy', hex: '#1e3a5f' },
   { label: 'Espresso', hex: '#2e2620' },
+]
+
+/** 时间轴主题色色板：强调色而非底色——中等饱和度,亮 / 暗两主题下与卡片底混色都可读。
+ * 首项 = 跟随全局 accent。 */
+const TIMELINE_ACCENT_SWATCHES: { label: string; hex: string | null }[] = [
+  { label: 'Default', hex: null },
+  { label: 'Indigo', hex: '#6366f1' },
+  { label: 'Violet', hex: '#8b5cf6' },
+  { label: 'Rose', hex: '#e11d48' },
+  { label: 'Amber', hex: '#d97706' },
+  { label: 'Emerald', hex: '#059669' },
+  { label: 'Teal', hex: '#0d9488' },
+  { label: 'Sky', hex: '#0284c7' },
+  { label: 'Slate', hex: '#64748b' },
 ]
 
 /** 色板圆点内的小徽标色：深色圆点用浅徽标，浅色圆点用深徽标。 */
@@ -308,7 +323,7 @@ function GeneralTab() {
         </div>
       </div>
 
-      {/* 时间轴窗口设置（显隐 / 项目上限 / 前后天数）,prefs 经 storage 桥即时同步到 timeline 窗口*/}
+      {/* 时间轴窗口设置,prefs 经 storage 桥即时同步到 timeline 窗口*/}
       <div className="setting-section">Timeline</div>
       <div className="setting-block">
         <ToggleRow
@@ -317,21 +332,6 @@ function GeneralTab() {
           checked={timelineVisible}
           onChange={toggleTimeline}
         />
-        <div className="setting-row">
-          <span title="Pinned projects first, then most recent; the window size may show fewer">Max projects</span>
-          <div className="setting-seg">
-            {[4, 6, 8, 12, 0].map((n) => (
-              <button
-                key={n}
-                className={`setting-seg-btn${(design.timelineMaxProjects ?? 8) === n ? ' is-active' : ''}`}
-                title={n === 0 ? 'As many as fit the window' : `Show up to ${n} projects`}
-                onClick={() => setDesignPrefs({ timelineMaxProjects: n })}
-              >
-                {n === 0 ? 'Fit' : n}
-              </button>
-            ))}
-          </div>
-        </div>
         <div className="setting-row">
           <span title="Days before today on the board">Past days</span>
           <div className="setting-seg">
@@ -348,7 +348,7 @@ function GeneralTab() {
           </div>
         </div>
         <div className="setting-row">
-          <span title="Sessions shown per past day; the rest are counted as +N">Past sessions</span>
+          <span title="Sessions shown per past day; the rest are counted as +N (click the cell on the timeline to expand and scroll)">Past sessions</span>
           <div className="setting-seg">
             {[1, 2, 3, 5].map((n) => (
               <button
@@ -363,7 +363,7 @@ function GeneralTab() {
           </div>
         </div>
         <div className="setting-row">
-          <span title="Sessions shown for today">Today sessions</span>
+          <span title="Sessions visible for today; scroll inside the cell to see the rest">Today sessions</span>
           <div className="setting-seg">
             {[3, 5, 8, 12].map((n) => (
               <button
@@ -488,7 +488,7 @@ function GeneralTab() {
 /* ---------------- Appearance：挂件美化组 + 主界面美化组 ---------------- */
 
 /** 取色槽位：挂件卡片 / 主界面顶栏 / 主界面主体 / 主界面边框。 */
-type ColorSlot = 'card' | 'titlebar' | 'panel' | 'border'
+type ColorSlot = 'card' | 'titlebar' | 'panel' | 'border' | 'timeline'
 
 function AppearanceTab() {
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
@@ -502,12 +502,14 @@ function AppearanceTab() {
     titlebar: useRef<HTMLDivElement>(null),
     panel: useRef<HTMLDivElement>(null),
     border: useRef<HTMLDivElement>(null),
+    timeline: useRef<HTMLDivElement>(null),
   }
   const popoverRefs = {
     card: useRef<HTMLDivElement>(null),
     titlebar: useRef<HTMLDivElement>(null),
     panel: useRef<HTMLDivElement>(null),
     border: useRef<HTMLDivElement>(null),
+    timeline: useRef<HTMLDivElement>(null),
   }
 
   // 点击弹层外关闭。内点 = 色板行 + 取色弹层两者：二者是平级节点，只认色板行
@@ -545,6 +547,7 @@ function AppearanceTab() {
     titlebar: { value: design.titlebarBg, set: (h) => setDesignPrefs({ titlebarBg: h }), rowRef: colorRowRefs.titlebar, popoverRef: popoverRefs.titlebar, fallback: '#f8f9fb' },
     panel: { value: design.panelBg, set: (h) => setDesignPrefs({ panelBg: h }), rowRef: colorRowRefs.panel, popoverRef: popoverRefs.panel, fallback: '#ffffff' },
     border: { value: design.borderColor, set: (h) => setDesignPrefs({ borderColor: h }), rowRef: colorRowRefs.border, popoverRef: popoverRefs.border, fallback: '#e2e8f0' },
+    timeline: { value: design.timelineAccent, set: (h) => setDesignPrefs({ timelineAccent: h }), rowRef: colorRowRefs.timeline, popoverRef: popoverRefs.timeline, fallback: '#2563eb' },
   }
 
   /** 色板行（PRESETS + 自定义钮）+ 取色弹层，包在槽位容器内：弹层 absolute
@@ -749,6 +752,62 @@ function AppearanceTab() {
           </button>
         </div>
       </div>
+
+      {/* 时间轴外观：窗口风格 + 三档背景 alpha,经 storage 桥即时同步到 timeline 窗口;与挂件 / 主界面零关联*/}
+      <div className="setting-section">Timeline appearance</div>
+      <div className="setting-block">
+        <div className="setting-row">
+          <span title="Accent for session cells, today and highlights; the top bar and panel colors are not affected">Theme color</span>
+          <span className="setting-value">{design.timelineAccent ? design.timelineAccent.toUpperCase() : 'Auto (follows system)'}</span>
+        </div>
+        {renderColorField('timeline', TIMELINE_ACCENT_SWATCHES)}
+        <div className="setting-row">
+          <span title="Shadow: floating cards with a system shadow, like the main window. Flat: no shadow, edge to edge">Window style</span>
+          <div className="setting-seg">
+            {(['shadow', 'flat'] as const).map((v) => (
+              <button
+                key={v}
+                className={`setting-seg-btn${(design.timelineWindowStyle ?? 'shadow') === v ? ' is-active' : ''}`}
+                title={v === 'shadow' ? 'System shadow and a transparent margin, like the main window' : 'No shadow; the cards fill the window'}
+                onClick={() => setDesignPrefs({ timelineWindowStyle: v })}
+              >
+                {v === 'shadow' ? 'Shadow' : 'Flat'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <ToggleRow
+          label="Color cells by usage"
+          title="Darker session cells for more tokens; off gives every session cell the same light tint"
+          checked={design.timelineHeat ?? true}
+          onChange={(v) => setDesignPrefs({ timelineHeat: v })}
+        />
+        {TIMELINE_ALPHA_ROWS.map((r) => (
+          <div key={r.key} className="setting-row">
+            <span title={r.hint}>{r.label}</span>
+            <input
+              type="range"
+              title="Drag to adjust"
+              min={r.min}
+              max={1}
+              step={0.05}
+              value={design[r.key] ?? r.def}
+              onChange={(e) => setDesignPrefs({ [r.key]: Number(e.target.value) })}
+            />
+            <span className="setting-value">{Math.round((design[r.key] ?? r.def) * 100)}%</span>
+          </div>
+        ))}
+        <div className="setting-actions">
+          <button
+            className="setting-btn"
+            disabled={design.timelineAccent === undefined && design.timelineWindowStyle === undefined && design.timelineHeat === undefined && TIMELINE_ALPHA_ROWS.every((r) => design[r.key] === undefined)}
+            onClick={() => setDesignPrefs({ timelineAccent: undefined, timelineWindowStyle: undefined, timelineHeat: undefined, timelineBgAlpha: undefined, timelineBarAlpha: undefined, timelineCellAlpha: undefined })}
+            title="Reset the timeline theme color, window style, usage colors and opacity settings"
+          >
+            Restore defaults
+          </button>
+        </div>
+      </div>
     </>
   )
 }
@@ -760,6 +819,14 @@ function normalizeHex(hex: string): string | undefined {
   if (/^[0-9a-f]{6}$/i.test(t)) return `#${t.toLowerCase()}`
   return undefined
 }
+
+/* ---------------- 时间轴外观三档 alpha（默认值与 timelineConfig 同源） ---------------- */
+
+const TIMELINE_ALPHA_ROWS: { key: 'timelineBgAlpha' | 'timelineBarAlpha' | 'timelineCellAlpha'; label: string; hint: string; min: number; def: number }[] = [
+  { key: 'timelineBgAlpha', label: 'Panel background opacity', hint: 'The board panel below the top bar; the date labels float on it', min: 0, def: TIMELINE_BG_ALPHA },
+  { key: 'timelineBarAlpha', label: 'Top bar opacity', hint: 'The header bar with project names and the fold button', min: 0.2, def: TIMELINE_BAR_ALPHA },
+  { key: 'timelineCellAlpha', label: 'Session cell opacity', hint: 'Session cell backgrounds; text stays fully opaque', min: 0.2, def: TIMELINE_CELL_ALPHA },
+]
 
 /* ---------------- 材质三档（spike，两窗口共用行控件） ---------------- */
 
@@ -1253,7 +1320,7 @@ function SubscriptionsTab() {
         </div>
         <ToggleRow
           label="Trigger: low 5h remaining"
-          title="Triggers when 5h remaining is at or below the threshold"
+          title="Triggers when 5h remaining is at or below the threshold and usage is still growing; stops once usage stops growing"
           checked={lowOn}
           disabled={!boostOn}
           onChange={(v) => setBoost({ orbBoostLowEnabled: v })}

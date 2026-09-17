@@ -2,7 +2,16 @@
 // snake_case 契约（contract.ts）→ 驼峰内部形状一次映射;失败返回 null（tryInvoke 口径）。
 // TimelineCell.title 是内容列:只供 timeline 窗口本地渲染,不得进入导出 / 日志 / 其它视图。
 
-import type { AckAttentionArgs, AttentionItemContract, FocusAgentWindowArgs, FocusResultContract, TimelineQueryArgs, TimelineResultContract } from './contract'
+import type {
+  AckAttentionArgs,
+  AttentionItemContract,
+  FocusAgentWindowArgs,
+  FocusResultContract,
+  OpenAgentSessionArgs,
+  OpenResultContract,
+  TimelineQueryArgs,
+  TimelineResultContract,
+} from './contract'
 import { tryInvoke } from './tauri'
 import { rememberProjectLabels } from './projectLabels'
 
@@ -21,7 +30,10 @@ export interface TimelineCell {
 }
 
 export interface TimelineSession {
+  /** agent 展示名。 */
   agent: string
+  /** agent 键（双击跳转用）。 */
+  agentKey: string
   sessionId: string
   /** 【内容列】空 → 用 startedAt 回退成时刻。 */
   title: string | null
@@ -74,6 +86,7 @@ export async function getProjectTimeline(from: string, to: string): Promise<Time
       agents: c.agents ?? [],
       items: (c.items ?? []).map((i) => ({
         agent: i.agent,
+        agentKey: i.agent_key ?? '',
         sessionId: i.session_id,
         title: i.title,
         startedAt: i.started_at,
@@ -106,6 +119,8 @@ export interface AttentionItem {
   since: number
   lastEvent: number
   acked: boolean
+  /** 暂压：你正在该宿主窗口里,不亮也不算确认。 */
+  held: boolean
 }
 
 export async function getAttention(): Promise<AttentionItem[] | null> {
@@ -122,6 +137,7 @@ export async function getAttention(): Promise<AttentionItem[] | null> {
     since: i.since,
     lastEvent: i.last_event,
     acked: i.acked,
+    held: i.held ?? false,
   }))
 }
 
@@ -136,4 +152,14 @@ export async function focusAgentWindow(agent: string, sessionId: string): Promis
   const args: FocusAgentWindowArgs = { agent, session_id: sessionId }
   const res = await tryInvoke<FocusResultContract>('focus_agent_window', { ...args })
   return res ? res.found : null
+}
+
+// ---- 双击会话跳转:窗口在 → 前置;不在 → 启动宿主（IDE 类带项目目录）;宿主找不到 → 打开项目目录。
+// null = 命令本身失败（非 Tauri 环境 / 未知会话）。 ----
+export type OpenOutcome = OpenResultContract['outcome']
+
+export async function openAgentSession(agentKey: string, sessionId: string): Promise<OpenOutcome | null> {
+  const args: OpenAgentSessionArgs = { agent: agentKey, session_id: sessionId }
+  const res = await tryInvoke<OpenResultContract>('open_agent_session', { ...args })
+  return res ? res.outcome : null
 }

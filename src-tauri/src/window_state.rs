@@ -307,6 +307,7 @@ pub fn restore(app: &AppHandle) {
                 board,
                 strip_x: file.timeline_strip_x,
                 strip_w: file.timeline_strip_w,
+                ..Default::default()
             };
         }
         // 启动形态（restore_orb 结果:贴边 = 竖条 false、未贴边/首次 = 表盘 true）

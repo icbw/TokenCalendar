@@ -73,6 +73,10 @@ pub fn set_visible(app: &AppHandle, label: &str, visible: bool) -> Result<(), St
         if label == MAIN_LABEL {
             let _ = window.set_focus();
         }
+        // 时间轴从托盘 / 设置召回时,窥视态（几像素细边）回完整条态,免得「显示了却看不见」
+        if label == TIMELINE_LABEL {
+            crate::timeline_form::unpeek(app);
+        }
     } else {
         window.hide().map_err(|e| e.to_string())?;
     }

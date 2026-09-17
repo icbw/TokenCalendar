@@ -161,6 +161,9 @@ pub struct TurnState {
     /// 由 agent 决定）。只供 `focus_agent_window` 选目标进程,不进任何口径。
     #[serde(default)]
     pub host: Option<String>,
+    /// 最近一次真实用户输入时刻（前台自动确认判「当前会话」;旧游标 None,下次输入补上）。
+    #[serde(default)]
+    pub last_input: Option<i64>,
     #[serde(default)]
     recent: Vec<RecentResponse>,
 }
@@ -267,6 +270,9 @@ impl TurnState {
             }
         }
         self.close(batch, agent);
+        if user_input {
+            self.last_input = Some(self.last_input.map_or(ts, |t| t.max(ts)));
+        }
         self.seq += 1;
         let key_seq = self.seq_base + self.seq;
         let start_day = super::millis_to_local_day_hour(ts).map(|(d, _)| d).unwrap_or_default();
@@ -473,7 +479,16 @@ impl TurnState {
                 other => (LivePhase::Idle, other.unwrap_or(0), self.project()),
             },
         };
-        LiveTurn { project_key, parent_id: self.parent_id.clone(), title: self.title.clone(), host: self.host.clone(), phase, last_event }
+        LiveTurn {
+            project_key,
+            parent_id: self.parent_id.clone(),
+            title: self.title.clone(),
+            host: self.host.clone(),
+            phase,
+            last_event,
+            last_input: self.last_input,
+            watch: None,
+        }
     }
 
     pub fn set_explicit_wall(&mut self, ms: i64) {
@@ -684,8 +699,10 @@ mod tests {
         st.set_session("s");
         st.set_project(r"E:\p");
         assert_eq!(st.observe().phase, LivePhase::Idle, "空会话");
+        assert_eq!(st.observe().last_input, None);
         st.begin(&mut b, "a", T0, true);
         assert_eq!(st.observe().phase, LivePhase::Busy);
+        assert_eq!(st.observe().last_input, Some(T0), "真实输入记为最近输入");
         st.response(&mut b, "a", T0 + 1_000, None, "m", tok(1, 1), None, 1);
         st.tool_start(&mut b, "a", T0 + 1_000, "c");
         st.mark_done(T0 + 1_500, true);

@@ -37,8 +37,8 @@ export function onTimelineAttention(cb: () => void): Promise<Unlisten> {
 }
 
 // 时间轴形态广播（set_timeline_form 真变时发），载荷 'board' | 'strip'。
-export function onTimelineFormChanged(cb: (form: 'board' | 'strip') => void): Promise<Unlisten> {
-  return listen<'board' | 'strip'>('timeline-form-changed', (f) => cb(f))
+export function onTimelineFormChanged(cb: (form: 'board' | 'strip' | 'peek') => void): Promise<Unlisten> {
+  return listen<'board' | 'strip' | 'peek'>('timeline-form-changed', (f) => cb(f))
 }
 
 export function onMainVisibilityChanged(cb: (visible: boolean) => void): Promise<Unlisten> {

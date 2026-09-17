@@ -4,34 +4,43 @@
  * 31 天太多——每格只能放一个会话;默认收到 7 + 今天 + 7。 */
 export const TIMELINE_PAST_DAYS = 7
 export const TIMELINE_FUTURE_DAYS = 7
-/** 最多显示项目数默认值（prefs timelineMaxProjects;0 = 不限,只按容量）。 */
-export const TIMELINE_MAX_PROJECTS = 8
 /** ：过去每天显示的会话数 / 今天显示的会话数默认值（prefs timelinePastSessions / timelineTodaySessions）。 */
 export const TIMELINE_PAST_SESSIONS = 1
 export const TIMELINE_TODAY_SESSIONS = 5
+/** 格内滚动：点击格子临时展开到的可见会话数（设置值更大时取设置值）;
+ * 格子失焦自动折回设置状态。首期是常量不进设置。 */
+export const TIMELINE_EXPANDED_SESSIONS = 5
 
 /** 「⚠ Nd」未动徽章的最小天数（小于此值不显示,避免噪音）。 */
 export const INACTIVE_BADGE_DAYS = 3
 
 /** 格子尺寸范围：
- * 横向 = 项目行高 / 日列宽;纵向 = 项目列宽 / 会话格高。显示项目数 = min（设置上限, 容量),
- * 容量按容器尺寸除以最小尺寸;超出最小尺寸的窗口在 [min, max] 之间等分,再多留白。 */
-export const ROW_MIN_PX = 52
-export const ROW_MAX_PX = 96
+ * 项目列宽 / 会话格高。显示项目数 = min（设置上限, 容量),容量按面板宽除以最小列宽;
+ * 超出最小尺寸的窗口在 [min, max] 之间等分,再多留白。横向日程视图删除,其常量随之移除。 */
 export const COL_MIN_PX = 140
 export const COL_MAX_PX = 320
-export const DAY_COL_MIN_PX = 44
-/** 纵向会话格（一格一会话,向下堆叠）最小高;空日行最小高。 */
+/** 会话格（一格一会话,向下堆叠）最小高;空日行最小高。 */
 export const ITEM_MIN_PX = 36
 export const EMPTY_DAY_MIN_PX = 26
-/** 横向:日轴表头高;纵向:日标签列宽 + 右缘图标列占位。 */
-export const DAY_HEADER_PX = 22
+/** 顶栏项目表头行高;
+ * 左侧日标签列宽。 */
+export const BAR_HEAD_PX = 32
 export const DAY_LABEL_COL_PX = 46
-export const SIDE_ICONS_PX = 28
-/** 紧凑档阈值：横向日列宽低于此只显示轮数（纵向已有最小列宽,不再有紧凑档）。 */
-export const CELL_NARROW_PX = 72
-/** 横向项目标签列宽（纵向时项目表头高 = DAY_HEADER_PX × 2）。 */
-export const PROJECT_LABEL_COL_PX = 150
+/** 顶栏右侧按钮区宽:面板右侧留同宽,顶栏表头网格与面板网格列对齐。 */
+export const BAR_ACTIONS_PX = 36
+/** 外观 alpha 默认值（prefs timelineBgAlpha / timelineBarAlpha / timelineCellAlpha）。 */
+export const TIMELINE_BG_ALPHA = 0.55
+export const TIMELINE_BAR_ALPHA = 0.85
+export const TIMELINE_CELL_ALPHA = 0.8
+/** 用量着色关闭（prefs timelineHeat = false）时所有会话格的统一强调色占比（开启时按 tokens 在 0.14〜0.5 间取值）。 */
+export const TIMELINE_FLAT_HEAT = 0.22
+
+/** 条态 / 窥视把手四周（左右下）留给窄阴影的透明边（CSS 像素;与 timeline.css --tl-edge-pad、
+ * timeline_form.rs STRIP_H_LOGICAL / PEEK_*_LOGICAL 同源,改一处三处同改）。 */
+export const STRIP_SHADOW_PAD_PX = 5
+
+/** 条态无操作（指针不在窗口、无亮起项目）多久后收成窥视态细边。 */
+export const PEEK_DELAY_MS = 5000
 
 /** hover 状态卡显示延迟 / 收尾宽限（对齐 orb ㉝ 的手感档）。 */
 export const HOVER_DELAY_MS = 350
@@ -51,6 +60,13 @@ export function localDay(d: Date = new Date()): string {
 export function addDays(day: string, n: number): string {
   const [y, m, d] = day.split('-').map(Number)
   return localDay(new Date(y, m - 1, d + n))
+}
+
+/** 本地日 a 到 b 相隔天数（b 晚为正;按日历日,不受夏令时影响）。 */
+export function daysBetween(a: string, b: string): number {
+  const [ay, am, ad] = a.split('-').map(Number)
+  const [by, bm, bd] = b.split('-').map(Number)
+  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86_400_000)
 }
 
 export function dayParts(day: string): { y: number; m: number; d: number } {

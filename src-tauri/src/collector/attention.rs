@@ -12,6 +12,17 @@
 //! DSH = `turn/end` 闭轮;ZCode = `turn_usage.completed_at` 已写;CodeBuddy = 末条 request
 //! `state = complete`;WorkBuddy 无显式信号 → 启发式（末事件为 assistant message 且静默
 //! ≥ `HEURISTIC_SETTLE_MS`,中途 assistant 文本之后仍可能继续调工具）。
+//!
+//! 自动退出:`attention_watch` 守护线程**只在有未确认提示时**
+//! 醒着（`watch_needs`）,喂入前台窗口;进前台时刻取系统前台切换事件,不靠轮询。
+//! 宗旨「等待要提醒,正在对话不保持」,且**宁可多亮、不漏提醒**：
+//! - 只作用于 `waiting`;`tool_pending`（等批权限,agent 被阻塞）只靠源写入退出,从不自动确认。
+//! - 宿主窗口在前台且人在（键鼠闲置 < `INPUT_IDLE_MS`）→ 只看该窗口组的**当前会话**
+//!   （组内最近一次用户输入者）：进前台**之前**就亮的等待,停留 ≥ `FOREGROUND_DWELL_MS` 后确认;
+//!   在前台期间新亮的只**暂压**（`held`,不确认）,离开窗口 / 人走开即重新亮起,回来再按前一条确认。
+//! - 组内非当前会话（单窗口宿主里并行的别的会话）不压不确认;宿主不确定（CLI / 未知 entrypoint）
+//!   不参与（见 `agent_focus:watch_target`）。
+//! - 快速退出：亮着的会话由探针盯源文件 mtime,变了即提前唤醒采集（`watch_list`）。
 
 use std::collections::BTreeMap;
 
@@ -22,6 +33,10 @@ use serde::Serialize;
 pub const TOOL_PENDING_MS: i64 = 90_000;
 /// 启发式「答完」信号的静默确认时长。
 pub const HEURISTIC_SETTLE_MS: i64 = 60_000;
+/// 宿主窗口进前台后停留这么久才自动确认（Alt+Tab 路过不算看过）。
+pub const FOREGROUND_DWELL_MS: i64 = 2_000;
+/// 键鼠闲置超过此值 → 视为人不在（前台窗口不再暂压 / 不再确认）。
+pub const INPUT_IDLE_MS: u64 = 120_000;
 
 /// 会话现状（观测时刻的原始阶段,不含时间判定）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +64,28 @@ pub struct LiveTurn {
     pub phase: LivePhase,
     /// 会话最近事件时刻（毫秒）。
     pub last_event: i64,
+    /// 最近一次真实用户输入时刻（同一宿主窗口多会话时判定「当前会话」;旧游标 / 无此概念的源 None）。
+    pub last_input: Option<i64>,
+    /// 快速探针：会话源文件路径 + 采集时的 mtime（None = 无单文件可探,如 ZCode 库）。
+    pub watch: Option<(String, i64)>,
+}
+
+/// 前台窗口采样（`attention_watch` 喂入;人不在时喂 None）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForegroundWindow {
+    /// 根窗口句柄（判定「同一个窗口」;标题变化不算换窗口）。
+    pub window: isize,
+    /// 进程映像名（小写,不含路径）。
+    pub exe: String,
+    pub title: String,
+    /// 这个窗口进入前台的时刻（前台切换事件记录;0 = 未知,按「同窗口沿用、换窗口记为现在」推断）。
+    pub since: i64,
+}
+
+struct Foreground {
+    win: ForegroundWindow,
+    /// 这个窗口本次进入前台的时刻。
+    since: i64,
 }
 
 /// （agent_key, session_id)
@@ -71,6 +108,8 @@ pub struct AttentionItem {
     pub last_event: i64,
     /// 已确认（仅 waiting / tool_pending;同一会话进入新一段等待自动复位）。
     pub acked: bool,
+    /// 暂压（仅 waiting）：宿主窗口在前台期间新答完的当前会话,不亮也不确认;离开窗口即恢复亮起。
+    pub held: bool,
 }
 
 struct Entry {
@@ -79,11 +118,14 @@ struct Entry {
     acked_since: Option<i64>,
 }
 
+type Signature = Vec<(String, String, &'static str, i64, bool, bool)>;
+
 #[derive(Default)]
 pub struct AttentionTable {
     entries: BTreeMap<LiveKey, Entry>,
     /// 上一次 emit 时的派生签名（running 的 since 随每个事件前移,不参与比较,防活跃期每轮都 emit）。
-    last_sig: Vec<(String, String, &'static str, i64, bool)>,
+    last_sig: Signature,
+    fg: Option<Foreground>,
 }
 
 impl AttentionTable {
@@ -112,26 +154,68 @@ impl AttentionTable {
         })
     }
 
-    fn derive(&self, key: &LiveKey, e: &Entry, now: i64) -> Option<(&'static str, i64)> {
-        let o = &e.obs;
-        match o.phase {
+    /// 派生 （state, since, lit_at);`lit_at` = 按源时间戳这段提示应亮起的时刻（判「亮在进前台之前」用）。
+    fn derive(&self, key: &LiveKey, e: &Entry, now: i64) -> Option<(&'static str, i64, i64)> {
+        let t = e.obs.last_event;
+        match e.obs.phase {
             LivePhase::Idle => None,
-            LivePhase::Busy => Some(("running", o.last_event)),
+            LivePhase::Busy => Some(("running", t, t)),
             LivePhase::Tools => {
-                if now - o.last_event >= TOOL_PENDING_MS && !self.child_active(&key.0, &key.1, now) {
-                    Some(("tool_pending", o.last_event))
+                if now - t >= TOOL_PENDING_MS && !self.child_active(&key.0, &key.1, now) {
+                    Some(("tool_pending", t, t + TOOL_PENDING_MS))
                 } else {
-                    Some(("running", o.last_event))
+                    Some(("running", t, t))
                 }
             }
-            LivePhase::Done { exact } => {
-                if exact || now - o.last_event >= HEURISTIC_SETTLE_MS {
-                    Some(("waiting", o.last_event))
+            LivePhase::Done { exact: true } => Some(("waiting", t, t)),
+            LivePhase::Done { exact: false } => {
+                if now - t >= HEURISTIC_SETTLE_MS {
+                    Some(("waiting", t, t + HEURISTIC_SETTLE_MS))
                 } else {
-                    Some(("running", o.last_event))
+                    Some(("running", t, t))
                 }
             }
         }
+    }
+
+    /// 会话是否属于当前前台窗口（宿主进程对得上;按标题消歧的宿主还要标题含项目目录尾段）。
+    fn in_foreground(&self, key: &LiveKey, e: &Entry) -> bool {
+        let Some(fg) = self.fg.as_ref() else { return false };
+        e.obs.parent_id.is_none()
+            && e.obs.phase != LivePhase::Idle
+            && crate::agent_focus::watch_target(&key.0, e.obs.host.as_deref())
+                .is_some_and(|t| crate::agent_focus::window_matches(t, &fg.win.exe, &fg.win.title, &e.obs.project_key))
+    }
+
+    /// 是否为前台窗口组的当前会话：组内最近一次用户输入者且唯一;组内都没有输入记录时只认独苗。
+    /// 组 = 属于前台窗口的会话——宿主进程天然隔离 agent（登记表映像名互不重叠）;单窗口宿主的组跨项目,
+    /// 只动「当前会话」一个;按标题消歧的宿主（一窗一项目）组内出现多个项目键 = 同名目录撞标题,
+    /// 分不清是哪个项目,整组不动。
+    fn is_current(&self, key: &LiveKey, now: i64, idle_ms: i64) -> bool {
+        let group: Vec<(&LiveKey, Option<i64>, &str)> = self
+            .entries
+            .iter()
+            .filter(|(k, e)| now - e.obs.last_event <= idle_ms && self.in_foreground(k, e))
+            .map(|(k, e)| (k, e.obs.last_input, e.obs.project_key.as_str()))
+            .collect();
+        let by_title = self
+            .entries
+            .get(key)
+            .and_then(|e| crate::agent_focus::watch_target(&key.0, e.obs.host.as_deref()))
+            .is_some_and(|t| t.by_title);
+        if by_title && group.iter().any(|(_, _, p)| *p != group[0].2) {
+            return false;
+        }
+        let group: Vec<(&LiveKey, Option<i64>)> = group.into_iter().map(|(k, t, _)| (k, t)).collect();
+        let Some(max) = group.iter().map(|(_, t)| *t).max() else { return false };
+        let mut top = group.iter().filter(|(_, t)| *t == max);
+        let (Some((first, _)), None) = (top.next(), top.next()) else { return false };
+        (max.is_some() || group.len() == 1) && *first == key
+    }
+
+    /// 前台相关判据的共同前提：waiting + 属于前台窗口 + 当前会话。
+    fn foreground_current(&self, key: &LiveKey, e: &Entry, state: &str, now: i64, idle_ms: i64) -> bool {
+        state == "waiting" && self.in_foreground(key, e) && self.is_current(key, now, idle_ms)
     }
 
     /// 剔除：无状态、超过离开阈值无事件。
@@ -141,12 +225,17 @@ impl AttentionTable {
 
     /// 当前派生快照（子会话不列出;按 since 先后,「不做优先级排序」）。
     pub fn items(&self, now: i64, idle_ms: i64) -> Vec<AttentionItem> {
+        let fg_since = self.fg.as_ref().map(|f| f.since);
         let mut out: Vec<AttentionItem> = self
             .entries
             .iter()
             .filter(|(_, e)| e.obs.parent_id.is_none() && now - e.obs.last_event <= idle_ms)
             .filter_map(|(key, e)| {
-                let (state, since) = self.derive(key, e, now)?;
+                let (state, since, lit_at) = self.derive(key, e, now)?;
+                let acked = state != "running" && e.acked_since == Some(since);
+                let held = !acked
+                    && fg_since.is_some_and(|s| lit_at >= s)
+                    && self.foreground_current(key, e, state, now, idle_ms);
                 Some(AttentionItem {
                     agent: key.0.clone(),
                     agent_label: super::store::agent_label(&key.0),
@@ -157,7 +246,8 @@ impl AttentionTable {
                     state,
                     since,
                     last_event: e.obs.last_event,
-                    acked: state != "running" && e.acked_since == Some(since),
+                    acked,
+                    held,
                 })
             })
             .collect();
@@ -165,20 +255,89 @@ impl AttentionTable {
         out
     }
 
-    fn signature(items: &[AttentionItem]) -> Vec<(String, String, &'static str, i64, bool)> {
+    fn signature(items: &[AttentionItem]) -> Signature {
         items
             .iter()
-            .map(|i| (i.agent.clone(), i.session_id.clone(), i.state, if i.state == "running" { 0 } else { i.since }, i.acked))
+            .map(|i| (i.agent.clone(), i.session_id.clone(), i.state, if i.state == "running" { 0 } else { i.since }, i.acked, i.held))
             .collect()
+    }
+
+    /// 重算签名并与上次比较。返回 true = 需要 emit。
+    fn resync(&mut self, now: i64, idle_ms: i64) -> bool {
+        let sig = Self::signature(&self.items(now, idle_ms));
+        let changed = sig != self.last_sig;
+        self.last_sig = sig;
+        changed
     }
 
     /// 每轮采集后调用：剔除过期 → 派生 → 与上次签名比较。返回 true = 需要 emit。
     pub fn tick(&mut self, now: i64, idle_ms: i64) -> bool {
         self.prune(now, idle_ms);
-        let sig = Self::signature(&self.items(now, idle_ms));
-        let changed = sig != self.last_sig;
-        self.last_sig = sig;
-        changed
+        self.resync(now, idle_ms)
+    }
+
+    /// 喂入前台窗口（None = 没有 / 人不在）：维护进前台时刻 → 确认停留够久的「进前台前就亮」的当前会话等待。
+    /// 返回 true = 派生有变（需要 emit）。
+    pub fn set_foreground(&mut self, win: Option<ForegroundWindow>, now: i64, idle_ms: i64) -> bool {
+        let prev = self.fg.take();
+        self.fg = win.map(|win| {
+            let since = match prev {
+                _ if win.since > 0 => win.since,
+                Some(p) if p.win.window == win.window => p.since,
+                _ => now,
+            };
+            Foreground { win, since }
+        });
+        if let Some(fg_since) = self.fg.as_ref().map(|f| f.since).filter(|s| now - s >= FOREGROUND_DWELL_MS) {
+            let due: Vec<(LiveKey, i64)> = self
+                .entries
+                .iter()
+                .filter(|(_, e)| now - e.obs.last_event <= idle_ms)
+                .filter_map(|(k, e)| {
+                    let (state, since, lit_at) = self.derive(k, e, now)?;
+                    (e.acked_since != Some(since) && lit_at < fg_since && self.foreground_current(k, e, state, now, idle_ms))
+                        .then(|| (k.clone(), since))
+                })
+                .collect();
+            for (k, since) in due {
+                if let Some(e) = self.entries.get_mut(&k) {
+                    e.acked_since = Some(since);
+                }
+            }
+        }
+        self.resync(now, idle_ms)
+    }
+
+    /// 守护线程要做什么：（前台采样, 文件探针)。只看**未确认**的提示——前台暂压 / 确认只作用于未确认的
+    /// waiting（且宿主可判定）;探针只为让未确认的提示尽快熄灭。都 false → 守护线程挂起,零开销。
+    pub fn watch_needs(&self, now: i64, idle_ms: i64) -> (bool, bool) {
+        let mut needs = (false, false);
+        for (k, e) in self.entries.iter().filter(|(_, e)| e.obs.parent_id.is_none() && now - e.obs.last_event <= idle_ms) {
+            let Some((state, since, _)) = self.derive(k, e, now) else { continue };
+            if state == "running" || e.acked_since == Some(since) {
+                continue;
+            }
+            if state == "waiting" && crate::agent_focus::watch_target(&k.0, e.obs.host.as_deref()).is_some() {
+                needs.0 = true;
+            }
+            if e.obs.watch.is_some() {
+                needs.1 = true;
+            }
+        }
+        needs
+    }
+
+    /// 快速探针清单：未确认的 waiting / tool_pending（含暂压）且有源文件的会话 → （路径, 采集时 mtime)。
+    /// 文件再被写入 ≈ 用户回复了 / 批了权限,探针据此提前唤醒采集,不必等下一个采集周期。
+    pub fn watch_list(&self, now: i64, idle_ms: i64) -> Vec<(String, i64)> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.obs.parent_id.is_none() && now - e.obs.last_event <= idle_ms)
+            .filter(|(k, e)| {
+                self.derive(k, e, now).is_some_and(|(state, since, _)| state != "running" && e.acked_since != Some(since))
+            })
+            .filter_map(|(_, e)| e.obs.watch.clone())
+            .collect()
     }
 
     /// 聚焦前查会话的宿主线索与原始项目键（找目标进程 / 同进程多窗口按项目目录名消歧）。
@@ -192,10 +351,7 @@ impl AttentionTable {
         if self.entries.remove(&(agent.to_string(), session.to_string())).is_none() {
             return false;
         }
-        let sig = Self::signature(&self.items(now, idle_ms));
-        let changed = sig != self.last_sig;
-        self.last_sig = sig;
-        changed
+        self.resync(now, idle_ms)
     }
 
     /// 确认一个会话当前这一段等待。返回 true = 状态有变（需要 emit）。
@@ -205,8 +361,8 @@ impl AttentionTable {
             .entries
             .get(&key)
             .and_then(|e| self.derive(&key, e, now))
-            .filter(|(state, _)| *state != "running")
-            .map(|(_, since)| since)
+            .filter(|(state, _, _)| *state != "running")
+            .map(|(_, since, _)| since)
         else {
             return false;
         };
@@ -228,7 +384,16 @@ mod tests {
     const IDLE: i64 = 30 * 60_000;
 
     fn obs(phase: LivePhase, last: i64) -> LiveTurn {
-        LiveTurn { project_key: "e:/p".into(), parent_id: None, title: Some("t".into()), host: None, phase, last_event: last }
+        LiveTurn {
+            project_key: "e:/p".into(),
+            parent_id: None,
+            title: Some("t".into()),
+            host: None,
+            phase,
+            last_event: last,
+            last_input: None,
+            watch: None,
+        }
     }
 
     fn key(s: &str) -> LiveKey {
@@ -328,5 +493,204 @@ mod tests {
         t.seed(key("s"), obs(LivePhase::Done { exact: true }, NOW + 10));
         t.seed(key("s"), obs(LivePhase::Busy, NOW));
         assert_eq!(one(&t, NOW + 20).map(|x| x.0), Some("waiting"));
+    }
+
+    // ---- 前台自动确认 / 暂压 ----
+
+    fn desktop(phase: LivePhase, last: i64, input: Option<i64>) -> LiveTurn {
+        let mut o = obs(phase, last);
+        o.host = Some("claude-desktop".into());
+        o.last_input = input;
+        o
+    }
+
+    fn claude_window(window: isize) -> Option<ForegroundWindow> {
+        Some(ForegroundWindow { window, exe: "claude.exe".into(), title: "Claude".into(), since: 0 })
+    }
+
+    fn state_of(t: &AttentionTable, s: &str, now: i64) -> Option<(bool, bool)> {
+        t.items(now, IDLE).into_iter().find(|i| i.session_id == s).map(|i| (i.acked, i.held))
+    }
+
+    #[test]
+    fn foreground_acks_waiting_lit_before_entering_after_dwell() {
+        let mut t = AttentionTable::default();
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Done { exact: true }, NOW, Some(NOW - 30_000)))]));
+        t.tick(NOW, IDLE);
+        // 答完之后才切进窗口
+        assert!(!t.set_foreground(claude_window(1), NOW + 10_000, IDLE), "刚进前台:不压（亮在之前）也不确认（停留不够）");
+        assert_eq!(state_of(&t, "s", NOW + 10_000), Some((false, false)));
+        assert!(!t.set_foreground(claude_window(1), NOW + 10_000 + FOREGROUND_DWELL_MS - 1, IDLE));
+        assert!(t.set_foreground(claude_window(1), NOW + 10_000 + FOREGROUND_DWELL_MS, IDLE), "停留够 → 确认");
+        assert_eq!(state_of(&t, "s", NOW + 13_000), Some((true, false)));
+    }
+
+    #[test]
+    fn alt_tab_passing_through_does_not_ack() {
+        let mut t = AttentionTable::default();
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Done { exact: true }, NOW, Some(NOW - 1)))]));
+        t.set_foreground(claude_window(1), NOW + 1_000, IDLE);
+        t.set_foreground(Some(ForegroundWindow { window: 9, exe: "explorer.exe".into(), title: "x".into(), since: 0 }), NOW + 2_000, IDLE);
+        t.set_foreground(claude_window(1), NOW + 3_500, IDLE);
+        t.set_foreground(claude_window(1), NOW + 4_000, IDLE);
+        assert_eq!(state_of(&t, "s", NOW + 4_000), Some((false, false)), "换窗口重新计停留");
+    }
+
+    #[test]
+    fn waiting_lit_while_in_foreground_is_held_then_relights_on_leave() {
+        let mut t = AttentionTable::default();
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Busy, NOW, Some(NOW)))]));
+        t.set_foreground(claude_window(1), NOW, IDLE);
+        // 在窗口里看着它答完
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Done { exact: true }, NOW + 20_000, Some(NOW)))]));
+        assert!(t.tick(NOW + 21_000, IDLE));
+        assert!(!t.set_foreground(claude_window(1), NOW + 60_000, IDLE), "一直在前台:保持暂压,不确认");
+        assert_eq!(state_of(&t, "s", NOW + 60_000), Some((false, true)));
+        // 离开（或人走开 → 喂 None）→ 恢复亮起
+        assert!(t.set_foreground(None, NOW + 61_000, IDLE));
+        assert_eq!(state_of(&t, "s", NOW + 61_000), Some((false, false)));
+        // 回来停留够 → 确认
+        t.set_foreground(claude_window(1), NOW + 70_000, IDLE);
+        assert!(t.set_foreground(claude_window(1), NOW + 72_000, IDLE));
+        assert_eq!(state_of(&t, "s", NOW + 72_000), Some((true, false)));
+    }
+
+    #[test]
+    fn parallel_sessions_only_current_one_is_touched() {
+        let mut t = AttentionTable::default();
+        // a:先发、先答完;b:后发（用户最后在 b 里输入）
+        t.apply(BTreeMap::from([
+            (key("a"), desktop(LivePhase::Done { exact: true }, NOW + 10_000, Some(NOW))),
+            (key("b"), desktop(LivePhase::Done { exact: true }, NOW + 12_000, Some(NOW + 5_000))),
+        ]));
+        t.set_foreground(claude_window(1), NOW + 20_000, IDLE);
+        t.set_foreground(claude_window(1), NOW + 23_000, IDLE);
+        assert_eq!(state_of(&t, "b", NOW + 23_000), Some((true, false)), "当前会话确认");
+        assert_eq!(state_of(&t, "a", NOW + 23_000), Some((false, false)), "并行的别的会话保持亮起");
+    }
+
+    #[test]
+    fn ambiguous_or_unknown_hosts_are_left_alone() {
+        let mut t = AttentionTable::default();
+        // 两个会话都没有输入记录（旧游标）→ 无法判定当前会话
+        t.apply(BTreeMap::from([
+            (key("a"), desktop(LivePhase::Done { exact: true }, NOW, None)),
+            (key("b"), desktop(LivePhase::Done { exact: true }, NOW, None)),
+        ]));
+        // CLI（entrypoint 未知）会话:不参与
+        t.apply(BTreeMap::from([(key("cli"), obs(LivePhase::Done { exact: true }, NOW))]));
+        t.set_foreground(claude_window(1), NOW + 1_000, IDLE);
+        t.set_foreground(claude_window(1), NOW + 5_000, IDLE);
+        for s in ["a", "b", "cli"] {
+            assert_eq!(state_of(&t, s, NOW + 5_000), Some((false, false)), "{s}");
+        }
+    }
+
+    #[test]
+    fn tool_pending_is_never_auto_acked() {
+        let mut t = AttentionTable::default();
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Tools, NOW, Some(NOW)))]));
+        let now = NOW + TOOL_PENDING_MS + 1_000;
+        t.set_foreground(claude_window(1), now, IDLE);
+        t.set_foreground(claude_window(1), now + 10_000, IDLE);
+        let it = t.items(now + 10_000, IDLE).remove(0);
+        assert_eq!((it.state, it.acked, it.held), ("tool_pending", false, false));
+    }
+
+    #[test]
+    fn vscode_matches_by_project_title() {
+        let mut t = AttentionTable::default();
+        let mut o = obs(LivePhase::Done { exact: true }, NOW);
+        o.host = Some("claude-vscode".into());
+        o.project_key = "e:/projects/tokencalendar".into();
+        o.last_input = Some(NOW - 1);
+        t.apply(BTreeMap::from([(key("s"), o)]));
+        let vs = |title: &str| Some(ForegroundWindow { window: 7, exe: "code.exe".into(), title: title.into(), since: 0 });
+        t.set_foreground(vs("main.rs - OtherProj - Visual Studio Code"), NOW + 1_000, IDLE);
+        t.set_foreground(vs("main.rs - OtherProj - Visual Studio Code"), NOW + 5_000, IDLE);
+        assert_eq!(state_of(&t, "s", NOW + 5_000), Some((false, false)), "别的项目窗口不算");
+        let other =
+            Some(ForegroundWindow { window: 8, exe: "code.exe".into(), title: "AGENTS.md - TokenCalendar - Visual Studio Code".into(), since: 0 });
+        t.set_foreground(other.clone(), NOW + 6_000, IDLE);
+        t.set_foreground(other, NOW + 8_000, IDLE);
+        assert_eq!(state_of(&t, "s", NOW + 8_000), Some((true, false)));
+    }
+
+    #[test]
+    fn event_since_survives_sampling_gaps() {
+        // 守护线程挂起期间窗口已在前台:切换事件给出的进前台时刻早于答完 → 仍按「在前台期间答完」暂压
+        let mut t = AttentionTable::default();
+        t.apply(BTreeMap::from([(key("s"), desktop(LivePhase::Done { exact: true }, NOW + 20_000, Some(NOW)))]));
+        let mut w = claude_window(1);
+        w.as_mut().unwrap().since = NOW;
+        t.set_foreground(w, NOW + 25_000, IDLE);
+        assert_eq!(state_of(&t, "s", NOW + 25_000), Some((false, true)));
+    }
+
+    #[test]
+    fn other_projects_and_agents_are_not_touched() {
+        let mut t = AttentionTable::default();
+        let vs = |project: &str, input: i64| {
+            let mut o = obs(LivePhase::Done { exact: true }, NOW);
+            o.host = Some("claude-vscode".into());
+            o.project_key = project.into();
+            o.last_input = Some(input);
+            o
+        };
+        let mut codex = obs(LivePhase::Done { exact: true }, NOW);
+        codex.project_key = "e:/projects/tokencalendar".into();
+        codex.last_input = Some(NOW - 1);
+        t.apply(BTreeMap::from([
+            (key("mine"), vs("e:/projects/tokencalendar", NOW - 10)),
+            // 子串相似的别的项目,且输入更晚（若混进组会抢走「当前会话」）
+            (key("calendar"), vs("e:/work/calendar", NOW - 1)),
+            // 同一项目、另一个 agent
+            (("codex".to_string(), "cx".to_string()), codex),
+        ]));
+        let w = Some(ForegroundWindow { window: 3, exe: "code.exe".into(), title: "a.rs - TokenCalendar - Visual Studio Code".into(), since: 0 });
+        t.set_foreground(w.clone(), NOW + 1_000, IDLE);
+        t.set_foreground(w, NOW + 4_000, IDLE);
+        assert_eq!(state_of(&t, "mine", NOW + 4_000), Some((true, false)));
+        assert_eq!(state_of(&t, "calendar", NOW + 4_000), Some((false, false)), "别的项目不受影响");
+        assert_eq!(state_of(&t, "cx", NOW + 4_000), Some((false, false)), "同项目的别的 agent 不受影响");
+    }
+
+    #[test]
+    fn same_folder_name_in_different_paths_is_ambiguous() {
+        let mut t = AttentionTable::default();
+        let vs = |project: &str, input: i64| {
+            let mut o = obs(LivePhase::Done { exact: true }, NOW);
+            o.host = Some("claude-vscode".into());
+            o.project_key = project.into();
+            o.last_input = Some(input);
+            o
+        };
+        t.apply(BTreeMap::from([(key("a"), vs("e:/a/app", NOW - 10)), (key("b"), vs("d:/b/app", NOW - 1))]));
+        let w = Some(ForegroundWindow { window: 3, exe: "code.exe".into(), title: "x.rs - app - Visual Studio Code".into(), since: 0 });
+        t.set_foreground(w.clone(), NOW + 1_000, IDLE);
+        t.set_foreground(w, NOW + 4_000, IDLE);
+        assert_eq!(state_of(&t, "a", NOW + 4_000), Some((false, false)));
+        assert_eq!(state_of(&t, "b", NOW + 4_000), Some((false, false)), "标题分不清是哪个 app,整组不动");
+    }
+
+    #[test]
+    fn watch_needs_and_list_cover_unacked_lit_sessions_only() {
+        let mut t = AttentionTable::default();
+        assert_eq!(t.watch_needs(NOW, IDLE), (false, false), "空表 → 守护线程挂起");
+        let mut w = desktop(LivePhase::Done { exact: true }, NOW, Some(NOW - 1));
+        w.watch = Some(("c:/a.jsonl".into(), 5));
+        let mut r = obs(LivePhase::Busy, NOW);
+        r.watch = Some(("c:/b.jsonl".into(), 6));
+        t.apply(BTreeMap::from([(key("w"), w), (key("r"), r)]));
+        assert_eq!(t.watch_needs(NOW + 1, IDLE), (true, true));
+        assert_eq!(t.watch_list(NOW + 1, IDLE), vec![("c:/a.jsonl".to_string(), 5)]);
+        t.ack("claude-code", "w", NOW + 1, IDLE);
+        assert_eq!(t.watch_needs(NOW + 1, IDLE), (false, false), "确认后不再采样 / 探针");
+        assert!(t.watch_list(NOW + 1, IDLE).is_empty());
+        // CLI 会话（宿主不可判定）只需要探针
+        let mut cli = obs(LivePhase::Done { exact: true }, NOW);
+        cli.watch = Some(("c:/c.jsonl".into(), 7));
+        t.apply(BTreeMap::from([(key("cli"), cli)]));
+        assert_eq!(t.watch_needs(NOW + 1, IDLE), (false, true));
     }
 }

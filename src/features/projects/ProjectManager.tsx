@@ -1,8 +1,13 @@
 // 项目管理面板:Settings·Projects tab 与主窗口内弹出层（ProjectManagerModal）共用。
 // 结构:规则区（自动折叠开关 + 两个阈值 + Unknown 归 Scratch + Scratch 显隐）/ 列表区（筛选 · 排序 · 批量条 · 表格）。
+// 时间轴监测：名称列左侧 pin 图标切换;置顶行在任何排序下都额外提前
+// （按置顶先后）;筛选条 All 与 Active 之间的 pin 按钮 = 只看置顶。
 // 数据:list_project_meta（每目录键一行,状态按当前规则解析）;写操作经 projectService,成功后后端发 usage:changed,
 // 本面板与各分析视图经既有监听重取。active = false 时不取数（弹出层常驻 DOM,关闭时只停取数）。
 // 行存在性语义见 Rust project_meta.rs:Rename / Hide / Unhide / Keep 都让键脱离自动规则;Reset 回到自动态。
+// 状态徽章：Active / Scratch 徽章可点击切换——
+// Active → Scratch = 合并进 Scratch 伪项目（手动归入）;Scratch → Active = 手动归入的先取消合并,再 Keep（留 meta 行,
+// 规则不再作用）。Hidden / Merged 徽章不可点。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, projectService } from '../../services'
 import type { ProjectMetaList, ProjectMetaRow, ProjectStatus, ScratchRuleInfo, WriteResult } from '../../services'
@@ -10,11 +15,12 @@ import { formatCompact, formatFull } from '../matrix/matrixScale'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import './projects.css'
 
-type StatusFilter = 'all' | ProjectStatus
+type StatusFilter = 'all' | 'pinned' | ProjectStatus
 type SortKey = 'recent' | 'sessions'
 
 const STATUS_FILTERS: { v: StatusFilter; label: string; hint: string }[] = [
   { v: 'all', label: 'All', hint: 'Every folder seen in the data' },
+  { v: 'pinned', label: '', hint: 'Pinned: monitored on the Timeline window, listed first' },
   { v: 'active', label: 'Active', hint: 'Shown as their own project' },
   { v: 'hidden', label: 'Hidden', hint: 'Left out of analysis views and project lists' },
   { v: 'merged', label: 'Merged', hint: 'Counted under another project' },
@@ -46,7 +52,12 @@ function statusText(r: ProjectMetaRow): string {
 function statusHint(r: ProjectMetaRow, scratchHidden: boolean): string {
   const lines: string[] = []
   if (r.status === 'merged' && r.mergedInto) lines.push(`Counted under ${r.mergedInto}`)
-  if (r.status === 'scratch') lines.push(scratchHidden ? 'Collapsed into Scratch (Scratch is hidden)' : 'Collapsed into Scratch by the rule')
+  if (r.status === 'active') lines.push('Click to move into Scratch')
+  if (r.status === 'scratch') lines.push('Click to keep as its own project')
+  if (r.status === 'scratch') {
+    const how = r.mergedInto === projectService.SCRATCH_KEY ? 'Moved into Scratch by hand' : 'Collapsed into Scratch by the rule'
+    lines.push(scratchHidden ? `${how} (Scratch is hidden)` : how)
+  }
   if (r.status !== 'hidden' && r.effectiveKey === null && r.status !== 'scratch') lines.push('Not visible: its target project is hidden')
   if (r.managed && r.status === 'active') lines.push('Managed: the Scratch rule does not apply')
   return lines.join('\n')
@@ -77,8 +88,9 @@ export default function ProjectManager({ active }: { active: boolean }) {
   const [sessionsDraft, setSessionsDraft] = useState('')
   const [turnsDraft, setTurnsDraft] = useState('')
 
-  // 时间轴置顶（与 timeline 窗口共享 prefs timelinePinnedKeys,存原始目录键;
-  // storage 桥跨窗口同步——这里改 pin,timeline 窗口即时跟随）。
+  // 时间轴置顶（prefs timelinePinnedKeys,存原始目录键,置顶先后即时间轴列序;storage 桥跨窗口同步——这里改,
+  // timeline 窗口即时跟随）。置顶集 = 时间轴监测的项目集,只在这里管理（时间轴窗口的 pin 按钮已删）;
+  // 为空时时间轴回退为按窗口容量显示最近项目。
   const [pins, setPins] = useState<string[]>(() => getDesignPrefs().timelinePinnedKeys ?? [])
   useEffect(() => subscribeDesignPrefs((p) => setPins(p.timelinePinnedKeys ?? [])), [])
   const togglePin = (key: string) => {
@@ -147,10 +159,13 @@ export default function ProjectManager({ active }: { active: boolean }) {
   const rows = useMemo(() => list?.rows ?? [], [list])
   const byKey = useMemo(() => new Map(rows.map((r) => [r.key, r])), [rows])
   const counts = useMemo(() => {
-    const c: Record<StatusFilter, number> = { all: rows.length, active: 0, hidden: 0, merged: 0, scratch: 0 }
-    for (const r of rows) c[r.status] += 1
+    const c: Record<StatusFilter, number> = { all: rows.length, pinned: 0, active: 0, hidden: 0, merged: 0, scratch: 0 }
+    for (const r of rows) {
+      c[r.status] += 1
+      if (pins.includes(r.key)) c.pinned += 1
+    }
     return c
-  }, [rows])
+  }, [rows, pins])
   /** 被他人合并进来的键（不能再作合并源）。 */
   const targets = useMemo(() => new Set(rows.map((r) => r.mergedInto).filter((k): k is string => !!k)), [rows])
 
@@ -158,7 +173,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
     const q = query.trim().toLowerCase()
     const out = rows.filter(
       (r) =>
-        (filter === 'all' || r.status === filter) &&
+        (filter === 'all' || (filter === 'pinned' ? pins.includes(r.key) : r.status === filter)) &&
         (!q || r.key.toLowerCase().includes(q) || r.label.toLowerCase().includes(q) || (r.alias ?? '').toLowerCase().includes(q)),
     )
     if (sort === 'sessions') {
@@ -166,8 +181,13 @@ export default function ProjectManager({ active }: { active: boolean }) {
     } else {
       out.sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? '') || b.sessions - a.sessions || a.label.localeCompare(b.label))
     }
-    return out
-  }, [rows, filter, sort, query])
+    // 置顶行额外提前,按置顶先后（= 时间轴列序）;其余保持上面的排序
+    const pinRank = (r: ProjectMetaRow) => {
+      const i = pins.indexOf(r.key)
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i
+    }
+    return out.map((r, i) => ({ r, i })).sort((a, b) => pinRank(a.r) - pinRank(b.r) || a.i - b.i).map((x) => x.r)
+  }, [rows, filter, sort, query, pins])
 
   const toggleSelect = (key: string) =>
     setSelected((prev) => {
@@ -188,6 +208,15 @@ export default function ProjectManager({ active }: { active: boolean }) {
   // ---- 行操作 ----
 
   const setHidden = (r: ProjectMetaRow, hidden: boolean) => run(() => projectService.setProjectMeta(r.key, { alias: r.alias, hidden, note: r.note }))
+  /** 状态徽章切换：Active ⇄ Scratch。 */
+  const toggleScratch = async (r: ProjectMetaRow) => {
+    if (r.status === 'active') {
+      await run(() => projectService.mergeProjects([r.key], projectService.SCRATCH_KEY))
+    } else if (r.status === 'scratch') {
+      if (r.mergedInto === projectService.SCRATCH_KEY && !(await run(() => projectService.unmergeProjects([r.key])))) return
+      await setHidden(r, false)
+    }
+  }
 
   const saveRename = async () => {
     const editing = renamingRef.current
@@ -342,7 +371,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
                 title={f.hint}
                 onClick={() => setFilter(f.v)}
               >
-                {f.label} <span className="pm-count">{counts[f.v]}</span>
+                {f.v === 'pinned' ? <PinIcon /> : f.label} <span className="pm-count">{counts[f.v]}</span>
               </button>
             ))}
           </div>
@@ -460,10 +489,25 @@ export default function ProjectManager({ active }: { active: boolean }) {
                             onBlur={() => void saveRename()}
                           />
                         ) : (
-                          <>
-                            <span className="pm-label">{r.label}</span>
-                            <span className="pm-path">{r.key}</span>
-                          </>
+                          <div className="pm-name-wrap">
+                            {r.effectiveKey !== null || pins.includes(r.key) ? (
+                              <button
+                                type="button"
+                                className={`pm-pin-btn${pins.includes(r.key) ? ' is-active' : ''}`}
+                                title={pins.includes(r.key) ? 'Unpin: stop monitoring on the Timeline window' : 'Pin: monitor on the Timeline window and list first'}
+                                aria-pressed={pins.includes(r.key)}
+                                onClick={() => togglePin(r.key)}
+                              >
+                                <PinIcon />
+                              </button>
+                            ) : (
+                              <span className="pm-pin-btn is-placeholder" />
+                            )}
+                            <div className="pm-name-text">
+                              <span className="pm-label">{r.label}</span>
+                              <span className="pm-path">{r.key}</span>
+                            </div>
+                          </div>
                         )}
                       </td>
                       <td className="is-left pm-agents" title={r.agents.join(', ')}>
@@ -476,7 +520,18 @@ export default function ProjectManager({ active }: { active: boolean }) {
                         {r.firstDay === r.lastDay ? dayLabel(r.firstDay) : `${dayLabel(r.firstDay)} – ${dayLabel(r.lastDay)}`}
                       </td>
                       <td className="is-left" title={hint || undefined}>
-                        <span className={`pm-status is-${r.status}${r.effectiveKey === null && r.status !== 'hidden' ? ' is-invisible' : ''}`}>{statusText(r)}</span>
+                        {r.status === 'active' || r.status === 'scratch' ? (
+                          <button
+                            type="button"
+                            className={`pm-status is-toggle is-${r.status}${r.effectiveKey === null ? ' is-invisible' : ''}`}
+                            disabled={busy || (r.status === 'active' && targets.has(r.key))}
+                            onClick={() => void toggleScratch(r)}
+                          >
+                            {statusText(r)}
+                          </button>
+                        ) : (
+                          <span className={`pm-status is-${r.status}${r.effectiveKey === null && r.status !== 'hidden' ? ' is-invisible' : ''}`}>{statusText(r)}</span>
+                        )}
                       </td>
                       <td className="is-left">
                         <div className="pm-actions">
@@ -492,12 +547,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
                             Hide
                           </button>
                         )}
-                        {r.status === 'scratch' && (
-                          <button className="pm-act" disabled={busy} title="Keep as its own project; the Scratch rule stops applying" onClick={() => void setHidden(r, false)}>
-                            Keep
-                          </button>
-                        )}
-                        {r.mergedInto ? (
+                        {r.mergedInto && r.mergedInto !== projectService.SCRATCH_KEY ? (
                           <button className="pm-act" disabled={busy} title={`Stop counting under ${r.mergedLabel ?? r.mergedInto}`} onClick={() => void run(() => projectService.unmergeProjects([r.key]))}>
                             Unmerge
                           </button>
@@ -508,22 +558,12 @@ export default function ProjectManager({ active }: { active: boolean }) {
                             title={targets.has(r.key) ? 'Other folders are merged into this one' : 'Count this folder under another project'}
                             onClick={() => setMerging({ sources: [r.key], target: '' })}
                           >
-                            Merge into…
+                            Merge…
                           </button>
                         )}
                         {r.folderExists && (
                           <button className="pm-act" title="Open in File Explorer" onClick={() => void projectService.openProjectFolder(r.key).then((res) => !res.ok && setError(res.error))}>
-                            Open folder
-                          </button>
-                        )}
-                        {r.effectiveKey !== null && (
-                          <button
-                            className={`pm-act${pins.includes(r.key) ? ' is-active' : ''}`}
-                            title={pins.includes(r.key) ? 'Remove from the top of the Timeline window' : 'Keep at the top of the Timeline window'}
-                            aria-pressed={pins.includes(r.key)}
-                            onClick={() => togglePin(r.key)}
-                          >
-                            {pins.includes(r.key) ? 'Unpin' : 'Pin to timeline'}
+                            Open
                           </button>
                         )}
                         {r.managed && (
@@ -542,6 +582,14 @@ export default function ProjectManager({ active }: { active: boolean }) {
         )}
       </div>
     </div>
+  )
+}
+
+function PinIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+      <path d="M7.5 1 11 4.5 9.6 5.9 8.9 5.2 6.8 7.3l.4 2.4L6 10.9 3.9 8.8 1.5 11.2l-.7-.7 2.4-2.4L1.1 6l1.2-1.2 2.4.4 2.1-2.1-.7-.7L7.5 1Z" />
+    </svg>
   )
 }
 

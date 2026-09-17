@@ -1,6 +1,7 @@
 //! 订阅额度模块：与 collector 平行的独立数据链路。
 //!
 //! - 数据源：各 agent CLI 的**本机凭据文件**（只读）+ 平台 usage 端点（逆向）;
+//!   Claude 另有桌面端本地采样回落（claude_desktop.rs,零凭据）;
 //! - 存储：`<数据根>/subscriptions.db`（快照 + 绑定开关;凭据永不落库）;
 //! - 轮询：独立 daemon 线程（对齐 collector 模式）——默认 5 分钟,长期安静时
 //!   待机放慢（idle.rs,封顶 30 分钟;变化 / 本地 agent 活动 / 用户注意即退出）;
@@ -9,6 +10,7 @@
 
 pub mod boost;
 pub mod claude;
+pub mod claude_desktop;
 pub mod codex;
 pub mod credentials;
 pub mod idle;
@@ -156,31 +158,98 @@ impl RateGate {
     }
 }
 
+// ---------- 请求日志（限流分析用,dev-only） ----------
+
+thread_local! {
+    /// 本线程最近一次 usage 请求的 HTTP 结果标签（适配器发请求后写入,
+    /// `fetch_one` 取走记日志;None = 没发请求）。取数全程在同一线程。
+    static LAST_HTTP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 适配器在拿到 usage 响应后调用：记 HTTP 状态码（429 附原始 Retry-After）
+/// 或传输层错误种类。**只记状态,不含 URL 参数 / 头 / body——无 token 泄露面**。
+pub(crate) fn note_http(resp: &Result<ureq::Response, ureq::Error>) {
+    let label = match resp {
+        Ok(r) => r.status().to_string(),
+        Err(ureq::Error::Status(code, r)) => match r.header("retry-after") {
+            Some(ra) => format!("{code} retry-after={}", ra.trim()),
+            None => code.to_string(),
+        },
+        Err(ureq::Error::Transport(t)) => format!("transport:{:?}", t.kind()),
+    };
+    LAST_HTTP.with(|c| *c.borrow_mut() = Some(label));
+}
+
+/// 一轮取数一行：`via` = main / boost;`http` = 状态码或 `-`（未发请求）;
+/// `cooldown` = 结束时生效的限流暂停剩余秒数。
+fn log_fetch(via: &str, platform: Platform, adapters: &Adapters, snap: &SubscriptionSnapshot, note: &str) {
+    let http = LAST_HTTP.with(|c| c.borrow_mut().take()).unwrap_or_else(|| "-".into());
+    let cooldown = match platform {
+        Platform::Codex => adapters.codex.cooldown_remaining(),
+        Platform::Claude => adapters.claude.cooldown_remaining(),
+    };
+    let cooldown = cooldown.map_or_else(|| "-".to_string(), |s| format!("{s}s"));
+    crate::dev_log!(
+        "[subscription] fetch via={via} platform={} http={http} status={} cooldown={cooldown}{note}",
+        platform.as_str(),
+        snap.status.as_str(),
+    );
+}
+
 // ---------- 采集编排 ----------
 
-fn fetch_one(adapters: &Adapters, platform: Platform) -> SubscriptionSnapshot {
+/// 单平台取数一轮。
+pub(crate) fn fetch_one(adapters: &Adapters, platform: Platform, via: &str) -> SubscriptionSnapshot {
+    LAST_HTTP.with(|c| *c.borrow_mut() = None);
     // 冷却期内不碰网络（限流退避,静默保留旧数据）
     let cooling = match platform {
         Platform::Codex => adapters.codex.cooldown_remaining(),
         Platform::Claude => adapters.claude.cooldown_remaining(),
     };
     if cooling.is_some() {
-        return rate_limited_snapshot(platform);
+        let snap = rate_limited_snapshot(platform);
+        log_fetch(via, platform, adapters, &snap, " skipped=cooling");
+        return snap;
     }
 
-    match platform {
+    let mut note = "";
+    let snap = match platform {
         Platform::Codex => match adapters.codex.obtain_access(platform) {
             codex::Access::Ok(cred) => codex::fetch(&adapters.codex, cred),
             codex::Access::Dead => dead_snapshot(platform),
             codex::Access::None => idle_snapshot(platform),
             codex::Access::Transient => transient_snapshot(platform),
         },
-        Platform::Claude => match adapters.claude.obtain_access(platform) {
-            claude::Access::Ok(cred) => claude::fetch(&adapters.claude, cred),
-            claude::Access::Dead => dead_snapshot(platform),
-            claude::Access::None => idle_snapshot(platform),
-        },
+        // 主路径拿不到数（凭据过期 / 无凭据文件）→ 回落桌面端采样（claude_desktop.rs）
+        Platform::Claude => {
+            let primary = match adapters.claude.obtain_access(platform) {
+                claude::Access::Ok(cred) => claude::fetch(&adapters.claude, cred),
+                claude::Access::Dead => dead_snapshot(platform),
+                claude::Access::None => idle_snapshot(platform),
+            };
+            with_desktop_fallback(primary, &mut note)
+        }
+    };
+    log_fetch(via, platform, adapters, &snap, note);
+    snap
+}
+
+/// Claude 主路径结果套桌面端回落;真的换成了桌面端样本时给日志附 `source=desktop`
+/// 及主路径原状态。
+fn with_desktop_fallback(primary: SubscriptionSnapshot, note: &mut &'static str) -> SubscriptionSnapshot {
+    if primary.platform != Platform::Claude {
+        return primary;
     }
+    let before = primary.status;
+    let snap = claude_desktop::fallback(primary, chrono::Utc::now().timestamp());
+    if before != snap.status {
+        *note = match before {
+            FetchStatus::AuthFailed => " source=desktop primary=auth_failed",
+            FetchStatus::Idle => " source=desktop primary=idle",
+            _ => " source=desktop",
+        };
+    }
+    snap
 }
 
 fn dead_snapshot(platform: Platform) -> SubscriptionSnapshot {
@@ -265,13 +334,18 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     Platform::Claude => adapters.claude.is_dead(*platform),
                 };
                 let snap = if dead && !changed {
-                    dead_snapshot(*platform)
+                    // 判死零网络,但桌面端采样是本地文件,照读（Claude 专属回落）
+                    let mut note = "";
+                    let snap = with_desktop_fallback(dead_snapshot(*platform), &mut note);
+                    let note = if note.is_empty() { " skipped=dead" } else { " skipped=dead source=desktop" };
+                    log_fetch("main", *platform, &adapters, &snap, note);
+                    snap
                 } else {
                     // 取数互斥（审计 P3-）：与 boost 线程共用同一把平台锁,
                     // 防两线程同时进入 fetch_one（冷却检查与 429 冷却写入之间
                     // 无原子性,各发一请求会加速触限）。主轮询阻塞等锁。
                     let _lease = adapters.lock_fetch(*platform);
-                    fetch_one(&adapters, *platform)
+                    fetch_one(&adapters, *platform, "main")
                 };
                 let _ = write_store.save_snapshot(&snap);
                 // 待机评估：变化退出待机 / 无变化计安静轮（达标进入待机后退档）;翻转即广播
@@ -360,6 +434,13 @@ pub fn scan_subscription_credentials() -> Result<Vec<CredentialInfo>, String> {
     let mut out = vec![];
     for platform in [Platform::Codex, Platform::Claude] {
         let info = match credentials::read_credential(platform) {
+            // 只用桌面端（无 CLI 凭据文件）也可绑定:桌面端采样文件即数据源
+            None if platform == Platform::Claude && claude_desktop::is_present() => CredentialInfo {
+                platform,
+                present: true,
+                parseable: true,
+                account_hint: Some("claude-desktop".into()),
+            },
             Some(cred) => CredentialInfo {
                 platform,
                 present: true,
@@ -393,8 +474,11 @@ pub fn bind_subscription(
     let platform =
         Platform::from_str(&platform).ok_or_else(|| format!("unknown platform: {platform}"))?;
     // 绑定前置校验:凭据必须存在且可解析（避免绑了个空壳）
-    credentials::read_credential(platform)
-        .ok_or_else(|| "credential file not found or unparseable".to_string())?;
+    if credentials::read_credential(platform).is_none()
+        && !(platform == Platform::Claude && claude_desktop::is_present())
+    {
+        return Err("credential file not found or unparseable".to_string());
+    }
     let now = chrono::Utc::now().timestamp();
     {
         let store = state.0.lock().unwrap();

@@ -612,6 +612,7 @@ impl ZcodeAdapter {
         // 缺 turn_usage 行 / 未完成 = 模型在处理（工具明细不分,tool_pending 不适用）。
         let mut live_phase = LivePhase::Idle;
         let mut live_last = 0;
+        let mut live_input = None;
         for (seq, (start, _key, b)) in ordered.into_iter().enumerate() {
             let end = b
                 .completed_at
@@ -655,6 +656,7 @@ impl ZcodeAdapter {
                 LivePhase::Busy
             };
             live_last = end;
+            live_input = Some(start);
             prev_end = Some(end);
             span.0 = Some(span.0.map_or(start, |x| x.min(start)));
             span.1 = Some(span.1.map_or(end, |x| x.max(end)));
@@ -662,7 +664,17 @@ impl ZcodeAdapter {
         let title = title.filter(|t| !t.trim().is_empty());
         batch.live.insert(
             (META.id.to_string(), sid.to_string()),
-            LiveTurn { project_key: project.clone(), parent_id: parent.clone(), title: title.clone(), host: None, phase: live_phase, last_event: live_last },
+            LiveTurn {
+                project_key: project.clone(),
+                parent_id: parent.clone(),
+                title: title.clone(),
+                host: None,
+                phase: live_phase,
+                last_event: live_last,
+                last_input: live_input,
+                // ZCode 源是 SQLite 库,无单会话文件可探,吃采集节拍
+                watch: None,
+            },
         );
         batch.upsert_session(
             META.id,

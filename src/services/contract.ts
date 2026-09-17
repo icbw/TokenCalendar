@@ -316,7 +316,10 @@ export interface TimelineCellContract {
 }
 
 export interface TimelineSessionContract {
+  /** agent 展示名。 */
   agent: string
+  /** agent 键（open_agent_session 入参）。 */
+  agent_key: string
   session_id: string
   /** 【内容列】空 / null 前端回退 started_at 的时刻。 */
   title: string | null
@@ -363,6 +366,8 @@ export interface AttentionItemContract {
   last_event: number
   /** 已确认（仅 waiting / tool_pending;同一会话进入新一段等待自动复位）。 */
   acked: boolean
+  /** 暂压（仅 waiting）:宿主窗口在前台期间新答完的当前会话,不亮;离开窗口即恢复亮起。 */
+  held: boolean
 }
 
 /** ack_attention（agent, session_id) → 是否有变化。 */
@@ -379,6 +384,17 @@ export interface FocusAgentWindowArgs {
 }
 export interface FocusResultContract {
   found: boolean
+}
+
+/** open_agent_session（agent, session_id)（agent_focus.rs）:时间轴会话条双击 → 到该会话的 agent。
+ * agent = agent 键;项目目录与宿主线索由 Rust 从库里取,前端不传路径。 */
+export interface OpenAgentSessionArgs {
+  agent: string
+  session_id: string
+}
+export interface OpenResultContract {
+  /** focused 已前置窗口 / launched 已启动宿主 / folder 回退打开了项目目录 / none 无事可做。 */
+  outcome: 'focused' | 'launched' | 'folder' | 'none'
 }
 
 /** get_idle_threshold 返回。 */

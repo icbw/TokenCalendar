@@ -16,6 +16,17 @@
 //! 多显示器口径（红线）：「显示器枚举 + 该屏 rcWork + 该屏 scale」,不用窗口缓存
 //! scale;scale 乘文本缩放（text_scale.rs：WebView 内容按 DPI × 文本大小渲染,CSS 像素换
 //! 物理必须带上它——跟随系统文本大小,不用 set_zoom 抵消）。
+//! 窥视态 peek：条态的第二档——条态 5 秒无操作（指针不在、无亮起项目,前端计时）
+//! 收成贴顶的短小把手（`PEEK_W_LOGICAL` × `PEEK_H_LOGICAL`,居中于原条;窗口内 CSS 画 4px 半透明条 + 窄阴影,
+//! 整条宽的透明边白底下看不见、又宽易误触 → 缩窄 + 加阴影）,不挡全屏窗口;指针移入 / 出现亮起项目 / 托盘显示 → 回完整条态。
+//! peek 是运行时子态,不落盘（持久化形态仍是 strip,重启回完整条态再计时）;对前端表现为第三个形态名 "peek"。
+//!
+//! 遮挡自动折：时间轴不进任务栏,被遮住就难召回——看板态下后台线程每
+//! `OCCLUSION_POLL` 查一次前台窗口,前台窗口（非本窗口、非桌面 / 任务栏 / 任务视图外壳）覆盖看板所在
+//! 显示器工作区（全屏或最大化）→ 立即折成条态（条态置顶,随后按上面的规则收成 peek）。
+//!
+//! 窗口风格：看板态按 `floating` 施加 Shadow（主窗口组合）或 Flat 边缘组合,条态一律
+//! Flat;前端挂载与设置变更时经 `set_timeline_style` 下发,形态切换时本文件同步重施。
 //! **不复用 orb_dock.rs**：只有一种形态一条边,几何全部是本文件的纯函数（有单测）。
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -24,7 +35,15 @@ use crate::window_state::TimelineForm;
 use crate::AppState;
 
 /// 条态高度（CSS / 逻辑像素;~36,首期常量不进设置）。
-pub const STRIP_H_LOGICAL: f64 = 36.0;
+/// 条态加与窥视把手同款窄阴影 → 窗口高 = 36 可见条 + 5 下方阴影透明边
+/// （左右各 5 的阴影边由前端量宽时计入;与 timeline.css `--tl-edge-pad` 同源）。
+pub const STRIP_H_LOGICAL: f64 = 41.0;
+/// 窥视态窗口尺寸（CSS / 逻辑像素）:宽 = 短把手;高 = 4px 可见条 + 下方 / 两侧留给 CSS 窄阴影的透明边。
+/// 与 timeline.css `.is-peek` 的把手几何同源,改一处两处同改。
+pub const PEEK_W_LOGICAL: f64 = 88.0;
+pub const PEEK_H_LOGICAL: f64 = 9.0;
+/// 遮挡检测轮询间隔（看板态且可见时才做实际检查）。
+const OCCLUSION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 /// 条态宽度下限（前端未量出 / 空项目时的兜底;CSS 像素）。
 pub const STRIP_MIN_W_LOGICAL: f64 = 160.0;
 /// 条态宽度缺省（首次折条前端尚未量出时）。
@@ -52,11 +71,15 @@ pub struct FormState {
     pub strip_x: Option<i32>,
     /// 条态内容宽（CSS 像素;前端量出后随 set_timeline_form 传入）。
     pub strip_w: Option<f64>,
+    /// 看板态窗口风格:true = Shadow（DWM 阴影 + 呼吸位）/ false = Flat。运行时值,前端 prefs 下发。
+    pub floating: bool,
+    /// 条态子态:true = 窥视态（几像素细边）。运行时值,不落盘;离开条态即复位。
+    pub peek: bool,
 }
 
 impl Default for FormState {
     fn default() -> Self {
-        Self { form: TimelineForm::Board, board: None, strip_x: None, strip_w: None }
+        Self { form: TimelineForm::Board, board: None, strip_x: None, strip_w: None, floating: true, peek: false }
     }
 }
 
@@ -116,6 +139,14 @@ pub fn move_board_to(board: Rect, from: &Screen, to: &Screen) -> Rect {
     let x = (tl + dx).clamp(tl, tr - w);
     let y = (tt + dy).clamp(tt, tb - h);
     Rect { x, y, width: w as u32, height: h as u32 }
+}
+
+/// 窥视态：贴原条顶缘、以原条中心居中的短把手（宽不超过原条）。
+pub fn peek_rect(strip: Rect, scale: f64) -> Rect {
+    let w = ((PEEK_W_LOGICAL * scale).round() as u32).clamp(1, strip.width.max(1));
+    let h = ((PEEK_H_LOGICAL * scale).round() as u32).max(1);
+    let x = strip.x + (strip.width as i32 - w as i32) / 2;
+    Rect { x, y: strip.y, width: w, height: h }
 }
 
 fn center(r: &Rect) -> (i32, i32) {
@@ -190,6 +221,8 @@ fn apply_strip(window: &WebviewWindow, st: &FormState) -> Option<Rect> {
     let (cx, cy) = center(&board);
     let screen = all[screen_at(&all, cx, cy)?];
     let r = strip_rect(&screen, st.strip_w.unwrap_or(STRIP_DEFAULT_W_LOGICAL), st.strip_x, cx);
+    let r = if st.peek { peek_rect(r, screen.scale) } else { r };
+    crate::chrome::apply_timeline_style_chrome(window, false);
     let _ = window.set_min_size(None::<PhysicalSize<u32>>);
     let _ = window.set_resizable(false);
     let _ = window.set_maximizable(false);
@@ -198,7 +231,8 @@ fn apply_strip(window: &WebviewWindow, st: &FormState) -> Option<Rect> {
     Some(r)
 }
 
-fn apply_board(window: &WebviewWindow, board: Option<Rect>) {
+fn apply_board(window: &WebviewWindow, board: Option<Rect>, floating: bool) {
+    crate::chrome::apply_timeline_style_chrome(window, floating);
     let _ = window.set_always_on_top(false);
     let _ = window.set_resizable(true);
     let _ = window.set_maximizable(true);
@@ -208,9 +242,11 @@ fn apply_board(window: &WebviewWindow, board: Option<Rect>) {
     let _ = window.set_min_size(Some(tauri::LogicalSize::new(BOARD_MIN_W_LOGICAL, BOARD_MIN_H_LOGICAL)));
 }
 
-fn form_name(form: TimelineForm) -> &'static str {
+/// 对前端的形态名：board / strip / peek（peek = 条态 + 窥视子态）。
+fn form_name(form: TimelineForm, peek: bool) -> &'static str {
     match form {
         TimelineForm::Board => "board",
+        TimelineForm::Strip if peek => "peek",
         TimelineForm::Strip => "strip",
     }
 }
@@ -218,12 +254,17 @@ fn form_name(form: TimelineForm) -> &'static str {
 /// 切换形态（或条态下更新宽度）。顺序约束（Moved/Resized 可能同步回调 persist）：
 /// - 折条：先记看板几何 → 置 form = Strip → 施加条态几何（persist 此后读到 Strip,写记下的看板几何）;
 /// - 展开：先施加看板几何（form 仍 Strip,persist 写记下的看板几何）→ 再置 form = Board。
-pub fn set_form(app: &AppHandle, form: TimelineForm, strip_w: Option<f64>) -> Result<TimelineForm, String> {
+/// `peek` 只对条态有意义（条态 ↔ 窥视态只改高度;看板态恒复位）。返回前端形态名。
+pub fn set_form(app: &AppHandle, form: TimelineForm, peek: bool, strip_w: Option<f64>) -> Result<&'static str, String> {
     let window = app
         .get_webview_window(crate::visibility::TIMELINE_LABEL)
         .ok_or("timeline window not found")?;
     let state = app.state::<AppState>();
-    let prev = state.timeline_form.lock().unwrap().form;
+    let (prev, prev_peek) = {
+        let st = state.timeline_form.lock().unwrap();
+        (st.form, st.peek)
+    };
+    let prev_name = form_name(prev, prev_peek);
     match form {
         TimelineForm::Strip => {
             if prev == TimelineForm::Board && window.is_maximized().unwrap_or(false) {
@@ -240,26 +281,45 @@ pub fn set_form(app: &AppHandle, form: TimelineForm, strip_w: Option<f64>) -> Re
                     st.strip_w = Some(w);
                 }
                 st.form = TimelineForm::Strip;
+                st.peek = peek;
                 *st
             };
             let r = apply_strip(&window, &st);
-            crate::dev_log!("[timeline-form] strip (from {:?}) -> {:?}", prev, r);
+            if form_name(form, peek) != prev_name {
+                crate::dev_log!("[timeline-form] {} (from {}) -> {:?}", form_name(form, peek), prev_name, r);
+            }
         }
         TimelineForm::Board => {
             if prev == TimelineForm::Board {
-                return Ok(prev);
+                return Ok(prev_name);
             }
-            let board = state.timeline_form.lock().unwrap().board;
-            apply_board(&window, board);
-            state.timeline_form.lock().unwrap().form = TimelineForm::Board;
+            let (board, floating) = {
+                let st = state.timeline_form.lock().unwrap();
+                (st.board, st.floating)
+            };
+            apply_board(&window, board, floating);
+            {
+                let mut st = state.timeline_form.lock().unwrap();
+                st.form = TimelineForm::Board;
+                st.peek = false;
+            }
             crate::dev_log!("[timeline-form] board -> {:?}", board);
         }
     }
     crate::window_state::persist(app, &state);
-    if prev != form {
-        let _ = app.emit("timeline-form-changed", form_name(form));
+    let name = form_name(form, form == TimelineForm::Strip && peek);
+    if name != prev_name {
+        let _ = app.emit("timeline-form-changed", name);
     }
-    Ok(form)
+    Ok(name)
+}
+
+/// 召回（托盘 / 设置显示时间轴）:窥视态回完整条态;其余形态不动。
+pub fn unpeek(app: &AppHandle) {
+    let st = *app.state::<AppState>().timeline_form.lock().unwrap();
+    if st.form == TimelineForm::Strip && st.peek {
+        let _ = set_form(app, TimelineForm::Strip, false, None);
+    }
 }
 
 /// 启动恢复（window_state:restore 装载状态后调用）：上次是条态就恢复条态。
@@ -296,7 +356,8 @@ fn on_strip_drag_end(app: &AppHandle, cursor: (i32, i32)) {
     let to = all[to_i];
     let st = {
         let mut st = state.timeline_form.lock().unwrap();
-        if st.form != TimelineForm::Strip {
+        // 窥视态不记位置（把手几何 ≠ 条几何;指针移入已回完整条态,正常不会在 peek 下拖动）
+        if st.form != TimelineForm::Strip || st.peek {
             return;
         }
         if let Some(board) = st.board {
@@ -321,18 +382,66 @@ fn on_strip_drag_end(app: &AppHandle, cursor: (i32, i32)) {
 
 #[tauri::command]
 pub fn get_timeline_form(state: tauri::State<'_, AppState>) -> &'static str {
-    form_name(state.timeline_form.lock().unwrap().form)
+    let st = state.timeline_form.lock().unwrap();
+    form_name(st.form, st.peek)
 }
 
-/// `form` = "board" | "strip";`strip_width` = 条态内容 CSS 宽（条态下重复调用只更新宽度）。
+/// 窗口风格下发（前端挂载 + 设置变更）:记运行时值,看板态立即重施边缘组合;条态保持 Flat,展开时生效。
+#[tauri::command]
+pub fn set_timeline_style(app: AppHandle, floating: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window(crate::visibility::TIMELINE_LABEL)
+        .ok_or("timeline window not found")?;
+    let state = app.state::<AppState>();
+    let form = {
+        let mut st = state.timeline_form.lock().unwrap();
+        st.floating = floating;
+        st.form
+    };
+    if form == TimelineForm::Board {
+        crate::chrome::apply_timeline_style_chrome(&window, floating);
+    }
+    crate::dev_log!("[timeline-form] style floating={} (form {:?})", floating, form);
+    Ok(())
+}
+
+/// `form` = "board" | "strip" | "peek";`strip_width` = 条态内容 CSS 宽（条态下重复调用只更新宽度）。
 #[tauri::command]
 pub fn set_timeline_form(app: AppHandle, form: String, strip_width: Option<f64>) -> Result<&'static str, String> {
     let form = match form.as_str() {
-        "board" => TimelineForm::Board,
-        "strip" => TimelineForm::Strip,
+        "board" => (TimelineForm::Board, false),
+        "strip" => (TimelineForm::Strip, false),
+        "peek" => (TimelineForm::Strip, true),
         other => return Err(format!("unknown timeline form: {other}")),
     };
-    set_form(&app, form, strip_width).map(form_name)
+    set_form(&app, form.0, form.1, strip_width)
+}
+
+// ---------- 遮挡自动折 ----------
+
+/// 看板态且可见时,前台窗口覆盖看板所在显示器工作区 → 折成条态（主线程执行,执行前复核形态）。
+#[cfg(windows)]
+fn spawn_occlusion_watch(app: AppHandle, window: WebviewWindow) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || loop {
+        std::thread::sleep(OCCLUSION_POLL);
+        let state = app.state::<AppState>();
+        if !state.timeline_visible.load(Ordering::SeqCst) || state.timeline_form.lock().unwrap().form != TimelineForm::Board {
+            continue;
+        }
+        let Ok(hwnd) = window.hwnd() else { continue };
+        let Some(cover) = win::foreground_covering(hwnd.0 as isize) else { continue };
+        let inner = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let board = inner.state::<AppState>().timeline_form.lock().unwrap().form == TimelineForm::Board;
+            if board {
+                crate::dev_log!("[timeline-form] covered by {} -> fold to strip", cover);
+                let _ = set_form(&inner, TimelineForm::Strip, false, None);
+            }
+        });
+        // 等主线程折完再查,避免同一次遮挡重复排队
+        std::thread::sleep(OCCLUSION_POLL);
+    });
 }
 
 // ---------- 子类化（条态拖动约束 + 环境变化重施） ----------
@@ -341,6 +450,7 @@ pub fn install(app: &AppHandle) {
     #[cfg(windows)]
     if let Some(window) = app.get_webview_window(crate::visibility::TIMELINE_LABEL) {
         win::install(&window);
+        spawn_occlusion_watch(app.clone(), window);
     }
     #[cfg(not(windows))]
     let _ = app;
@@ -368,6 +478,49 @@ mod win {
     const REAPPLY_DELAY: Duration = Duration::from_millis(300);
 
     static WINDOW: OnceLock<WebviewWindow> = OnceLock::new();
+
+    /// 前台窗口外壳类名：桌面 / 任务栏 / 任务视图 / Alt+Tab 等覆盖整屏但不是「遮住看板的应用窗口」。
+    const SHELL_CLASSES: &[&str] = &[
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "MultitaskingViewFrame",
+        "XamlExplorerHostIslandWindow",
+        "ForegroundStaging",
+        "Windows.UI.Core.CoreWindow",
+    ];
+
+    /// 前台窗口是否覆盖 `own`（时间轴窗口）所在显示器的工作区（全屏或最大化）。
+    /// 覆盖 → 返回前台窗口类名;否则 None。
+    pub fn foreground_covering(own: isize) -> Option<String> {
+        use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, IsIconic, IsWindowVisible};
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_null() || fg as isize == own || IsWindowVisible(fg) == 0 || IsIconic(fg) != 0 {
+                return None;
+            }
+            let mut buf = [0u16; 128];
+            let n = GetClassNameW(fg, buf.as_mut_ptr(), buf.len() as i32);
+            let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            if SHELL_CLASSES.contains(&class.as_str()) {
+                return None;
+            }
+            let empty = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut r = empty;
+            if GetWindowRect(fg, &mut r) == 0 {
+                return None;
+            }
+            let monitor = MonitorFromWindow(own as HWND, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, rcMonitor: empty, rcWork: empty, dwFlags: 0 };
+            if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            let w = info.rcWork;
+            (r.left <= w.left && r.top <= w.top && r.right >= w.right && r.bottom >= w.bottom).then_some(class)
+        }
+    }
 
     pub fn install(window: &WebviewWindow) {
         let Ok(hwnd) = window.hwnd() else {
@@ -464,7 +617,7 @@ mod tests {
         let s = scr([0, 0, 2560, 1440], [0, 48, 2560, 1440], 1.5);
         let r = strip_rect(&s, 400.0, None, 1280);
         assert_eq!(r.y, 48);
-        assert_eq!(r.height, 54); // 36 × 1.5
+        assert_eq!(r.height, 62); // 41 × 1.5 = 61.5 → 62
         assert_eq!(r.width, 600);
         assert_eq!(r.x, 1280 - 300); // 无记忆 → 以看板中心居中
     }
@@ -489,8 +642,23 @@ mod tests {
         // 125% DPI × 150% 文本大小 = 1.875
         let s = scr([0, 0, 2560, 1440], [0, 0, 2560, 1392], 1.25 * 1.5);
         let r = strip_rect(&s, 320.0, None, 1280);
-        assert_eq!(r.height, 68); // 36 × 1.875 = 67.5 → 68
+        assert_eq!(r.height, 77); // 41 × 1.875 = 76.875 → 77
         assert_eq!(r.width, 600);
+    }
+
+    #[test]
+    fn peek_is_short_handle_centered_on_strip_top() {
+        let s = scr([0, 0, 2560, 1440], [0, 48, 2560, 1440], 1.5);
+        let strip = strip_rect(&s, 400.0, Some(300), 1280);
+        let peek = peek_rect(strip, s.scale);
+        assert_eq!(peek.y, strip.y);
+        assert_eq!(peek.width, 132); // 88 × 1.5
+        assert_eq!(peek.height, 14); // 9 × 1.5 = 13.5 → 14
+        // 居中于原条
+        assert_eq!(peek.x + peek.width as i32 / 2, strip.x + strip.width as i32 / 2);
+        // 原条比把手还窄 → 不超过原条
+        let narrow = Rect { width: 60, ..strip };
+        assert_eq!(peek_rect(narrow, s.scale).width, 60);
     }
 
     #[test]

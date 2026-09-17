@@ -316,6 +316,9 @@ impl Store {
                 let se: String = r.get(6)?;
                 let status = if hidden {
                     "hidden"
+                } else if merged_into.as_deref() == Some(SCRATCH_KEY) {
+                    // 手动归入 Scratch（合并目标 = Scratch 伪项目）与规则折叠同一状态
+                    "scratch"
                 } else if merged_into.is_some() {
                     "merged"
                 } else if se == SCRATCH_KEY {
@@ -415,12 +418,15 @@ impl Store {
         tx.commit().map_err(err)
     }
 
-    /// 把 `keys` 合并进 `into`（一层）。拒绝:并入自身（环）、目标本身已合并、源是他人的合并目标、Scratch 伪项目。
+    /// 把 `keys` 合并进 `into`（一层）。拒绝:并入自身（环）、目标本身已合并、源是他人的合并目标、Scratch 伪项目作源。
     /// 目标补建空 meta 行（显式项目,不受自动规则影响）。返回合并的键数。
+    /// **手动归入 Scratch**（管理列表点状态徽章在 Active / Scratch 间切换）= 以 `SCRATCH_KEY` 为目标
+    /// 合并;解析层不需改动（pm_res 取 Scratch 自身归属 = `__scratch`,Scratch 隐藏时连带不可）,列表状态报 `scratch`。
+    /// 只新增一种 merged_into 取值,无 schema 变化、不动既有行。
     pub fn merge_projects(&mut self, keys: &[String], into: &str) -> Result<usize, String> {
         let into = clean_key(into)?;
         let keys = clean_keys(keys)?;
-        if into == SCRATCH_KEY || keys.iter().any(|k| k == SCRATCH_KEY) {
+        if keys.iter().any(|k| k == SCRATCH_KEY) {
             return Err("Scratch cannot be merged".into());
         }
         if keys.contains(&into) {
@@ -669,6 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn manual_scratch_via_merge_into_scratch_key() {
+        let mut s = fixture();
+        let rule = ScratchRule::DEFAULT;
+        // 大目录（规则不折叠）手动归入 Scratch
+        assert_eq!(s.merge_projects(&keys(&["e:/work/big"]), SCRATCH_KEY).unwrap(), 1);
+        assert_eq!(pmap(&s, &rule)["e:/work/big"], SCRATCH_KEY);
+        let list = s.list_project_meta(&rule).unwrap();
+        assert!(list.rows.iter().all(|r| r.key != SCRATCH_KEY), "Scratch 伪项目仍不进管理列表");
+        let big = list.rows.iter().find(|r| r.key == "e:/work/big").unwrap();
+        assert_eq!((big.status.as_str(), big.effective_key.as_deref(), big.managed), ("scratch", Some(SCRATCH_KEY), true));
+        // Scratch 隐藏 → 连带不可见
+        s.set_project_meta(&input(SCRATCH_KEY, None, true)).unwrap();
+        assert!(!pmap(&s, &rule).contains_key("e:/work/big"));
+        s.set_project_meta(&input(SCRATCH_KEY, None, false)).unwrap();
+        // 回 Active：取消合并 + 保留行（Keep）
+        assert_eq!(s.unmerge_projects(&keys(&["e:/work/big"])).unwrap(), 1);
+        s.set_project_meta(&input("e:/work/big", None, false)).unwrap();
+        assert_eq!(pmap(&s, &rule)["e:/work/big"], "e:/work/big");
+        let big = s.list_project_meta(&rule).unwrap().rows.into_iter().find(|r| r.key == "e:/work/big").unwrap();
+        assert_eq!(big.status, "active");
+        // Scratch 仍不能作合并源
+        assert!(s.merge_projects(&keys(&[SCRATCH_KEY]), "e:/work/big").is_err());
+    }
+
+    #[test]
     fn merge_one_level_and_rejects_cycles() {
         let mut s = fixture();
         let rule = ScratchRule::DEFAULT;
@@ -696,7 +727,6 @@ mod tests {
         let target_as_source = s.merge_projects(&keys(&["e:/work/app"]), "e:/work/big");
         assert!(target_as_source.unwrap_err().contains("merge target"), "源是合并目标 → 拒绝（否则成环 / 两层）");
         assert!(s.merge_projects(&keys(&[SCRATCH_KEY]), "e:/work/big").is_err());
-        assert!(s.merge_projects(&keys(&["e:/work/big"]), SCRATCH_KEY).is_err());
         assert!(s.merge_projects(&[], "e:/work/big").is_err());
 
         // 目标隐藏 → 成员连带不可见

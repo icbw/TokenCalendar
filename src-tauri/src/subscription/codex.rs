@@ -172,6 +172,7 @@ pub fn fetch(adapter: &CodexAdapter, cred: RawCredential) -> SubscriptionSnapsho
     }
 
     let resp = req.timeout(std::time::Duration::from_secs(15)).call();
+    super::note_http(&resp);
     let body = match resp {
         Ok(r) => {
             adapter.gate.clear();

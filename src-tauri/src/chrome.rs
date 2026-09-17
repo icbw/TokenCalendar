@@ -180,20 +180,42 @@ pub fn apply_orb_chrome(window: &WebviewWindow) {
     set_ncr_disabled(window);
 }
 
-/// 应用 timeline（项目推进时间轴）窗口形态：边缘栈 = 挂件默认态原子组合
-/// （DONOTROUND + BORDER NONE + NCRP_DISABLED + shadow false，圆角由 CSS 独占），
+/// 应用 timeline（项目推进时间轴）窗口装配期形态：边缘栈 = 挂件默认态原子组合
+/// （DONOTROUND + BORDER NONE + NCRP_DISABLED + shadow false，圆角由 CSS 独占）。
+/// 起这只是装配初值：前端挂载即经 set_timeline_style 施加 Shadow / Flat
+/// （见 apply_timeline_style_chrome）。
 /// 与 widget 的差异：
 /// - **不置顶**（看板挂第二屏不需要，主屏会挡编辑器；条态置顶在 S4 由
 ///   `set_timeline_form` 切换，不在装配期定死）；
 /// - 可缩放（resizable=true 声明侧），min 480×200；初始 900×360 走 tauri.conf.json，
 ///   此处不 set_size（几何由 window_state restore 接管）；
-/// - 无材质档（边界：不装配材质 hook，透明度 CSS 化），组合装配后固定。
+/// - 无材质档（边界：不装配材质 hook，透明度 CSS 化）。
 pub fn apply_timeline_chrome(window: &WebviewWindow) {
     let _ = window.set_decorations(false);
     let _ = window.set_min_size(Some(tauri::LogicalSize::new(480.0, 200.0)));
     set_corner_preference(window, false);
     set_border_color_none(window);
     set_ncr_disabled(window);
+}
+
+/// timeline 窗口风格原子组合切换（「看看有阴影是否更好」,设置·Appearance
+/// Timeline appearance 的 Window style 两档）：
+/// - `shadow = true`（Shadow,默认）= 主窗口组合：NCRP 恢复系统默认 + DWM 阴影 + ROUND + BORDER NONE;
+///   CSS 侧外缘 8px 全透明呼吸位;
+/// - `shadow = false`（Flat）= 装配期组合（DONOTROUND + BORDER NONE + NCRP_DISABLED + shadow false）。
+/// 条态一律 Flat（贴顶细条不要阴影 / 呼吸位）;执行者 = timeline_form（形态切换与风格切换都经它）。
+/// NCR 相关属性必须整组切换（教训:勿单独改其一）。
+pub fn apply_timeline_style_chrome(window: &WebviewWindow, shadow: bool) {
+    if shadow {
+        set_ncr_default(window);
+        set_corner_preference(window, true);
+        set_border_color_none(window);
+        let _ = window.set_shadow(true);
+    } else {
+        set_corner_preference(window, false);
+        set_border_color_none(window);
+        set_ncr_disabled(window);
+    }
 }
 
 /// 挂件材质态边缘组合切换（spike；P4 教训：NCR 四属性必须作为

@@ -629,6 +629,7 @@ impl Adapter for DshAdapter {
                 next.size = size;
                 next.mtime = mtime;
             }
+            batch.watch_live(&next.turn.session_id, &file, next.mtime);
             batch.cursors.push((scope, next.to_json()));
         }
 
