@@ -149,6 +149,20 @@ pub fn peek_rect(strip: Rect, scale: f64) -> Rect {
     Rect { x, y: strip.y, width: w, height: h }
 }
 
+/// 条态宽度更新（不切形态）：只在条态（含窥视态）且宽度有效、确有变化时记下并要求重施几何。
+/// 看板态一律忽略——前端量宽回调与形态广播先后不定（展开时窗口先变大、`timeline-form-changed` 后到）,
+/// 迟到的宽度更新不得把刚展开的看板折回条态（无监测组时展开即缩回）。
+pub fn update_strip_width(st: &mut FormState, w: f64) -> bool {
+    if st.form != TimelineForm::Strip || !w.is_finite() || w <= 0.0 {
+        return false;
+    }
+    if st.strip_w.is_some_and(|cur| (cur - w).abs() < 1.0) {
+        return false;
+    }
+    st.strip_w = Some(w);
+    true
+}
+
 fn center(r: &Rect) -> (i32, i32) {
     (r.x + r.width as i32 / 2, r.y + r.height as i32 / 2)
 }
@@ -265,6 +279,10 @@ pub fn set_form(app: &AppHandle, form: TimelineForm, peek: bool, strip_w: Option
         (st.form, st.peek)
     };
     let prev_name = form_name(prev, prev_peek);
+    // 窥视态只从条态进入：前端 peek 计时器迟到（期间已展开）时不得把看板折回去
+    if form == TimelineForm::Strip && peek && prev == TimelineForm::Board {
+        return Ok(prev_name);
+    }
     match form {
         TimelineForm::Strip => {
             if prev == TimelineForm::Board && window.is_maximized().unwrap_or(false) {
@@ -405,7 +423,8 @@ pub fn set_timeline_style(app: AppHandle, floating: bool) -> Result<(), String> 
     Ok(())
 }
 
-/// `form` = "board" | "strip" | "peek";`strip_width` = 条态内容 CSS 宽（条态下重复调用只更新宽度）。
+/// `form` = "board" | "strip" | "peek";`strip_width` = 条态内容 CSS 宽（随形态切换一并带上;
+/// 单纯的宽度更新走 `set_timeline_strip_width`,不经本命令）。
 #[tauri::command]
 pub fn set_timeline_form(app: AppHandle, form: String, strip_width: Option<f64>) -> Result<&'static str, String> {
     let form = match form.as_str() {
@@ -415,6 +434,26 @@ pub fn set_timeline_form(app: AppHandle, form: String, strip_width: Option<f64>)
         other => return Err(format!("unknown timeline form: {other}")),
     };
     set_form(&app, form.0, form.1, strip_width)
+}
+
+/// 条态内容宽更新（前端 ResizeObserver 量宽回调专用）：不切形态,看板态无操作（见 `update_strip_width`）。
+/// 形态切换只走 `set_timeline_form`。
+#[tauri::command]
+pub fn set_timeline_strip_width(app: AppHandle, width: f64) -> Result<(), String> {
+    let window = app
+        .get_webview_window(crate::visibility::TIMELINE_LABEL)
+        .ok_or("timeline window not found")?;
+    let state = app.state::<AppState>();
+    let st = {
+        let mut st = state.timeline_form.lock().unwrap();
+        if !update_strip_width(&mut st, width) {
+            return Ok(());
+        }
+        *st
+    };
+    let _ = apply_strip(&window, &st);
+    crate::window_state::persist(&app, &state);
+    Ok(())
 }
 
 // ---------- 遮挡自动折 ----------
@@ -659,6 +698,28 @@ mod tests {
         // 原条比把手还窄 → 不超过原条
         let narrow = Rect { width: 60, ..strip };
         assert_eq!(peek_rect(narrow, s.scale).width, 60);
+    }
+
+    #[test]
+    fn strip_width_update_never_touches_board_form() {
+        // 看板态：迟到的宽度更新被忽略,形态与记忆宽度都不变
+        let mut st = FormState { strip_w: Some(158.0), ..FormState::default() };
+        assert!(!update_strip_width(&mut st, 640.0));
+        assert_eq!(st.form, TimelineForm::Board);
+        assert_eq!(st.strip_w, Some(158.0));
+        // 条态：有效且有变化才更新
+        st.form = TimelineForm::Strip;
+        assert!(update_strip_width(&mut st, 640.0));
+        assert_eq!(st.strip_w, Some(640.0));
+        assert!(!update_strip_width(&mut st, 640.4)); // 不足 1px 不重施
+        assert!(!update_strip_width(&mut st, 0.0));
+        assert!(!update_strip_width(&mut st, f64::NAN));
+        assert_eq!(st.strip_w, Some(640.0));
+        // 窥视态同属条态：更新宽度但不改 peek 子态
+        st.peek = true;
+        assert!(update_strip_width(&mut st, 300.0));
+        assert!(st.peek);
+        assert_eq!(st.form, TimelineForm::Strip);
     }
 
     #[test]

@@ -79,10 +79,17 @@ export async function getTimelineForm(): Promise<TimelineForm | null> {
   return tryInvoke<TimelineForm>('get_timeline_form')
 }
 
-/** 形态切换一个执行者：Rust 原子完成尺寸 + 位置 + 置顶;条态下重复调用只更新宽度。
+/** 形态切换一个执行者：Rust 原子完成尺寸 + 位置 + 置顶。只在用户 / 计时器确有切换意图时调用——
+ * 单纯的宽度更新走 setTimelineStripWidth。
  * stripWidth = 条态内容 CSS 宽（前端量出,Rust 按该屏 scale × 文本大小换算并钳到工作区）。 */
 export async function setTimelineForm(form: TimelineForm, stripWidth?: number): Promise<TimelineForm | null> {
   return tryInvoke<TimelineForm>('set_timeline_form', { form, stripWidth })
+}
+
+/** 条态内容宽更新（量宽回调专用）：不切形态,Rust 在看板态忽略——量宽回调与形态广播先后不定,
+ * 迟到的宽度更新不得把刚展开的看板折回条态。 */
+export async function setTimelineStripWidth(width: number): Promise<void> {
+  await tryInvoke<null>('set_timeline_strip_width', { width })
 }
 
 /** 时间轴看板窗口风格：true = Shadow（DWM 阴影 + 透明呼吸位,同主窗口）/ false = Flat。条态恒 Flat。 */

@@ -210,6 +210,7 @@ fn main() {
             visibility::toggle_timeline,
             timeline_form::get_timeline_form,
             timeline_form::set_timeline_form,
+            timeline_form::set_timeline_strip_width,
             timeline_form::set_timeline_style,
             subscription::get_subscription_snapshots,
             subscription::scan_subscription_credentials,

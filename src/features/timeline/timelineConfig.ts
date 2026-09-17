@@ -19,6 +19,11 @@ export const INACTIVE_BADGE_DAYS = 3
  * 超出最小尺寸的窗口在 [min, max] 之间等分,再多留白。横向日程视图删除,其常量随之移除。 */
 export const COL_MIN_PX = 140
 export const COL_MAX_PX = 320
+/** 容量只认看板态的量值：看板区高低于此值 = 窗口还是条态几何（条态窗口高 ≤ 41,看板最小高 200
+ * 扣顶栏与间隙后看板区 ≥ ~140）,不拿来算容量。 */
+export const BOARD_BODY_MIN_H_PX = 100
+/** 从未量到过看板（首次启动即条态且本机无记忆）时的容量缺省 = 缺省窗口宽 900 能放下的列数。 */
+export const DEFAULT_CAPACITY = 5
 /** 会话格（一格一会话,向下堆叠）最小高;空日行最小高。 */
 export const ITEM_MIN_PX = 36
 export const EMPTY_DAY_MIN_PX = 26

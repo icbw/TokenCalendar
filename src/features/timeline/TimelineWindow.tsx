@@ -78,7 +78,9 @@ import {
   COL_MAX_PX,
   COL_MIN_PX,
   BAR_HEAD_PX,
+  BOARD_BODY_MIN_H_PX,
   DAY_LABEL_COL_PX,
+  DEFAULT_CAPACITY,
   EMPTY_DAY_MIN_PX,
   HOVER_DELAY_MS,
   HOVER_GRACE_MS,
@@ -294,6 +296,19 @@ interface HoverState {
   top: number
 }
 
+/** 上次看板态容量的本机记忆（仅「启动即条态」时用;每窗口便利值,不进 prefs）。 */
+const CAPACITY_KEY = 'tc.timeline.boardCapacity'
+
+function readStoredCapacity(): number {
+  try {
+    const n = Number(localStorage.getItem(CAPACITY_KEY))
+    if (Number.isInteger(n) && n >= 1) return n
+  } catch {
+    // 读不到 → 缺省
+  }
+  return DEFAULT_CAPACITY
+}
+
 /** 双击跳转后会话条「已受理」描边的持续时间。 */
 const OPEN_FEEDBACK_MS = 1200
 
@@ -401,6 +416,8 @@ export default function TimelineWindow() {
   }, [])
   const peek = form === 'peek'
   const strip = form === 'strip' || peek
+  const formRef = useRef(form)
+  formRef.current = form
 
   // ---- 数据 ----
   const [today, setToday] = useState(() => localDay())
@@ -469,21 +486,40 @@ export default function TimelineWindow() {
   // ---- 容量：ResizeObserver 量看板区（contentRect 已扣 padding）,按最小尺寸算能放下的项目数 ----
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const barScrollRef = useRef<HTMLDivElement | null>(null)
-  const [bodySize, setBodySize] = useState({ w: 0, h: 0 })
+  // 容量只认看板态的量值：条态 / 窥视态下看板层仍参与布局,但窗口只有条那么宽,
+  // 照量会把容量压成 1 → 无监测组时条上只剩一个项目名。条态沿用上次看板态的容量（localStorage 记一份,
+  // 供「启动即条态」使用;读写失败退回缺省）。形态广播与窗口变形先后不定,所以两头都验：形态是看板,
+  // 且量到的高度确实是看板（条态窗口高 ≤ 41,看板最小高 200）。
+  const measured = useRef({ w: 0, h: 0 })
+  const [capacity, setCapacity] = useState(readStoredCapacity)
+  const commitCapacity = useCallback(() => {
+    const { w, h } = measured.current
+    if (formRef.current !== 'board' || h < BOARD_BODY_MIN_H_PX) return
+    const next = Math.max(1, Math.floor((w - DAY_LABEL_COL_PX) / (COL_MIN_PX + 2)))
+    setCapacity((prev) => {
+      if (prev === next) return prev
+      try {
+        localStorage.setItem(CAPACITY_KEY, String(next))
+      } catch {
+        // 记不下只影响下次「启动即条态」的项目数
+      }
+      return next
+    })
+  }, [])
   useLayoutEffect(() => {
     const el = bodyRef.current
     if (!el) return
     const ro = new ResizeObserver((entries) => {
       const r = entries[0]?.contentRect
-      if (r) setBodySize({ w: Math.floor(r.width), h: Math.floor(r.height) })
+      if (!r) return
+      measured.current = { w: Math.floor(r.width), h: Math.floor(r.height) }
+      commitCapacity()
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
-  const capacity = useMemo(() => {
-    const byWindow = Math.floor((bodySize.w - DAY_LABEL_COL_PX) / (COL_MIN_PX + 2))
-    return Math.max(1, byWindow)
-  }, [bodySize])
+  }, [commitCapacity])
+  // 窗口先变大、形态广播后到 → 广播到达时补认一次
+  useEffect(() => commitCapacity(), [form, commitCapacity])
 
   // ---- 项目集：监测组（原始键 → 有效键,组序）;组空回退按后端 last_day 倒序裁到容量 ----
   const rawToEff = useMemo(() => {
@@ -604,8 +640,6 @@ export default function TimelineWindow() {
   const stripInnerRef = useRef<HTMLDivElement | null>(null)
   const stripWidth = useRef(0)
   const sentWidth = useRef(0)
-  const formRef = useRef(form)
-  formRef.current = form
   const foldToStrip = useCallback(() => {
     sentWidth.current = stripWidth.current
     void windowService.setTimelineForm('strip', stripWidth.current || undefined)
@@ -620,12 +654,13 @@ export default function TimelineWindow() {
       // + 左右 1px 边框（inner 绝对定位在 padding box 内,窗口宽要含边框）+ 左右阴影透明边
       const w = Math.ceil(el.getBoundingClientRect().width) + 2 + 2 * STRIP_SHADOW_PAD_PX
       stripWidth.current = w
-      // 条态下内容变宽 / 变窄（项目增减、亮起补位、字体加载）→ 重发意图,Rust 保持左缘重施
-      // 带当前形态名重发（peek 下更新宽度不能把细边撑回完整条）
+      // 条态下内容变宽 / 变窄（项目增减、亮起补位、字体加载）→ 只更新宽度,Rust 保持左缘重施。
+      // 不经 setTimelineForm：formRef 可能落后于 Rust（展开时窗口先变大、形态广播后到）,
+      // 带形态名重发会把刚展开的看板折回去;宽度命令在看板态被 Rust 忽略
       const cur = formRef.current
       if ((cur === 'strip' || cur === 'peek') && w > 0 && Math.abs(w - sentWidth.current) >= 1) {
         sentWidth.current = w
-        void windowService.setTimelineForm(cur, w)
+        void windowService.setTimelineStripWidth(w)
       }
     })
     ro.observe(el)
@@ -635,7 +670,7 @@ export default function TimelineWindow() {
   useEffect(() => {
     if (strip && stripWidth.current > 0 && stripWidth.current !== sentWidth.current) {
       sentWidth.current = stripWidth.current
-      void windowService.setTimelineForm(formRef.current, stripWidth.current)
+      void windowService.setTimelineStripWidth(stripWidth.current)
     }
   }, [strip])
 
