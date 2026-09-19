@@ -950,7 +950,17 @@ mod tests {
                 error_count: 0,
                 retry_count: 0,
                 aborted: false,
-                parts: vec![TurnPart { day, model: t.model.into(), input: t.tokens, output: 0, total: t.tokens, model_calls: 1, turn_mark: t.mark }],
+                parts: vec![TurnPart {
+                    day,
+                    model: t.model.into(),
+                    input: t.tokens,
+                    output: 0,
+                    total: t.tokens,
+                    cache_read: 0,
+                    cache_write: 0,
+                    model_calls: 1,
+                    turn_mark: t.mark,
+                }],
             },
         );
     }

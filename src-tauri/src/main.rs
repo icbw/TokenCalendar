@@ -220,6 +220,12 @@ fn main() {
             subscription::set_subscription_poll_secs,
             subscription::set_subscription_fetch_policy,
             subscription::get_subscription_estimator,
+            // 只读查询面（价格 / 价格 × 用量 / 读数两层）
+            subscription::query::get_price_models,
+            subscription::query::get_price_at,
+            subscription::query::get_model_usage,
+            subscription::query::get_quota_readings,
+            subscription::query::get_quota_days,
             subscription::idle::get_subscription_idle,
             subscription::idle::set_subscription_idle_enabled,
             subscription::idle::note_subscription_attention,

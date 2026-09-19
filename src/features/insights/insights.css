@@ -535,3 +535,133 @@
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- 价格面板：美元当量 / 价格梯度 / 官方价目对照表 ----
+   表格是这三块的主体（四项单价 × 分模型,列多且要能逐列对齐比较）,所以这里
+   是 Insights 里唯一用 <table> 的地方：数字列一律 tabular-nums 右对齐,
+   模型列左对齐并在窄窗下截断（完整名与出处走 title）。 */
+
+.price-totals {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.price-total-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.price-total-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}
+
+.price-total-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 口径说明行（红线文案:等价价值 ≠ 账单）——常驻,不是 hover 才出现的免责声明 */
+.price-note {
+  margin: 8px 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+.price-note-warn {
+  color: var(--text-muted);
+}
+
+.price-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.price-table th {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text-faint);
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.price-table td {
+  text-align: right;
+  color: var(--text);
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.price-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.price-table th.price-col-model,
+.price-table td.price-col-model {
+  text-align: left;
+  width: 40%;
+  max-width: 0; /* 与 width 合用才让 ellipsis 在表格里生效 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.price-table td.price-col-model .legend-swatch {
+  margin-right: 6px;
+  vertical-align: baseline;
+}
+
+/* 价目不可信（回落 / 路由标签）：只标一个约等号,提示「这部分是估的」,不是误差棒 */
+.price-unknown-mark {
+  color: var(--text-faint);
+  font-weight: 700;
+}
+
+.price-table th.price-col-usd,
+.price-table td.price-col-usd {
+  width: 26%;
+  white-space: nowrap;
+}
+
+/* 占比条与金额同格:条在左、数在右,一眼看出谁占了这段区间的大头 */
+.price-share-track {
+  display: inline-block;
+  width: 52%;
+  height: 6px;
+  margin-right: 6px;
+  vertical-align: middle;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.price-share-bar {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  opacity: 0.85;
+}
+
+.price-usd-value {
+  font-weight: 600;
+}
+
+/* 分段明细行（只有被官方降过价的模型才有第二段） */
+.price-seg-row td {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.price-seg-row td.price-col-model {
+  padding-left: 22px;
+}

@@ -113,6 +113,9 @@ export interface EstimatorState {
   calibrated: boolean
   pairs: number
   est_pct_since_fetch: number
+  /** 归一化系数（**百分点 / 美元当量**）：1 美元的官方 API 当量吃掉多少配额。
+   * 取倒数 = 「1% 配额 ≈ 多少美元」。旧版 Rust 没有这个字段时为 undefined。 */
+  scale?: number
   /** 已收割留存的**本地读数**条数（Claude = 桌面端 plan-usage-history.json 的采样；
    * Codex = 会话 rollout 里 token_count 事件带的 rate_limits；0 = 本机没有这类源）。
    * 两个源自己都会滚掉旧数据，这个数会越过那条线继续涨 = 样本密度在累积。
@@ -159,4 +162,178 @@ export async function noteAttention(): Promise<void> {
 export async function applyIdleEnabled(enabled: boolean): Promise<void> {
   if (!inTauri) return
   await setIdleEnabled(enabled).catch(() => {})
+}
+
+// ---------- ：价格与读数的只读查询面 ----------
+// 五条命令都只读本地库、零网络。形状由 Rust subscription/query.rs 定，snake_case 契约。
+
+/** 一个模型的一段价目生效期（Rust price:PriceRow）。
+ * 四项 usd_* 都是**官方公布的 API 单价，USD / Mtok**。绝大多数模型终其生命周期只有
+ * 一行；有第二行的那个模型就是被官方降过价的——价格梯度图里的台阶正是这些行。 */
+export interface PriceModelRow {
+  platform: SubscriptionPlatform
+  /** 小写子串模式（'opus' / 'gpt-5-6-sol'…），匹配时最长键优先。 */
+  match_key: string
+  /** unix 秒；该价目开始生效。 */
+  effective_from: number
+  display_name: string
+  usd_input: number
+  usd_output: number
+  usd_cache_read: number
+  usd_cache_write: number
+  /** 出处（这张表是可审计的官方价格快照，要能回答「这个数从哪儿来」）。 */
+  source_note: string
+}
+
+/** 某平台全部模型的全部生效期（按 match_key、生效期升序）。 */
+export async function getPriceModels(
+  platform: SubscriptionPlatform,
+): Promise<PriceModelRow[] | null> {
+  return tryInvoke<PriceModelRow[]>('get_price_models', { platform })
+}
+
+export interface PriceAtResult {
+  platform: SubscriptionPlatform
+  /** 实际取价的时刻（unix 秒；入参省略时是 Rust 侧的「此刻」）。 */
+  at: number
+  /** 每个 match_key 至多一行。 */
+  rows: PriceModelRow[]
+}
+
+/** 某时刻各模型的有效价目（官方价目对照表 / 诊断用；at 省略 = 此刻）。 */
+export async function getPriceAt(
+  platform: SubscriptionPlatform,
+  at?: number,
+): Promise<PriceAtResult | null> {
+  return tryInvoke<PriceAtResult>('get_price_at', { platform, at: at ?? null })
+}
+
+/** 一个模型在一段价目生效期内的用量与美元当量。 */
+export interface ModelUsageSegment {
+  /** 该段价目的起点（null = 没命中任何价目键，单价来自回落常量）。 */
+  effective_from: number | null
+  /** 实际命中的价目键（null = 回落；codex-auto-review 命中的是它**路由到**的键）。 */
+  match_key: string | null
+  /** 价目是否可信（回落 / 路由标签 → false）。 */
+  known: boolean
+  usd_input: number
+  usd_output: number
+  usd_cache_read: number
+  usd_cache_write: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  usd: number
+}
+
+export interface ModelUsageRow {
+  model_key: string
+  display_name: string
+  known: boolean
+  /** 用户发起的对话轮次（COLLECTOR_GUIDE 红线口径）。
+   * **不按价目段切分**——轮次只有日粒度，摊到两段上就是造数据。 */
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  total_tokens: number
+  /** 美元当量合计（各段各按各自单价算完再相加）。 */
+  usd: number
+  /** 按价目生效期切开的明细（没被降过价的模型只有一段）。 */
+  segments: ModelUsageSegment[]
+}
+
+export interface ModelUsageResult {
+  platform: SubscriptionPlatform
+  /** 实际生效的日区间（回显；入参省略时 = 该平台在 collector 里的全部历史）。 */
+  from: string
+  to: string
+  usd_total: number
+  /** 其中价目不可信那部分（回落模型 + codex-auto-review）。提示用，不是误差棒。 */
+  usd_unknown: number
+  /** 按美元当量降序。 */
+  rows: ModelUsageRow[]
+}
+
+/** 区间内的分模型用量与代价，按各模型自己的价目生效段切分。
+ * from / to = 本地日期 'YYYY-MM-DD' 闭区间；省略 = 该平台的全部历史。
+ *
+ * **口径红线**：usd 是「这些 token 若按官方 API 单价计费值多少钱」的**当量**，
+ * 不是账单——用户付的是固定月费。文案一律说「相当于」。 */
+export async function getModelUsage(
+  platform: SubscriptionPlatform,
+  from?: string,
+  to?: string,
+): Promise<ModelUsageResult | null> {
+  return tryInvoke<ModelUsageResult>('get_model_usage', {
+    platform,
+    from: from ?? null,
+    to: to ?? null,
+  })
+}
+
+/** 归一化读数序列的一行（Rust model:QuotaReading）。 */
+export interface QuotaReading {
+  /** 读数时刻（unix 秒；语义随 source 不同）。 */
+  t: number
+  /** 窗口种类，原样透传：'5h' / '7d' / '7d_opus'。 */
+  kind: string
+  used_percent: number
+  /** 窗尾（unix 秒；null = **该来源不提供**，不是「没有窗尾」）。 */
+  resets_at: number | null
+  plan_type: string
+  source: 'api' | 'desktop' | 'rollout'
+}
+
+/** 读数序列（闭区间，unix 秒；kind 省略 = 全部窗口种类）。
+ * **年度曲线不要走这条**——那是几千行的量，日级汇总已经算好了（getQuotaDays）。 */
+export async function getQuotaReadings(
+  platform: SubscriptionPlatform,
+  from: number,
+  to: number,
+  kind?: string,
+): Promise<QuotaReading[] | null> {
+  return tryInvoke<QuotaReading[]>('get_quota_readings', {
+    platform,
+    kind: kind ?? null,
+    from,
+    to,
+  })
+}
+
+/** 日级汇总的一行（Rust model:QuotaDay；纯派生，可从读数层完整重建）。 */
+export interface QuotaDay {
+  /** 本地日期 'YYYY-MM-DD'。 */
+  day: string
+  kind: string
+  /** 当日读数条数（按时刻去重之后）。 */
+  n: number
+  t_first: number
+  t_last: number
+  used_first: number
+  used_last: number
+  used_max: number
+  used_min: number
+  /** 当日观测到的额度消耗（相邻读数正向差之和）。
+   * **是下界不是账单**——滚动窗口里消耗与过期同时发生。 */
+  gain_pct: number
+  /** 当日观测到的窗口回收（负向差之和的绝对值）。 */
+  drop_pct: number
+  /** 当日跨过窗口重置的次数（两端有一端不提供窗尾就判不出来，恒为 0）。 */
+  resets: number
+  /** 当天第一条读数与它前面那条之间的间隔（秒）。讲「这天用了多少」必须同时看它
+   * ——它说明这笔涨幅是跨多久攒出来的。 */
+  carry_secs: number
+}
+
+/** 日级汇总（闭区间，本地日期 'YYYY-MM-DD'；kind 省略 = 全部种类）。 */
+export async function getQuotaDays(
+  platform: SubscriptionPlatform,
+  from: string,
+  to: string,
+  kind?: string,
+): Promise<QuotaDay[] | null> {
+  return tryInvoke<QuotaDay[]>('get_quota_days', { platform, kind: kind ?? null, from, to })
 }

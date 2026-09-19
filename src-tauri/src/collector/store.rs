@@ -178,6 +178,13 @@ pub struct TurnPart {
     pub input: i64,
     pub output: i64,
     pub total: i64,
+    /// cache 两项落到原始层——口径变更要能只读库内原始层就地重算（migrations.rs 开篇原则）。
+    /// **必须带 `serde（default)`**:本结构随 `TurnAcc.parts` 序列化进游标,缺字段会让旧游标
+    /// 整条反序列化失败 → 该源从零重扫 → 历史整份重复入账。
+    #[serde(default)]
+    pub cache_read: i64,
+    #[serde(default)]
+    pub cache_write: i64,
     pub model_calls: i64,
     pub turn_mark: i64,
 }
@@ -349,7 +356,7 @@ pub struct Store {
 /// v12 = Claude Code 续聊 / fork 副本文件按行 uuid 折进根会话（新表 seen_line / session_alias）→ 清库重扫。
 /// v13 = 项目归属口径:Claude Code 按会话文件所在文件夹（源自己的分组）、ZCode 子会话继承根会话、
 /// Codex 会话行取源 `threads.cwd` → **就地升级**（migrations.rs,备份后重算已有行,不清库）。
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 /// 低于此版本的库仍走清库重建（结构差异逐版累积,已发布用户最低 v10 = 0.5.7）;v12 起只就地迁移。
 const LEGACY_RESET_VERSION: i64 = 12;
 
@@ -439,6 +446,8 @@ CREATE TABLE IF NOT EXISTS turn_raw (
     input_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     total_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_key, session_id, turn_seq)
 );
 CREATE INDEX IF NOT EXISTS turn_raw_by_day ON turn_raw (agent_key, day);
@@ -452,6 +461,8 @@ CREATE TABLE IF NOT EXISTS turn_part (
     input_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     total_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     model_calls    INTEGER NOT NULL DEFAULT 0,
     turn_mark      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_key, session_id, turn_seq, day, model_key)
@@ -607,6 +618,10 @@ impl Store {
         // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
         // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
         // 口径语义与实现模式见 §对话轮。
+        // v15 = Claude Code 的 total 口径:Anthropic 的 input_tokens 是 cache-exclusive 且无 provider total,
+        // 旧口径 total = input + output 退化成「约等于 output」,低估约 100〜220 倍 →
+        // total 改四项和;原始层 turn_raw / turn_part 补 cache 两列,存量按日格 cache 分摊回填
+        // → 就地升级,不清库（migrations.rs）。
         // v13 起迁移纪律（migrations.rs）:结构用 CREATE IF NOT EXISTS / ALTER 补齐,口径用库内原始层就地重算,
         // 不再清库重扫。v12 之前的库结构与现行差异太大（原始层 / credit / seen_line 逐版新增）,仍走一次清库到 v12。
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -635,6 +650,13 @@ impl Store {
                 tx.execute_batch("PRAGMA user_version = 14").map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 crate::dev_log!("[collector] schema -> 14 in place: {:?}", report);
+            }
+            if version < 15 {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let report = super::migrations::upgrade_v15(&tx)?;
+                tx.execute_batch("PRAGMA user_version = 15").map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                crate::dev_log!("[collector] schema -> 15 in place: {:?}", report);
             }
         }
         Ok(Store { conn, live: BTreeMap::new(), turn_span: None, pending_usage: BTreeMap::new() })
@@ -1383,6 +1405,77 @@ impl Store {
             by_model_day,
         })
     }
+
+    /// 某个 agent 在 `[from_day, to_day]`（本地日,闭区间）内的
+    /// **分模型 × 小时**用量四项 `[输入, 输出, 缓存读, 缓存写]`。
+    ///
+    /// 订阅侧的价目按**时刻**取（`price:price_at`）,所以这里给到小时而不是天：
+    /// 一个模型真被降价时,分界线落在哪一天的哪一刻就从哪一刻切开,不需要「这一天
+    /// 算旧价还是新价」这种人为规则。小时表与日表在 codex / claude-code 两源上逐位
+    /// 相等,所以用它不损失任何量。
+    pub fn model_usage_hours(
+        &self,
+        agent_key: &str,
+        from_day: &str,
+        to_day: &str,
+    ) -> Vec<(String, u8, String, [i64; 4])> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT day, hour, model_key, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens
+               FROM hourly_usage
+              WHERE agent_key = ?1 AND day >= ?2 AND day <= ?3
+              ORDER BY day, hour, model_key",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map(rusqlite::params![agent_key, from_day, to_day], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?.clamp(0, 23) as u8,
+                r.get::<_, String>(2)?,
+                [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?],
+            ))
+        });
+        it.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 同区间的**分模型用户轮次**（`daily_usage.request_count` 口径
+    /// = 用户发起的对话轮次,COLLECTOR_GUIDE 红线,不是模型调用 / 工具调用）。
+    ///
+    /// 只到天——小时表里没有这一列。所以它**不按价目段切分**,只挂在模型上
+    /// （切分一天的轮次得靠按 token 比例摊,那是造数据）。
+    pub fn model_requests(
+        &self,
+        agent_key: &str,
+        from_day: &str,
+        to_day: &str,
+    ) -> Vec<(String, i64)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT model_key, COALESCE(SUM(request_count), 0)
+               FROM daily_usage
+              WHERE agent_key = ?1 AND day >= ?2 AND day <= ?3
+              GROUP BY model_key ORDER BY model_key",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map(rusqlite::params![agent_key, from_day, to_day], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        });
+        it.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 该 agent 有用量记录的日期跨度（`None` = 一条都没有）。
+    /// 查询面用它把「区间没给」折成「全部历史」。
+    pub fn agent_day_span(&self, agent_key: &str) -> Option<(String, String)> {
+        self.conn
+            .query_row(
+                "SELECT MIN(day), MAX(day) FROM daily_usage WHERE agent_key = ?1",
+                [agent_key],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .ok()
+            .and_then(|(a, b)| Some((a?, b?)))
+    }
 }
 
 #[cfg(test)]
@@ -2085,7 +2178,7 @@ mod tests {
     }
 
     fn part(day: &str, model: &str, total: i64, calls: i64, mark: i64) -> TurnPart {
-        TurnPart { day: day.into(), model: model.into(), input: total, output: 0, total, model_calls: calls, turn_mark: mark }
+        TurnPart { day: day.into(), model: model.into(), input: total, output: 0, total, cache_read: 0, cache_write: 0, model_calls: calls, turn_mark: mark }
     }
 
     fn raw_turn(sid: &str, seq: i64, day: &str, start: i64, gap: Option<i64>, parts: Vec<TurnPart>) -> TurnRow {

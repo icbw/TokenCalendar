@@ -111,16 +111,47 @@ const AUTO_REVIEW_ROUTES_TO: &str = "gpt-5-6-luna";
 /// 每个模型按它**在该时刻生效**的价目取价——一个区间里的不同模型各取各的时间线,
 /// 所以「区间跨世代」这个问题不存在。
 pub fn cost_of(platform: Platform, model_key: &str, t: &Tokens, at: i64) -> (f64, bool) {
-    let (input, output, cache_read, cache_write, known) = resolve(platform, model_key, at);
-    let usd = input * t.input as f64
-        + output * t.output as f64
-        + cache_read * t.cache_read as f64
-        + cache_write * t.cache_write as f64;
-    (usd / PER_MTOK, known)
+    let p = priced_at(platform, model_key, at);
+    (p.usd_of(t), p.known)
 }
 
-/// 取该模型在该时刻的四项单价 + 是否可信。
-fn resolve(platform: Platform, model_key: &str, at: i64) -> (f64, f64, f64, f64, bool) {
+/// 某个模型在某个时刻实际用来计价的那一组单价（含**回落**与**路由折价**之后的结果）。
+///
+/// 这是 [`cost_of`] 心里那把尺子的外露形态。S2 的查询面要回答「这段用量是按哪条
+/// 价目算出来的」,而答案不能是"再查一次 price 表"——回落模型与 `codex-auto-review`
+/// 的折价都发生在 [`cost_of`] 里,查 price 表看不,两条路就会给出不同的数。
+/// 所以取价只有这一个入口,代价计算与展示共用它（S2「一个阶段数据集对应
+/// 一个价格指标」）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Priced {
+    /// 命中的价目段起点（`None` = 没命中任何键,四项单价来自回落常量）。
+    pub effective_from: Option<i64>,
+    /// 命中行的展示名;没命中则原样回 `model_key`。
+    pub display_name: String,
+    /// 实际命中的 `match_key`（`None` = 回落）。`codex-auto-review` 命中的是它
+    /// **路由到**的那个键,所以这个字段同时也说明了折价按谁算。
+    pub match_key: Option<String>,
+    pub usd_input: f64,
+    pub usd_output: f64,
+    pub usd_cache_read: f64,
+    pub usd_cache_write: f64,
+    /// 价目是否可信（回落 / 路由标签 → false,语义见 [`AUTO_REVIEW`]）。
+    pub known: bool,
+}
+
+impl Priced {
+    /// 一笔 token 明细按这组单价折成的**美元当量**。
+    pub fn usd_of(&self, t: &Tokens) -> f64 {
+        (self.usd_input * t.input as f64
+            + self.usd_output * t.output as f64
+            + self.usd_cache_read * t.cache_read as f64
+            + self.usd_cache_write * t.cache_write as f64)
+            / PER_MTOK
+    }
+}
+
+/// 取该模型在该时刻实际生效的一组单价（口径见 [`Priced`]）。
+pub fn priced_at(platform: Platform, model_key: &str, at: i64) -> Priced {
     let fb = match platform {
         Platform::Claude => CLAUDE_FALLBACK,
         Platform::Codex => CODEX_FALLBACK,
@@ -130,8 +161,26 @@ fn resolve(platform: Platform, model_key: &str, at: i64) -> (f64, f64, f64, f64,
     // 路由标签:折成当前路由的价,但不给 known——理由见 AUTO_REVIEW
     let lookup_key = if auto_review { AUTO_REVIEW_ROUTES_TO } else { model_key };
     match price::price_at(platform, lookup_key, at) {
-        Some(r) => (r.usd_input, r.usd_output, r.usd_cache_read, r.usd_cache_write, !auto_review),
-        None => (fb.input, fb.output, fb.cache_read, fb.cache_write, false),
+        Some(r) => Priced {
+            effective_from: Some(r.effective_from),
+            display_name: r.display_name,
+            match_key: Some(r.match_key),
+            usd_input: r.usd_input,
+            usd_output: r.usd_output,
+            usd_cache_read: r.usd_cache_read,
+            usd_cache_write: r.usd_cache_write,
+            known: !auto_review,
+        },
+        None => Priced {
+            effective_from: None,
+            display_name: model_key.to_string(),
+            match_key: None,
+            usd_input: fb.input,
+            usd_output: fb.output,
+            usd_cache_read: fb.cache_read,
+            usd_cache_write: fb.cache_write,
+            known: false,
+        },
     }
 }
 

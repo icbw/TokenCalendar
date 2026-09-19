@@ -1,8 +1,15 @@
 //! Claude Code 适配器：`~/.claude/projects/**/*.jsonl` 递归（CLAUDE_CONFIG_DIR 可覆盖）。
 //!
-//! 口径（跟随旧项目）：仅 `type=="assistant"` 且 `message.usage` 存在的行；
-//! input/output 取 `message.usage.input_tokens / output_tokens` 原始值（cache 分项
-//! 独立字段,不计入 total）；total = input + output（Anthropic 无 total 字段的旧约定）；
+//! 口径（起）：仅 `type=="assistant"` 且 `message.usage` 存在的行；
+//! input/output 取 `message.usage.input_tokens / output_tokens` 原始值；
+//! **total = input + output + cache_read + cache_write**。
+//! Anthropic 的 usage 没有 total 字段,而 `input_tokens` 是 **cache-exclusive** 的——开了
+//! prompt caching 之后真实输入几乎全落在 `cache_read_input_tokens` /
+//! `cache_creation_input_tokens` 里,`input_tokens` 只剩个位数（本机一行:
+//! in=2 / cache_write=2623 / cache_read=99404 / out=459）。旧口径 total = input + output
+//! 因此退化成「约等于 output」,把 Claude 的用量低估约 100〜220 倍（
+//! _claude-total-excludes-cache）。四项和正是守则给出的自洽关系
+//! `total = input_excl + cache + output`。
 //! 时间取顶层 `timestamp`（RFC3339）→ 本地日。模型缺失填 "unknown"。
 //!
 //! **v8 token 去重**：一次 API 响应被流式拆成多条 assistant 行（thinking / text / tool_use
@@ -123,13 +130,9 @@ fn assistant_usage(v: &Value) -> Option<(String, u8, String, Tokens)> {
         .unwrap_or("unknown")
         .to_string();
     let (day, hour) = rfc3339_to_local_day_hour(v.get("timestamp")?.as_str()?)?;
-    let tokens = Tokens {
-        input,
-        output,
-        total: input + output,
-        cache_read: get("cache_read_input_tokens"),
-        cache_write: get("cache_creation_input_tokens"),
-    };
+    let (cache_read, cache_write) = (get("cache_read_input_tokens"), get("cache_creation_input_tokens"));
+    // total 四项和:Anthropic 无 provider total,且 input 不含 cache（见文件头口径）。
+    let tokens = Tokens { input, output, total: input + output + cache_read + cache_write, cache_read, cache_write };
     Some((day, hour, model, tokens))
 }
 
@@ -633,7 +636,7 @@ mod tests {
     fn usage_fields_and_zero_skip() {
         let v: Value = serde_json::from_str(&assistant("2026-09-05T18:30:00.123Z", "msg_01", r#"{"type":"text","text":"x"}"#, 1234, 567)).unwrap();
         let (day, hour, model, t) = assistant_usage(&v).unwrap();
-        assert_eq!((t.input, t.output, t.total, t.cache_read, t.cache_write), (1234, 567, 1801, 4800, 120));
+        assert_eq!((t.input, t.output, t.total, t.cache_read, t.cache_write), (1234, 567, 1234 + 567 + 4800 + 120, 4800, 120));
         assert_eq!(model, "claude-opus-5");
         assert!(day.len() == 10 && hour <= 23);
         let zero: Value = serde_json::from_str(r#"{"type":"assistant","timestamp":"2026-09-05T18:30:00Z","message":{"model":"m","usage":{"input_tokens":0,"output_tokens":0}}}"#).unwrap();
@@ -650,6 +653,8 @@ mod tests {
         line.replace(S, S2)
     }
     const TEXT: &str = r#"{"type":"text","text":"x"}"#;
+    /// 冻结样本每条 assistant 行带的 cache 两项（同一 message.id 只入账一次）。
+    const CPM: i64 = 4800 + 120;
 
     /// 根文件:两轮 + 末尾一条未得响应的输入（实证:根文件末尾的 stop_hook / 中断行不被复制）。
     fn root_lines() -> Vec<String> {
@@ -760,9 +765,9 @@ mod tests {
         let calls: Vec<i64> = turns.iter().map(|t| t.model_calls).collect();
         assert_eq!(calls, vec![1, 1, 0, 1 + 1, 1], "第 4 轮含子代理调用");
         assert_eq!(turns[2].aborted, false, "根文件末尾未响应的轮不判中止");
-        assert_eq!(turns.iter().map(|t| t.total_tokens).sum::<i64>(), 110 + 220 + 330 + 440 + 55, "token 只计一份");
+        assert_eq!(turns.iter().map(|t| t.total_tokens).sum::<i64>(), 110 + 220 + 330 + 440 + 55 + 4 * CPM, "token 只计一份");
         let (tasks, rows, requests, tokens, aliases, seen) = family_summary(&store);
-        assert_eq!((tasks, rows, requests, tokens), (1, 5, 4, 110 + 220 + 330 + 440 + 55));
+        assert_eq!((tasks, rows, requests, tokens), (1, 5, 4, 110 + 220 + 330 + 440 + 55 + 4 * CPM));
         assert_eq!((aliases, seen), (1, 5 + 4 + 2), "一个别名;已计行 = 根 5 + fork 新 4 + 子代理 2");
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
@@ -785,7 +790,7 @@ mod tests {
         let sa = family_summary(&a);
         let sb = family_summary(&b);
         assert_eq!(sa, sb, "两种到达顺序计数一致");
-        assert_eq!(sa, (1, 5, 4, 110 + 220 + 330 + 440, 1, 9));
+        assert_eq!(sa, (1, 5, 4, 110 + 220 + 330 + 440 + 4 * CPM, 1, 9));
         assert_eq!(a.test_task_sessions(META.id), vec![S.to_string()], "真实顺序:根文件的 sessionId 是根");
         assert_eq!(b.test_task_sessions(META.id), vec![S2.to_string()], "极端顺序:先到者为根,根文件成续篇");
         assert!(a.test_project_conservation().is_empty() && b.test_project_conservation().is_empty());
@@ -804,7 +809,7 @@ mod tests {
             ],
         );
         let _ = std::fs::remove_dir_all(&dir_c);
-        assert_eq!(family_summary(&c), (1, 6, 5, 110 + 220 + 330 + 440 + 550, 1, 11));
+        assert_eq!(family_summary(&c), (1, 6, 5, 110 + 220 + 330 + 440 + 550 + 5 * CPM, 1, 11));
     }
 
     /// 旧版副本（2026-09-09 前的桌面版,实证 2c0e1ae7 / 7494e2a8 族）:复制行连 `sessionId` 都沿用根会话,
@@ -824,7 +829,7 @@ mod tests {
             &[vec![(root_rel.as_str(), root_lines())], vec![(fork_rel.as_str(), old_fork)]],
         );
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(family_summary(&store), (1, 4, 3, 110 + 220 + 330, 1, 5 + 2));
+        assert_eq!(family_summary(&store), (1, 4, 3, 110 + 220 + 330 + 3 * CPM, 1, 5 + 2));
         assert_eq!(store.test_task_sessions(META.id), vec![S.to_string()]);
         let alias: Option<String> = store.session_root_alias(META.id, S2);
         assert_eq!(alias.as_deref(), Some(S), "别名取文件名主干");
@@ -875,7 +880,7 @@ mod tests {
         assert_eq!((t1.subagent_count, t1.subagent_calls), (1, 1), "子代理并入第 1 轮");
         assert_eq!(t1.wall_ms, Some(30_000), "注入之后的事件不延长 wall");
         assert_eq!(t1.tool_ms, Some(3_000));
-        assert_eq!(t1.total_tokens, 110 + 220 + 330 + 55, "按 message.id 去重 + 子代理 token 并入");
+        assert_eq!(t1.total_tokens, 110 + 220 + 330 + 55 + 3 * CPM, "按 message.id 去重 + 子代理 token 并入");
         assert_eq!(t1.project_key, "e:/Work/Demo");
         assert_eq!(t1.gap_ms, None);
         assert_eq!(t1.ttft_ms, None);
@@ -896,7 +901,7 @@ mod tests {
         // request_count:两次真实输入拿到响应（第 1、3 轮）;注入与中止不计
         let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
         assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 2);
-        assert_eq!(rows[0].month_total, 110 + 220 + 330 + 11 + 55);
+        assert_eq!(rows[0].month_total, 110 + 220 + 330 + 11 + 55 + 4 * CPM);
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
 }

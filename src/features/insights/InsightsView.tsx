@@ -12,6 +12,7 @@ import { formatFull } from '../matrix/matrixScale'
 import { OUTLIER_Z, TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
+import PricingBlock from './PricingBlock'
 import { HOUR_BUCKET_MAX_DAYS, rangeShortLabel, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
 import { openProjectManager } from '../projects/projectManagerStore'
@@ -676,6 +677,7 @@ export default function InsightsView() {
       <div className="insights-scroll">
         {trend.card}
         <AnomalyBlock />
+        <PricingBlock />
         {showCredit && <CreditBlock />}
       </div>
     </div>

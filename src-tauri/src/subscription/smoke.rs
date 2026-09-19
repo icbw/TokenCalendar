@@ -2449,3 +2449,251 @@ fn codex_quota_token_weights_on_real_db() {
         }
     }
 }
+
+// ============================================================================
+// 只读查询面的真库核对
+// ============================================================================
+
+/// 把 collector.db（含 -wal / -shm）整份复制到工作目录。
+fn clone_collector(src: &PathBuf, out: &PathBuf) -> PathBuf {
+    std::fs::create_dir_all(out).expect("create out dir");
+    let dst = out.join("collector.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", src.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", dst.display())).expect("copy db");
+        }
+    }
+    dst
+}
+
+/// 本地日 `day` 的第 `hour` 小时起点（unix 秒;独立复算用,**故意不复用**
+/// `query:local_hour_ts`——复用就成了自己对自己）。
+fn local_hour(day: &str, hour: u8) -> i64 {
+    use chrono::TimeZone;
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(hour as u32, 0, 0))
+        .and_then(|dt| chrono::Local.from_local_datetime(&dt).earliest())
+        .map(|dt| dt.timestamp())
+        .expect("local hour")
+}
+
+fn mmdd(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|d| d.format("%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// **S2 查询面真库核对**：五条命令的本体各跑一遍真库副本,核对
+///  价目表出得来,且某个时刻每个键恰好一行;
+///  分模型用量对 `hourly_usage` **token 守恒**、对 `cost_of` **代价逐位相同**;
+///  读数两层按序、条数与库里的 `SELECT COUNT（*)` 对得上。
+#[test]
+#[ignore]
+fn s2_query_surface_on_real_db() {
+    use super::price;
+    use super::query;
+
+    let Some(sub_src) = real_db() else {
+        eprintln!("没有找到订阅真库,跳过（设 TC_SUB_DB=<路径>）");
+        return;
+    };
+    let out = std::env::var_os("TC_SMOKE_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tc_s2_smoke");
+    let _ = std::fs::remove_dir_all(&out);
+    let sub_dst = clone_db(&sub_src, &out);
+    let sub = SubStore::open(&sub_dst).expect("open subscriptions.db");
+    // 价目索引从库装载（启动顺序里这一步排在重算之前,这里照做）
+    price::load_from(&sub);
+    println!("订阅库副本 -> {}", sub_dst.display());
+    println!("价目索引来自库: {}", price::is_loaded_from_db());
+
+    // ---------- （1) 价目表 ----------
+    let now = chrono::Utc::now().timestamp();
+    for platform in [Platform::Codex, Platform::Claude] {
+        let all = price::rows_for(platform);
+        let at_now = price::rows_at(platform, now);
+        let keys: std::collections::BTreeSet<&str> =
+            all.iter().map(|r| r.match_key.as_str()).collect();
+        println!(
+            "\n=== {} 价目：{} 行 / {} 个键;此刻有效 {} 行 ===",
+            platform.as_str(),
+            all.len(),
+            keys.len(),
+            at_now.len()
+        );
+        assert_eq!(at_now.len(), keys.len(), "某时刻每个键必须恰好一行");
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &at_now {
+            assert!(seen.insert(r.match_key.clone()), "{} 出了两行", r.match_key);
+        }
+        let multi: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| all.iter().filter(|r| r.match_key == *k).count() > 1)
+            .collect();
+        println!(
+            "  有第二段生效期的键（= 被官方降过价的模型）：{}",
+            if multi.is_empty() { "（无）".to_string() } else { multi.join(", ") }
+        );
+        for r in at_now.iter().take(3) {
+            println!(
+                "  {:<16} {:<24} in {:>7.3} out {:>7.3} cr {:>7.4} cw {:>7.3}  自 {}",
+                r.match_key,
+                r.display_name,
+                r.usd_input,
+                r.usd_output,
+                r.usd_cache_read,
+                r.usd_cache_write,
+                chrono::DateTime::from_timestamp(r.effective_from, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()
+            );
+        }
+    }
+
+    // ---------- （2) 分模型用量 ----------
+    let Some(col_src) = real_collector_db() else {
+        eprintln!("没有找到 collector.db,分模型用量这一段跳过（设 TC_COLLECTOR_DB=<路径>）");
+        return;
+    };
+    let col_dst = clone_collector(&col_src, &out);
+    let col = crate::collector::store::Store::open(&col_dst).expect("open collector.db");
+    println!("\n采集库副本 -> {}", col_dst.display());
+
+    for platform in [Platform::Codex, Platform::Claude] {
+        let got = query::model_usage(&col, platform, None, None);
+        println!(
+            "\n=== {} 分模型用量 {} 〜 {}：{} 个模型,合计 ${:.2}（其中价目不可信 ${:.2}）===",
+            platform.as_str(),
+            got.from,
+            got.to,
+            got.rows.len(),
+            got.usd_total,
+            got.usd_unknown
+        );
+        println!(
+            "  {:<22} {:>6} {:>13} {:>12} {:>14} {:>10} {:>4}",
+            "模型", "轮次", "输入", "输出", "缓存读", "美元当量", "段"
+        );
+        for r in &got.rows {
+            println!(
+                "  {:<22} {:>6} {:>13} {:>12} {:>14} {:>10.2} {:>4}{}",
+                r.model_key,
+                r.requests,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.usd,
+                r.segments.len(),
+                if r.known { "" } else { "  <- 价目不可信" }
+            );
+        }
+
+        // token 守恒：查询面的四项合计 == 小时表原始合计
+        let agent = platform.collector_source();
+        let raw: (i64, i64, i64, i64) = rusqlite::Connection::open(&col_dst)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
+                   FROM hourly_usage WHERE agent_key = ?1",
+                [agent],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        let sum = |f: fn(&query::ModelUsageRow) -> i64| got.rows.iter().map(f).sum::<i64>();
+        assert_eq!(
+            (
+                sum(|r| r.input_tokens),
+                sum(|r| r.output_tokens),
+                sum(|r| r.cache_read_tokens),
+                sum(|r| r.cache_write_tokens)
+            ),
+            raw,
+            "{} 查询面的 token 必须与小时表逐项相等",
+            platform.as_str()
+        );
+        for r in &got.rows {
+            assert_eq!(
+                r.input_tokens,
+                r.segments.iter().map(|s| s.input_tokens).sum::<i64>(),
+                "{} 段内 token 不守恒",
+                r.model_key
+            );
+            assert_eq!(
+                r.total_tokens,
+                r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens
+            );
+        }
+
+        // 代价一致：逐小时用 cost_of 自己再算一遍,必须与查询面逐位相同
+        let mut independent = 0.0f64;
+        for (day, hour, model, t) in col.model_usage_hours(agent, &got.from, &got.to) {
+            let tokens = super::cost::Tokens {
+                input: t[0],
+                output: t[1],
+                cache_read: t[2],
+                cache_write: t[3],
+            };
+            independent += super::cost::cost_of(platform, &model, &tokens, local_hour(&day, hour)).0;
+        }
+        println!(
+            "  逐小时 cost_of 独立复算：${independent:.6}   查询面：${:.6}",
+            got.usd_total
+        );
+        assert!(
+            (independent - got.usd_total).abs() < 1e-6,
+            "{} 查询面与 cost_of 必须给出同一个数",
+            platform.as_str()
+        );
+    }
+
+    // ---------- （3) 读数两层 ----------
+    let conn = rusqlite::Connection::open(&sub_dst).unwrap();
+    for platform in [Platform::Codex, Platform::Claude] {
+        let kinds = sub.quota_kinds(platform);
+        println!("\n=== {} 读数两层（种类 {:?}）===", platform.as_str(), kinds);
+        let mut readings_total = 0usize;
+        for k in &kinds {
+            let rs = sub.quota_readings(platform, k, i64::MIN / 2, i64::MAX / 2);
+            let ds = sub.quota_days(platform, k, "0000-00-00", "9999-99-99");
+            readings_total += rs.len();
+            let gain: f64 = ds.iter().map(|d| d.gain_pct).sum();
+            let drop: f64 = ds.iter().map(|d| d.drop_pct).sum();
+            let resets: i64 = ds.iter().map(|d| d.resets).sum();
+            let carry_max = ds.iter().map(|d| d.carry_secs).max().unwrap_or(0);
+            println!(
+                "  {k:<7} 读数 {:>6} 条（{}）  日行 {:>3} 天  涨 {:>7.1} / 掉 {:>7.1} 点  重置 {resets:>3} 次  最长攒账 {:.1} 天",
+                rs.len(),
+                rs.first()
+                    .zip(rs.last())
+                    .map(|(a, b)| format!("{} 〜 {}", mmdd(a.t), mmdd(b.t)))
+                    .unwrap_or_else(|| "空".to_string()),
+                ds.len(),
+                gain,
+                drop,
+                carry_max as f64 / 86_400.0
+            );
+            assert!(rs.windows(2).all(|w| w[0].t <= w[1].t), "读数必须按时刻升序");
+            assert!(ds.windows(2).all(|w| w[0].day <= w[1].day), "日行必须按日期升序");
+        }
+        // 「kind 省略 = 全部种类」：各种类条数之和 == 库里按 （kind, t) 去重后的条数
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT kind, t FROM quota_reading WHERE platform = ?1)",
+                [platform.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            readings_total as i64, rows,
+            "{} 去重后的读数条数对不上",
+            platform.as_str()
+        );
+    }
+    println!("\n全部核对通过。");
+}

@@ -37,6 +37,14 @@ impl Platform {
             _ => None,
         }
     }
+    /// 上一条的逆：该平台的用量记在 collector 的哪个 `agent_key` 名下。
+    /// 分模型用量查询按它去 collector.db 取数。
+    pub fn collector_source(&self) -> &'static str {
+        match self {
+            Platform::Codex => "codex",
+            Platform::Claude => "claude-code",
+        }
+    }
 }
 
 /// 额度窗口种类（kind 语义跨平台对齐：5h 滚动 / 7d 滚动 / 附加窗口）。
@@ -164,7 +172,7 @@ pub struct SubscriptionSnapshot {
 /// 一行 = **一个窗口在某一时刻的一次读数**。与 `SubscriptionSnapshot` 的区别是维度：
 /// 快照是「此刻两个窗口各是多少」,这里是「某个窗口一路走来是多少」——前者每平台
 /// 一行覆盖式写入,后者只增不删。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaReading {
     /// 读数时刻（unix 秒;语义随 `source` 不同,见 [`SnapshotSource`]）。
     pub t: i64,
@@ -181,7 +189,7 @@ pub struct QuotaReading {
 /// 日级汇总的一行（-4;**纯派生**,可从 `quota_reading` 完全重建）。
 ///
 /// 日界按**本地日期**切,与热力图 / collector 的 `YYYY-MM-DD` 同口径。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaDay {
     /// 本地日期 `YYYY-MM-DD`。
     pub day: String,

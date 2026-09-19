@@ -390,6 +390,8 @@ impl TurnState {
                     p.input += t.input;
                     p.output += t.output;
                     p.total += t.total;
+                    p.cache_read += t.cache_read;
+                    p.cache_write += t.cache_write;
                     p.model_calls += new_call as i64;
                     p.turn_mark += mark;
                 }
@@ -399,6 +401,8 @@ impl TurnState {
                     input: t.input,
                     output: t.output,
                     total: t.total,
+                    cache_read: t.cache_read,
+                    cache_write: t.cache_write,
                     model_calls: new_call as i64,
                     turn_mark: mark,
                 }),
@@ -573,6 +577,18 @@ impl TurnState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 游标里嵌着 `TurnAcc.parts`:给 `TurnPart` 加字段时若忘了 `serde(default)`,旧游标整条反序列化
+    /// 失败 → 该源从零重扫 → 历史整份重复入账（2026-09-19 实测 workbuddy 全表翻倍）。
+    #[test]
+    fn legacy_cursor_without_new_turn_part_fields_still_loads() {
+        let legacy = r#"{"session_id":"S","open":{"seq":1,"started_at":1,"start_day":"2026-09-05",
+            "project_key":"e:/W","last_event":2,"wall_end":2,"anchor":2,
+            "parts":[{"day":"2026-09-05","model":"m","input":1,"output":2,"total":3,"model_calls":1,"turn_mark":1}]}}"#;
+        let st: TurnState = serde_json::from_str(legacy).expect("旧游标必须能读");
+        let parts = &st.open.as_ref().unwrap().parts;
+        assert_eq!((parts[0].total, parts[0].cache_read, parts[0].cache_write), (3, 0, 0), "缺的 cache 两项按 0 补");
+    }
 
     const T0: i64 = 1_788_602_400_000; // 2026-09-05 本地日内
 

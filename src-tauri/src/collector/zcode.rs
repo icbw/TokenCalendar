@@ -579,10 +579,22 @@ impl ZcodeAdapter {
                         p.input += t.input;
                         p.output += t.output;
                         p.total += t.total;
+                        p.cache_read += t.cache_read;
+                        p.cache_write += t.cache_write;
                         p.model_calls += 1;
                         p.turn_mark = p.turn_mark.max(mark);
                     }
-                    None => b.parts.push(TurnPart { day, model, input: t.input, output: t.output, total: t.total, model_calls: 1, turn_mark: mark }),
+                    None => b.parts.push(TurnPart {
+                        day,
+                        model,
+                        input: t.input,
+                        output: t.output,
+                        total: t.total,
+                        cache_read: t.cache_read,
+                        cache_write: t.cache_write,
+                        model_calls: 1,
+                        turn_mark: mark,
+                    }),
                 }
             }
         }

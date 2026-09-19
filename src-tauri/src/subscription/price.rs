@@ -194,10 +194,8 @@ pub fn price_at(platform: Platform, model_key: &str, at: i64) -> Option<PriceRow
 
 /// 某平台的全部价目行（按 match_key 与生效期排序）。
 ///
-/// 这是「让价格成为可查询、可展示的数据」的读口。S1 只把它做出来并用单测
-/// 钉住排序与完整性,**命令面留给 S2**（`get_price_models` / `get_price_at`）
-/// ⇒ 非 test 构建里暂时没有调用点。
-#[allow(dead_code)]
+/// 这是「让价格成为可查询、可展示的数据」的读口,S2 的
+/// `get_price_models` 直接出它。
 pub fn rows_for(platform: Platform) -> Vec<PriceRow> {
     #[cfg(test)]
     if let Some(out) = OVERRIDE.with(|o| {
@@ -208,7 +206,6 @@ pub fn rows_for(platform: Platform) -> Vec<PriceRow> {
     collect_rows(&index(), platform)
 }
 
-#[allow(dead_code)]
 fn collect_rows(idx: &Index, platform: Platform) -> Vec<PriceRow> {
     let mut out: Vec<PriceRow> = idx
         .by_platform
@@ -219,6 +216,43 @@ fn collect_rows(idx: &Index, platform: Platform) -> Vec<PriceRow> {
     out.sort_by(|a, b| {
         a.match_key.cmp(&b.match_key).then(a.effective_from.cmp(&b.effective_from))
     });
+    out
+}
+
+/// 某平台**在 `at` 时刻生效**的价目：每个 `match_key` 至多一行（按 match_key 排序）。
+///
+/// 与 [`rows_for`] 的区别是维度：那个是「这个模型一路走来有过哪些价」,这个是
+/// 「那一刻全线是什么价」。S2 的 `get_price_at` 出它,S3 的价目对照表按它画。
+///
+/// 取段规则与 [`price_at`] 完全一致（含「`at` 早于首段则取首段」那条），
+/// 所以对照表里的数与代价计算用的数必然是同一个。
+pub fn rows_at(platform: Platform, at: i64) -> Vec<PriceRow> {
+    #[cfg(test)]
+    if let Some(out) = OVERRIDE.with(|o| {
+        o.borrow().as_ref().map(|idx| collect_rows_at(idx, platform, at))
+    }) {
+        return out;
+    }
+    collect_rows_at(&index(), platform, at)
+}
+
+fn collect_rows_at(idx: &Index, platform: Platform, at: i64) -> Vec<PriceRow> {
+    let mut out: Vec<PriceRow> = idx
+        .by_platform
+        .get(&platform)
+        .into_iter()
+        .flat_map(|groups| {
+            groups.iter().filter_map(move |g| {
+                g.segments
+                    .iter()
+                    .rev()
+                    .find(|s| s.effective_from <= at)
+                    .or_else(|| g.segments.first())
+                    .cloned()
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.match_key.cmp(&b.match_key));
     out
 }
 

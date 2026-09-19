@@ -27,6 +27,7 @@ pub mod demand;
 pub mod idle;
 pub mod model;
 pub mod price;
+pub mod query;
 pub mod store;
 #[cfg(test)]
 mod smoke;
@@ -869,6 +870,10 @@ pub struct EstimatorState {
     pub pairs: u32,
     /// 距上次读数的预计消耗（百分点）。
     pub est_pct_since_fetch: f64,
+    /// 当前归一化系数（**百分点 / 美元当量**）：1 美元的官方 API 当量吃掉多少配额。
+    /// 取倒数就是「1% 配额 ≈ 多少美元」——Insights 价格面板用它把「相当于多少钱」
+    /// 与「还剩多少额度」接上（-bis）。未装载过样本时 = 出厂预设。
+    pub scale: f64,
     /// 已收割留存的桌面端采样条数（仅 Claude 有源;0 = 本机没有桌面端采样文件）。
     /// 桌面端自己只保约 14 天,这个数会越过那条线继续涨——它就是「样本密度」。
     pub desktop_samples: i64,
@@ -891,6 +896,7 @@ pub fn get_subscription_estimator(
                 calibrated: pairs >= calib::CALIBRATED_PAIRS,
                 pairs,
                 est_pct_since_fetch: demand::estimated_pct(p),
+                scale: calib::scale(p),
                 desktop_samples: store.sample_count(p),
                 foreign: bootstrap::evidence(p),
             }

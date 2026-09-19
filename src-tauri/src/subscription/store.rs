@@ -1585,8 +1585,7 @@ impl SubStore {
     }
 
     /// 某窗口在区间内的读数（`[from, to]` 闭区间,**按时刻去重后**升序）。
-    /// S2 查询面与统计层的唯一读口。
-    #[allow(dead_code)]
+    /// S2 查询面与统计层的唯一读口（命令面 `get_quota_readings`）。
     pub fn quota_readings(
         &self,
         platform: Platform,
@@ -1638,8 +1637,7 @@ impl SubStore {
     }
 
     /// 日级汇总（`[from_day, to_day]` 闭区间,`YYYY-MM-DD`;按日期升序）。
-    /// 年度曲线与统计指标的读口（同上,命令面留 S2 接线）。
-    #[allow(dead_code)]
+    /// 年度曲线与统计指标的读口（命令面 `get_quota_days`）。
     pub fn quota_days(
         &self,
         platform: Platform,
@@ -1676,6 +1674,21 @@ impl SubStore {
                 })
             },
         );
+        it.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 该平台出现过的窗口种类（`5h` / `7d` / `7d_opus`…,升序）。
+    ///
+    /// 种类是**平台给什么就是什么**（`QuotaWindow.kind` 原样透传）,所以能有哪几种
+    /// 只有库知道。查询面据此把「没指定 kind」折成「全都要」,而不是在代码里写死一张
+    /// 枚举表——写死的那张表会在上游加窗口的那天悄悄漏掉新种类。
+    pub fn quota_kinds(&self, platform: Platform) -> Vec<String> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT DISTINCT kind FROM quota_reading WHERE platform = ?1 ORDER BY kind",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map([platform.as_str()], |r| r.get::<_, String>(0));
         it.map(|rs| rs.flatten().collect()).unwrap_or_default()
     }
 

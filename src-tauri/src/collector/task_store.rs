@@ -192,7 +192,9 @@ fn upsert_session(conn: &Connection, agent: &str, row: &SessionRow) -> Res<()> {
 }
 
 fn write_turn_raw(conn: &Connection, agent: &str, row: &TurnRow) -> Res<()> {
-    let (input, output, total) = row.parts.iter().fold((0, 0, 0), |a, p| (a.0 + p.input, a.1 + p.output, a.2 + p.total));
+    let (input, output, total, cache_read, cache_write) = row.parts.iter().fold((0, 0, 0, 0, 0), |a, p| {
+        (a.0 + p.input, a.1 + p.output, a.2 + p.total, a.3 + p.cache_read, a.4 + p.cache_write)
+    });
     // 会话行兜底（适配器正常会先 upsert_session;缺失时以轮信息建占位行）
     conn.prepare_cached(
         "INSERT OR IGNORE INTO session (agent_key, session_id, project_key, started_at, ended_at)
@@ -204,8 +206,8 @@ fn write_turn_raw(conn: &Connection, agent: &str, row: &TurnRow) -> Res<()> {
     conn.prepare_cached(
         "INSERT OR REPLACE INTO turn_raw (agent_key, session_id, turn_seq, day, project_key, model_key, started_at, ended_at,
              wall_ms, model_ms, tool_ms, ttft_ms, gap_ms, model_calls, tool_calls, error_count, retry_count,
-             input_tokens, output_tokens, total_tokens, aborted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+             input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens, aborted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
     )
     .map_err(err)?
     .execute(params![
@@ -229,6 +231,8 @@ fn write_turn_raw(conn: &Connection, agent: &str, row: &TurnRow) -> Res<()> {
         input,
         output,
         total,
+        cache_read,
+        cache_write,
         row.aborted as i64
     ])
     .map_err(err)?;
@@ -238,18 +242,34 @@ fn write_turn_raw(conn: &Connection, agent: &str, row: &TurnRow) -> Res<()> {
         .map_err(err)?;
     let mut ins = conn
         .prepare_cached(
-            "INSERT INTO turn_part (agent_key, session_id, turn_seq, day, model_key, input_tokens, output_tokens, total_tokens, model_calls, turn_mark)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO turn_part (agent_key, session_id, turn_seq, day, model_key, input_tokens, output_tokens, total_tokens,
+                 cache_read_tokens, cache_write_tokens, model_calls, turn_mark)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(agent_key, session_id, turn_seq, day, model_key) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
+                cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
                 model_calls = model_calls + excluded.model_calls,
                 turn_mark = turn_mark + excluded.turn_mark",
         )
         .map_err(err)?;
     for p in &row.parts {
-        ins.execute(params![agent, row.session_id, row.turn_seq, p.day, p.model, p.input, p.output, p.total, p.model_calls, p.turn_mark])
+        ins.execute(params![
+            agent,
+            row.session_id,
+            row.turn_seq,
+            p.day,
+            p.model,
+            p.input,
+            p.output,
+            p.total,
+            p.cache_read,
+            p.cache_write,
+            p.model_calls,
+            p.turn_mark
+        ])
             .map_err(err)?;
     }
     Ok(())

@@ -361,6 +361,8 @@ fn push_request_turn(batch: &mut Batch, target: &TurnTarget, idx: usize, r: &Ind
                 input: t.input,
                 output: t.output,
                 total: t.total,
+                cache_read: t.cache_read,
+                cache_write: t.cache_write,
                 model_calls: 1,
                 turn_mark: 1,
             }],

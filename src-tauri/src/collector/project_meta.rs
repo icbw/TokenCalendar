@@ -535,7 +535,7 @@ mod tests {
                     error_count: 0,
                     retry_count: 0,
                     aborted: false,
-                    parts: vec![TurnPart { day, model: "m".into(), input: 10, output: 0, total: 10, model_calls: 1, turn_mark: 1 }],
+                    parts: vec![TurnPart { day, model: "m".into(), input: 10, output: 0, total: 10, cache_read: 0, cache_write: 0, model_calls: 1, turn_mark: 1 }],
                 },
             );
         }
