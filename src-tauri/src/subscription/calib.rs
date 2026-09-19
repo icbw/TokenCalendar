@@ -125,7 +125,7 @@ const ZERO_DELTA_SLACK: f64 = 2.0;
 /// 一起往前漂;真开始用了,窗尾才 snap 回**真实窗首 + 窗长**,于是看上去往回走了一点。
 /// 这是一个账号内部的正常现象。真库：Codex 的 5h 窗尾后退 345 次,其中 334 次
 /// 在 10 分钟以内（edu 211/220、plus 123/125）,剩下 11 次是**换账号**。
-const TAIL_DRIFT_SLACK_SECS: i64 = 600;
+pub(super) const TAIL_DRIFT_SLACK_SECS: i64 = 600;
 
 /// 可信带中心自举的最多轮数,与「够稳了」的相对变动阈值。
 const FIT_PASSES: usize = 4;

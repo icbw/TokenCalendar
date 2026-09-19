@@ -159,6 +159,57 @@ pub struct SubscriptionSnapshot {
     pub source: SnapshotSource,
 }
 
+/// 归一化读数序列的一行（-4;落库形状见 `store` 的 `quota_reading` 建表注释）。
+///
+/// 一行 = **一个窗口在某一时刻的一次读数**。与 `SubscriptionSnapshot` 的区别是维度：
+/// 快照是「此刻两个窗口各是多少」,这里是「某个窗口一路走来是多少」——前者每平台
+/// 一行覆盖式写入,后者只增不删。
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaReading {
+    /// 读数时刻（unix 秒;语义随 `source` 不同,见 [`SnapshotSource`]）。
+    pub t: i64,
+    /// 窗口种类,原样透传适配器给的 kind："5h" / "7d" / "7d_opus"。
+    pub kind: String,
+    pub used_percent: f64,
+    /// 窗尾（unix 秒;`None` = **该来源不提供**,不是「没有窗尾」）。
+    pub resets_at: Option<i64>,
+    /// 该读数当时的套餐（源给不出 → 空串）。
+    pub plan_type: String,
+    pub source: SnapshotSource,
+}
+
+/// 日级汇总的一行（-4;**纯派生**,可从 `quota_reading` 完全重建）。
+///
+/// 日界按**本地日期**切,与热力图 / collector 的 `YYYY-MM-DD` 同口径。
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaDay {
+    /// 本地日期 `YYYY-MM-DD`。
+    pub day: String,
+    pub kind: String,
+    /// 当日读数条数（**按时刻去重之后**）。
+    pub n: i64,
+    pub t_first: i64,
+    pub t_last: i64,
+    pub used_first: f64,
+    pub used_last: f64,
+    pub used_max: f64,
+    pub used_min: f64,
+    /// 当日观测到的**额度消耗**：相邻读数正向差之和（跨零点那一笔算进后一天）。
+    /// 滚动窗口里消耗与过期同时发生 ⇒ 这是**下界**,不是账单。
+    pub gain_pct: f64,
+    /// 当日观测到的**窗口回收**：相邻读数负向差之和（绝对值）。
+    pub drop_pct: f64,
+    /// 当日跨过窗口重置的次数。窗尾要前移得**比时间本身还快**才算——空窗时服务端
+    /// 报的是 `now + 窗长`,它跟着时间漂,不是重置。两端有一端不提供窗尾（回填的存量
+    /// 行 / Claude 桌面端）就判不出来,恒为 0。
+    pub resets: i64,
+    /// 当天第一条读数与它前面那条之间的间隔（秒;前面没有读数则 0）。
+    ///
+    /// 空档之后的第一笔涨幅按定义整笔记在后一天,这个数就是让消费方看得
+    /// 「这笔涨幅是跨多久攒出来的」。多长算太久由消费方定。
+    pub carry_secs: i64,
+}
+
 /// 凭据发现项（设置页扫描列表用;**永不包含 token 值,只含掩码**）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialInfo {

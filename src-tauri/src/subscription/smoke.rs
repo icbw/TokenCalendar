@@ -32,6 +32,139 @@ fn clone_db(src: &PathBuf, out: &PathBuf) -> PathBuf {
     dst
 }
 
+/// **读数时间序列两层的真库迁移**（-4）：在真库副本上跑一遍开库顺序,
+/// 核对 `desktop_sample` 一行不动、 已收割的读数全部就地回填进 `quota_reading`、
+///  `quota_daily` 由它完整长出来且与整表重建逐位相同、 再开一次什么都不变。
+#[test]
+#[ignore]
+fn quota_reading_layers_migrate_real_db() {
+    let Some(src) = real_db() else {
+        eprintln!("没有找到真库,跳过（设 TC_SUB_DB=<路径>）");
+        return;
+    };
+    let out = std::env::var_os("TC_SMOKE_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tc_quota_smoke");
+    let _ = std::fs::remove_dir_all(&out);
+    let dst = clone_db(&src, &out);
+    println!("真库副本 → {}", dst.display());
+
+    // 迁移前：库里有多少条已收割读数,以及有没有 quota_reading
+    let (samples_before, had_table) = {
+        let c = rusqlite::Connection::open(&dst).unwrap();
+        let had: bool = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quota_reading'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        let mut st = c
+            .prepare("SELECT platform, COUNT(*) FROM desktop_sample GROUP BY 1 ORDER BY 1")
+            .unwrap();
+        let it = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap();
+        (it.flatten().collect::<Vec<_>>(), had)
+    };
+    println!("--- 迁移前 ---");
+    println!("  quota_reading 表存在: {had_table}");
+    for (p, n) in &samples_before {
+        println!("  desktop_sample {p}: {n} 行");
+    }
+
+    let s = SubStore::open(&dst).expect("open");
+    println!("--- 迁移后 ---");
+    for (p, n_before) in &samples_before {
+        let platform = Platform::from_str(p).unwrap();
+        let after = s.sample_count(platform);
+        assert_eq!(after, *n_before, "desktop_sample 一行都不能动（{p}）");
+        let readings = s.quota_reading_count(platform);
+        println!(
+            "  {p}: desktop_sample {after} 行（不变） → quota_reading {readings} 行（去重前）"
+        );
+        assert!(
+            readings >= n_before * 2,
+            "每条样本两个窗口 ⇒ 至少 {} 行,实得 {readings}",
+            n_before * 2
+        );
+        if let Some((first, last)) = s.quota_reading_span(platform) {
+            println!(
+                "     跨度 {:.1} 天 [{first}, {last}]",
+                (last - first) as f64 / 86_400.0
+            );
+        }
+    }
+
+    // 日级汇总：逐日打印最近两周,并与整表重建对拍
+    for platform in [Platform::Claude, Platform::Codex] {
+        for kind in ["5h", "7d"] {
+            let days = s.quota_days(platform, kind, "0000-00-00", "9999-99-99");
+            if days.is_empty() {
+                continue;
+            }
+            let total_n: i64 = days.iter().map(|d| d.n).sum();
+            let total_gain: f64 = days.iter().map(|d| d.gain_pct).sum();
+            let total_drop: f64 = days.iter().map(|d| d.drop_pct).sum();
+            let resets: i64 = days.iter().map(|d| d.resets).sum();
+            println!(
+                "  quota_daily {} {}: {} 天 / {} 条读数 / Σ涨 {:.0}% / Σ掉 {:.0}% / 重置 {} 次",
+                platform.as_str(),
+                kind,
+                days.len(),
+                total_n,
+                total_gain,
+                total_drop,
+                resets
+            );
+            for d in days.iter().rev().take(10).rev() {
+                println!(
+                    "     {} n={:<4} {:.0}%→{:.0}% (max {:.0}) 涨 {:.0} 掉 {:.0} 重置 {} 攒入 {}s",
+                    d.day,
+                    d.n,
+                    d.used_first,
+                    d.used_last,
+                    d.used_max,
+                    d.gain_pct,
+                    d.drop_pct,
+                    d.resets,
+                    d.carry_secs
+                );
+            }
+            // 去重后的读数条数必须与汇总里的 n 对得上
+            let deduped = s
+                .quota_readings(platform, kind, i64::MIN / 2, i64::MAX / 2)
+                .len() as i64;
+            assert_eq!(total_n, deduped, "汇总的 n 之和 = 去重后的读数条数");
+        }
+    }
+
+    // 增量 ↔ 整表重建对拍（纯派生层的定义）
+    for platform in [Platform::Claude, Platform::Codex] {
+        let before: Vec<_> = ["5h", "7d"]
+            .iter()
+            .map(|k| s.quota_days(platform, k, "0000-00-00", "9999-99-99"))
+            .collect();
+        s.refresh_quota_daily(platform, None).unwrap();
+        let after: Vec<_> = ["5h", "7d"]
+            .iter()
+            .map(|k| s.quota_days(platform, k, "0000-00-00", "9999-99-99"))
+            .collect();
+        assert_eq!(before, after, "{} 的增量结果与整表重建必须逐位相同", platform.as_str());
+    }
+    println!("  增量汇总 ↔ 整表重建：逐位相同");
+
+    // 幂等：再开一次,两层都不变
+    let counts: Vec<i64> =
+        [Platform::Claude, Platform::Codex].iter().map(|p| s.quota_reading_count(*p)).collect();
+    drop(s);
+    let s2 = SubStore::open(&dst).expect("reopen");
+    let counts2: Vec<i64> =
+        [Platform::Claude, Platform::Codex].iter().map(|p| s2.quota_reading_count(*p)).collect();
+    assert_eq!(counts, counts2, "再开一次不该重复回填");
+    println!("  再开一次：quota_reading 行数不变 {counts2:?} ⇒ 迁移幂等");
+}
+
 /// 世代分布快照：`（platform, weight_ver, plan_type, 行数)`。
 fn generations(s: &SubStore) -> Vec<(String, i64, String, i64)> {
     let mut st = s

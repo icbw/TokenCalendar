@@ -30,6 +30,13 @@ impl SubStore {
         // 全新库（两张都没有）不算升级,不必备份空文件。
         let price_table_added =
             !Self::has_table(&conn, "price_model") && Self::has_table(&conn, "usage_pair");
+        // 同理：`quota_reading` 缺、而 `desktop_sample` 已在 ⇒ 这一开是存量库的结构
+        // 升级,动它之前要落备份。**回填本身不看这个标记**（见 `backfill_readings`）。
+        let reading_table_added =
+            !Self::has_table(&conn, "quota_reading") && Self::has_table(&conn, "desktop_sample");
+        // `quota_daily` 是**纯派生层**：形状变了直接丢掉重建,不必 ALTER 回填。
+        // 这条与「读数层只增不删」并不矛盾——分界线就是「丢了还能不能长回来」。
+        Self::drop_stale_quota_daily(&conn);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS binding (
                  platform TEXT PRIMARY KEY,
@@ -140,16 +147,86 @@ impl SubStore {
                  -- 恰好就是价格时间线（设计 7.4 末段）。
                  source_note     TEXT    NOT NULL DEFAULT '',
                  PRIMARY KEY (platform, match_key, effective_from)
+             );
+             -- **归一化读数时间序列**（PHASE15 §9-4）：与 `desktop_sample` **两层并存**。
+             -- `desktop_sample` 是「源的忠实副本」——它照抄本地文件里写着的那几个数;
+             -- 这张表是**归一化序列**：三路来源（api / desktop / rollout）都按同一形状
+             -- 落进来,一行 = **一个窗口在某一时刻的一次读数**,带窗尾与套餐。
+             --
+             -- 为什么不合并进 `desktop_sample`（2026-09-18 定案）:两者的精度语义不同
+             -- ——`desktop_sample` 只有 5h/7d 两列、没有窗尾、没有 `7d_opus`,而 API 读数
+             -- 带窗尾且窗口种类是开放集合。合并会丢掉「这个数原本是什么精度、从哪来」。
+             --
+             -- 同一时刻同一窗口可能有两条来源（比如取数轮与收割轮撞在同一秒）：
+             -- **`src` 进主键,两条都留,查询时按优先级取一条,不在写入时合并**
+             -- （优先级见 `SRC_RANK`）。
+             --
+             -- **只增不删**,与 `desktop_sample` 同一条红线：读数历史是丢了就再也回不来的
+             -- 长期档案（AGENTS.md §3）。
+             CREATE TABLE IF NOT EXISTS quota_reading (
+                 platform     TEXT    NOT NULL,
+                 -- 窗口种类,原样透传适配器给的 kind：5h / 7d / 7d_opus
+                 kind         TEXT    NOT NULL,
+                 -- 读数时刻（unix 秒）:api = 请求时刻;desktop = 采样时刻;
+                 -- rollout = 产生这条读数的那次 API 调用的时刻
+                 t            INTEGER NOT NULL,
+                 -- 读数来源（model::SnapshotSource 的 as_str）
+                 src          TEXT    NOT NULL,
+                 used_percent REAL    NOT NULL,
+                 -- 窗尾（unix 秒;NULL = 该来源不提供,不是「没有窗尾」）
+                 resets_at    INTEGER,
+                 -- 该读数当时的套餐（源给不出 → ''）
+                 plan_type    TEXT    NOT NULL DEFAULT '',
+                 PRIMARY KEY (platform, kind, t, src)
+             );
+             -- **日级汇总**（PHASE15 §9-4）：年度曲线与统计指标读这一层。
+             -- **纯派生**——可从 `quota_reading` 完全重建（`rebuild_quota_daily`），
+             -- 所以它可以随口径升版整表重算,不属于「丢了就回不来」的那一类。
+             -- 日界按**本地日期**切（与热力图 / collector 的 `YYYY-MM-DD` 同口径）。
+             CREATE TABLE IF NOT EXISTS quota_daily (
+                 platform   TEXT    NOT NULL,
+                 kind       TEXT    NOT NULL,
+                 day        TEXT    NOT NULL,
+                 -- 当日读数条数（**按时刻去重之后**,见 SRC_RANK）
+                 n          INTEGER NOT NULL,
+                 t_first    INTEGER NOT NULL,
+                 t_last     INTEGER NOT NULL,
+                 used_first REAL    NOT NULL,
+                 used_last  REAL    NOT NULL,
+                 used_max   REAL    NOT NULL,
+                 used_min   REAL    NOT NULL,
+                 -- 当日观测到的**额度消耗**：相邻读数正向差的和（跨零点的那一笔算进
+                 -- 后一天）。滚动窗口里消耗与过期同时发生 ⇒ 这是**下界**,不是账单。
+                 gain_pct   REAL    NOT NULL,
+                 -- 当日观测到的**窗口回收**：相邻读数负向差的和（取绝对值）。
+                 drop_pct   REAL    NOT NULL,
+                 -- 当日跨过窗口重置的次数（判据见 `is_window_reset`：窗尾要前移得
+                 -- **比时间本身还快**才算,否则空窗漂移会被整片误判;两端有一端不提供
+                 -- 窗尾就判不出来,所以回填进来的存量行恒为 0）
+                 resets     INTEGER NOT NULL,
+                 -- **当天第一笔差值是跨多久攒出来的**（秒;当天第一条读数与它前面那条
+                 -- 之间的间隔,前面没有读数则 0）。读数序列是有洞的——关机 / 换机器 /
+                 -- 源文件被清掉都会留下空档,而空档之后的第一笔涨幅按定义整笔记在
+                 -- 后一天。把这个间隔一并存下来,消费方才分得清「这一天真消耗了 14%」
+                 -- 和「这 14% 是两天没看、一次记上的」。**存原始观测不存判断**：
+                 -- 多长算「太久」由消费方定,这里不替它划线。
+                 carry_secs INTEGER NOT NULL,
+                 PRIMARY KEY (platform, kind, day)
              );",
         )
         .map_err(|e| e.to_string())?;
-        Self::upgrade_schema(&conn, path, price_table_added)?;
+        Self::upgrade_schema(&conn, path, price_table_added, reading_table_added)?;
         let store = Self { conn };
         // 出厂种子按主键幂等 upsert（每次开库都跑一遍：新装填满、升级补齐、
         // 已是最新则原样写回）。必须在 recompute_stale_costs 之前——重算要按库里的价目。
         if let Err(e) = store.upsert_price_seed(super::price::factory_seed()) {
             crate::dev_log!("[subscription] price seed upsert failed: {e}");
         }
+        // 已收割的读数历史补进归一化序列（按行数判,自愈;稳态是两次 COUNT）。
+        store.backfill_readings();
+        // 日级汇总是纯派生层：口径版本对不上就整表按 quota_reading 重建一次
+        // （新装 / 刚回填完的存量库都走这一次;版本一致时只多一次 meta 查询）。
+        store.ensure_quota_daily();
         Ok(store)
     }
 
@@ -164,6 +241,33 @@ impl SubStore {
     }
 
     // ---------- 就地列升级（**只 ALTER + 回填,永不清表**,红线见 AGENTS.md） ----------
+
+    /// `quota_daily` 的形状与当前代码对不上（缺列）就整表丢掉,让下面的
+    /// `CREATE TABLE IF NOT EXISTS` 按新形状重建、`ensure_quota_daily` 按
+    /// `quota_reading` 重算一遍。
+    ///
+    /// **只有这一张表可以这么处理**：它的每一个数都能从读数层重新算出来。读数层
+    /// （`quota_reading` / `desktop_sample`）与样本层的原始观测一律走就地 ALTER
+    /// ——丢了就再也回不来（AGENTS.md）。
+    fn drop_stale_quota_daily(conn: &Connection) {
+        if !Self::has_table(conn, "quota_daily") {
+            return;
+        }
+        const COLUMNS: [&str; 13] = [
+            "platform", "kind", "day", "n", "t_first", "t_last", "used_first", "used_last",
+            "used_max", "used_min", "gain_pct", "drop_pct", "carry_secs",
+        ];
+        if COLUMNS.iter().all(|c| Self::has_column(conn, "quota_daily", c)) {
+            return;
+        }
+        let _ = conn.execute_batch("DROP TABLE quota_daily;");
+        if Self::has_table(conn, "meta") {
+            let _ = conn.execute("DELETE FROM meta WHERE k LIKE 'quota_daily_rule_%'", []);
+        }
+        crate::dev_log!(
+            "[subscription] quota_daily dropped for rebuild (derived layer, shape changed)"
+        );
+    }
 
     /// 该表是否已有此列（`PRAGMA table_info`;表不存在按「没有」处理）。
     fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -184,6 +288,7 @@ impl SubStore {
         conn: &Connection,
         path: &Path,
         price_table_added: bool,
+        reading_table_added: bool,
     ) -> Result<(), String> {
         let need_pair_src = !Self::has_column(conn, "usage_pair", "src");
         let need_snapshot_source = !Self::has_column(conn, "snapshot", "source");
@@ -198,6 +303,7 @@ impl SubStore {
             && !need_pair_resets
             && !need_pair_aged
             && !price_table_added
+            && !reading_table_added
         {
             return Ok(());
         }
@@ -271,10 +377,78 @@ impl SubStore {
             // recompute_stale_costs 按各模型在 t1 时刻生效的价目重算。
             crate::dev_log!("[subscription] price_model table added (existing rows untouched)");
         }
+        if reading_table_added {
+            // 表由上面的 CREATE TABLE IF NOT EXISTS 建好;回填在 open 里按行数补,
+            // 不挂在「表刚建出来」这个条件上（理由见 backfill_readings）。
+            crate::dev_log!("[subscription] quota_reading table added (backfill pending)");
+        }
         crate::dev_log!(
-            "[subscription] store schema upgraded in place (pair.src / snapshot.source / pair epoch / price_model / sample.plan_type / pair.resets / pair.aged_cost)"
+            "[subscription] store schema upgraded in place (pair.src / snapshot.source / pair epoch / price_model / sample.plan_type / pair.resets / pair.aged_cost / quota_reading + quota_daily)"
         );
         Ok(())
+    }
+
+    /// 把 `desktop_sample` 里的读数历史**就地回填**进 `quota_reading`
+    /// （-4 的迁移那一步）。
+    ///
+    /// `desktop_sample` 里已经躺着两个平台全部收割过的读数——那是丢了就再也回不来的
+    /// 历史,新表必须从它长出来,而**不是**重新去扫一遍源文件（源本身会滚掉:桌面端
+    /// 历史只留约 14 天,rollout 会被归档 / 清掉 / `CODEX_HOME` 改指向）。
+    ///
+    /// **判据是行数不是「表刚建出来」**:迁移前的备份是在
+    /// `CREATE TABLE IF NOT EXISTS` **之后**落的,所以备份文件里已经带着一张空的
+    /// `quota_reading`——照「表在不在」判,用户拿备份回滚再打开就永远不会回填,那段
+    /// 读数历史等于凭空消失。按「读数行数还不够 `desktop_sample` 的两倍」判则自愈：
+    /// 写入是 `INSERT OR IGNORE`,多跑一次只是白扫,少跑一次会丢历史。
+    /// 追平之后这个条件恒假（在线路还会往上加 api 行）,稳态零额外开销。
+    ///
+    /// 来源标记按**当初是谁写的**如实标：`desktop_sample` 的 claude 行全部来自
+    /// 桌面端 `plan-usage-history.json`（`bootstrap`）,codex 行全部来自会话 rollout
+    /// （`codex_rollout`）——两个收割器各写各的平台,没有交叉。
+    ///
+    /// 窗尾一律 NULL = **未知**,不是「没有窗尾」：那张表根本没记这个数。往后新落的
+    /// 行才带窗尾。**一行都不删**:`desktop_sample` 原样留着,两层并存（见建表注释）。
+    fn backfill_readings(&self) {
+        for platform in [Platform::Codex, Platform::Claude] {
+            let samples = self.sample_count(platform);
+            if samples == 0 || self.quota_reading_count(platform) >= samples * 2 {
+                continue;
+            }
+            let src = match platform {
+                Platform::Codex => "rollout",
+                Platform::Claude => "desktop",
+            };
+            let mut filled = 0usize;
+            for (kind, col) in [("5h", "used5"), ("7d", "used7")] {
+                match self.conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO quota_reading
+                             (platform, kind, t, src, used_percent, resets_at, plan_type)
+                         SELECT platform, ?1, t, ?2, {col}, NULL, plan_type
+                           FROM desktop_sample WHERE platform = ?3"
+                    ),
+                    rusqlite::params![kind, src, platform.as_str()],
+                ) {
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        crate::dev_log!("[subscription] quota_reading backfill failed: {e}");
+                        return;
+                    }
+                }
+            }
+            crate::dev_log!(
+                "[subscription] quota_reading backfilled from desktop_sample ({}): {} row(s)                  (desktop_sample untouched)",
+                platform.as_str(),
+                filled
+            );
+            // 读数层刚长出一大段历史 ⇒ 汇总层必须跟着整表重算。不能指望
+            // `ensure_quota_daily` ——它只在口径版本对不上时才动手,而这里版本没变。
+            if filled > 0 {
+                if let Err(e) = self.refresh_quota_daily(platform, None) {
+                    crate::dev_log!("[subscription] quota_daily rebuild after backfill failed: {e}");
+                }
+            }
+        }
     }
 
     // ---------- price_model（官方价目快照;**只 upsert,永不删行**,见建表注释） ----------
@@ -491,6 +665,9 @@ impl SubStore {
                 ],
             )
             .map_err(|e| e.to_string())?;
+        // 快照是「此刻」的覆盖式一行,读数序列是「一路走来」的只增层——同一个事实的
+        // 两个维度,所以落快照顺手把它也记进序列（只收 api 来源,理由见该函数）。
+        self.record_snapshot_reading(snap);
         Ok(())
     }
 
@@ -1039,6 +1216,485 @@ impl SubStore {
         self.conn
             .query_row(
                 "SELECT MIN(t), MAX(t) FROM desktop_sample WHERE platform = ?1",
+                [platform.as_str()],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .ok()
+            .and_then(|(a, b)| Some((a?, b?)))
+    }
+
+    // ---------- quota_reading / quota_daily（读数时间序列两层;-4） ----------
+
+    /// 日级汇总的**口径订号**。改了 `gain_pct` / `drop_pct` / `resets` 任何一条的
+    /// 算法,或者改了日界口径,就 +1 ——开库时发现库里记的版本对不上,整表按
+    /// `quota_reading` 重建一次（它是纯派生层,重建不丢任何东西）。
+    ///
+    /// 读数层 `quota_reading` **没有**对应的版本号:它只增不删,没有「重算」一说。
+    pub const QUOTA_DAILY_RULE_VERSION: i64 = 2;
+
+    fn quota_daily_rule_key(platform: Platform) -> String {
+        format!("quota_daily_rule_{}", platform.as_str())
+    }
+
+    /// 同一时刻同一窗口撞上多条来源时的取舍（小者优先;「查询时按
+    /// 优先级取一条,不在写入时合并」）。
+    ///
+    /// `api` 最先：它的时刻就是请求时刻,语义最直接。`rollout` 次之——它和 `api`
+    /// 是同一个服务端数字,只是走本地文件到手。`desktop` 最后：整数百分比、采样时刻。
+    fn src_rank(src: &str) -> u8 {
+        match src {
+            "api" => 0,
+            "rollout" => 1,
+            _ => 2,
+        }
+    }
+
+    /// unix 秒 → **本地日期** `YYYY-MM-DD`（与热力图 / collector 同口径）。
+    ///
+    /// 逐条按 `chrono:Local` 换算而不是记一个固定时区偏移：夏令时的历史边界由系统
+    /// 时区库回答,这样同一条读数换算出的日期与它当时所在的日历日一致。
+    fn local_day(t: i64) -> String {
+        chrono::DateTime::from_timestamp(t, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).date_naive().to_string())
+            .unwrap_or_default()
+    }
+
+    /// 本地日期 `YYYY-MM-DD` 的零点（unix 秒;算不出 → `i64:MIN`,等于「不设下界」）。
+    fn local_day_start(day: &str) -> i64 {
+        use chrono::TimeZone;
+        chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|dt| chrono::Local.from_local_datetime(&dt).earliest())
+            .map(|dt| dt.timestamp())
+            .unwrap_or(i64::MIN)
+    }
+
+    /// 落一批读数（**只增不删**,主键 `（platform, kind, t, src)` 冲突走 IGNORE）。
+    ///
+    /// 冲突忽略而不是覆盖,与 `desktop_sample` 同一条理由：同一秒里可能有多条并发
+    /// 会话各自回报同一份服务端状态,先到的与后到的等价,没有「哪条更对」可言;而覆盖
+    /// 会让结果依赖遍历顺序。
+    ///
+    /// 真新增了行就**顺手把受影响的那几天汇总重算一遍**——两层由此永远一致,
+    /// `quota_daily` 不需要单独的维护入口。返回本次新增的行数。
+    pub fn insert_readings(
+        &self,
+        platform: Platform,
+        rows: &[super::model::QuotaReading],
+    ) -> Result<usize, String> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut inserted = 0usize;
+        let mut min_t = i64::MAX;
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR IGNORE INTO quota_reading
+                         (platform, kind, t, src, used_percent, resets_at, plan_type)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| e.to_string())?;
+            for r in rows {
+                let n = stmt
+                    .execute(rusqlite::params![
+                        platform.as_str(),
+                        r.kind,
+                        r.t,
+                        r.source.as_str(),
+                        r.used_percent,
+                        r.resets_at,
+                        r.plan_type,
+                    ])
+                    .map_err(|e| e.to_string())?;
+                if n > 0 {
+                    inserted += n;
+                    min_t = min_t.min(r.t);
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        if inserted > 0 {
+            self.refresh_quota_daily(platform, Some(min_t))?;
+        }
+        Ok(inserted)
+    }
+
+    /// 快照里的窗口 → 读数行（取数路径的写入口;`fetched_at` 就是这条读数的时刻）。
+    ///
+    /// **只收 `api` 来源**：另外两路各有自己的收割器,它们落的是**全量历史**而不是
+    /// 「最新一条」,而且时刻语义更准。尤其 `claude_desktop:apply_flat_sample` 会把
+    /// 样本的下降进快照却**不推进 `fetched_at`**（那是有意的,见该函数）——照搬进
+    /// 读数序列就会把新值配上旧时刻。
+    pub fn record_snapshot_reading(&self, snap: &SubscriptionSnapshot) {
+        if snap.source != SnapshotSource::Api || snap.status != FetchStatus::Ok {
+            return;
+        }
+        let Some(t) = snap.fetched_at else { return };
+        let rows: Vec<_> = snap
+            .windows
+            .iter()
+            .map(|w| super::model::QuotaReading {
+                t,
+                kind: w.kind.clone(),
+                used_percent: w.used_percent,
+                resets_at: w.resets_at,
+                plan_type: snap.plan_type.clone(),
+                source: SnapshotSource::Api,
+            })
+            .collect();
+        if let Err(e) = self.insert_readings(snap.platform, &rows) {
+            crate::dev_log!("[subscription] quota_reading insert failed: {e}");
+        }
+    }
+
+    /// 开库时的一次性对表：库里记的日级口径版本对不上 ⇒ 整表重建（纯派生层）。
+    /// 版本一致则一行不动、一次查询了事。
+    pub fn ensure_quota_daily(&self) {
+        for platform in [Platform::Codex, Platform::Claude] {
+            let key = Self::quota_daily_rule_key(platform);
+            if self.meta_i64(&key) == Some(Self::QUOTA_DAILY_RULE_VERSION) {
+                continue;
+            }
+            match self.refresh_quota_daily(platform, None) {
+                Ok(n) => {
+                    let _ = self.set_meta_i64(&key, Self::QUOTA_DAILY_RULE_VERSION);
+                    crate::dev_log!(
+                        "[subscription] quota_daily rebuilt under rule v{} for {}: {} day-row(s)",
+                        Self::QUOTA_DAILY_RULE_VERSION,
+                        platform.as_str(),
+                        n
+                    );
+                }
+                Err(e) => crate::dev_log!("[subscription] quota_daily rebuild failed: {e}"),
+            }
+        }
+    }
+
+    /// 重算日级汇总。`since = None` 整表重建;`Some（t)` 只重算 `t` 所在**本地日**
+    /// 及其之后的那些天。
+    ///
+    /// 增量重算仍然要读**边界之前的最后一条读数**——跨零点的那一笔差值算进后一天,
+    /// 少了它当天的 `gain_pct` 就从第二条读数才开始累。
+    ///
+    /// 返回写入的天数（两个窗口种类各算一天）。
+    pub fn refresh_quota_daily(
+        &self,
+        platform: Platform,
+        since: Option<i64>,
+    ) -> Result<usize, String> {
+        let from_day = since.map(Self::local_day);
+        let floor = from_day.as_deref().map(Self::local_day_start).unwrap_or(i64::MIN);
+
+        //  边界之前每个窗口的最后一条读数（只用来当 prev,不进汇总）。
+        let mut seeds: Vec<(String, i64, String, f64, Option<i64>)> = vec![];
+        if from_day.is_some() {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT kind, t, src, used_percent, resets_at FROM quota_reading r
+                      WHERE platform = ?1 AND t < ?2
+                        AND t = (SELECT MAX(t) FROM quota_reading
+                                  WHERE platform = ?1 AND kind = r.kind AND t < ?2)
+                      ORDER BY kind, t, src",
+                )
+                .map_err(|e| e.to_string())?;
+            let it = stmt
+                .query_map(rusqlite::params![platform.as_str(), floor], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .map_err(|e| e.to_string())?;
+            seeds = it.flatten().collect();
+        }
+
+        //  边界之后的全部读数。
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT kind, t, src, used_percent, resets_at FROM quota_reading
+                  WHERE platform = ?1 AND t >= ?2 ORDER BY kind, t, src",
+            )
+            .map_err(|e| e.to_string())?;
+        let it = stmt
+            .query_map(rusqlite::params![platform.as_str(), floor], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(String, i64, String, f64, Option<i64>)> = it.flatten().collect();
+        drop(stmt);
+
+        let days = Self::fold_days(&seeds, &rows);
+
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        match from_day.as_deref() {
+            Some(d) => tx
+                .execute(
+                    "DELETE FROM quota_daily WHERE platform = ?1 AND day >= ?2",
+                    rusqlite::params![platform.as_str(), d],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())?,
+            None => tx
+                .execute("DELETE FROM quota_daily WHERE platform = ?1", [platform.as_str()])
+                .map(|_| ())
+                .map_err(|e| e.to_string())?,
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO quota_daily (platform, kind, day, n, t_first, t_last,
+                         used_first, used_last, used_max, used_min, gain_pct, drop_pct, resets,
+                         carry_secs)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .map_err(|e| e.to_string())?;
+            for d in &days {
+                stmt.execute(rusqlite::params![
+                    platform.as_str(),
+                    d.kind,
+                    d.day,
+                    d.n,
+                    d.t_first,
+                    d.t_last,
+                    d.used_first,
+                    d.used_last,
+                    d.used_max,
+                    d.used_min,
+                    d.gain_pct,
+                    d.drop_pct,
+                    d.resets,
+                    d.carry_secs,
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(days.len())
+    }
+
+    /// 同一 `（kind, t)` 的多条来源按 `src_rank` 收敛成一条（输入须按 kind, t 升序）。
+    fn dedupe_by_source(
+        src: &[(String, i64, String, f64, Option<i64>)],
+    ) -> Vec<&(String, i64, String, f64, Option<i64>)> {
+        let mut out: Vec<&(String, i64, String, f64, Option<i64>)> = vec![];
+        for r in src {
+            match out.last() {
+                Some(last) if last.0 == r.0 && last.1 == r.1 => {
+                    if Self::src_rank(&r.2) < Self::src_rank(&last.2) {
+                        out.pop();
+                        out.push(r);
+                    }
+                }
+                _ => out.push(r),
+            }
+        }
+        out
+    }
+
+    /// 两条读数之间**真的跨过了一次窗口重置**吗。
+    ///
+    /// 光看「窗尾前移了」会把**空窗漂移**整片误判成重置：窗口空着的时候服务端报的是
+    /// `now + 窗长`,它跟着 now 一起往前走 ⇒ 每两条读数之间窗尾都在前移,且前移量
+    /// **恰好等于两条读数的间隔**。本机 :Codex 的 5h 空窗时连续 8 条
+    /// 读数给出 7 次「前移」,没有一次是真重置。
+    ///
+    /// 所以判据是**前移得比时间本身还快**——真重置会把窗尾整段推到下一个窗口
+    /// （最多一个窗长）,而漂移永远追不上时间。容差沿用
+    /// [`super:calib:TAIL_DRIFT_SLACK_SECS`]（同一个现象的同一个常量）。
+    ///
+    /// 两端有一端不提供窗尾（回填进来的存量行、Claude 桌面端）就判不出来 ⇒ false。
+    /// 这里**不拿「读数变小了」兜底**：那是标定的判据,它宁可错杀;日级汇总要的是
+    /// 「重置发生过几次」这一个可核对的事实,推断出来的不算。
+    fn is_window_reset(t0: i64, t1: i64, r0: Option<i64>, r1: Option<i64>) -> bool {
+        match (r0, r1) {
+            (Some(a), Some(b)) => b - a > (t1 - t0) + super::calib::TAIL_DRIFT_SLACK_SECS,
+            _ => false,
+        }
+    }
+
+    /// 纯逻辑的折叠（单测直接覆盖）：读数序列 → 日级汇总。
+    ///
+    /// `seeds` 是重算边界之前每个窗口的最后一条读数,只当 prev 用、不产出汇总行。
+    /// 两段都按 `（kind, t, src)` 升序。
+    fn fold_days(
+        seeds: &[(String, i64, String, f64, Option<i64>)],
+        rows: &[(String, i64, String, f64, Option<i64>)],
+    ) -> Vec<super::model::QuotaDay> {
+        use std::collections::BTreeMap;
+        // （kind, day) → 汇总
+        let mut acc: BTreeMap<(String, String), super::model::QuotaDay> = BTreeMap::new();
+        // kind → 上一条读数 （used, resets_at, t)
+        let mut prev: BTreeMap<String, (f64, Option<i64>, i64)> = BTreeMap::new();
+
+        for r in Self::dedupe_by_source(seeds) {
+            prev.insert(r.0.clone(), (r.3, r.4, r.1));
+        }
+
+        // kind → 上一条读数的时刻（算 carry_secs 用）
+        let mut prev_t: BTreeMap<String, i64> = BTreeMap::new();
+        for r in Self::dedupe_by_source(seeds) {
+            prev_t.insert(r.0.clone(), r.1);
+        }
+
+        for r in Self::dedupe_by_source(rows) {
+            let (kind, t, used, resets) = (r.0.clone(), r.1, r.3, r.4);
+            let day = Self::local_day(t);
+            let fresh = !acc.contains_key(&(kind.clone(), day.clone()));
+            let e = acc
+                .entry((kind.clone(), day.clone()))
+                .or_insert_with(|| super::model::QuotaDay {
+                    day: day.clone(),
+                    kind: kind.clone(),
+                    n: 0,
+                    t_first: t,
+                    t_last: t,
+                    used_first: used,
+                    used_last: used,
+                    used_max: used,
+                    used_min: used,
+                    gain_pct: 0.0,
+                    drop_pct: 0.0,
+                    resets: 0,
+                    carry_secs: 0,
+                });
+            if fresh {
+                e.carry_secs = prev_t.get(&kind).map(|p| t - p).unwrap_or(0);
+            }
+            if let Some((pu, pr, pt)) = prev.get(&kind) {
+                let d = used - pu;
+                if d > 0.0 {
+                    e.gain_pct += d;
+                } else {
+                    e.drop_pct += -d;
+                }
+                if Self::is_window_reset(*pt, t, *pr, resets) {
+                    e.resets += 1;
+                }
+            }
+            e.n += 1;
+            e.t_last = t;
+            e.used_last = used;
+            e.used_max = e.used_max.max(used);
+            e.used_min = e.used_min.min(used);
+            prev.insert(kind.clone(), (used, resets, t));
+            prev_t.insert(kind, t);
+        }
+        acc.into_values().collect()
+    }
+
+    /// 某窗口在区间内的读数（`[from, to]` 闭区间,**按时刻去重后**升序）。
+    /// S2 查询面与统计层的唯一读口。
+    #[allow(dead_code)]
+    pub fn quota_readings(
+        &self,
+        platform: Platform,
+        kind: &str,
+        from: i64,
+        to: i64,
+    ) -> Vec<super::model::QuotaReading> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT kind, t, src, used_percent, resets_at, plan_type FROM quota_reading
+              WHERE platform = ?1 AND kind = ?2 AND t >= ?3 AND t <= ?4
+              ORDER BY kind, t, src",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map(rusqlite::params![platform.as_str(), kind, from, to], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        });
+        let Ok(it) = it else { return vec![] };
+        let all: Vec<(String, i64, String, f64, Option<i64>, String)> = it.flatten().collect();
+        let keyed: Vec<(String, i64, String, f64, Option<i64>)> = all
+            .iter()
+            .map(|r| (r.0.clone(), r.1, r.2.clone(), r.3, r.4))
+            .collect();
+        Self::dedupe_by_source(&keyed)
+            .into_iter()
+            .map(|r| {
+                let plan = all
+                    .iter()
+                    .find(|a| a.1 == r.1 && a.2 == r.2)
+                    .map(|a| a.5.clone())
+                    .unwrap_or_default();
+                super::model::QuotaReading {
+                    t: r.1,
+                    kind: r.0.clone(),
+                    used_percent: r.3,
+                    resets_at: r.4,
+                    plan_type: plan,
+                    source: SnapshotSource::from_str(&r.2).unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// 日级汇总（`[from_day, to_day]` 闭区间,`YYYY-MM-DD`;按日期升序）。
+    /// 年度曲线与统计指标的读口（同上,命令面留 S2 接线）。
+    #[allow(dead_code)]
+    pub fn quota_days(
+        &self,
+        platform: Platform,
+        kind: &str,
+        from_day: &str,
+        to_day: &str,
+    ) -> Vec<super::model::QuotaDay> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT day, n, t_first, t_last, used_first, used_last, used_max, used_min,
+                    gain_pct, drop_pct, resets, carry_secs
+               FROM quota_daily
+              WHERE platform = ?1 AND kind = ?2 AND day >= ?3 AND day <= ?4
+              ORDER BY day",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map(
+            rusqlite::params![platform.as_str(), kind, from_day, to_day],
+            |r| {
+                Ok(super::model::QuotaDay {
+                    day: r.get(0)?,
+                    kind: kind.to_string(),
+                    n: r.get(1)?,
+                    t_first: r.get(2)?,
+                    t_last: r.get(3)?,
+                    used_first: r.get(4)?,
+                    used_last: r.get(5)?,
+                    used_max: r.get(6)?,
+                    used_min: r.get(7)?,
+                    gain_pct: r.get(8)?,
+                    drop_pct: r.get(9)?,
+                    resets: r.get(10)?,
+                    carry_secs: r.get(11)?,
+                })
+            },
+        );
+        it.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 已留存的读数行数（诊断行 / 日志用;**未去重**,同一时刻多来源各算一行）。
+    pub fn quota_reading_count(&self, platform: Platform) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM quota_reading WHERE platform = ?1",
+                [platform.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// 读数序列的时间跨度 （最早, 最新)。
+    pub fn quota_reading_span(&self, platform: Platform) -> Option<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT MIN(t), MAX(t) FROM quota_reading WHERE platform = ?1",
                 [platform.as_str()],
                 |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
             )
@@ -1749,5 +2405,403 @@ mod tests {
         assert_eq!(loaded.status, FetchStatus::Idle);
         assert!(loaded.windows.is_empty());
         assert_eq!(loaded.fetched_at, None);
+    }
+
+    // ---------- quota_reading / quota_daily（PHASE15 §9-4） ----------
+
+    fn reading(t: i64, kind: &str, used: f64, src: SnapshotSource) -> super::super::model::QuotaReading {
+        super::super::model::QuotaReading {
+            t,
+            kind: kind.into(),
+            used_percent: used,
+            resets_at: None,
+            plan_type: String::new(),
+            source: src,
+        }
+    }
+
+    /// 本地日 `day_offset` 天前的当地零点 + `secs` 秒（测试与时区无关：日界由
+    /// 被测代码自己的 `local_day_start` 给出）。
+    fn at_local(day: &str, secs: i64) -> i64 {
+        SubStore::local_day_start(day) + secs
+    }
+
+    /// 某个真实存在的本地日（用今天,保证时区换算一定成立）。
+    fn today() -> String {
+        SubStore::local_day(chrono::Utc::now().timestamp())
+    }
+
+    fn day_before(day: &str) -> String {
+        (chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap() - chrono::Duration::days(1))
+            .to_string()
+    }
+
+    /// 读数层**只增不删**且幂等：同一批喂两遍,第二遍一行都不新增。
+    #[test]
+    fn readings_are_append_only_and_idempotent() {
+        let s = mem_store();
+        let p = Platform::Claude;
+        let rows = vec![
+            reading(1_000, "5h", 10.0, SnapshotSource::Desktop),
+            reading(1_000, "7d", 4.0, SnapshotSource::Desktop),
+            reading(1_900, "5h", 12.0, SnapshotSource::Desktop),
+        ];
+        assert_eq!(s.insert_readings(p, &rows).unwrap(), 3);
+        assert_eq!(s.insert_readings(p, &rows).unwrap(), 0, "重复收割不新增");
+        assert_eq!(s.quota_reading_count(p), 3);
+        assert_eq!(s.quota_reading_span(p), Some((1_000, 1_900)));
+        assert_eq!(s.quota_reading_count(Platform::Codex), 0, "平台之间互不串");
+    }
+
+    /// 同一时刻同一窗口的两条来源:**两条都留在库里**,查询时按优先级取一条
+    /// （2026-09-18 定案:不在写入时合并）。
+    #[test]
+    fn both_sources_are_kept_and_the_query_picks_by_priority() {
+        let s = mem_store();
+        let p = Platform::Claude;
+        s.insert_readings(p, &[reading(1_000, "5h", 10.0, SnapshotSource::Desktop)]).unwrap();
+        s.insert_readings(p, &[reading(1_000, "5h", 10.4, SnapshotSource::Api)]).unwrap();
+        assert_eq!(s.quota_reading_count(p), 2, "两条来源各占一行");
+        let got = s.quota_readings(p, "5h", 0, 9_999);
+        assert_eq!(got.len(), 1, "查询收敛成一条");
+        assert_eq!(got[0].source, SnapshotSource::Api, "api 优先");
+        assert_eq!(got[0].used_percent, 10.4);
+    }
+
+    /// 日级汇总把相邻差拆成「涨」与「掉」两笔:滚动窗口里消耗与过期同时发生,
+    /// 合成一个净值就再也分不开了。
+    #[test]
+    fn daily_gain_and_drop_split_the_deltas() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let d = today();
+        let rows: Vec<_> = [(3_600, 10.0), (7_200, 15.0), (10_800, 12.0), (14_400, 20.0)]
+            .iter()
+            .map(|(sec, used)| reading(at_local(&d, *sec), "5h", *used, SnapshotSource::Rollout))
+            .collect();
+        s.insert_readings(p, &rows).unwrap();
+        let days = s.quota_days(p, "5h", &d, &d);
+        assert_eq!(days.len(), 1);
+        let day = &days[0];
+        assert_eq!(day.n, 4);
+        assert_eq!(day.used_first, 10.0);
+        assert_eq!(day.used_last, 20.0);
+        assert_eq!(day.used_max, 20.0);
+        assert_eq!(day.used_min, 10.0);
+        assert!((day.gain_pct - 13.0).abs() < 1e-9, "5 + 8 = 13,掉的那 3 不抵扣");
+        assert!((day.drop_pct - 3.0).abs() < 1e-9);
+        assert_eq!(day.resets, 0, "这一路没有窗尾 ⇒ 判不出重置");
+    }
+
+    /// 跨零点的那一笔差值算进**后一天**：额度是那天消耗掉的。
+    #[test]
+    fn a_delta_across_midnight_lands_on_the_later_day() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let d1 = today();
+        let d0 = day_before(&d1);
+        s.insert_readings(
+            p,
+            &[
+                reading(at_local(&d0, 86_400 - 600), "5h", 10.0, SnapshotSource::Rollout),
+                reading(at_local(&d1, 600), "5h", 18.0, SnapshotSource::Rollout),
+            ],
+        )
+        .unwrap();
+        let a = s.quota_days(p, "5h", &d0, &d0);
+        let b = s.quota_days(p, "5h", &d1, &d1);
+        assert_eq!(a[0].gain_pct, 0.0, "前一天只有一条读数,没有可比的前值");
+        assert!((b[0].gain_pct - 8.0).abs() < 1e-9, "跨零点那 8 个点记在后一天");
+        assert_eq!(a[0].carry_secs, 0, "前面没有读数 ⇒ 没有攒进来的东西");
+        assert_eq!(b[0].carry_secs, 1_200, "这 8 个点是跨 20 分钟攒出来的");
+    }
+
+    /// 空档之后的第一笔涨幅整笔记在后一天——这是定义,不是 bug。要紧的是
+    /// **让消费方看得见它跨了多久**（`carry_secs`),别把两天没看的账算成一天的消耗。
+    #[test]
+    fn a_long_outage_is_visible_in_carry_secs() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let d2 = today();
+        let d1 = day_before(&d2);
+        let d0 = day_before(&d1);
+        s.insert_readings(
+            p,
+            &[
+                reading(at_local(&d0, 36_000), "5h", 10.0, SnapshotSource::Rollout),
+                // d1 整天没有任何读数（关机 / 源文件被清掉）
+                reading(at_local(&d2, 36_000), "5h", 24.0, SnapshotSource::Rollout),
+            ],
+        )
+        .unwrap();
+        assert!(s.quota_days(p, "5h", &d1, &d1).is_empty(), "没有读数的那天不造行");
+        let day = &s.quota_days(p, "5h", &d2, &d2)[0];
+        assert_eq!(day.n, 1);
+        assert!((day.gain_pct - 14.0).abs() < 1e-9);
+        assert_eq!(day.carry_secs, 2 * 86_400, "这 14% 是跨两天攒出来的,看得见");
+    }
+
+    /// 派生层的形状变了就整表丢掉重建（读数层永远不许这么干）。
+    #[test]
+    fn a_shape_change_drops_and_rebuilds_the_derived_layer() {
+        let dir = std::env::temp_dir().join(format!("tc_sub_qshape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subscriptions.db");
+        let d = today();
+        {
+            let s = SubStore::open(&path).unwrap();
+            s.insert_readings(
+                Platform::Codex,
+                &[
+                    reading(at_local(&d, 3_600), "5h", 10.0, SnapshotSource::Rollout),
+                    reading(at_local(&d, 7_200), "5h", 18.0, SnapshotSource::Rollout),
+                ],
+            )
+            .unwrap();
+            // 模拟「上一版的 quota_daily 少一列」
+            s.conn
+                .execute_batch(
+                    "DROP TABLE quota_daily;
+                     CREATE TABLE quota_daily (platform TEXT NOT NULL, kind TEXT NOT NULL,
+                         day TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (platform, kind, day));
+                     INSERT INTO quota_daily VALUES ('codex', '5h', '1999-01-01', 7);",
+                )
+                .unwrap();
+        }
+        let s = SubStore::open(&path).unwrap();
+        let days = s.quota_days(Platform::Codex, "5h", "0000-00-00", "9999-99-99");
+        assert_eq!(days.len(), 1, "旧形状整表丢掉,按 quota_reading 重建");
+        assert_eq!(days[0].day, d, "1999 那行是旧表的残留,不该还在");
+        assert!((days[0].gain_pct - 8.0).abs() < 1e-9);
+        // 读数层一行没丢
+        assert_eq!(s.quota_reading_count(Platform::Codex), 2);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 窗尾前移才算一次重置（读数没变小也算——那正是「读数变小了」这条旧判据
+    /// 抓不到的那一类）。
+    #[test]
+    fn window_tail_moves_are_counted_as_resets() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let d = today();
+        let mk = |sec: i64, used: f64, tail: i64| super::super::model::QuotaReading {
+            resets_at: Some(tail),
+            ..reading(at_local(&d, sec), "5h", used, SnapshotSource::Rollout)
+        };
+        s.insert_readings(p, &[mk(3_600, 10.0, 50_000), mk(7_200, 12.0, 50_000), mk(10_800, 14.0, 68_000)])
+            .unwrap();
+        let day = &s.quota_days(p, "5h", &d, &d)[0];
+        assert_eq!(day.resets, 1, "窗尾前移一次;读数一路在涨,旧判据一次都抓不到");
+    }
+
+    /// **空窗漂移不是重置**（2026-09-19 真机实测改的判据）：窗口空着时服务端报
+    /// `now + 窗长`,窗尾每条读数都在前移,前移量恰好等于读数间隔。真库里 Codex 的
+    /// 5h 空窗连续 8 条读数给出 7 次「前移」,一次真重置都没有。
+    #[test]
+    fn an_empty_window_drifting_forward_is_not_a_reset() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let d = today();
+        const WINDOW: i64 = 5 * 3_600;
+        // 空窗:每条读数的窗尾都是「该读数时刻 + 窗长」
+        let rows: Vec<_> = [0_i64, 110, 143, 177, 197]
+            .iter()
+            .map(|off| {
+                let t = at_local(&d, 3_600 + off);
+                super::super::model::QuotaReading {
+                    resets_at: Some(t + WINDOW),
+                    ..reading(t, "5h", 0.0, SnapshotSource::Api)
+                }
+            })
+            .collect();
+        s.insert_readings(p, &rows).unwrap();
+        let day = &s.quota_days(p, "5h", &d, &d)[0];
+        assert_eq!(day.n, 5);
+        assert_eq!(day.resets, 0, "跟着时间漂的窗尾一次重置都不该算");
+        // 同一串里插一次真重置：窗尾整段推到下一个窗口
+        let t = at_local(&d, 3_600 + 400);
+        s.insert_readings(
+            p,
+            &[super::super::model::QuotaReading {
+                resets_at: Some(t + WINDOW + 4 * 3_600),
+                ..reading(t, "5h", 3.0, SnapshotSource::Api)
+            }],
+        )
+        .unwrap();
+        assert_eq!(s.quota_days(p, "5h", &d, &d)[0].resets, 1, "真重置照样抓得到");
+    }
+
+    /// 增量重算（每落一条读数顺手刷受影响的那几天）与整表重建**逐位相同**
+    /// ——`quota_daily` 是纯派生层,这条是它的定义。
+    #[test]
+    fn incremental_refresh_matches_a_full_rebuild() {
+        let s = mem_store();
+        let p = Platform::Claude;
+        let d1 = today();
+        let d0 = day_before(&d1);
+        // 一条一条地喂：每次 insert_readings 内部都会刷一次日级汇总
+        for (day, sec, used) in [
+            (&d0, 3_600, 5.0),
+            (&d0, 40_000, 11.0),
+            (&d0, 80_000, 9.0),
+            (&d1, 1_800, 14.0),
+            (&d1, 50_000, 6.0),
+        ] {
+            s.insert_readings(p, &[reading(at_local(day, sec), "5h", used, SnapshotSource::Desktop)])
+                .unwrap();
+        }
+        let incremental = s.quota_days(p, "5h", &d0, &d1);
+        assert_eq!(incremental.len(), 2);
+        s.refresh_quota_daily(p, None).unwrap();
+        let rebuilt = s.quota_days(p, "5h", &d0, &d1);
+        assert_eq!(incremental, rebuilt, "增量与重建必须逐位相同");
+        // 跨零点那一笔（9.0 → 14.0）记在后一天,增量路径也不能漏
+        assert!((rebuilt[1].gain_pct - 5.0).abs() < 1e-9);
+    }
+
+    /// 快照落库顺手记进读数序列,但**只收 api**：桌面端修正过的快照 `fetched_at`
+    /// 停在上一条 api 读数的时刻（见 `claude_desktop::apply_flat_sample`），
+    /// 照搬会把新值配上旧时刻。
+    #[test]
+    fn only_api_snapshots_reach_the_reading_series() {
+        let s = mem_store();
+        let p = Platform::Claude;
+        let snap = |used: f64, at: i64, src| SubscriptionSnapshot {
+            platform: p,
+            plan_type: "max".into(),
+            windows: vec![QuotaWindow { kind: "5h".into(), used_percent: used, resets_at: Some(at + 300) }],
+            fetched_at: Some(at),
+            status: FetchStatus::Ok,
+            source: src,
+        };
+        s.save_snapshot(&snap(20.0, 1_000, SnapshotSource::Api)).unwrap();
+        assert_eq!(s.quota_reading_count(p), 1);
+        // 桌面端把读数下修进快照,时刻**不推进** ⇒ 不进序列
+        s.save_snapshot(&snap(14.0, 1_000, SnapshotSource::Desktop)).unwrap();
+        let got = s.quota_readings(p, "5h", 0, 9_999);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].used_percent, 20.0, "序列里留的是那一刻真的取到的数");
+        assert_eq!(got[0].plan_type, "max");
+        assert_eq!(got[0].resets_at, Some(1_300));
+        // 失败轮只推进 status,同样不该在序列里留下什么
+        s.save_snapshot(&SubscriptionSnapshot {
+            platform: p,
+            plan_type: "unknown".into(),
+            windows: vec![],
+            fetched_at: None,
+            status: FetchStatus::NetworkFailed,
+            source: SnapshotSource::Api,
+        })
+        .unwrap();
+        assert_eq!(s.quota_reading_count(p), 1);
+    }
+
+    /// 存量库升级：`desktop_sample` 里的读数历史**就地回填**进 `quota_reading`,
+    /// 而且原表一行不动（两层并存,禁止清库重扫）。
+    #[test]
+    fn existing_samples_are_backfilled_into_the_reading_series() {
+        let dir = std::env::temp_dir().join(format!("tc_sub_qr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subscriptions.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE usage_pair (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL,
+                     t0 INTEGER NOT NULL, t1 INTEGER NOT NULL, used5_0 REAL NOT NULL, used5_1 REAL NOT NULL,
+                     used7_0 REAL NOT NULL, used7_1 REAL NOT NULL, cost REAL NOT NULL,
+                     unknown_cost REAL NOT NULL, breakdown TEXT NOT NULL);
+                 CREATE TABLE desktop_sample (platform TEXT NOT NULL, t INTEGER NOT NULL,
+                     used5 REAL NOT NULL, used7 REAL NOT NULL, plan_type TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (platform, t));
+                 INSERT INTO desktop_sample VALUES ('claude', 1000, 10.0, 4.0, ''),
+                                                   ('claude', 1900, 12.0, 4.0, ''),
+                                                   ('codex',  1500, 30.0, 8.0, 'edu');",
+            )
+            .unwrap();
+        }
+        let s = SubStore::open(&path).unwrap();
+        assert_eq!(s.sample_count(Platform::Claude), 2, "原表一行不动");
+        assert_eq!(s.sample_count(Platform::Codex), 1);
+        // 一条样本 → 两个窗口两行
+        assert_eq!(s.quota_reading_count(Platform::Claude), 4);
+        assert_eq!(s.quota_reading_count(Platform::Codex), 2);
+        // 来源按**当初是谁写的**如实标
+        let claude = s.quota_readings(Platform::Claude, "5h", 0, 9_999);
+        assert_eq!(claude.len(), 2);
+        assert_eq!(claude[0].source, SnapshotSource::Desktop);
+        assert_eq!(claude[0].resets_at, None, "那张表没记窗尾 ⇒ 未知");
+        let codex = s.quota_readings(Platform::Codex, "7d", 0, 9_999);
+        assert_eq!(codex[0].source, SnapshotSource::Rollout);
+        assert_eq!(codex[0].used_percent, 8.0);
+        assert_eq!(codex[0].plan_type, "edu");
+        // 幂等：再开一次不重复回填、不报错
+        drop(s);
+        let s2 = SubStore::open(&path).unwrap();
+        assert_eq!(s2.quota_reading_count(Platform::Claude), 4);
+        assert_eq!(s2.sample_count(Platform::Claude), 2);
+        drop(s2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **拿迁移前备份回滚再打开**：备份是在建表之后落的,里面已经带着一张空的
+    /// `quota_reading`——按「表在不在」判就永远不回填,那段读数历史等于凭空消失。
+    /// 判据是行数,所以这一开必须把它补回来。
+    #[test]
+    fn a_restored_backup_with_an_empty_series_still_gets_backfilled() {
+        let dir = std::env::temp_dir().join(format!("tc_sub_qrestore_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subscriptions.db");
+        {
+            let s = SubStore::open(&path).unwrap();
+            s.insert_samples(Platform::Claude, &[(1_000, 10.0, 4.0), (1_900, 12.0, 4.0)]).unwrap();
+            // 模拟备份快照：表在、但一条读数都没有
+            s.conn.execute("DELETE FROM quota_reading", []).unwrap();
+            assert_eq!(s.quota_reading_count(Platform::Claude), 0);
+        }
+        let s = SubStore::open(&path).unwrap();
+        assert_eq!(s.quota_reading_count(Platform::Claude), 4, "空序列要被补回来");
+        assert_eq!(s.sample_count(Platform::Claude), 2, "源表一行不动");
+        assert!(
+            !s.quota_days(Platform::Claude, "5h", "0000-00-00", "9999-99-99").is_empty(),
+            "补完读数之后汇总层也要跟着长出来"
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 日级口径升版 ⇒ 开库时整表重建（纯派生层可以这么干,读数层不行）。
+    #[test]
+    fn a_daily_rule_bump_rebuilds_the_summary_layer() {
+        let dir = std::env::temp_dir().join(format!("tc_sub_qd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subscriptions.db");
+        let d = today();
+        {
+            let s = SubStore::open(&path).unwrap();
+            s.insert_readings(
+                Platform::Codex,
+                &[
+                    reading(at_local(&d, 3_600), "5h", 10.0, SnapshotSource::Rollout),
+                    reading(at_local(&d, 7_200), "5h", 18.0, SnapshotSource::Rollout),
+                ],
+            )
+            .unwrap();
+            // 手动把汇总层弄脏 + 把版本标记退回,模拟「口径改过了」
+            s.conn.execute("DELETE FROM quota_daily", []).unwrap();
+            s.set_meta_i64("quota_daily_rule_codex", 0).unwrap();
+        }
+        let s = SubStore::open(&path).unwrap();
+        let days = s.quota_days(Platform::Codex, "5h", &d, &d);
+        assert_eq!(days.len(), 1, "开库时按 quota_reading 重建回来了");
+        assert!((days[0].gain_pct - 8.0).abs() < 1e-9);
+        assert_eq!(s.meta_i64("quota_daily_rule_codex"), Some(SubStore::QUOTA_DAILY_RULE_VERSION));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

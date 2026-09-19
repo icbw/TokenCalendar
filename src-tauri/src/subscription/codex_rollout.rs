@@ -479,6 +479,27 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     let samples: Vec<_> =
         scan.readings.iter().map(|r| (r.t, r.used5, r.used7, r.plan.clone())).collect();
     let harvested = store.insert_samples_of(Platform::Codex, &samples).unwrap_or(0);
+    // 同一批读数再落一遍**归一化序列**（-4;两层并存,见 store 建表注释）。
+    // 这一路比桌面端全：rollout 的每条 rate_limits 都自带窗尾与套餐,两个窗口各一行。
+    let quota_rows: Vec<_> = scan
+        .readings
+        .iter()
+        .flat_map(|r| {
+            [("5h", r.used5, r.resets5), ("7d", r.used7, r.resets7)].map(|(kind, used, resets)| {
+                super::model::QuotaReading {
+                    t: r.t,
+                    kind: kind.into(),
+                    used_percent: used,
+                    resets_at: resets,
+                    plan_type: r.plan.clone(),
+                    source: super::model::SnapshotSource::Rollout,
+                }
+            })
+        })
+        .collect();
+    if let Err(e) = store.insert_readings(Platform::Codex, &quota_rows) {
+        crate::dev_log!("[subscription] codex quota_reading insert failed: {e}");
+    }
 
     // 样本按套餐分组落库：insert_pairs 一次只带一个 plan_type,而回溯窗里可能跨过套餐变更。
     let mut by_plan: BTreeMap<String, Vec<(Pair, (f64, f64), String)>> = BTreeMap::new();
@@ -550,7 +571,7 @@ fn log_scan(store: &SubStore, scan: &Scan, harvested: usize, pairs: usize) {
     let gap = store.median_sample_gap(Platform::Codex).unwrap_or(0);
     crate::dev_log!(
         "[subscription] codex rollout harvest +{} reading(s) from {}/{} file(s) ({:.1} MB) \
-         → kept {} over {:.1}d (median gap {}s) → +{} pair(s)",
+         → kept {} over {:.1}d (median gap {}s) → +{} pair(s), quota_reading {} row(s)",
         harvested,
         scan.files_read,
         scan.files_total,
@@ -558,7 +579,8 @@ fn log_scan(store: &SubStore, scan: &Scan, harvested: usize, pairs: usize) {
         total,
         span_days,
         gap,
-        pairs
+        pairs,
+        store.quota_reading_count(Platform::Codex)
     );
     if scan.weekly_only > 0 {
         // 老版 CLI（本机 2026-07/08 的 plus 记录）只回报周窗 ⇒ 这些读数进不了标定。

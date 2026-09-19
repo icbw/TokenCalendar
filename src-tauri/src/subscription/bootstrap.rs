@@ -317,9 +317,27 @@ fn day_of(ts: i64) -> String {
 /// 索引查询的开销。首次运行（空库 / 刚升级）等价于原来的冷启动——水位线落在
 /// `now - HORIZON_DAYS`,一次把近两周补齐。
 pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, usize) {
-    let harvested = sub_store
-        .insert_samples(Platform::Claude, &super::claude_desktop::all_samples())
-        .unwrap_or(0);
+    let desktop_samples = super::claude_desktop::all_samples();
+    let harvested = sub_store.insert_samples(Platform::Claude, &desktop_samples).unwrap_or(0);
+    // 同一批读数再落一遍**归一化序列**（-4;两层并存,见 store 建表注释）。
+    // 桌面端不提供窗尾也不提供套餐 ⇒ `resets_at` / `plan_type` 留空,那是「源给不出」
+    // 而不是「没有」。写入按主键幂等,所以这里照旧可以每轮无脑全量喂。
+    let readings: Vec<_> = desktop_samples
+        .iter()
+        .flat_map(|(t, used5, used7)| {
+            [("5h", *used5), ("7d", *used7)].map(|(kind, used)| super::model::QuotaReading {
+                t: *t,
+                kind: kind.into(),
+                used_percent: used,
+                resets_at: None,
+                plan_type: String::new(),
+                source: super::model::SnapshotSource::Desktop,
+            })
+        })
+        .collect();
+    if let Err(e) = sub_store.insert_readings(Platform::Claude, &readings) {
+        crate::dev_log!("[subscription] claude quota_reading insert failed: {e}");
+    }
 
     // 水位线 = 桌面端那一路已经建到哪儿;没有则从回溯上限起（= 原冷启动行为）。
     let floor = now - HORIZON_DAYS * 86_400;
@@ -451,13 +469,24 @@ fn log_density(sub_store: &SubStore, harvested: usize, pairs: usize) {
     };
     let gap = sub_store.median_sample_gap(Platform::Claude).unwrap_or(0);
     crate::dev_log!(
-        "[subscription] claude desktop harvest +{} sample(s) → kept {} over {:.1}d (median gap {}s) → +{} pair(s)",
+        "[subscription] claude desktop harvest +{} sample(s) → kept {} over {:.1}d (median gap {}s) → +{} pair(s), quota_reading {} row(s) over {:.1}d",
         harvested,
         total,
         span_days,
         gap,
-        pairs
+        pairs,
+        sub_store.quota_reading_count(Platform::Claude),
+        reading_span_days(sub_store, Platform::Claude)
     );
+}
+
+/// 归一化读数序列的跨度（天;不足两条 → 0）。两个窗口种类各一行,所以行数是样本数的
+/// 两倍左右——这一行的用处是让「两层都在长」在日志里看得。
+fn reading_span_days(sub_store: &SubStore, platform: Platform) -> f64 {
+    match sub_store.quota_reading_span(platform) {
+        Some((first, last)) if last > first => (last - first) as f64 / 86_400.0,
+        _ => 0.0,
+    }
 }
 
 #[cfg(test)]
