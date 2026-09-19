@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::credentials::{self, MemoryToken, RawCredential};
-use super::model::{FetchStatus, Platform, QuotaWindow, SubscriptionSnapshot};
+use super::model::{FetchStatus, Platform, QuotaWindow, SnapshotSource, SubscriptionSnapshot};
 use super::RateGate;
 
 /// 上报的 CLI 版本：UA 只要求形态正确 + 版本够新。
@@ -86,7 +86,12 @@ impl ClaudeAdapter {
 
     /// 凭据文件变化 → 清内存缓存（下轮重新现读;判死自愈入口）。
     /// 冷却也一并清掉：文件都换了（用户重登/CLI 续期）,旧限流判定不再适用。
+    /// **只认自己平台的变化**：gate 是 Claude 自己的 429 退避,别的平台换凭据
+    /// 不该把它清掉。
     pub fn invalidate(&self, platform: Platform) {
+        if platform != Platform::Claude {
+            return;
+        }
         self.tokens_slot().remove(&platform);
         self.gate.clear();
     }
@@ -201,6 +206,7 @@ pub fn parse_usage(cred: &super::credentials::RawCredential, body: &str, now: i6
         windows,
         fetched_at: Some(now),
         status: FetchStatus::Ok,
+        source: SnapshotSource::Api,
     }
 }
 
@@ -217,5 +223,6 @@ fn error_snapshot(status: FetchStatus) -> SubscriptionSnapshot {
         windows: vec![],
         fetched_at: None,
         status,
+        source: SnapshotSource::Api,
     }
 }

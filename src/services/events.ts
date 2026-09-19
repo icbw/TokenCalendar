@@ -57,19 +57,14 @@ export function onWidgetSnapLanded(
   return listen<{ col: number; row: number }>('widget-snap-landed', (v) => cb(v))
 }
 
-// 订阅快照变更（Rust 轮询 daemon 每轮/绑定/解绑/手动刷新后发）。
+// 订阅快照变更（Rust 取数 daemon 在**读数真的变了**的轮 + 绑定/解绑/
+// 手动刷新后发;取数触发源含本地 token 探针与兜底间隔,前端一律汇入这一条事件）。
 export function onSubscriptionChanged(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('subscription:changed', () => cb())
 }
 
-// boost 监控（Rust boost 线程:成功取数落槽 / 退出回落 / 总开关清场后发）。
-// 载荷恒为 true——前端收到后重查 get_subscription_boost。
-export function onSubscriptionBoost(cb: () => void): Promise<Unlisten> {
-  return listen<boolean>('subscription:boost', () => cb())
-}
-
-// 待机监控（Rust 主轮询退档/复位翻转后发）。
-// 载荷恒为 true——前端收到后重查 get_subscription_idle。
+// 待机监控（Rust 侧待机态翻转后发:进入 = 安静满 10 分钟,退出 = 本地
+// agent 活动 / 用户注意）。载荷恒为 true——前端收到后重查 get_subscription_idle。
 export function onSubscriptionIdle(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('subscription:idle', () => cb())
 }

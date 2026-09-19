@@ -40,7 +40,9 @@ impl Platform {
 }
 
 /// 额度窗口种类（kind 语义跨平台对齐：5h 滚动 / 7d 滚动 / 附加窗口）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq`:主轮询据此判「落库后读数真的变了吗」,只有真变了才广播
+/// `subscription:changed`（两端都来自同一份 JSON 往返,浮点按位可比）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaWindow {
     /// "5h" | "7d" | "7d_opus"（附加窗口原样透传,前端按需展示）。
     pub kind: String,
@@ -99,8 +101,50 @@ impl FetchStatus {
     }
 }
 
-/// 单平台订阅快照（归一化,落库/命令面同形状）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 读数来源：
+/// - `api` = 平台 usage 端点读数,`fetched_at` = 请求时刻,与本地代价的累计区间对得上
+///   （差不到一秒）;
+/// - `desktop` = Claude 桌面端 `plan-usage-history.json` 采样,`fetched_at` = 样本时刻
+///与「这段时间花了多少」对应的不是同一段时间;
+/// - `rollout` = Codex 会话 rollout 里 `token_count` 事件带的 `rate_limits`,
+///   `fetched_at` = 那次 API 调用的时刻。**它和 `api` 是同一个服务端数字**——
+///   Codex 在每次响应里回的限流状态,只是走本地文件到手,不花一个请求。
+///
+/// 三者的百分比精度其实相同,分开标不是为了
+/// 精度,是为了**时刻语义**：`api` 的时刻就是「现在」,另外两个是「那一刻」。
+///
+/// **在线标定样本只认两端都是 `api` 的读数对**（`record_pair`）:另外两路各自按**读数
+/// 自己的时刻**精确切割（[`super:bootstrap`] / [`super:codex_rollout`]）——两个窗口
+/// 同源、偏移归零,而且密度比取数轮高得多。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotSource {
+    #[default]
+    Api,
+    Desktop,
+    Rollout,
+}
+
+impl SnapshotSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SnapshotSource::Api => "api",
+            SnapshotSource::Desktop => "desktop",
+            SnapshotSource::Rollout => "rollout",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "api" => Some(SnapshotSource::Api),
+            "desktop" => Some(SnapshotSource::Desktop),
+            "rollout" => Some(SnapshotSource::Rollout),
+            _ => None,
+        }
+    }
+}
+
+/// 单平台订阅快照（归一化,落库/命令面同形状;`PartialEq` 见 `QuotaWindow`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionSnapshot {
     pub platform: Platform,
     /// 套餐名（"plus"/"pro"/"max"/"free"…;获取失败为 "unknown"）。
@@ -110,6 +154,9 @@ pub struct SubscriptionSnapshot {
     pub fetched_at: Option<i64>,
     /// 状态。
     pub status: FetchStatus,
+    /// 读数来源（语义见 [`SnapshotSource`];失败轮沿用库内上一条的来源）。
+    #[serde(default)]
+    pub source: SnapshotSource,
 }
 
 /// 凭据发现项（设置页扫描列表用;**永不包含 token 值,只含掩码**）。

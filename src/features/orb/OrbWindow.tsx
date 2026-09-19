@@ -25,7 +25,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
 import { events, subscriptionService, windowService, type OrbDockState, type PlatformIdleState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
-import { getDesignPrefs, orbBoostConfig, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
+import { getDesignPrefs, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
@@ -124,8 +124,13 @@ const PILL_LEVEL_FADE = 6
  * 矩形只需盖住水位线以下,取一个远大于轮廓高度的定值即可。 */
 const PILL_LEVEL_RECT_H = 200
 
-/** 快照兜底节流（Rust 事件即时推送之外的低频兜底,S4：30s）。 */
-const RESNAP_INTERVAL_MS = 30_000
+/** 秒表节拍（30s）：周重置倒计时 / 5h 重置时刻是渲染时按 `Date.now` 算的,
+ * 没有新快照也要重算,否则读数不动时倒计时会冻住。**只触发重渲染,不查后端**。 */
+const TICK_MS = 30_000
+/** 每多少个节拍补查一次快照（= 5 分钟）：快照的即时性由 `subscription:changed`
+ * 负责,这条只是「万一漏了一次事件」的兜底。旧版每 30s 直查一次,注释却写着
+ * 「30s 内不重复 invoke」的节流——那个节流从来不存在。 */
+const RESNAP_EVERY_TICKS = 10
 
 /** 手动刷新的反馈时长（㉖）：下限 = 扫掠弧至少走完一轮（看得）;上限兜住
  * 「收不到完成信号」的情形——`fetched_at` 只在**成功**取数时推进,所以网络/
@@ -394,7 +399,8 @@ export default function OrbWindow() {
   )
   useEffect(() => subscribeDesignPrefs((p) => setActivePlatformId(p.orbPlatform)), [])
 
-  // 数据消费：初查 + subscription:changed 即时重查 + 30s 兜底节流
+  // 数据消费：初查 + subscription:changed 即时重查（Rust 侧只在读数真的变了才发,
+  // 见 subscription/mod.rs）+ 5 分钟一次的漏事件兜底。
   const refresh = useCallback(() => {
     subscriptionService.getSnapshots().then((s) => {
       if (s) setSnapshots(s)
@@ -402,68 +408,36 @@ export default function OrbWindow() {
   }, [])
 
   useEffect(() => {
-    refresh()
     let off: (() => void) | null = null
     let disposed = false
-    void events.onSubscriptionChanged(() => {
-      // 节流：Rust 每轮轮询后都会 emit,前端 30s 内不重复 invoke
-      refresh()
-    }).then((unlisten) => {
+    // 先订阅、注册完成后再初查（审计 P3-,与待机那条 effect 同款）：初查若与
+    // 注册并行,注册窗口期内的变更事件不会重放——读数会陈旧到下一轮。
+    void events.onSubscriptionChanged(refresh).then((unlisten) => {
       if (disposed) unlisten()
       else off = unlisten
+      if (!disposed) refresh()
     })
-    const timer = window.setInterval(refresh, RESNAP_INTERVAL_MS)
     return () => {
       disposed = true
       off?.()
-      window.clearInterval(timer)
     }
   }, [refresh])
 
-  // boost 补充数据：Rust boost 线程独立取数,**只走自身事件推送**
-  // （激活中按配置间隔一轮一 emit）,不混入主快照的 changed/30s 兜底——
-  // 独立通道的语义由这条 effect 单点维持。
-  const [boostSnaps, setBoostSnaps] = useState<SubscriptionSnapshot[]>([])
-  const lastBoostAt = useRef(0)
+  // 秒表节拍：倒计时按 `Date.now` 渲染,没有新快照也要重算;顺带每 10 拍补查
+  // 一次快照兜住漏掉的事件（见 TICK_MS / RESNAP_EVERY_TICKS）。
+  const [, setTick] = useState(0)
+  const ticks = useRef(0)
   useEffect(() => {
-    subscriptionService.getBoost().then((s) => s && setBoostSnaps(s)).catch(() => {})
-    let off: (() => void) | null = null
-    let disposed = false
-    void events.onSubscriptionBoost(() => {
-      subscriptionService.getBoost().then((s) => {
-        if (!s) return
-        setBoostSnaps(s)
-        // 只有「新数据落地」才触发刷新特效;退出回落/总开关清场（空槽或旧时刻）
-        // 静默——回落到主快照读数不该再跑一遍扫掠弧。
-        const maxAt = s.reduce((m, b) => Math.max(m, (b.fetched_at ?? 0) * 1000), 0)
-        if (maxAt > lastBoostAt.current) {
-          lastBoostAt.current = maxAt
-          setPhase('landing')
-          refreshStart.current = Date.now()
-        }
-      }).catch(() => {})
-    }).then((unlisten) => {
-      if (disposed) unlisten()
-      else off = unlisten
-    })
-    return () => {
-      disposed = true
-      off?.()
-    }
-  }, [])
+    const timer = window.setInterval(() => {
+      ticks.current += 1
+      setTick(ticks.current) // 只为触发重渲染——倒计时是渲染时按 Date.now() 算的
+      if (ticks.current % RESNAP_EVERY_TICKS === 0) refresh()
+    }, TICK_MS)
+    return () => window.clearInterval(timer)
+  }, [refresh])
 
-  // boost 配置恢复与跟随：orb 常驻窗口承担恢复（主轮询间隔的恢复挂在设置页
-  // Subscriptions tab 挂载,boost 若也挂那里,没开过设置页就永远不生效）;
-  // 设置页改动经 storage 桥到这里,原值幂等重下发。
-  useEffect(() => {
-    subscriptionService.applyBoostConfig(orbBoostConfig(getDesignPrefs()))
-    return subscribeDesignPrefs((p) => {
-      subscriptionService.setBoostConfig(orbBoostConfig(p)).catch(() => {})
-    })
-  }, [])
-
-  // 待机监控：主轮询退档状态跟随——Rust 档位翻转（进入/退出待机）
-  // 时发 subscription:idle,这里重查;档位表在 Rust 内存,重启回基础档无需恢复。
+  // 待机监控：Rust 侧待机态跟随——翻转（进入/退出）时发 subscription:idle,
+  // 这里重查;待机态在 Rust 内存,重启即全亮无需恢复。
   const [idleStates, setIdleStates] = useState<PlatformIdleState[]>([])
   useEffect(() => {
     const query = () => {
@@ -483,8 +457,8 @@ export default function OrbWindow() {
       off?.()
     }
   }, [])
-  // 待机开关恢复与跟随（同 boost 语义：orb 常驻窗口承担恢复,设置页改动经
-  // storage 桥到这里）。Rust 侧 set 会唤醒主轮询,只在值真变化时下发——
+  // 待机开关恢复与跟随：orb 是常驻窗口,由它承担运行时值恢复（设置页改动经
+  // storage 桥到这里）。Rust 侧 set 会唤醒兜底取数,只在值真变化时下发——
   // 无关 designPrefs 广播被 React state 同值 bail-out 挡住,不触发无谓刷新。
   const [idleOn, setIdleOn] = useState(() => orbIdleEnabled(getDesignPrefs()))
   useEffect(() => subscribeDesignPrefs((p) => setIdleOn(orbIdleEnabled(p))), [])
@@ -508,27 +482,21 @@ export default function OrbWindow() {
   const activePlatform = Math.max(0, boundSnaps.findIndex((s) => s.platform === activePlatformId))
 
   const snap = boundSnaps[activePlatform]
-  // boost 补充路由：该平台 boost 快照比主快照新 → 5h/7d 读数走
-  // boost 数据（加速节奏的高频结果）;主快照始终是绑定/状态语义的权威。
-  // Rust 侧槽内只有成功取数（失败轮不落槽）,merge 无需二次兜底。
-  const boostSnap = boostSnaps.find((b) => b.platform === snap?.platform)
-  const boosting = !!boostSnap && (boostSnap.fetched_at ?? 0) > (snap?.fetched_at ?? 0)
-  const effSnap =
-    boosting && boostSnap && snap
-      ? { ...snap, windows: boostSnap.windows, fetched_at: boostSnap.fetched_at }
-      : snap
-  // 待机（standby）：所有已绑定平台都已进入待机（连续 3 轮无变化且安静
-  // ≥ 10 分钟,期间无本地 agent 活动与用户注意）且没有任何平台在 boost 高频监控中 → 整体待机,悬浮球减淡 50%（.is-standby,
-  // orb.css）。取「全局安静态」而非按显示中平台判定——单平台显示下切换平台
-  // 不会亮度跳变;任一平台有变化/在 boost 中 = 用户在用,恢复全亮。
+  // 读数单一来源：快照只走 get_subscription_snapshots + subscription:changed。
+  // 取数由本地 token 探针驱动（本机一有新 token 就取）+ 兜底间隔覆盖网页用量,
+  // 两条触发源在 Rust 侧汇成同一份快照,前端不再做多通道择新。
+  // 待机：
+  // 安静起点 = 最近一次本地 agent 活动 / 用户注意,Rust 侧是**全局**一个数,
+  // 两个平台的 idle 恒相同（idle.rs）。这里仍按「所有已绑定平台都待机」判,
+  // 是为了不依赖那个实现细节——整体待机才减淡 50%（.is-standby,orb.css）;
+  // 取全局安静态而非按显示中平台判定,单平台显示下切换平台不会亮度跳变。
   const idleMap = new Map(idleStates.map((s) => [s.platform, s.idle]))
   const standby =
     idleOn &&
     boundSnaps.length > 0 &&
-    boundSnaps.every((s) => idleMap.get(s.platform) === true) &&
-    boostSnaps.length === 0
-  const w5h = windowOf(effSnap, '5h')
-  const w7d = windowOf(effSnap, '7d') ?? windowOf(effSnap, '7d_opus')
+    boundSnaps.every((s) => idleMap.get(s.platform) === true)
+  const w5h = windowOf(snap, '5h')
+  const w7d = windowOf(snap, '7d') ?? windowOf(snap, '7d_opus')
   // 「剩余 = 100 − 已用」换算（口径单侧）。
   const remain7d = w7d ? Math.max(0, Math.min(100, 100 - w7d.used_percent)) : null
   const remain5h = w5h ? Math.max(0, Math.min(100, 100 - w5h.used_percent)) : null
@@ -872,9 +840,7 @@ export default function OrbWindow() {
   // 该窗口无数据（未绑定/凭据失效）→ 退化为状态提示,正好解释读数为什么是「—」。
   const statusTip: TipContent = {
     label: snap ? planTitle : undefined,
-    // boost 激活中在状态提示尾行挂「boosting」（不显眼,
-    // 仅 hover 可;高频刷新本身已有扫掠弧特效在提示）
-    lines: [hint.text, ...(boosting ? ['boosting'] : [])],
+    lines: [hint.text],
     level: hint.level,
   }
   const weeklyTip: TipContent = weekIdle

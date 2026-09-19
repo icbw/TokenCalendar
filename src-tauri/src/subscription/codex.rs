@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use serde_json::Value;
 
 use super::credentials::{self, MemoryToken, RawCredential, RefreshOutcome};
-use super::model::{FetchStatus, Platform, QuotaWindow, SubscriptionSnapshot};
+use super::model::{FetchStatus, Platform, QuotaWindow, SnapshotSource, SubscriptionSnapshot};
 use super::RateGate;
 
 pub struct CodexAdapter {
@@ -53,7 +53,7 @@ impl CodexAdapter {
     /// 统一准入：从内存缓存或凭据文件取得可用 access token。
     /// 死态复活条件 = 凭据文件 mtime 变化（mod.rs 轮询里清缓存）。
     /// 锁只覆盖内存缓存读写——**网络刷新在锁外做**（审计 P2-：持锁刷新会把
-    /// 共享同一 Adapters 的 boost 线程阻塞最长 15s）。
+    /// 共享同一 Adapters 的其他取数方阻塞最长 15s）。
     pub fn obtain_access(&self, platform: Platform) -> Access {
         {
             let cache = self.tokens_slot();
@@ -289,6 +289,7 @@ pub fn parse_usage(
         windows,
         fetched_at: Some(now),
         status: FetchStatus::Ok,
+        source: SnapshotSource::Api,
     }
 }
 
@@ -340,5 +341,6 @@ fn snapshot_error(
         windows: vec![],
         fetched_at: None,
         status,
+        source: SnapshotSource::Api,
     }
 }

@@ -252,8 +252,8 @@
   margin-left: 12px;
 }
 
-/* boost：行内数字输入（阈值/自定义间隔）与单位后缀。
-   与 setting-seg 同族的窄控件语言（零内边距基调、圆角、弱边框）。 */
+/* 行内数字输入（阈值一类的窄数值控件）与单位后缀，当前由设置·Projects 的
+   自动折叠规则消费。与 setting-seg 同族的窄控件语言（零内边距基调、圆角、弱边框）。 */
 .setting-num {
   margin-left: 12px;
   width: 52px;
@@ -292,6 +292,12 @@
   font-size: var(--font-size-xs);
   color: var(--text-faint);
   line-height: 1.6;
+}
+
+/* 本机之外的消耗（多机 / 网页 / 手机 App）提示：比同行其余读数重一档,
+   但**不引入新色**——它是「值得看一眼的事实」,不是错误态。 */
+.setting-note-warn {
+  color: var(--text-muted);
 }
 
 /* Widget design parameters */

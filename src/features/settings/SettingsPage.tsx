@@ -8,9 +8,9 @@
 import { useEffect, useRef, useState } from 'react'
 // react-colorful 自注入样式（运行时 <style> 注入，无独立 CSS 文件可 import）。
 import { HexColorPicker, HexColorInput } from 'react-colorful'
-import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type ExportResult, type DataInfo, type SubscriptionSnapshot, type UpdateCheck, type UpdateProgress } from '../../services'
+import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type EstimatorState, type ExportResult, type DataInfo, type SubscriptionSnapshot, type UpdateCheck, type UpdateProgress } from '../../services'
 import { currentMonth } from '../../lib/time'
-import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, orbBoostConfig, SIZE_PRESETS, RADIUS_PRESETS, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
+import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
 import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
@@ -24,7 +24,7 @@ const TABS: { id: SettingsTab; label: string; hint: string }[] = [
   { id: 'appearance', label: 'Appearance', hint: 'Colors, glass material and corner radius' },
   { id: 'projects', label: 'Projects', hint: 'Rename, hide and merge project folders; Scratch rule' },
   { id: 'data', label: 'Data', hint: 'Storage, backup, restore and export' },
-  { id: 'subscriptions', label: 'Subscriptions', hint: 'Quota polling, boost monitoring and binding' },
+  { id: 'subscriptions', label: 'Subscriptions', hint: 'Quota readings, standby and binding' },
   { id: 'about', label: 'About', hint: 'Version and updates' },
 ]
 
@@ -1107,30 +1107,34 @@ function DataTab() {
 
 /* ---------------- Subscriptions：悬浮球总开关 + 平台绑定卡 ---------------- */
 
-const POLL_OPTIONS = [300, 600, 900, 1800] // 秒 → 5/10/15/30 分钟
-const BOOST_INTERVAL_OPTIONS = [60, 120, 180] // 秒 → 1/2/3 分钟（超出 = Custom 档）
+const POLL_OPTIONS = [300, 600, 900, 1800] // 秒 → 5/10/15/30 分钟（兜底取数间隔）
+const POLL_DEFAULT_SECS = 1800 // 默认 30 分钟（2026-09-18：兜底无动态检测能力，取封顶档；时机由本地 token 驱动）
 
 function SubscriptionsTab() {
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   const [scan, setScan] = useState<CredentialInfo[]>([])
   const [snapshots, setSnapshots] = useState<SubscriptionSnapshot[]>([])
+  const [estimator, setEstimator] = useState<EstimatorState[]>([])
   const [notice, setNotice] = useState<string | null>(null)
-  // boost 数字输入（spike 阈值 / 自定义间隔）：draft 态自由输入,blur/Enter 校验
-  // 提交（越界回弹显示现值）;Custom 档由「值不在预设档」或显式点击 Custom 展开。
-  const [spikeDraft, setSpikeDraft] = useState<string | null>(null)
-  const [intervalDraft, setIntervalDraft] = useState<string | null>(null)
-  const [customMode, setCustomMode] = useState(false)
-  const customInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => subscribeDesignPrefs(setDesign), [])
 
-  // 初查 + subscription:changed 跟随（bind/unbind/轮询完成都会汇入同一事件）
+  // 初查 + subscription:changed 跟随（bind/unbind/轮询完成都会汇入同一事件）。
+  // 估算器是诊断只读接口,同样只在这两处查——不轮询。
   useEffect(() => {
+    const loadEstimator = () =>
+      subscriptionService
+        .getEstimator()
+        // null = 非 Tauri 环境或旧版 Rust 还没这条命令 → 保持空,校准状态行整行不显示
+        .then((e) => e && setEstimator(e))
+        .catch(() => {})
     subscriptionService.scanCredentials().then((s) => s && setScan(s)).catch(console.error)
     subscriptionService.getSnapshots().then((s) => s && setSnapshots(s)).catch(console.error)
+    void loadEstimator()
     let off: (() => void) | null = null
     void events.onSubscriptionChanged(() => {
       subscriptionService.getSnapshots().then((s) => s && setSnapshots(s)).catch(console.error)
+      void loadEstimator()
     }).then((unlisten) => {
       off = unlisten
     })
@@ -1139,11 +1143,35 @@ function SubscriptionsTab() {
     }
   }, [])
 
-  // 轮询间隔运行时值恢复（prefs 装载完成后一次性下发）
+  // 兜底取数间隔运行时值恢复（prefs 装载完成后一次性下发）
   useEffect(() => {
     const secs = design.subscriptionPollSecs
     if (secs) subscriptionService.applyPollSecs(secs)
   }, [design.subscriptionPollSecs])
+
+  // 取数策略（阈值 + 低余量收紧）运行时值恢复：两键合成一次下发,值变化时重发。
+  const fetchPct = subscriptionFetchPct(design)
+  const tightenLow = subscriptionTightenLow(design)
+  useEffect(() => {
+    void applySubscriptionFetchPolicy(getDesignPrefs())
+  }, [fetchPct, tightenLow])
+
+  // 阈值输入 draft + onBlur 提交（与 Projects 的 Scratch 规则同款）：非法值回退显示当前值。
+  const [pctDraft, setPctDraft] = useState(() => String(fetchPct))
+  useEffect(() => setPctDraft(String(fetchPct)), [fetchPct])
+  const commitFetchPct = (draft: string) => {
+    const n = Number(draft)
+    const { min, max, step } = SUBSCRIPTION_FETCH_PCT
+    if (!Number.isFinite(n) || n < min || n > max || !Number.isInteger(n / step)) {
+      setNotice(`Fetch threshold must be ${min} to ${max}% in steps of ${step}`)
+      setPctDraft(String(fetchPct))
+      return
+    }
+    setNotice(null)
+    if (n === fetchPct) return
+    setDesignPrefs({ subscriptionFetchPct: n })
+    subscriptionService.setFetchPolicy(n, tightenLow).catch(console.error)
+  }
 
   // 悬浮球总开关（㉚,「顶栏 Orbit 钮 / 表盘右键关闭后设置页
   // 复选框不跟随,反过来也不 check」）：状态**直接取可见性单一源**——Rust
@@ -1170,8 +1198,8 @@ function SubscriptionsTab() {
     }
   }, [])
   const toggleOrb = (next: boolean) => {
-    // 开 = showOrb;关 = hideOrb（停轮询与绑定数据不在此处——绑定管理独立于呈现,
-    // 轮询始终低频,实施口径:总开关只控呈现,凭据绑定在平台卡卸载）
+    // 开 = showOrb;关 = hideOrb（停取数与绑定数据不在此处——绑定管理独立于呈现,
+    // 兜底取数始终低频,实施口径:总开关只控呈现,凭据绑定在平台卡卸载）
     windowService[next ? 'showOrb' : 'hideOrb']().catch(console.error)
   }
 
@@ -1205,31 +1233,6 @@ function SubscriptionsTab() {
     subscriptionService.refreshNow().catch(console.error)
   }
 
-  // boost 配置：designPrefs 持久化 + 运行时下发双写（与 setPoll 同款）。
-  // setDesignPrefs 同步生效,随后的 getDesignPrefs 已含本次 patch。
-  const setBoost = (patch: Partial<DesignPrefs>) => {
-    setDesignPrefs(patch)
-    subscriptionService.setBoostConfig(orbBoostConfig(getDesignPrefs())).catch(console.error)
-  }
-  const boostOn = design.orbBoostEnabled ?? false
-  const spikeOn = design.orbBoostSpikeEnabled ?? true
-  const lowOn = design.orbBoostLowEnabled ?? false
-  const intervalVal = design.orbBoostIntervalSecs ?? 60
-  const customInterval = customMode || !BOOST_INTERVAL_OPTIONS.includes(intervalVal)
-  const commitSpike = () => {
-    if (spikeDraft == null) return
-    const v = Number(spikeDraft)
-    if (Number.isInteger(v) && v >= 5 && v <= 50) setBoost({ orbBoostSpikePct: v })
-    setSpikeDraft(null) // 非法输入回弹显示现值
-  }
-  const commitInterval = () => {
-    if (intervalDraft == null) return
-    const v = Number(intervalDraft)
-    if (Number.isInteger(v) && v >= 30 && v <= 240) setBoost({ orbBoostIntervalSecs: v })
-    setIntervalDraft(null)
-  }
-  const boostIntervalLabel = customInterval ? `${intervalVal}s` : `${intervalVal / 60}m`
-
   const snapOf = (platform: string) => snapshots.find((s) => s.platform === platform)
   const boundOf = (platform: string) => {
     const s = snapOf(platform)
@@ -1246,14 +1249,79 @@ function SubscriptionsTab() {
           checked={orbVisible}
           onChange={toggleOrb}
         />
+        {/* 按预计消耗取数：本地 token 按模型加权折算出代价,
+            乘以自动校准的系数 → 「距上次读数大约消耗了百分之几」,达到阈值就取一次读数。*/}
         <div className="setting-row">
-          <span title="How often quota is polled">Refresh interval</span>
+          <span title="Pull a reading when the estimated use since the last one reaches this. Estimated from local tokens, weighted per model.">
+            Fetch threshold
+          </span>
+          <span>
+            <input
+              className="setting-num"
+              type="number"
+              aria-label="Fetch threshold"
+              value={pctDraft}
+              min={SUBSCRIPTION_FETCH_PCT.min}
+              max={SUBSCRIPTION_FETCH_PCT.max}
+              step={SUBSCRIPTION_FETCH_PCT.step}
+              onChange={(e) => setPctDraft(e.target.value)}
+              onBlur={() => commitFetchPct(pctDraft)}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+            <span className="setting-unit">%</span>
+          </span>
+        </div>
+        {/* 低余量收紧：5h 剩余 ≤ 20% 时阈值减半（默认 5% → 2.5%）,额度见底那段读数更密。*/}
+        <ToggleRow
+          label="Tighten when low"
+          title="Halve the threshold when 5h remaining is at or below 20%"
+          checked={tightenLow}
+          onChange={(v) => {
+            setDesignPrefs({ subscriptionTightenLow: v })
+            subscriptionService.setFetchPolicy(fetchPct, v).catch(console.error)
+          }}
+        />
+        {/* 校准状态（只读诊断,每平台一行）：估算器是否已被读数校准 + 样本数;
+            距上次读数的预计消耗放 hover,不占版面。命令不可用时整块不渲染。*/}
+        {estimator.length > 0 ? (
+          <div className="setting-note">
+            {estimator.map((e) => (
+              <div
+                key={e.platform}
+                title={`Estimated ${e.est_pct_since_fetch.toFixed(1)}% used since the last reading`}
+              >
+                {e.platform === 'claude' ? 'Claude' : 'Codex'} ·{' '}
+                {e.calibrated ? 'calibrated' : 'calibrating — factory weights'} ({e.pairs}{' '}
+                {e.pairs === 1 ? 'sample' : 'samples'})
+                {/* 收割留存的本地读数条数（Claude = 桌面端采样;Codex = 会话 rollout 里的
+                    rate_limits;0 / 缺字段时整段不显示）——两个源自己都会滚掉旧数据,
+                    这个数越过源的保留线继续涨就是密度在累积。*/}
+                {e.desktop_samples ? ` · ${e.desktop_samples} local readings kept` : ''}
+                {/* 本机 agent 解释不了的消耗：只在真的检出时显示,没有就整段不出现
+                    ——不给用户增加一条恒为 0 的噪声读数。**不写成「别的设备」**：
+                    本机桌面端自己的对话同样不走 collector 源却吃同一份配额。*/}
+                {e.foreign && e.foreign.unexplained > 0 ? (
+                  <span
+                    className="setting-note-warn"
+                    title={`Usage grew in ${e.foreign.unexplained} of ${e.foreign.windows} sampled windows with no local agent activity (+${e.foreign.unexplained_pct.toFixed(1)}% of the 5h window). Something else draws on the same quota — the Claude desktop app's own chats, the web app, a phone, or another computer. Readings stay correct; only the local consumption estimate is affected.`}
+                  >
+                    {` · ${e.foreign.unexplained}/${e.foreign.windows} windows unexplained in ${e.foreign.window_hours}h (+${e.foreign.unexplained_pct.toFixed(1)}%)`}
+                  </span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {/* 兜底取数：主路径是上面的预计消耗阈值。本项只管「本地留不下
+            痕迹」的用量（网页 / 在线会话）的兜底节奏,默认 30 分钟。*/}
+        <div className="setting-row">
+          <span title="Readings follow the estimated use above; this is the fallback for usage with no local trace (web/online sessions)">Fallback poll</span>
           <div className="setting-seg">
             {POLL_OPTIONS.map((s) => (
               <button
                 key={s}
-                className={`setting-seg-btn${(design.subscriptionPollSecs ?? 300) === s ? ' is-active' : ''}`}
-                title={`Poll every ${s / 60} minutes`}
+                className={`setting-seg-btn${(design.subscriptionPollSecs ?? POLL_DEFAULT_SECS) === s ? ' is-active' : ''}`}
+                title={`Fallback fetch every ${s / 60} minutes`}
                 onClick={() => setPoll(s)}
               >
                 {s / 60}m
@@ -1261,13 +1329,12 @@ function SubscriptionsTab() {
             ))}
           </div>
         </div>
-        {/* Standby monitoring：全部平台连续 3 轮无变化且
-            安静 ≥ 10 分钟 → 悬浮球减淡并逐档放慢（封顶 30 分钟）;读数变化 / 本地
-            agent 活动 / 手动刷新·展开·切换平台立即退出。默认开（退档是收敛行为,
-            与 boost 提频需显式授权相反口径）。*/}
+        {/* Standby monitoring：待机看的是**本地 agent 十分钟
+            没有新 token**（不再是「读数连续无变化」）→ 悬浮球减淡;新 token / 手动刷新·展开·
+            切换平台立即退出。取数频次不受待机影响（兜底本身已是封顶档）。默认开。*/}
         <ToggleRow
           label="Standby monitoring"
-          title="Dims the orb and slows polling (max 30 min) after 10+ min without usage changes or agent activity"
+          title="Dims the orb after 10 minutes with no new tokens from local agents"
           checked={design.orbIdleEnabled ?? true}
           onChange={(v) => {
             setDesignPrefs({ orbIdleEnabled: v })
@@ -1284,107 +1351,6 @@ function SubscriptionsTab() {
           </button>
         </div>
         {notice ? <div className="setting-note">{notice}</div> : null}
-      </div>
-
-      {/* Boost monitoring：订阅 boost 补充路由。
-          两触发条件 OR;退出 = 滚动 5 样本窗口内所有已启用条件不再成立。
-          间隔档 1/2/3 分钟 + Custom（30〜240 秒,与 Rust clamp_cfg 同域）。*/}
-      <div className="setting-section">Boost monitoring</div>
-      <div className="setting-block">
-        <ToggleRow
-          label="Enable boost monitoring"
-          title="Faster orb refresh while usage spikes or quota runs low"
-          checked={boostOn}
-          onChange={(v) => setBoost({ orbBoostEnabled: v })}
-        />
-        <ToggleRow
-          label="Trigger: usage spike"
-          title="Triggers when a poll interval consumes more than the threshold"
-          checked={spikeOn}
-          disabled={!boostOn}
-          onChange={(v) => setBoost({ orbBoostSpikeEnabled: v })}
-        />
-        <div className="setting-row">
-          <span title="Consumed share of the 5h quota per poll interval">Spike threshold</span>
-          <input
-            className="setting-num"
-            title="Percent consumed per poll interval (5-50)"
-            type="number" min={5} max={50} step={1} aria-label="Spike threshold percent"
-            value={spikeDraft ?? String(design.orbBoostSpikePct ?? 10)}
-            disabled={!boostOn || !spikeOn}
-            onChange={(e) => setSpikeDraft(e.target.value)}
-            onBlur={commitSpike}
-            onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-          />
-          <span className="setting-unit">%</span>
-        </div>
-        <ToggleRow
-          label="Trigger: low 5h remaining"
-          title="Triggers when 5h remaining is at or below the threshold and usage is still growing; stops once usage stops growing"
-          checked={lowOn}
-          disabled={!boostOn}
-          onChange={(v) => setBoost({ orbBoostLowEnabled: v })}
-        />
-        <div className="setting-row">
-          <span title="5h remaining at or below this value">Low threshold</span>
-          <div className="setting-seg">
-            {[20, 30, 40].map((v) => (
-              <button
-                key={v}
-                className={`setting-seg-btn${(design.orbBoostLowPct ?? 30) === v ? ' is-active' : ''}`}
-                title={`Trigger at ${v}% remaining`}
-                disabled={!boostOn || !lowOn}
-                onClick={() => setBoost({ orbBoostLowPct: v })}
-              >
-                {v}%
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="setting-row">
-          <span title="How often the orb polls while boosting">Boost interval</span>
-          <div className="setting-seg">
-            {BOOST_INTERVAL_OPTIONS.map((s) => (
-              <button
-                key={s}
-                className={`setting-seg-btn${!customInterval && intervalVal === s ? ' is-active' : ''}`}
-                title={`Boost poll every ${s / 60} min`}
-                disabled={!boostOn}
-                onClick={() => { setCustomMode(false); setBoost({ orbBoostIntervalSecs: s }) }}
-              >
-                {s / 60}m
-              </button>
-            ))}
-            <button
-              className={`setting-seg-btn${customInterval ? ' is-active' : ''}`}
-              title="Set a custom interval in seconds"
-              disabled={!boostOn}
-              onClick={() => { setCustomMode(true); window.setTimeout(() => customInputRef.current?.focus(), 0) }}
-            >
-              Custom
-            </button>
-          </div>
-        </div>
-        {customInterval ? (
-          <div className="setting-row">
-            <span title="Interval between boost polls">Custom seconds</span>
-            <input
-              ref={customInputRef}
-              className="setting-num"
-              title="Seconds between boost polls (30-240)"
-              type="number" min={30} max={240} step={1} aria-label="Custom boost interval seconds"
-              value={intervalDraft ?? String(intervalVal)}
-              disabled={!boostOn}
-              onChange={(e) => setIntervalDraft(e.target.value)}
-              onBlur={commitInterval}
-              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-            />
-            <span className="setting-unit">s</span>
-          </div>
-        ) : null}
-        <div className="setting-note">
-          While boosting, the orb polls a separate lane every {boostIntervalLabel} and shows the refresh sweep; it exits after 5 samples of low usage.
-        </div>
       </div>
 
       <div className="setting-section">Platforms</div>

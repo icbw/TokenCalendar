@@ -22,6 +22,13 @@ export interface SubscriptionSnapshot {
   windows: QuotaWindow[]
   fetched_at: number | null
   status: string
+  /** 读数来源：'api' = 平台端点读数（小数精度）；'desktop' = Claude
+   * 桌面端本地采样（整数百分比，空闲期的余量恢复靠它零请求正）。旧版 Rust
+   * 没有这个字段时为 undefined——前端不据此改显示，只作诊断。 */
+  /** 读数来源：`api` = 平台 usage 端点；`desktop` = Claude 桌面端采样文件；
+   * `rollout` = Codex 会话 rollout 里 token_count 事件带的 rate_limits
+   * （与 api 是同一个服务端数字，只是走本地文件到手、不花请求）。 */
+  source?: 'api' | 'desktop' | 'rollout'
 }
 
 /** 凭据发现项（scan_subscription_credentials 出口；只含掩码）。 */
@@ -52,52 +59,83 @@ export async function refreshNow(): Promise<void> {
   await tryInvoke<null>('refresh_subscriptions_now')
 }
 
-/** 设置轮询间隔（秒；仅改运行时值，持久化由 designPrefs.subscriptionPollSecs 承担）。 */
+/** 设置兜底取数间隔（秒；仅改运行时值，持久化由 designPrefs.subscriptionPollSecs 承担）。
+ * 读数主路径是本地 token 探针（采集器发现本机新 token 即取数），本命令只调节
+ * 「本地无痕迹」用量（网页 / 在线会话）的兜底节奏。 */
 export async function setPollSecs(secs: number): Promise<void> {
   await tryInvoke<null>('set_subscription_poll_secs', { secs })
 }
 
-/** 恢复轮询间隔运行时值（前端装载 designPrefs 后调用；非 Tauri 环境静默跳过）。 */
+/** 恢复兜底取数间隔运行时值（前端装载 designPrefs 后调用；非 Tauri 环境静默跳过）。 */
 export async function applyPollSecs(secs: number): Promise<void> {
   if (!inTauri) return
   await setPollSecs(secs).catch(() => {})
 }
 
-/** boost 监控配置（Rust subscription/boost.rs BoostConfig 同形,snake_case 契约）。
- * 触发条件 OR（任一命中即进入）:spike = 相邻主轮询 used_5h 差 ≥ 阈值;
- * low = 5h 剩余 ≤ 阈值。退出 = 滚动 5 样本窗口内所有已启用条件不再成立。 */
-export interface BoostConfig {
-  enabled: boolean
-  spike_enabled: boolean
-  spike_threshold_pct: number
-  low_enabled: boolean
-  low_threshold_pct: number
-  interval_secs: number
+/** 下发「按预计消耗取数」策略（仅改运行时值，持久化由 designPrefs 的
+ * subscriptionFetchPct / subscriptionTightenLow 承担）。
+ * - pct：距上次读数的预计消耗达到百分之几就取一次读数（Rust 侧 clamp 到 0.5〜10.0、步进 0.5）；
+ * - tightenLow：5h 剩余 ≤ 20% 时把阈值减半。
+ * 参数键同时带 camelCase 与 snake_case：Tauri 默认把 JS 的 camelCase 映射到 Rust
+ * snake_case 形参，而契约文本写的是 snake_case——两种都带上，Rust 侧无论是否声明
+ * rename_all = "snake_case" 都能取到（多余的键被忽略）。 */
+export async function setFetchPolicy(pct: number, tightenLow: boolean): Promise<void> {
+  // 参数名走 Tauri 默认的 camelCase → snake_case 映射（与 migrate_data_root 同款）
+  await tryInvoke<null>('set_subscription_fetch_policy', {
+    thresholdPct: pct,
+    tightenWhenLow: tightenLow,
+  })
 }
 
-/** 当前 boost 快照（仅激活中平台有值;boost 结果不落库,独立于主快照通道）。 */
-export async function getBoost(): Promise<SubscriptionSnapshot[] | null> {
-  return tryInvoke<SubscriptionSnapshot[]>('get_subscription_boost')
+/** 估算器诊断态（Rust get_subscription_estimator 出口形状,snake_case 契约;每个已支持平台一条）。
+ * calibrated = 已用数据校准（false = 仍在用出厂预设权重）;pairs = 有效标定样本数;
+ * est_pct_since_fetch = 距上次读数的预计消耗（百分点,估计值）。 */
+/** 「本机 agent 解释不了的消耗」证据（Rust bootstrap:ForeignEvidence 出口形状）。
+ * 判据 = 相邻两条服务端采样之间**用量涨了而本机一条轮记录都没有**。
+ * **它说明不了是谁在用**，只说明不是本机的 agent——可能是另一台电脑、网页版、
+ * 本机 Claude 桌面端自己的对话（不走 collector 源却吃同一份配额），或手机 App。
+ * 文案一律说「本地 token 解释不了」，不要说成「别的设备」。
+ * 它只把盲区量出来摆上台面：取数与读数走的是服务端真值不会错，被污染的是**标定**
+ * （样本的涨幅含别处的量、代价只有本机的）。 */
+export interface ForeignEvidence {
+  /** 统计窗口内可判定的相邻样本区间数（太新的不算——本地轮可能还没采到）。 */
+  windows: number
+  /** 其中「服务端涨了、本机零痕迹」的区间数。 */
+  unexplained: number
+  /** 这些区间累计的服务端涨幅（百分点）。 */
+  unexplained_pct: number
+  /** 统计窗口长度（小时）。 */
+  window_hours: number
 }
 
-/** 下发 boost 配置（持久化由 designPrefs 承担,这里只改运行时值）。 */
-export async function setBoostConfig(config: BoostConfig): Promise<void> {
-  await tryInvoke<null>('set_subscription_boost', { config })
+export interface EstimatorState {
+  platform: SubscriptionPlatform
+  calibrated: boolean
+  pairs: number
+  est_pct_since_fetch: number
+  /** 已收割留存的**本地读数**条数（Claude = 桌面端 plan-usage-history.json 的采样；
+   * Codex = 会话 rollout 里 token_count 事件带的 rate_limits；0 = 本机没有这类源）。
+   * 两个源自己都会滚掉旧数据，这个数会越过那条线继续涨 = 样本密度在累积。
+   * 字段名沿用 desktop_samples 不改——改名要同时动契约与前端，而它只是个计数。 */
+  desktop_samples?: number
+  /** 本机之外的消耗证据（旧版 Rust 没有这个字段时为 undefined）。 */
+  foreign?: ForeignEvidence
 }
 
-/** 恢复 boost 配置运行时值（orb 窗口装载时调用;非 Tauri 环境静默跳过）。 */
-export async function applyBoostConfig(config: BoostConfig): Promise<void> {
-  if (!inTauri) return
-  await setBoostConfig(config).catch(() => {})
+/** 取一次估算器状态。**诊断只读,不要轮询**：设置页挂载查一次,收到 subscription:changed
+ * 再重查即可。旧版 Rust 没有这条命令时 tryInvoke 返回 null（调用方据此整行不显示）。 */
+export async function getEstimator(): Promise<EstimatorState[] | null> {
+  return tryInvoke<EstimatorState[]>('get_subscription_estimator')
 }
 
 /** 待机监控状态（Rust subscription/idle.rs 出口形状,snake_case 契约）。
- * idle = 该平台已进入待机（连续 3 轮无变化且安静 ≥ 10 分钟,检测放慢中）;
- * interval_secs = 当前档位。 */
+ * idle = 已进入待机（安静起点距今满 10 分钟;安静起点 = 最近一次本地 agent 活动
+ * 或用户注意）。**待机是全局视觉态**,两条记录的 idle 恒相同——按平台给形状只是
+ * 让前端「所有已绑定平台都待机才减淡」的判据不必特判。
+ * 待机只管减淡,**不改变取数频次**。 */
 export interface PlatformIdleState {
   platform: SubscriptionPlatform
   idle: boolean
-  interval_secs: number
 }
 
 /** 当前待机态（orb 窗口初查口;事件 subscription:idle 翻转后重查）。 */
@@ -105,8 +143,8 @@ export async function getIdle(): Promise<PlatformIdleState[] | null> {
   return tryInvoke<PlatformIdleState[]>('get_subscription_idle')
 }
 
-/** 下发待机开关（持久化由 designPrefs 承担,这里只改运行时值;
- * Rust 侧会唤醒主轮询——调用方应只在值变化时调用）。 */
+/** 下发待机开关（持久化由 designPrefs 承担,这里只改运行时值）。
+ * Rust 侧幂等早退,且**不再唤醒取数**——待机是视觉态,不该改变网络行为。 */
 export async function setIdleEnabled(enabled: boolean): Promise<void> {
   await tryInvoke<null>('set_subscription_idle_enabled', { enabled })
 }

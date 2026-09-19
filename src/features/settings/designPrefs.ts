@@ -9,7 +9,16 @@
  * designPrefs 只存档位名；档位切换即 set_widget_size，几何落盘兜底。 */
 export type SizePreset = 'large' | 'medium' | 'small'
 
-import type { BoostConfig, SubscriptionPlatform } from '../../services/subscriptionService'
+import type { SubscriptionPlatform } from '../../services/subscriptionService'
+import { setFetchPolicy } from '../../services/subscriptionService'
+
+/** 「按预计消耗取数」阈值的合法域（与 Rust clamp 同源：0.5〜10.0，步进 0.5；
+ * 默认 2 = 距上次读数预计消耗 2% 就取一次）。设置页的 min/max/step 取这里。 */
+// 默认由 2 改为 5（DEFAULT_THRESHOLD_PCT 同源）：
+// 阈值的单位是「5h 窗口的百分点」，而两个平台的窗口值钱程度差一个数量级
+//2% 对 Codex
+// 相当于两三毛钱的活就要打一次请求。Codex 的读数新鲜度不靠它——rollout 会零请求推进快照。
+export const SUBSCRIPTION_FETCH_PCT = { min: 0.5, max: 10, step: 0.5, default: 5 } as const
 
 /** 毛玻璃材质档（undefined = 关闭）。两窗口各自独立一个键。
  * 版本门槛：Mica 仅 Win11（22000+，apply 失败自动回退关闭）；Acrylic
@@ -94,26 +103,24 @@ export interface DesignPrefs {
    * 超出截断为「+N more」摘要行）。默认 15;0 = 不限。热力图是主体,行数
    * 上限保证小窗下热力图完整可见、不被图表面板挤压。 */
   matrixMaxRows: number
-  /** ：订阅轮询间隔（秒）。默认 300（5 分钟）;设置页下拉 5/10/15/30 分钟。
-   * 持久化在此键,运行时值经 set_subscription_poll_secs 下发（窗口装载时恢复）。 */
+  /** ：订阅**兜底取数间隔**（秒）。默认 600（10 分钟）;设置页下拉 5/10/15/30 分钟。
+   * 读数主路径是本地 token 探针（采集器一发现本机新 token 就立即取数）,本键只管
+   * 「本地留不下痕迹」那部分用量（网页 / 在线会话）的兜底节奏。持久化在此键,
+   * 运行时值经 set_subscription_poll_secs 下发（窗口装载时恢复）。 */
   subscriptionPollSecs?: number
-  /** boost 监控：悬浮球订阅 boost 补充路由（Rust
-   * subscription/boost.rs）。总开关**默认关**（提频联网属显式授权,与 autoUpdate
-   * 同口径）;两触发条件 OR——spike（相邻主轮询 used_5h 差 ≥ 阈值,缺省 = 开）
-   * 与 low（5h 剩余 ≤ 阈值,缺省 = 关）;boost 间隔默认 60s（可 120/180/自定义）。
-   * 运行时经 set_subscription_boost 下发,orb 窗口装载时恢复;boost 状态本身
-   * 不持久化（重启按主快照重评）。 */
-  orbBoostEnabled?: boolean
-  orbBoostSpikeEnabled?: boolean
-  orbBoostSpikePct?: number
-  orbBoostLowEnabled?: boolean
-  orbBoostLowPct?: number
-  orbBoostIntervalSecs?: number
-  /** 待机监控：主轮询自适应退档（Rust subscription/idle.rs）。
+  /** 取数阈值（百分点;undefined = 2）：本地 token 按模型加权折算成「距上次读数大约
+   * 消耗了百分之几」,达到本值就取一次读数——这是取数主路径,subscriptionPollSecs
+   * 只剩兜底。合法域见 SUBSCRIPTION_FETCH_PCT（0.5〜10,0.5 的整数倍;Rust 侧同域 clamp）。
+   * 运行时值经 set_subscription_fetch_policy 下发（与 subscriptionTightenLow 合成一次调用）。 */
+  subscriptionFetchPct?: number
+  /** 低余量收紧（undefined = 开）：5h 窗口剩余 ≤ 20% 时把上面的阈值减半（默认 2% → 1%）,
+   * 额度见底那段时间读数更密。与 subscriptionFetchPct 同一条下发命令。 */
+  subscriptionTightenLow?: boolean
+  /** 待机监控：兜底取数自适应退档（Rust subscription/idle.rs）。
    * 读数无变化逐档放慢（封顶 30 分钟）,任何变化立即回设置档;待机中悬浮球整体
-   * 减淡 50%。**默认开**（undefined = 开）——退档是收敛行为,与 boost「提频需
-   * 显式授权」的口径相反。运行时经 set_subscription_idle_enabled 下发,orb 窗口
-   * 装载时恢复;档位状态本身不持久化（重启回基础档重评）。 */
+   * 减淡 50%。**默认开**（undefined = 开）——退档是收敛行为,不需要显式授权。
+   * 运行时经 set_subscription_idle_enabled 下发,orb 窗口装载时恢复;档位状态本身
+   * 不持久化（重启回基础档重评）。 */
   orbIdleEnabled?: boolean
   /** 悬浮球上次显示的订阅平台（启动恢复上次的平台,而非固定第一个）。
    * 按平台 id 记（绑定集合变化时下标会错位）;该平台未绑定 → 回落第一个已绑定平台,
@@ -220,28 +227,40 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.matrixMaxRows !== undefined && !(typeof p.matrixMaxRows === 'number' && Number.isInteger(p.matrixMaxRows) && p.matrixMaxRows >= 0 && p.matrixMaxRows <= 100)) {
     delete p.matrixMaxRows
   }
-  // 订阅轮询间隔（60〜1800 秒整）白名单清洗。
+  // 兜底取数间隔只认设置页四个档（秒;Rust 侧受理域仍是 60〜1800,
+  // 前端收窄到下拉可选值,越界或旧档视为未设置 → 回默认 600）。
   // （悬浮球总开关的 `orbEnabled` 键已退役：可见性单一源在 Rust visibility.rs,
   //   持久化在 window-state.json 的 orb_visible;设置页直接消费该源,见㉚。）
-  if (p.subscriptionPollSecs !== undefined && !(typeof p.subscriptionPollSecs === 'number' && Number.isInteger(p.subscriptionPollSecs) && p.subscriptionPollSecs >= 60 && p.subscriptionPollSecs <= 1800)) {
+  if (p.subscriptionPollSecs !== undefined && ![300, 600, 900, 1800].includes(p.subscriptionPollSecs as number)) {
     delete p.subscriptionPollSecs
   }
-  // boost 监控键清洗：布尔 + 整数域（阈值/间隔越界视为未设置 → 回默认档;
-  // 与 Rust clamp_cfg 同域,双端兜底）。orbIdleEnabled 同族（待机退档开关）。
-  for (const k of ['orbBoostEnabled', 'orbBoostSpikeEnabled', 'orbBoostLowEnabled', 'orbIdleEnabled'] as const) {
-    if (p[k] !== undefined && typeof p[k] !== 'boolean') delete p[k]
+  // 取数阈值：只认 0.5〜10 且是 0.5 的整数倍（与 Rust clamp / 步进同域;
+  // 0.5 的倍数在二进制里精确可表示,×2 取整判断无误差）。越界 / 非法步进视为未设置 → 回默认 2。
+  if (
+    p.subscriptionFetchPct !== undefined &&
+    !(
+      typeof p.subscriptionFetchPct === 'number' &&
+      Number.isFinite(p.subscriptionFetchPct) &&
+      p.subscriptionFetchPct >= SUBSCRIPTION_FETCH_PCT.min &&
+      p.subscriptionFetchPct <= SUBSCRIPTION_FETCH_PCT.max &&
+      Number.isInteger(p.subscriptionFetchPct / SUBSCRIPTION_FETCH_PCT.step)
+    )
+  ) {
+    delete p.subscriptionFetchPct
   }
+  // 低余量收紧开关：非布尔视为未设置（回默认开）。
+  if (p.subscriptionTightenLow !== undefined && typeof p.subscriptionTightenLow !== 'boolean') delete p.subscriptionTightenLow
+  // 待机退档开关：非布尔视为未设置（回默认开）。
+  if (p.orbIdleEnabled !== undefined && typeof p.orbIdleEnabled !== 'boolean') delete p.orbIdleEnabled
   if (p.orbPlatform !== undefined && p.orbPlatform !== 'codex' && p.orbPlatform !== 'claude') {
     delete p.orbPlatform
   }
-  if (p.orbBoostSpikePct !== undefined && !(typeof p.orbBoostSpikePct === 'number' && Number.isInteger(p.orbBoostSpikePct) && p.orbBoostSpikePct >= 5 && p.orbBoostSpikePct <= 50)) {
-    delete p.orbBoostSpikePct
-  }
-  if (p.orbBoostLowPct !== undefined && !(typeof p.orbBoostLowPct === 'number' && Number.isInteger(p.orbBoostLowPct) && p.orbBoostLowPct >= 10 && p.orbBoostLowPct <= 50)) {
-    delete p.orbBoostLowPct
-  }
-  if (p.orbBoostIntervalSecs !== undefined && !(typeof p.orbBoostIntervalSecs === 'number' && Number.isInteger(p.orbBoostIntervalSecs) && p.orbBoostIntervalSecs >= 30 && p.orbBoostIntervalSecs <= 240)) {
-    delete p.orbBoostIntervalSecs
+  // 退役键清理（取数改由本地 token 探针驱动,提频档位整组退役;
+  // `orbEnabled` 更早退役,可见性单一源在 Rust visibility.rs）。旧 prefs.json 里的
+  // 残值静默清掉——不读、不回写、不报错。**只认这两条前缀**：命名空间通配会把
+  // 将来新增的 orb 前缀键一并吞掉。
+  for (const k of Object.keys(p)) {
+    if (k.startsWith('orbBoost') || k === 'orbEnabled') delete (p as Record<string, unknown>)[k]
   }
   // 离开阈值:整数分钟 1〜1440（与 Rust task_store 同域）,越界视为未设置。
   if (p.idleThresholdMin !== undefined && !(typeof p.idleThresholdMin === 'number' && Number.isInteger(p.idleThresholdMin) && p.idleThresholdMin >= 1 && p.idleThresholdMin <= 1440)) {
@@ -417,24 +436,27 @@ export function subscribeDesignPrefs(fn: (p: DesignPrefs) => void): () => void {
   return () => listeners.delete(fn)
 }
 
-/** designPrefs → boost 运行时配置（Rust BoostConfig 形状;缺省档与
- * Rust default_config 对齐：总开关关 / spike 开 10% / low 关 30% / 60s）。
- * 设置页改动与 orb 窗口装载恢复共用,避免两处各写一套缺省合并。 */
-export function orbBoostConfig(p: DesignPrefs): BoostConfig {
-  return {
-    enabled: p.orbBoostEnabled ?? false,
-    spike_enabled: p.orbBoostSpikeEnabled ?? true,
-    spike_threshold_pct: p.orbBoostSpikePct ?? 10,
-    low_enabled: p.orbBoostLowEnabled ?? false,
-    low_threshold_pct: p.orbBoostLowPct ?? 30,
-    interval_secs: p.orbBoostIntervalSecs ?? 60,
-  }
-}
-
 /** designPrefs → 待机开关（undefined = 开;与 Rust ENABLED 初值对齐——
  * 退档是收敛行为,无需显式授权）。 */
 export function orbIdleEnabled(p: DesignPrefs): boolean {
   return p.orbIdleEnabled ?? true
+}
+
+/** designPrefs → 取数阈值（百分点;undefined = 2）。 */
+export function subscriptionFetchPct(p: DesignPrefs): number {
+  return p.subscriptionFetchPct ?? SUBSCRIPTION_FETCH_PCT.default
+}
+
+/** designPrefs → 低余量收紧（undefined = 开）。 */
+export function subscriptionTightenLow(p: DesignPrefs): boolean {
+  return p.subscriptionTightenLow ?? true
+}
+
+/** 恢复 / 下发取数策略运行时值：两键合成一次 set_subscription_fetch_policy
+ * （与 applyPollSecs 同款——持久化在本模块,运行时值归 Rust;非 Tauri 环境与
+ * 旧版 Rust 缺命令时静默跳过,不打断调用方）。 */
+export async function applySubscriptionFetchPolicy(p: DesignPrefs): Promise<void> {
+  await setFetchPolicy(subscriptionFetchPct(p), subscriptionTightenLow(p)).catch(() => {})
 }
 
 // 跨窗口实时互通：widget / main 两个窗口共享同源 localStorage。

@@ -3,32 +3,64 @@
 //! - 数据源：各 agent CLI 的**本机凭据文件**（只读）+ 平台 usage 端点（逆向）;
 //!   Claude 另有桌面端本地采样回落（claude_desktop.rs,零凭据）;
 //! - 存储：`<数据根>/subscriptions.db`（快照 + 绑定开关;凭据永不落库）;
-//! - 轮询：独立 daemon 线程（对齐 collector 模式）——默认 5 分钟,长期安静时
-//!   待机放慢（idle.rs,封顶 30 分钟;变化 / 本地 agent 活动 / 用户注意即退出）;
-//!   绑定前零网络,凭据判死后零网络（mtime 自愈探针复活）;
+//! - 取数节奏：
+//!   **按预计消耗取数**——采集线程报来的分模型 token 经 cost.rs 折成加权代价、
+//!   经 calib.rs 的标定系数换成「大约消耗了百分之几」,达到阈值（默认 5%,可调）
+//!   就取一轮（最快 60 秒,demand.rs）;本地无 token 则不取;固定间隔降为**兜底**（默认 30 分钟）,
+//!   只为覆盖不产生本地 token 的在线 / 网页用量,Claude 侧兜底先用桌面端采样
+//!   零请求探测有没有涨（claude_desktop:probe_growth）——**没涨也会把样本里的下降
+//!   正进快照**（5h 是滚动窗口,空闲期余量会自己恢复,见 `apply_flat_sample`）;
+//!   本地 token 静默 10 分钟即待机
+//!   （idle.rs,全局视觉态,只翻转悬浮球减淡,不改取数频次）;绑定前零网络,凭据判死后零网络
+//!   （mtime 探针复活）;**没取到更新读数的轮按 demand.rs 的退避推后重试**
 //! - 红线：凭据文件只读不写,刷新 token 只存内存;单平台失败不拖垮整体。
 
-pub mod boost;
+pub mod bootstrap;
+pub mod calib;
 pub mod claude;
 pub mod claude_desktop;
 pub mod codex;
+pub mod codex_rollout;
+pub mod cost;
 pub mod credentials;
+pub mod demand;
 pub mod idle;
 pub mod model;
+pub mod price;
 pub mod store;
+#[cfg(test)]
+mod smoke;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 
-use model::{CredentialInfo, FetchStatus, Platform, SubscriptionSnapshot};
+use model::{CredentialInfo, FetchStatus, Platform, SnapshotSource, SubscriptionSnapshot};
 use store::SubStore;
 
-/// 默认轮询间隔（5 分钟起步,S4 设置页 5/10/15/30 分钟可调）。
-const DEFAULT_POLL_SECS: u64 = 300;
+/// 默认**兜底**取数间隔（30 分钟;设置页 5/10/15/30 分钟可调）。
+/// 兜底没有任何动态检测能力,只是「本地 token 看不见的用量」的最后一道保底,
+/// 故取封顶档;真正的取数时机由本地 token 驱动（demand.rs）。
+const DEFAULT_POLL_SECS: u64 = 1800;
 const MIN_POLL_SECS: u64 = 60;
 const MAX_POLL_SECS: u64 = 1800;
+
+/// 桌面端采样的**收割节律**。
+/// 与取数无关——收割只读本机文件、零网络,所以它可以比兜底档密得多：桌面端 15 分钟
+/// 写一条,5 分钟扫一次即可做到「样本一落地就进库」,也让兜底轮的读数正
+/// （`apply_flat_sample`）最多滞后这么久,而不是等到下一个兜底轮（默认 30 分钟）。
+/// mtime 没变时这一轮只花一次 stat。
+const HARVEST_SECS: u64 = 300;
+
+/// 手动刷新的最小间隔。手动刷新走 `wake` 推进代际,
+/// 一轮进行期间的连点会被代际吸收成一轮,但「一轮结束后再点」是不受任何约束的
+/// ——Claude 的 usage 端点按 User-Agent 分限流桶,连打最容易把自己打进 429 冷却。
+/// 被挡下的那次仍然退待机 + 广播,前端刷新动画照常落地,用户感觉不到差别。
+const MANUAL_REFRESH_MIN_GAP_SECS: i64 = 15;
+
+/// 上次放行的手动刷新时刻（unix 秒;0 = 从未）。
+static LAST_MANUAL_REFRESH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// 轮询间隔（prefs 前的运行时默认;S4 设置页接线后经 AppState 存储）。
 static POLL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(DEFAULT_POLL_SECS);
@@ -52,17 +84,54 @@ pub fn reschedule() {
     WAKE.1.notify_all();
 }
 
-/// 待机退出入口（用户注意 / 本地 agent 活动,语义见 `idle:note_attention`）:
-/// 翻转广播 `subscription:idle`,应检时刻提前则唤醒主轮询重算睡眠。
-pub fn nudge_standby(app: &AppHandle, fetch_now: Option<Platform>) {
+/// 本地 token 信号（采集线程每源一轮调用一次）：退出待机 + 按**预计消耗**排定取数。
+/// `usage` = 提交的分模型 token 明细（模型 → [输入, 输出, 缓存读, 缓存写]）;
+/// `platform` = 该源计入的订阅平台（None = 该源不对应订阅,只退待机）。
+pub fn note_local_tokens(
+    app: &AppHandle,
+    platform: Option<Platform>,
+    usage: &std::collections::BTreeMap<String, [i64; 4]>,
+) {
     let now = chrono::Utc::now().timestamp();
-    let a = idle::note_attention(now, fetch_now);
-    if a.flipped {
-        idle::emit_idle(app);
-        crate::dev_log!("[subscription] standby exited (attention, fetch_now={:?})", fetch_now);
+    nudge_standby(app);
+    let Some(platform) = platform else { return };
+    if usage.is_empty() {
+        return;
     }
-    if a.rescheduled {
-        reschedule();
+    // 余量决定阈值（开「低余量收紧」时 5h 剩余 ≤ 20% 阈值减半）
+    let remaining = remaining_5h(app, platform);
+    if let Some(due) = demand::note_tokens(platform, usage, now, remaining) {
+        if idle::pull_forward(platform, due) {
+            reschedule();
+        }
+        crate::dev_log!(
+            "[subscription] {} est +{:.2}% (threshold {:.2}%) → fetch due in {}s",
+            platform.as_str(),
+            demand::estimated_pct(platform),
+            demand::effective_threshold(remaining),
+            (due - now).max(0)
+        );
+    }
+}
+
+/// 该平台最近一次读数的 5h 剩余百分比（拿不到 → None,按原阈值处理）。
+fn remaining_5h(app: &AppHandle, platform: Platform) -> Option<f64> {
+    let state = app.try_state::<SubscriptionReader>()?;
+    let store = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let snap = store.load_snapshot(platform)?;
+    snap.windows
+        .iter()
+        .find(|w| w.kind == "5h")
+        .map(|w| 100.0 - w.used_percent)
+}
+
+/// 待机退出入口（用户注意 / 本地 agent 活动,语义见 `idle:note_attention`）:
+/// 只翻转视觉态并广播 `subscription:idle`——取数时机单一源在 demand.rs。
+pub fn nudge_standby(app: &AppHandle) {
+    let now = chrono::Utc::now().timestamp();
+    if idle::note_attention(now) {
+        idle::emit_idle(app);
+        crate::dev_log!("[subscription] standby exited (local tokens / attention)");
     }
 }
 
@@ -82,13 +151,9 @@ pub fn set_poll_secs(v: u64) {
 pub struct Adapters {
     codex: codex::CodexAdapter,
     claude: claude::ClaudeAdapter,
-    /// 判死时记录的凭据文件 mtime（复活探针基线,预留诊断;当前自愈走 last_mtime 局部表）。
-    #[allow(dead_code)]
-    dead_mtime: Mutex<std::collections::HashMap<Platform, Option<i64>>>,
-    /// 取数互斥（每平台一枚,下标 = `fetch_lock_index`）：boost 线程与主轮询共享
-    /// 同一个 Adapters,无互斥时两者可能在冷却检查与 429 冷却写入之间各发一请求
-    /// （限流桶风险,审计 P3-）。主轮询阻塞等锁;boost 走 try 让行（不阻塞
-    /// 其 1s 节拍）。
+    /// 取数互斥（每平台一枚,下标 = `fetch_lock_index`）：命令面的立即刷新与
+    /// 轮询线程可能同时进入取数,无互斥时两者会在冷却检查与 429 冷却写入之间
+    /// 各发一请求（限流桶风险,审计 P3-）。
     fetch_locks: [Mutex<()>; 2],
 }
 
@@ -101,20 +166,13 @@ impl Adapters {
         }
     }
 
-    /// 取数互斥守卫（阻塞;主轮询用）：同一平台同一时刻只有一个线程在取数。
+    /// 取数互斥守卫（阻塞）：同一平台同一时刻只有一个线程在取数。
     pub fn lock_fetch(&self, platform: Platform) -> std::sync::MutexGuard<'_, ()> {
         self.fetch_locks[Self::fetch_lock_index(platform)]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 取数互斥守卫（try;boost 用）：主轮询正在取数时让行（None）,不阻塞线程;
-    /// 锁被 poison 同样让行（下一 interval 自然重试）。
-    pub fn try_lock_fetch(&self, platform: Platform) -> Option<std::sync::MutexGuard<'_, ()>> {
-        self.fetch_locks[Self::fetch_lock_index(platform)]
-            .try_lock()
-            .ok()
-    }
 }
 
 /// 共享读取连接（命令线程查快照;WAL 一写多读,写连接归轮询线程）。
@@ -180,7 +238,7 @@ pub(crate) fn note_http(resp: &Result<ureq::Response, ureq::Error>) {
     LAST_HTTP.with(|c| *c.borrow_mut() = Some(label));
 }
 
-/// 一轮取数一行：`via` = main / boost;`http` = 状态码或 `-`（未发请求）;
+/// 一轮取数一行：`via` = token / fallback / wake;`http` = 状态码或 `-`（未发请求）;
 /// `cooldown` = 结束时生效的限流暂停剩余秒数。
 fn log_fetch(via: &str, platform: Platform, adapters: &Adapters, snap: &SubscriptionSnapshot, note: &str) {
     let http = LAST_HTTP.with(|c| c.borrow_mut().take()).unwrap_or_else(|| "-".into());
@@ -252,6 +310,92 @@ fn with_desktop_fallback(primary: SubscriptionSnapshot, note: &mut &'static str)
     snap
 }
 
+/// 兜底轮的零请求短路（仅 Claude）：桌面端采样比上次读数新且没涨 ⇒ 不必打网络
+/// （桌面端记的是服务端口径,在线 / 网页用量也在内——正是兜底轮要覆盖的场景）。
+/// 返回 Some = 零网络。token 驱动轮与唤醒轮不短路——用户要的就是那一刻
+/// 的即时读数。
+///
+/// 「没涨」**不等于**「没变」：5h / 7d 都是滚动窗口,空闲期间
+/// 旧用量不断过期,余量会自己涨回来。旧版把这条已经握在手里的更新样本整个丢掉、快照
+/// 原样保留,于是球上的数停在偏低的旧值,要等复工那一笔 token 或手动刷新才纠正。
+/// 现在把样本里的**下降**正进快照（仍然零网络,细则见 `apply_flat_sample`）。
+fn skip_by_desktop_probe(
+    via: &str,
+    platform: Platform,
+    prev: Option<&SubscriptionSnapshot>,
+    now: i64,
+) -> Option<SubscriptionSnapshot> {
+    if via != "fallback" || platform != Platform::Claude {
+        return None;
+    }
+    let prev = prev?;
+    match claude_desktop::probe_growth(prev, now) {
+        claude_desktop::OnlineProbe::NoGrowth => Some(claude_desktop::apply_flat_sample(prev, now)),
+        _ => None,
+    }
+}
+
+/// 成功取到新读数后落一条标定样本,并重算系数。
+/// 上一读数不是成功态 / 本地零代价（纯在线用量）→ 不落样本,但账目照常清零。
+///
+/// **只认两端都是 API 读数的读数对**：桌面端来源的读数是整数
+/// 百分比,`fetched_at` 又是样本时刻（可能比轮时刻早十几分钟）,而代价是按 token 到达
+/// 时刻累加的——两个时间窗对不齐,单条样本的错配可达区间的一半。桌面端那一路改由
+/// `bootstrap:ingest` 按**样本时刻**精确切,密度还更高（15 分钟一条）。
+fn record_pair(
+    store: &SubStore,
+    platform: Platform,
+    prev: Option<&SubscriptionSnapshot>,
+    snap: &SubscriptionSnapshot,
+    now: i64,
+) {
+    let acc = demand::take_account(platform, now);
+    let (Some(prev), Some(t1)) = (prev, snap.fetched_at) else { return };
+    let (Some(t0), true) = (prev.fetched_at, prev.status == FetchStatus::Ok) else { return };
+    if acc.cost <= 0.0 || acc.since <= 0 {
+        return;
+    }
+    // 两端任一来自桌面端采样 → 交给 bootstrap:ingest 那一路（账目照常清零）
+    if prev.source != SnapshotSource::Api || snap.source != SnapshotSource::Api {
+        return;
+    }
+    let used = |s: &SubscriptionSnapshot, kind: &str| {
+        s.windows.iter().find(|w| w.kind == kind).map(|w| w.used_percent)
+    };
+    let (Some(u5_0), Some(u5_1)) = (used(prev, "5h"), used(snap, "5h")) else { return };
+    let resets = |s: &SubscriptionSnapshot| {
+        s.windows.iter().find(|w| w.kind == "5h").and_then(|w| w.resets_at)
+    };
+    let pair = calib::Pair {
+        t0,
+        t1,
+        used5_0: u5_0,
+        used5_1: u5_1,
+        // 两端各自申报的窗尾:前移了就是这中间重置过,Δ 不是这段消耗涨出来的
+        resets5_0: resets(prev),
+        resets5_1: resets(snap),
+        cost: acc.cost,
+        unknown_cost: acc.unknown_cost,
+    };
+    let used7 = (used(prev, "7d").unwrap_or(0.0), used(snap, "7d").unwrap_or(0.0));
+    if let Err(e) =
+        store.insert_pair(platform, &pair, used7, &acc.breakdown_json, "online", &snap.plan_type)
+    {
+        crate::dev_log!("[subscription] {} pair insert failed: {}", platform.as_str(), e);
+        return;
+    }
+    crate::dev_log!(
+        "[subscription] {} pair: est {:.2}% vs actual {:.2}% over {}s (cost {:.1}{})",
+        platform.as_str(),
+        pair.cost * calib::scale(platform),
+        pair.used5_1 - pair.used5_0,
+        pair.t1 - pair.t0,
+        pair.cost,
+        if pair.unknown_cost > 0.0 { ", unknown models" } else { "" }
+    );
+    calib::refit_from_store(store, platform);
+}
+
 fn dead_snapshot(platform: Platform) -> SubscriptionSnapshot {
     SubscriptionSnapshot {
         platform,
@@ -259,6 +403,7 @@ fn dead_snapshot(platform: Platform) -> SubscriptionSnapshot {
         windows: vec![],
         fetched_at: None,
         status: FetchStatus::AuthFailed,
+        source: SnapshotSource::Api,
     }
 }
 
@@ -269,6 +414,7 @@ fn idle_snapshot(platform: Platform) -> SubscriptionSnapshot {
         windows: vec![],
         fetched_at: None,
         status: FetchStatus::Idle,
+        source: SnapshotSource::Api,
     }
 }
 
@@ -279,6 +425,7 @@ fn transient_snapshot(platform: Platform) -> SubscriptionSnapshot {
         windows: vec![],
         fetched_at: None,
         status: FetchStatus::NetworkFailed,
+        source: SnapshotSource::Api,
     }
 }
 
@@ -289,39 +436,96 @@ fn rate_limited_snapshot(platform: Platform) -> SubscriptionSnapshot {
         windows: vec![],
         fetched_at: None,
         status: FetchStatus::RateLimited,
+        source: SnapshotSource::Api,
     }
 }
 
 fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     crate::dev_log!("[subscription] thread started");
+    // 本地读数的收割 + 增量标定路径（零网络零凭据）：
+    // - Claude 走桌面端 plan-usage-history.json + collector.db（bootstrap.rs）;
+    // - Codex 走会话 rollout 里的 rate_limits,读数与代价同一行（codex_rollout.rs）。
+    // collector.db 的路径取一次:数据根在运行期不变,每轮重取只是白跑。
+    let collector_db = crate::data_root::current(&app).ok().map(|r| r.db_path());
+    // 上次收割时看到的源文件 mtime（None = 还没看过;文件没动就不重新解析）。
+    let mut last_harvest_mtime: Option<i64> = None;
+    let mut last_rollout_mtime: Option<i64> = None;
     let mut last_mtime: std::collections::HashMap<Platform, Option<i64>> =
         std::collections::HashMap::new();
     // wake 代际：wait 返回后代际有变 = 手动刷新/bind/间隔调整唤醒 → 全量一轮
-    //（绕过待机退档的应检时刻;初始 true = 启动先全量一轮）。代际未变的醒来
+    //（绕过各平台的应检时刻;初始 true = 启动先全量一轮）。代际未变的醒来
     //（`reschedule` / 虚假唤醒）只检到期平台。
     let mut woke = true;
 
     loop {
-        let now = chrono::Utc::now().timestamp();
+        // 收割桌面端采样 + 按样本时刻增量建标定样本（零网络）。
+        // 放在取数之前：的兜底短路要用最新样本做读数正。
+        // **不看绑定**——桌面端历史只滚动保留 14 天,绑定前错过的样本以后再也拿不回来,
+        // 而收割本身只是本机文件读 + 幂等写。
+        if let Some(db) = collector_db.as_ref() {
+            let mtime = claude_desktop::history_mtime();
+            if mtime.is_some() && mtime != last_harvest_mtime {
+                last_harvest_mtime = mtime;
+                bootstrap::ingest(&write_store, db, chrono::Utc::now().timestamp());
+            }
+        }
+        // Codex 那一路（同样不看绑定,理由同上;它连 collector.db 都不需要——读数与
+        // 代价都在 rollout 的同一行上）。闸门同样是 mtime：只 stat 不读内容。
+        //
+        // 它还会**零请求地推进 Codex 快照**：rollout 里的 rate_limits 与 usage 端点
+        // 同源同精度,只是走本地文件到手。真改了就立刻广播,不等下面的取数轮
+        // ——用贵模型时一个轮次能吃掉 5h 窗十几二十个点,那正是最不该显示旧数的时候。
+        {
+            let mtime = codex_rollout::newest_mtime();
+            if mtime.is_some() && mtime != last_rollout_mtime {
+                last_rollout_mtime = mtime;
+                let (_, _, snapshot_changed) =
+                    codex_rollout::ingest(&write_store, chrono::Utc::now().timestamp());
+                if snapshot_changed {
+                    emit_changed(&app);
+                }
+            }
+        }
+
         let bound = write_store.bound_platforms();
         idle::prune(&bound);
-        let mut checked = false;
-        let mut idle_flipped = false;
+        demand::prune(&bound);
+        let mut changed_any = false;
         if !bound.is_empty() {
             let base = poll_secs();
             for platform in &bound {
-                // 待机放慢（idle.rs）：未到该平台应检时刻就跳过;唤醒轮不受限
-                if !woke && !idle::due(*platform, now) {
+                // 每个平台开检时重取时刻：上一个平台的取数可能在网络上耗了数秒到
+                // 数十秒,拿轮首的旧时刻去判到期 / 排下一轮会整体偏早。
+                let now = chrono::Utc::now().timestamp();
+                // 取数来源：
+                // - wake:手动刷新 / 绑定 / 间隔变更的全量轮;
+                // - token:本地 token 驱动（demand.rs）已到应检时刻;
+                // - fallback:兜底轮（覆盖不产生本地 token 的在线 / 网页用量）。
+                let by_token = demand::due_now(*platform, now);
+                let by_fallback = idle::due(*platform, now);
+                if !woke && !by_token && !by_fallback {
                     continue;
                 }
+                let via = if woke {
+                    "wake"
+                } else if by_token {
+                    "token"
+                } else {
+                    "fallback"
+                };
 
                 // 凭据文件 mtime 探针:变化 → 清内存 token 缓存（判死自愈入口;
                 // 无变化且未判死 → 走缓存/现读）。纳秒级 stat,无网络。
                 let mtime = credentials::credential_mtime(*platform);
                 let changed = last_mtime.get(platform) != Some(&mtime);
                 if changed {
-                    adapters.codex.invalidate(*platform);
-                    adapters.claude.invalidate(*platform);
+                    // 只清**该平台自己**的适配器：`ClaudeAdapter:invalidate` 顺带清
+                    // 429 冷却闸,对两个适配器都调会让 Codex 凭据续期（CLI 每次刷新
+                    // 都重写 auth.json）清掉 Claude 的限流退避。
+                    match platform {
+                        Platform::Codex => adapters.codex.invalidate(*platform),
+                        Platform::Claude => adapters.claude.invalidate(*platform),
+                    }
                 }
                 last_mtime.insert(*platform, mtime);
 
@@ -333,44 +537,86 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                         matches!(adapters.codex.obtain_access(*platform), codex::Access::Dead),
                     Platform::Claude => adapters.claude.is_dead(*platform),
                 };
+                let prev = write_store.load_snapshot(*platform);
+                // 快照（落库与日志在各分支内完成;待机判据已改为本地 token 静默,
+                // 不再消费读数内容,故此处只留绑定供将来扩展)
                 let snap = if dead && !changed {
                     // 判死零网络,但桌面端采样是本地文件,照读（Claude 专属回落）
                     let mut note = "";
                     let snap = with_desktop_fallback(dead_snapshot(*platform), &mut note);
                     let note = if note.is_empty() { " skipped=dead" } else { " skipped=dead source=desktop" };
-                    log_fetch("main", *platform, &adapters, &snap, note);
+                    log_fetch(via, *platform, &adapters, &snap, note);
+                    let _ = write_store.save_snapshot(&snap);
                     snap
+                } else if let Some(quiet) = skip_by_desktop_probe(via, *platform, prev.as_ref(), now) {
+                    // 兜底轮 + 桌面端采样证明上次读数之后没涨 → 零网络。
+                    // 快照不是「原样保留」而是「把样本里的下降正进去」（滚动窗口的
+                    // 余量恢复,见 apply_flat_sample）——真改了才落库,没改时 save 是等价
+                    // 写入,下面的 changed_any 仍判不出变化,不会白广播。
+                    let note = if prev.as_ref().is_some_and(|p| &quiet != p) {
+                        " skipped=desktop-flat corrected=desktop-sample"
+                    } else {
+                        " skipped=desktop-flat"
+                    };
+                    log_fetch(via, *platform, &adapters, &quiet, note);
+                    let _ = write_store.save_snapshot(&quiet);
+                    quiet
                 } else {
-                    // 取数互斥（审计 P3-）：与 boost 线程共用同一把平台锁,
-                    // 防两线程同时进入 fetch_one（冷却检查与 429 冷却写入之间
-                    // 无原子性,各发一请求会加速触限）。主轮询阻塞等锁。
+                    // 取数互斥（审计 P3-）：与命令面的立即刷新共用同一把平台锁,
+                    // 防两处同时进入 fetch_one（冷却检查与 429 冷却写入之间无
+                    // 原子性,各发一请求会加速触限）。
                     let _lease = adapters.lock_fetch(*platform);
-                    fetch_one(&adapters, *platform, "main")
+                    let snap = fetch_one(&adapters, *platform, via);
+                    drop(_lease);
+                    let _ = write_store.save_snapshot(&snap);
+                    snap
                 };
-                let _ = write_store.save_snapshot(&snap);
-                // 待机评估：变化退出待机 / 无变化计安静轮（达标进入待机后退档）;翻转即广播
-                if idle::observe(*platform, &snap, base, now) {
-                    idle_flipped = true;
-                    crate::dev_log!("[subscription] {} standby toggled", platform.as_str());
+                // 「拿到了**更新的**读数」——三条分支同一判据：判死轮也可能靠
+                // 桌面端采样拿到新样本,那同样是一次真实读数。取「更新」而非「不同」:
+                // 桌面端样本可能比上次 API 读数更旧,那不算进展。
+                let advanced = match (snap.fetched_at, prev.as_ref().and_then(|p| p.fetched_at)) {
+                    (Some(t1), Some(t0)) => t1 > t0,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                // 取数结束的真实时刻（取数可能耗了数十秒;记账与排下一轮都按它算）
+                let done_at = chrono::Utc::now().timestamp();
+                // 有进展才清账并落一条标定样本（失败轮不清,下轮照样该取）
+                if advanced {
+                    record_pair(&write_store, *platform, prev.as_ref(), &snap, done_at);
                 }
-                checked = true;
+                // 尝试记进账目：最小间隔从**尝试**时刻起算,没进展则把应检时刻
+                // 按退避推后（否则故障期间每个采集轮都会重试一次,见 demand.rs）。
+                demand::note_attempt(*platform, done_at, advanced);
+                // 兜底应检时刻按设置档顺延（待机不改变取数频次）
+                idle::schedule_next(*platform, base, done_at);
+                // 广播按**落库后真的变了**判（失败轮只推进 status、安静轮原样保留,
+                // 见 store:save_snapshot）：无变化的轮广播出去,前端每轮都要白跑一次
+                // 查询与重渲染。
+                changed_any |= write_store.load_snapshot(*platform) != prev;
             }
-            if checked {
+            if changed_any {
                 emit_changed(&app);
-            }
-            if idle_flipped {
-                idle::emit_idle(&app);
             }
         }
 
-        // 可中断睡眠（wake 提前返回）：睡到最近的应检时刻——待机退档后一觉
-        // 最长可到 30 分钟;无绑定时仍按基础档空转睡眠（零网络）。
+        let now = chrono::Utc::now().timestamp();
+        // 待机判据 = 安静起点距今满 10 分钟（idle.rs）:每次醒来重算一次,翻转即广播
+        if idle::evaluate(now) {
+            idle::emit_idle(&app);
+            crate::dev_log!("[subscription] standby toggled");
+        }
+
+        // 可中断睡眠（wake 提前返回）：睡到最近的应检时刻与最近的待机判定时刻里
+        // 较早的那个（兜底档最长 30 分钟）;无绑定时仍按基础档空转睡眠（零网络）。
         // ⚠ 代际读取与 wait 必须**同一把锁贯穿**（审计 P1-）：分两次 lock 会在
         // 解锁间隙丢 wake 通知（notify 无等待者即失效,待机深档时唤醒最长被吞
         // 30 分钟）——读代际、算时长、进等待三步之间不得释放 WAKE.0。
         let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
         let gen_before = *guard;
-        let wait = idle::next_wait_secs(now, poll_secs());
+        // 收割节律参与封顶（零网络,见 HARVEST_SECS）：兜底档 30 分钟时也不至于让
+        // 桌面端样本在库外压半小时。无绑定时同样照睡 HARVEST_SECS——收割不看绑定。
+        let wait = idle::next_wait_secs(now, poll_secs()).min(HARVEST_SECS);
         let (guard, _) = WAKE
             .1
             .wait_timeout(guard, Duration::from_secs(wait))
@@ -395,20 +641,30 @@ pub fn spawn(app: AppHandle) -> Result<(), String> {
     let adapters = Arc::new(Adapters {
         codex: codex::CodexAdapter::new(),
         claude: claude::ClaudeAdapter::new(),
-        dead_mtime: Mutex::new(std::collections::HashMap::new()),
         fetch_locks: [Mutex::new(()), Mutex::new(())],
     });
 
-    app.manage(SubscriptionReader(reader.clone()));
-    app.manage(SubscriptionAdapters(adapters.clone()));
+    // 价目索引装载（取数路径零 IO;库里的行由 SubStore:open 的幂等 upsert 保证是最新
+    // 出厂种子 + 更早版本留下的历史生效段）。**必须排在重算之前**——重算要按库里的价目,
+    // 而不是编译期种子那份兜底。
+    price::load_from(&write_store);
 
-    // boost 监控（独立补充路由,见 boost.rs）:共享只读连接与适配器句柄
-    // （token 缓存/RateGate 同源,两线程不各持一套限流闸）。
-    boost::spawn(
-        app.clone(),
-        SubscriptionReader(reader),
-        adapters.clone(),
-    )?;
+    // 价格数据集升订号后的**就地重算**（价格变更的落点）：按 breakdown 里的原始 token,
+    // **每个模型按它在该区间 t1 时刻生效的价目**把存量行的 cost 重算一遍。订号没变时
+    // 只是一次索引查询。必须排在标定装载之前——否则这一轮会拿旧尺子量出来的 cost 先拟合一次。
+    for platform in [Platform::Codex, Platform::Claude] {
+        if let Err(e) = write_store.recompute_stale_costs(platform) {
+            crate::dev_log!("[subscription] {} cost recompute failed: {e}", platform.as_str());
+        }
+    }
+    // 标定系数启动装载（排除存疑行 + 按当前套餐筛,口径见 store:pairs_for_fit;
+    // 空库 = 出厂预设）
+    for platform in [Platform::Codex, Platform::Claude] {
+        calib::refit_from_store(&write_store, platform);
+    }
+
+    app.manage(SubscriptionReader(reader));
+    app.manage(SubscriptionAdapters(adapters.clone()));
 
     std::thread::Builder::new()
         .name("subscription".into())
@@ -507,6 +763,7 @@ pub fn unbind_subscription(
             windows: vec![],
             fetched_at: None,
             status: FetchStatus::Idle,
+            source: SnapshotSource::Api,
         });
     }
     wake();
@@ -516,15 +773,88 @@ pub fn unbind_subscription(
 
 /// 手动立即刷新（右键菜单/设置页按钮）。手动刷新 = 用户注意到额度 → 先退出待机
 ///再全量取数;注意在前,唤醒轮的无变化只计第 1 轮安静。
+///
+/// **最小间隔 `MANUAL_REFRESH_MIN_GAP_SECS`**：被挡下的
+/// 那次不推进代际（= 不触发全量轮,两个平台各省一次请求）,但退待机与广播照发,前端的
+/// 刷新三态动画正常落地。只挡手动这一路——bind / unbind / 改档的 `wake` 不是连点面,
+/// 不受此限。
 #[tauri::command]
 pub fn refresh_subscriptions_now(app: AppHandle) -> Result<(), String> {
-    nudge_standby(&app, None);
-    wake();
+    use std::sync::atomic::Ordering;
+    nudge_standby(&app);
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_MANUAL_REFRESH.load(Ordering::SeqCst);
+    if now - last >= MANUAL_REFRESH_MIN_GAP_SECS {
+        LAST_MANUAL_REFRESH.store(now, Ordering::SeqCst);
+        wake();
+    } else {
+        crate::dev_log!(
+            "[subscription] manual refresh throttled ({}s since last, min {}s)",
+            now - last,
+            MANUAL_REFRESH_MIN_GAP_SECS
+        );
+    }
     emit_changed(&app);
     Ok(())
 }
 
-/// 设置轮询间隔（秒;设置页 Subscriptions tab 5/10/15/30 分钟下拉）。
+/// 取数策略（设置页 Subscriptions tab）：预计消耗达到 `threshold_pct` 就取一次读数;
+/// `tighten_when_low` = 5h 剩余 ≤ 20% 时阈值减半。持久化在前端 designPrefs,
+/// 本命令只改运行时值（窗口装载时恢复,与 set_subscription_poll_secs 同款）。
+#[tauri::command]
+pub fn set_subscription_fetch_policy(threshold_pct: f64, tighten_when_low: bool) -> Result<(), String> {
+    // 幂等早退（审计 P2-）：装载恢复 + 设置页直调会重复下发同一值
+    if (demand::threshold_pct() - threshold_pct).abs() < 1e-9
+        && demand::tighten_when_low() == tighten_when_low
+    {
+        return Ok(());
+    }
+    let (pct, tighten) = demand::set_policy(threshold_pct, tighten_when_low);
+    crate::dev_log!("[subscription] fetch policy: threshold={pct}% tighten_when_low={tighten}");
+    Ok(())
+}
+
+/// 估算器诊断（设置页状态行;只读,不触发任何网络）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EstimatorState {
+    pub platform: Platform,
+    /// 是否已按校准（样本数达门槛;false = 仍以出厂预设权重为主）。
+    pub calibrated: bool,
+    /// 参与拟合的有效样本数。
+    pub pairs: u32,
+    /// 距上次读数的预计消耗（百分点）。
+    pub est_pct_since_fetch: f64,
+    /// 已收割留存的桌面端采样条数（仅 Claude 有源;0 = 本机没有桌面端采样文件）。
+    /// 桌面端自己只保约 14 天,这个数会越过那条线继续涨——它就是「样本密度」。
+    pub desktop_samples: i64,
+    /// 「本机解释不了的消耗」证据（多机 / 网页 / 手机 App 的信号,语义
+    /// [`bootstrap:ForeignEvidence`];无源的平台恒为全零）。
+    pub foreign: bootstrap::ForeignEvidence,
+}
+
+#[tauri::command]
+pub fn get_subscription_estimator(
+    state: tauri::State<'_, SubscriptionReader>,
+) -> Result<Vec<EstimatorState>, String> {
+    let store = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    Ok([Platform::Codex, Platform::Claude]
+        .into_iter()
+        .map(|p| {
+            let pairs = calib::sample_count(p);
+            EstimatorState {
+                platform: p,
+                calibrated: pairs >= calib::CALIBRATED_PAIRS,
+                pairs,
+                est_pct_since_fetch: demand::estimated_pct(p),
+                desktop_samples: store.sample_count(p),
+                foreign: bootstrap::evidence(p),
+            }
+        })
+        .collect())
+}
+
+/// 设置**兜底**取数间隔（秒;设置页 Subscriptions tab 5/10/15/30 分钟下拉）。
+/// 常规取数由本地 token 驱动,此值只决定「本地无 token 时多久兜底取一轮」。
 /// 存 prefs 侧的持久化由前端 designPrefs 管理（subscriptionPollSecs 键）,
 /// 此处只改运行时值——重启后前端初查时再调用本命令恢复。
 #[tauri::command]

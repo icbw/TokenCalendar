@@ -329,9 +329,17 @@ pub struct Store {
     conn: Connection,
     /// 已提交批次的会话现状观测,等采集线程 `take_live` 合入注意力表。
     live: BTreeMap<(String, String), super::attention::LiveTurn>,
-    /// 已提交批次里最晚的轮结束时刻（毫秒;采集线程每源 collect 后 `take_latest_turn_end`
-    /// 取走——订阅待机的本地活动信号,见 subscription/idle.rs）。
-    latest_turn_end: Option<i64>,
+    /// 已提交批次里轮结束时刻的**区间**（毫秒,（最早, 最晚);采集线程每源 collect 后
+    /// `take_turn_span` 取走）——订阅侧的本地活动信号。要区间而不只要最晚一条：
+    /// 最晚一条只能证明「用户刚才在工作」,而首轮回填 / 整会话重建的批次里最晚一条
+    /// 往往也是新的,区间起点才能把「这批 token 是刚消耗的」与「这批是历史补导」
+    /// 分开。
+    turn_span: Option<(i64, i64)>,
+    /// 已提交批次的 token 明细（源 id → 模型 → [输入, 输出, 缓存读, 缓存写]）。
+    /// 采集线程每源 collect 后 `take_source_usage` 取走——订阅取数时机的本地信号:
+    /// 分模型是因为限流窗口按价值计,贵模型少量 token 也可能吃掉可观额度
+    /// （见 subscription/cost.rs）。
+    pending_usage: BTreeMap<String, BTreeMap<String, [i64; 4]>>,
 }
 
 /// 当前 schema 版本。
@@ -629,7 +637,7 @@ impl Store {
                 crate::dev_log!("[collector] schema -> 14 in place: {:?}", report);
             }
         }
-        Ok(Store { conn, live: BTreeMap::new(), latest_turn_end: None })
+        Ok(Store { conn, live: BTreeMap::new(), turn_span: None, pending_usage: BTreeMap::new() })
     }
 
     /// 迁移前备份：`<库目录>/backups/collector-v<旧版本>-<时间>.db`（`VACUUM INTO`,含 WAL 里未落盘的内容）。
@@ -679,9 +687,15 @@ impl Store {
         super::task_store::threshold_marker(&self.conn)
     }
 
-    /// 取走自上次调用以来已提交批次的最晚轮结束时刻（None = 期间无轮数据）。
-    pub fn take_latest_turn_end(&mut self) -> Option<i64> {
-        self.latest_turn_end.take()
+    /// 取走自上次调用以来已提交批次的轮结束时刻区间 （最早, 最晚)（None = 期间无轮数据）。
+    pub fn take_turn_span(&mut self) -> Option<(i64, i64)> {
+        self.turn_span.take()
+    }
+
+    /// 取走该源自上次调用以来已提交的分模型 token 明细（空 = 期间无新用量）。
+    /// 订阅侧据此估算「大约又消耗了百分之几」并决定何时取读数（见 subscription/demand.rs）。
+    pub fn take_source_usage(&mut self, source_id: &str) -> BTreeMap<String, [i64; 4]> {
+        self.pending_usage.remove(source_id).unwrap_or_default()
     }
 
     /// 取走已提交批次的会话现状观测。
@@ -828,8 +842,28 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())?;
         // 提交成功才暂存观测（失败的批次下轮重读,观测随之重发）
         self.live.extend(batch.live.iter().map(|(k, v)| (k.clone(), v.clone())));
-        if let Some(end) = batch.turns.values().map(|t| t.ended_at).max() {
-            self.latest_turn_end = Some(self.latest_turn_end.map_or(end, |cur| cur.max(end)));
+        let ends = batch.turns.values().map(|t| t.ended_at);
+        if let (Some(first), Some(last)) = (ends.clone().min(), ends.max()) {
+            self.turn_span = Some(
+                self.turn_span
+                    .map_or((first, last), |(f, l)| (f.min(first), l.max(last))),
+            );
+        }
+        // 提交的分模型 token（entries 值 = [输入, 输出, 总, 轮次, 缓存读, 缓存写]）
+        for ((_, _, model), v) in &batch.entries {
+            if v[0] + v[1] + v[4] + v[5] == 0 {
+                continue;
+            }
+            let slot = self
+                .pending_usage
+                .entry(source_id.to_string())
+                .or_default()
+                .entry(model.clone())
+                .or_insert([0; 4]);
+            slot[0] += v[0];
+            slot[1] += v[1];
+            slot[2] += v[4];
+            slot[3] += v[5];
         }
         Ok(())
     }
@@ -2077,11 +2111,12 @@ mod tests {
         }
     }
 
-    /// 订阅待机的本地活动信号:已提交批次的最晚轮结束时刻跨批累积取最大,取走即清;无轮批次不产生信号。
+    /// 订阅侧的本地活动信号:已提交批次的轮结束时刻区间跨批累积（起点取最早、终点取最晚）,
+    /// 取走即清;无轮批次不产生信号。
     #[test]
-    fn latest_turn_end_accumulates_and_takes() {
+    fn turn_span_accumulates_and_takes() {
         let mut s = Store::open_in_memory().unwrap();
-        assert_eq!(s.take_latest_turn_end(), None);
+        assert_eq!(s.take_turn_span(), None);
         let mut b = Batch::default();
         b.add_turn("a", raw_turn("s", 1, "2026-09-01", 9_000_000, None, vec![]));
         b.add_turn("a", raw_turn("s", 2, "2026-09-01", 5_000_000, None, vec![]));
@@ -2089,10 +2124,10 @@ mod tests {
         let mut b = Batch::default();
         b.add_turn("b", raw_turn("t", 1, "2026-09-01", 2_000_000, None, vec![]));
         s.commit("b", &b).unwrap();
-        assert_eq!(s.take_latest_turn_end(), Some(9_001_000), "两批取最大");
-        assert_eq!(s.take_latest_turn_end(), None, "取走即清");
+        assert_eq!(s.take_turn_span(), Some((2_001_000, 9_001_000)), "两批取并集");
+        assert_eq!(s.take_turn_span(), None, "取走即清");
         s.commit("a", &Batch::default()).unwrap();
-        assert_eq!(s.take_latest_turn_end(), None, "无轮批次不产生信号");
+        assert_eq!(s.take_turn_span(), None, "无轮批次不产生信号");
     }
 
     /// 跨午夜 / 多模型的轮:token 与 turns 按切片的日与模型落账,daily_project 仍逐格守恒;

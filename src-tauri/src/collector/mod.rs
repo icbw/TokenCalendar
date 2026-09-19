@@ -388,15 +388,33 @@ fn run(app: AppHandle, mut store: Store) {
                         store.record_failure(meta.id, &e.code, &e.message);
                     }
                 }
-                // 订阅待机的本地活动信号：本源刚提交的轮里有**最近**事件
-                // = 用户正在 agent 工作 → 悬浮球退出待机;源对应的订阅平台原在待机时
-                // 立即补取一轮。首轮回填 / 新源补导的历史轮不在窗口内,不算活动。
-                if let Some(end) = store.take_latest_turn_end() {
-                    if end >= store::now_millis() - activity_window_ms() {
-                        crate::subscription::nudge_standby(
-                            &app,
-                            crate::subscription::model::Platform::of_collector_source(meta.id),
-                        );
+                // 订阅取数的本地信号：
+                // 本源刚提交的轮里有**最近**事件 = 用户正在 agent 工作 → 悬浮球退出待机,
+                // 并把新增 token 交给 demand.rs 排定取数（重任务开头的大量写入要立刻
+                // 反映到读数上）。
+                //
+                // 两道闸分开：
+                // - **活动信号**看区间终点——最晚一轮在窗口内就算「用户在工作」;
+                // - **取数账目**要求区间起点也在窗口内。首轮回填 / 整会话重建的批次里
+                //   最晚一轮往往也是新的（用户刚用过 agent）,旧判据会把同批的几个月历史
+                //   token 当成「刚刚消耗」交给 demand：既凭空触发取数,又会落一条 cost 巨大、
+                //   涨幅很小的标定样本,把换算系数压到近乎零（calib.rs 的和之比拟合）。
+                //   混批宁可整批不计——少算一轮账目只是这一段估偏小,算错一轮却会持久跑偏。
+                let usage = store.take_source_usage(meta.id);
+                if let Some((first, last)) = store.take_turn_span() {
+                    let fresh_since = store::now_millis() - activity_window_ms();
+                    if last >= fresh_since {
+                        let platform = crate::subscription::model::Platform::of_collector_source(meta.id);
+                        if first >= fresh_since {
+                            crate::subscription::note_local_tokens(&app, platform, &usage);
+                        } else {
+                            crate::dev_log!(
+                                "[collector] {} backfill batch (turn span {}s) → 只退待机,token 不计取数账目",
+                                meta.id,
+                                (last - first) / 1000
+                            );
+                            crate::subscription::nudge_standby(&app);
+                        }
                     }
                 }
             }

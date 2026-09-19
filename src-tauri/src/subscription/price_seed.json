@@ -1,0 +1,303 @@
+{
+  "_doc": [
+    "price_model 的出厂种子 —— **生成产物,不要手改**。",
+    "生成器 scripts/price-seed-gen.mjs,规格 scripts/price-keys.json,",
+    "数据源 https://models.dev/api.json 的第一方目录（sst/models.dev,MIT）。",
+    "",
+    "四项 usd_* 均为 **USD / Mtok** 的官方 API 定价,按模型名精确对准、不做归一化",
+    "（PHASE15 §4.2：不要只存派生值）。match_key 是小写子串模式,匹配时**最长键优先**;",
+    "effective_from 为 unix 秒,一个模型的一段生效期 = 一行。",
+    "",
+    "**本文件不写生成时间**：写了就会每次重跑都产生 diff,而维护契约要求\"只在数据真的",
+    "动了时才提交\"。\"什么时候核对的\"由本文件自己的 git 历史回答 —— 定时重跑 + 只在",
+    "数据变动时提交,其 commit history 恰好就是价格时间线（设计 §7.4 末段）。"
+  ],
+  "rows": [
+    {
+      "platform": "claude",
+      "match_key": "claude-fable-5-1",
+      "effective_from": 1788220800,
+      "display_name": "Claude Fable 5.1",
+      "usd_input": 10,
+      "usd_output": 50,
+      "usd_cache_read": 0.25,
+      "usd_cache_write": 12.5,
+      "source_note": "models.dev/anthropic · claude-fable-5-1 · 上游 last_updated 2026-09-01"
+    },
+    {
+      "platform": "claude",
+      "match_key": "fable",
+      "effective_from": 1780790400,
+      "display_name": "Claude Fable 5",
+      "usd_input": 10,
+      "usd_output": 50,
+      "usd_cache_read": 1,
+      "usd_cache_write": 12.5,
+      "source_note": "models.dev/anthropic · claude-fable-5 · 上游 last_updated 2026-06-09"
+    },
+    {
+      "platform": "claude",
+      "match_key": "haiku",
+      "effective_from": 1760486400,
+      "display_name": "Claude Haiku 4.5",
+      "usd_input": 1,
+      "usd_output": 5,
+      "usd_cache_read": 0.1,
+      "usd_cache_write": 1.25,
+      "source_note": "models.dev/anthropic · claude-haiku-4-5,claude-haiku-4-5-20251001 · 上游 last_updated 2025-10-15"
+    },
+    {
+      "platform": "claude",
+      "match_key": "mythos",
+      "effective_from": 1780963200,
+      "display_name": "Claude Mythos 5",
+      "usd_input": 10,
+      "usd_output": 50,
+      "usd_cache_read": 1,
+      "usd_cache_write": 12.5,
+      "source_note": "models.dev/azure · claude-mythos-5 · 上游 last_updated 2026-06-09"
+    },
+    {
+      "platform": "claude",
+      "match_key": "opus",
+      "effective_from": 1763942400,
+      "display_name": "Claude Opus 4.5〜5",
+      "usd_input": 5,
+      "usd_output": 25,
+      "usd_cache_read": 0.5,
+      "usd_cache_write": 6.25,
+      "source_note": "models.dev/anthropic · claude-opus-4-5,claude-opus-4-5-20251101,claude-opus-4-6,claude-opus-4-7,claude-opus-4-8,claude-opus-5 · 上游 last_updated 2026-07-24"
+    },
+    {
+      "platform": "claude",
+      "match_key": "sonnet",
+      "effective_from": 1759104000,
+      "display_name": "Claude Sonnet 4.5〜4.6",
+      "usd_input": 3,
+      "usd_output": 15,
+      "usd_cache_read": 0.3,
+      "usd_cache_write": 3.75,
+      "source_note": "models.dev/anthropic · claude-sonnet-4-5,claude-sonnet-4-5-20250929,claude-sonnet-4-6 · 上游 last_updated 2026-03-13"
+    },
+    {
+      "platform": "claude",
+      "match_key": "sonnet-5",
+      "effective_from": 1782691200,
+      "display_name": "Claude Sonnet 5",
+      "usd_input": 2,
+      "usd_output": 10,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/anthropic · claude-sonnet-5 · 上游 last_updated 2026-06-30"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5",
+      "effective_from": 1754524800,
+      "display_name": "GPT-5",
+      "usd_input": 1.25,
+      "usd_output": 10,
+      "usd_cache_read": 0.125,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5 · 上游 last_updated 2025-08-07 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-1",
+      "effective_from": 1762992000,
+      "display_name": "GPT-5.1",
+      "usd_input": 1.25,
+      "usd_output": 10,
+      "usd_cache_read": 0.125,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.1 · 上游 last_updated 2025-11-13 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-2",
+      "effective_from": 1765411200,
+      "display_name": "GPT-5.2",
+      "usd_input": 1.75,
+      "usd_output": 14,
+      "usd_cache_read": 0.175,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.2,gpt-5.2-chat-latest · 上游 last_updated 2025-12-11 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-2-pro",
+      "effective_from": 1765411200,
+      "display_name": "GPT-5.2 Pro",
+      "usd_input": 21,
+      "usd_output": 168,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.2-pro · 上游 last_updated 2025-12-11 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-3",
+      "effective_from": 1770249600,
+      "display_name": "GPT-5.3 Codex",
+      "usd_input": 1.75,
+      "usd_output": 14,
+      "usd_cache_read": 0.175,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.3-codex,gpt-5.3-codex-spark,gpt-5.3-chat-latest · 上游 last_updated 2026-03-03 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4",
+      "effective_from": 1772668800,
+      "display_name": "GPT-5.4",
+      "usd_input": 2.5,
+      "usd_output": 15,
+      "usd_cache_read": 0.25,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.4 · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4-mini",
+      "effective_from": 1773705600,
+      "display_name": "GPT-5.4 mini",
+      "usd_input": 0.75,
+      "usd_output": 4.5,
+      "usd_cache_read": 0.075,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.4-mini · 上游 last_updated 2026-03-17 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4-nano",
+      "effective_from": 1773705600,
+      "display_name": "GPT-5.4 nano",
+      "usd_input": 0.2,
+      "usd_output": 1.25,
+      "usd_cache_read": 0.02,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.4-nano · 上游 last_updated 2026-03-17 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4-pro",
+      "effective_from": 1772668800,
+      "display_name": "GPT-5.4 Pro",
+      "usd_input": 30,
+      "usd_output": 180,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.4-pro · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-5",
+      "effective_from": 1776902400,
+      "display_name": "GPT-5.5",
+      "usd_input": 5,
+      "usd_output": 30,
+      "usd_cache_read": 0.5,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.5 · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-5-pro",
+      "effective_from": 1776902400,
+      "display_name": "GPT-5.5 Pro",
+      "usd_input": 30,
+      "usd_output": 180,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5.5-pro · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6",
+      "usd_input": 4,
+      "usd_output": 20,
+      "usd_cache_read": 0.4,
+      "usd_cache_write": 5,
+      "source_note": "models.dev/openai · gpt-5.6 · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-luna",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Luna",
+      "usd_input": 0.2,
+      "usd_output": 1.2,
+      "usd_cache_read": 0.02,
+      "usd_cache_write": 0.25,
+      "source_note": "models.dev/openai · gpt-5.6-luna · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-sol",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Sol",
+      "usd_input": 4,
+      "usd_output": 20,
+      "usd_cache_read": 0.4,
+      "usd_cache_write": 5,
+      "source_note": "models.dev/openai · gpt-5.6-sol · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-terra",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Terra",
+      "usd_input": 2,
+      "usd_output": 12,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/openai · gpt-5.6-terra · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-mini",
+      "effective_from": 1754524800,
+      "display_name": "GPT-5 mini",
+      "usd_input": 0.25,
+      "usd_output": 2,
+      "usd_cache_read": 0.025,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5-mini · 上游 last_updated 2025-08-07 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-nano",
+      "effective_from": 1754524800,
+      "display_name": "GPT-5 nano",
+      "usd_input": 0.05,
+      "usd_output": 0.4,
+      "usd_cache_read": 0.005,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5-nano · 上游 last_updated 2025-08-07 · cache_write:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-pro",
+      "effective_from": 1759708800,
+      "display_name": "GPT-5 Pro",
+      "usd_input": 15,
+      "usd_output": 120,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "source_note": "models.dev/openai · gpt-5-pro · 上游 last_updated 2025-10-06 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价)"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-astra",
+      "effective_from": 1788480000,
+      "display_name": "GPT-6 Astra",
+      "usd_input": 10,
+      "usd_output": 50,
+      "usd_cache_read": 1,
+      "usd_cache_write": 12.5,
+      "source_note": "models.dev/openai · gpt-6-astra · 上游 last_updated 2026-09-04 · 长上下文档位 272k:上游有,本版未实现"
+    }
+  ]
+}
