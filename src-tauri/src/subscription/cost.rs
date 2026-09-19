@@ -21,7 +21,8 @@
 //! 未知模型（新代号模型随时会出现）落回落价目,并标记 `unknown`——这种样本照常参与
 //! **触发估算**（有总比没有强）,但不参与**标定**（价目不可信的样本会污染系数）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{LazyLock, Mutex};
 
 use super::model::Platform;
 use super::price;
@@ -207,15 +208,157 @@ pub fn parse_breakdown(json: &str) -> BTreeMap<String, [i64; 4]> {
 /// 改这两个数**不需要**升 [`WEIGHT_VERSION`]（不参与 `cost` 的计算）,也不需要升
 /// `calib:ADMISSION_RULE_VERSION`（真库：换成先验之后,两个平台参与拟合的
 /// 样本集一条不变,只是混合公式不再把值往 `1.0` 拽）。
+///
+/// **这两个数各自属于一档套餐**（[`BASE_PLAN_CLAUDE`] / [`BASE_PLAN_CODEX`]）,
+/// 别的档由 [`plan_multiplier`] 的倍率表折算。
 const PRIOR_CLAUDE: f64 = 0.89;
 const PRIOR_CODEX: f64 = 8.9;
 
-/// 该平台的出厂预设系数（%/美元当量）。语义与来历见 [`PRIOR_CLAUDE`]。
-pub fn prior_scale(platform: Platform) -> f64 {
+/// 出厂预设所在的那一档（倍率 1.0 的基准）。
+///
+/// - Claude = **Max 5x**;
+/// - Codex = **Plus / Edu**（官方对照表里 Standard Business 与 Plus 同额;本机那台
+///   的 `plan_type` 在 plus / edu 之间跳,两档同量级,同归这一档）。
+const BASE_PLAN_CLAUDE: &str = "max_5x";
+const BASE_PLAN_CODEX: &str = "plus";
+
+/// 套餐 → 倍率对照表。
+///
+/// 倍率是**推出来的,不是测出来的**：由官方公布的限额比直接取倒数——配额大 N 倍的档,
+/// 同样 1 美元当量只吃掉 1/N 的百分点 ⇒ `scale` 就是基准档的 1/N。这比「拿基准档的
+/// 数当所有档用」强,但仍是估计;真实数由两条回溯路的样本在首次启动后接管
+/// （预设在混合公式里只值 `calib:PRIOR_WEIGHT` 个样本当量）。
+///
+/// 要防的是**低估**方向：配额更小的档（Claude Pro）真实系数更大,预设偏小 ⇒ 取数偏晚
+/// ⇒ 「界面上还有余量、其实已经用完」。反过来高估只会让取数偏频、显示更新更勤。
+/// 所以**同名档拿不准时一律取较小的那一档**（Pro 5x 而不是 Pro 20x）。
+///
+/// > ⚠️ **同一个词在两个平台意思相反**：Claude 的 Pro 是**小**档（Max 之下）,
+/// > ChatGPT 的 Pro 是**大**档（Plus 之上）。两张表因此方向相反,别互相抄。
+///
+/// 匹配按**子串、从特殊到一般**——同一个函数既吃 `plan_type`（"max" / "plus"）
+/// 也吃 Claude 凭据里的 `rateLimitTier`（"default_claude_max_5x"）。表里没有的档
+/// （Claude Team / Enterprise、ChatGPT Free / Go / Enterprise：官方没给可比的限额）
+/// 回落 1.0 = 按基准档算,与加这张表之前的行为一致。
+fn plan_table(platform: Platform) -> &'static [(&'static str, f64)] {
     match platform {
+        // 官方：Max 5x = 5 × Pro,Max 20x = 20 × Pro（同一句话里给出）⇒ 以 Max 5x 为
+        // 基准,Pro = 5 倍、Max 20x = 1/4 倍。
+        Platform::Claude => &[
+            ("max_20x", 0.25),
+            ("max20x", 0.25),
+            ("max_5x", 1.0),
+            ("max", 1.0), // 凭据 `subscriptionType` 只说 "max",分不出 5x / 20x → 按 5x 算
+            ("pro", 5.0),
+        ],
+        // 官方 Codex 对照表（每 5 小时消息条数估计,逐模型行的比例一致）：
+        // Plus = Standard Business = 1,Pro 5x = 5,Pro 20x = 20。
+        Platform::Codex => &[
+            ("pro_20x", 0.05),
+            ("pro20x", 0.05),
+            ("pro_5x", 0.2),
+            ("pro", 0.2), // API 的 `plan_type` 只说 "pro" → 按 5x 算（取较小档,偏高估）
+            ("plus", 1.0),
+            ("business", 1.0),
+            ("edu", 1.0), // 官方表里没有,但本机实测就在这一档
+        ],
+    }
+}
+
+/// 表里查一档（大小写无关的子串匹配;查不到 = None,由调用方决定回落）。
+fn plan_lookup(platform: Platform, plan: &str) -> Option<f64> {
+    let p = plan.trim().to_ascii_lowercase();
+    if p.is_empty() {
+        return None;
+    }
+    plan_table(platform).iter().find(|(k, _)| p.contains(k)).map(|(_, m)| *m)
+}
+
+/// 基准档的名字（倍率 1.0 的那一档;回落时按它算）。
+fn base_plan(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Claude => BASE_PLAN_CLAUDE,
+        Platform::Codex => BASE_PLAN_CODEX,
+    }
+}
+
+/// 当前套餐（进程内单一源）——预设要按档折算,而 [`prior_scale`] 的调用方
+/// （`calib:scale`）拿不到 store。两格分开存：
+/// - `plan` = 快照里的 `plan_type`（两个平台都有,但 Claude 侧只到 "max"）;
+/// - `tier` = Claude 凭据的 `rateLimitTier`（**只有它分得出 5x / 20x**）。
+///
+/// 取值时 `tier` 优先,但**只在它能在表里查到**时才算数——拿不准就退回 `plan`,
+/// 再拿不准退回基准档。
+#[derive(Default, Clone)]
+struct PlanHint {
+    plan: String,
+    tier: String,
+}
+
+static PLAN: LazyLock<Mutex<HashMap<Platform, PlanHint>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn plan_slot() -> std::sync::MutexGuard<'static, HashMap<Platform, PlanHint>> {
+    PLAN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 记下快照里的套餐名（`store` 每次读写快照时调用——快照行就是套餐的单一源）。
+pub fn set_plan(platform: Platform, plan: &str) {
+    let mut slot = plan_slot();
+    let hint = slot.entry(platform).or_default();
+    if hint.plan != plan {
+        hint.plan = plan.to_string();
+    }
+}
+
+/// 记下 Claude 凭据里的 `rateLimitTier`（取数时顺手带上;它是 5x / 20x 的唯一来源）。
+pub fn set_plan_tier(platform: Platform, tier: &str) {
+    let mut slot = plan_slot();
+    let hint = slot.entry(platform).or_default();
+    if hint.tier != tier {
+        hint.tier = tier.to_string();
+    }
+}
+
+/// 两个套餐名是不是同一**倍率类**——我们自己的模型认为它们的窗口一样大,
+/// 那它们的标定样本就可比,该放进同一代。
+///
+/// **两边都得在表里查得到才算数**。查不到的档走的是「回落基准档」那条路,
+/// 那是一个占位值而不是判断——拿它当依据会把一堆互不相干的档（Claude Team、
+/// ChatGPT Go…）通通归成基准档那一类。所以只要有一边查不到,就退回按名字精确比,
+/// 与加这条之前的行为相同。
+pub fn same_plan_class(platform: Platform, a: &str, b: &str) -> bool {
+    match (plan_lookup(platform, a), plan_lookup(platform, b)) {
+        // 两边都是表里的字面常量,相等就是逐位相等
+        (Some(x), Some(y)) => (x - y).abs() <= f64::EPSILON,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
+}
+
+/// 两格合一的取值规则（纯函数,可单测——**不要**在单测里动进程全局:
+/// `calib` 的单测与本模块同一个测试二进制,并行跑会互相踩）。
+fn resolve_multiplier(platform: Platform, tier: &str, plan: &str) -> f64 {
+    plan_lookup(platform, tier)
+        .or_else(|| plan_lookup(platform, plan))
+        // 两格都认不出（"unknown" / 官方改了命名 / 表里没收的档）→ 按基准档算,
+        // 也就是原样用 PRIOR_* 那个值,与加这张表之前逐位相同。
+        .unwrap_or_else(|| plan_lookup(platform, base_plan(platform)).unwrap_or(1.0))
+}
+
+/// 当前套餐相对基准档的倍率。
+fn current_multiplier(platform: Platform) -> f64 {
+    let hint = plan_slot().get(&platform).cloned().unwrap_or_default();
+    resolve_multiplier(platform, &hint.tier, &hint.plan)
+}
+
+/// 该平台**当前套餐**的出厂预设系数（%/美元当量）。
+/// 基准档的值见 [`PRIOR_CLAUDE`],按档折算的倍率见 [`plan_table`]。
+pub fn prior_scale(platform: Platform) -> f64 {
+    let base = match platform {
         Platform::Claude => PRIOR_CLAUDE,
         Platform::Codex => PRIOR_CODEX,
-    }
+    };
+    base * current_multiplier(platform)
 }
 
 #[cfg(test)]
@@ -482,5 +625,90 @@ mod tests {
             assert!((b - 13.0).abs() < 1e-12, "旧价 3 + 10");
             assert!((a - 4.0).abs() < 1e-12, "新价 3 + 1");
         });
+    }
+
+    /// 基准档的倍率必须是 1.0——否则 `PRIOR_CLAUDE` / `PRIOR_CODEX` 记的实测值
+    /// 就不再是它自己那一档的了。
+    #[test]
+    fn base_plans_are_the_unit_of_the_table() {
+        assert_eq!(plan_lookup(Platform::Claude, BASE_PLAN_CLAUDE), Some(1.0));
+        assert_eq!(plan_lookup(Platform::Codex, BASE_PLAN_CODEX), Some(1.0));
+    }
+
+    /// 官方限额比：Claude Max 5x = 5 × Pro、Max 20x = 20 × Pro;
+    /// Codex Pro 5x = 5 × Plus、Pro 20x = 20 × Plus。倍率取倒数。
+    #[test]
+    fn plan_multipliers_follow_the_published_limit_ratios() {
+        let claude = |plan| resolve_multiplier(Platform::Claude, "", plan);
+        let codex = |plan| resolve_multiplier(Platform::Codex, "", plan);
+        assert_eq!(claude("pro"), 5.0);
+        assert_eq!(claude("max"), 1.0);
+        assert_eq!(claude("max_20x"), 0.25);
+        assert_eq!(codex("plus"), 1.0);
+        assert_eq!(codex("edu"), 1.0);
+        assert_eq!(codex("pro"), 0.2);
+        // 同一个词在两个平台方向相反（Claude Pro 是小档,ChatGPT Pro 是大档）,
+        // 这一行就是钉子
+        assert!(claude("pro") > codex("pro"));
+    }
+
+    /// 凭据里的 `rateLimitTier` 原样进表也要认得出来（子串匹配,从特殊到一般）。
+    #[test]
+    fn credential_tier_strings_resolve_without_preprocessing() {
+        let tier = |t| resolve_multiplier(Platform::Claude, t, "max");
+        assert_eq!(tier("default_claude_max_5x"), 1.0);
+        assert_eq!(tier("DEFAULT_CLAUDE_MAX_20X"), 0.25);
+        assert_eq!(resolve_multiplier(Platform::Claude, "default_claude_pro", "pro"), 5.0);
+    }
+
+    /// 倍率类：表里同倍率的两个档算同类;倍率不同的不算;**有一边表里没有就退回按名字比**
+    /// （回落值是占位不是判断,拿它归类会把互不相干的档并到基准档那一类）。
+    #[test]
+    fn same_multiplier_means_same_class_but_only_for_plans_in_the_table() {
+        let codex = |a, b| same_plan_class(Platform::Codex, a, b);
+        assert!(codex("edu", "plus"), "官方对照表里 Business 与 Plus 同额,edu 按实测同档");
+        assert!(codex("plus", "business"));
+        assert!(!codex("edu", "pro"), "Pro 5x 是 Plus 的 5 倍,不同类");
+        assert!(!codex("edu", "team"), "team 不在表里 ⇒ 退回按名字比");
+        assert!(codex("team", "TEAM"), "都不在表里时按名字比,大小写无关");
+        assert!(!codex("team", "enterprise"));
+        // Claude：max 与 max_5x 是同一档,max_20x 不是
+        assert!(same_plan_class(Platform::Claude, "max", "default_claude_max_5x"));
+        assert!(!same_plan_class(Platform::Claude, "max", "max_20x"));
+        assert!(!same_plan_class(Platform::Claude, "max", "pro"));
+    }
+
+    /// 表里没有的档 / 空串 → 1.0（= 按基准档算,与加这张表之前同）。
+    #[test]
+    fn unknown_plans_fall_back_to_the_base_plan() {
+        for p in ["", "unknown", "team", "enterprise", "go", "free"] {
+            assert_eq!(resolve_multiplier(Platform::Codex, "", p), 1.0, "codex {p}");
+        }
+        for p in ["", "unknown", "team", "enterprise"] {
+            assert_eq!(resolve_multiplier(Platform::Claude, "", p), 1.0, "claude {p}");
+        }
+    }
+
+    /// `tier` 优先于 `plan`,但**只在它查得到**时——查不到要退回 `plan` 而不是基准档。
+    /// （走纯函数,不动进程全局:`calib` 的单测同二进制并行跑,会互相踩。）
+    #[test]
+    fn tier_wins_only_when_it_resolves() {
+        let m = |tier, plan| resolve_multiplier(Platform::Claude, tier, plan);
+        assert_eq!(m("default_claude_max_20x", "max"), 0.25, "tier 分得出 20x");
+        assert_eq!(m("some_new_tier_name", "pro"), 5.0, "认不出的 tier → 退回 plan");
+        assert_eq!(m("", "pro"), 5.0, "没有 tier（Codex 侧就没有）→ 只看 plan");
+        assert_eq!(m("", "unknown"), 1.0, "两格都认不出 → 基准档");
+    }
+
+    /// 预设按当前套餐折算：同一个基准实测值 × 倍率。
+    #[test]
+    fn prior_scale_is_the_base_measurement_times_the_plan_multiplier() {
+        let claude_pro = PRIOR_CLAUDE * resolve_multiplier(Platform::Claude, "", "pro");
+        let codex_pro = PRIOR_CODEX * resolve_multiplier(Platform::Codex, "", "pro");
+        assert!((claude_pro - 4.45).abs() < 1e-12, "Claude Pro 窗口只有 Max 5x 的 1/5");
+        assert!((codex_pro - 1.78).abs() < 1e-12, "ChatGPT Pro 窗口是 Plus 的 5 倍");
+        // 没设过任何套餐（单测里的常态）→ 基准档,与加这张表之前逐位相同
+        assert_eq!(prior_scale(Platform::Claude), PRIOR_CLAUDE);
+        assert_eq!(prior_scale(Platform::Codex), PRIOR_CODEX);
     }
 }

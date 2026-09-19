@@ -71,6 +71,23 @@ pub struct RawCredential {
     /// Claude 的 usage 端点不返回 plan,只能从凭据 `subscriptionType` 取;
     /// Codex 的 plan 在 usage 响应里（plan_type）,此处留 None。
     pub plan_hint: Option<String>,
+    /// **账号指纹**（Codex 的 `auth.json` → `tokens.account_id` 的哈希前缀;Claude 侧
+    /// 凭据里没有等价字段,留 None）。
+    ///
+    /// 为什么要它：一台机器可以登录**多个**账号并来回切,而每个账号有自己独立的额度
+    /// 窗口。`plan_type` 只是个代理——本机 2026-07 就出现过**两个都是 plus** 的账号
+    /// 交替使用,代理完全失效。
+    ///
+    /// **存哈希不存原值**：链路只需要「和上次是不是同一个」这一个判断,原值进不了库
+    /// （`meta` 不存任何凭据类原文）。
+    pub account_fp: Option<String>,
+    /// 限额档原文（Claude 的 `rateLimitTier`,如 `default_claude_max_5x`;小写）。
+    ///
+    /// 与 [`plan_hint`]（Self:plan_hint) 分开留着,因为**只有它分得出 Max 5x / 20x**
+    /// ——`subscriptionType` 两者都只说 "max",而两档配额差 4 倍。它只喂
+    /// `cost:set_plan_tier`（挑出厂预设的倍率）,**不进库**：`usage_pair.plan_type`
+    /// 仍按 `plan_hint` 的粗粒度标,换个粒度会让存量样本整批对不上号。
+    pub plan_tier: Option<String>,
 }
 
 /// JWT payload 提取（不验签——本工具只读自显;失败返回 None,调用方降级）。
@@ -146,6 +163,12 @@ pub fn read_credential(platform: Platform) -> Option<RawCredential> {
                 access_expired: false,
                 account_hint: hint,
                 plan_hint: None,
+                plan_tier: None,
+                account_fp: v
+                    .get("tokens")
+                    .and_then(|t| t.get("account_id"))
+                    .and_then(|x| x.as_str())
+                    .map(fingerprint),
             })
         }
         Platform::Claude => {
@@ -167,7 +190,14 @@ pub fn read_credential(platform: Platform) -> Option<RawCredential> {
                 refresh_token: refresh,
                 access_expired,
                 account_hint: hint,
+                // Claude 的凭据里没有账号 id（只有 subscriptionType / rateLimitTier）
+                account_fp: None,
                 plan_hint: plan_from_oauth(oauth),
+                plan_tier: oauth
+                    .get("rateLimitTier")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty()),
             })
         }
     }
@@ -191,6 +221,20 @@ fn plan_from_oauth(oauth: &Value) -> Option<String> {
         .iter()
         .find(|p| tier.contains(**p))
         .map(|p| (*p).to_string())
+}
+
+/// 账号指纹：FNV-1a 64 位的十六进制（16 字符）。
+///
+/// **只用来比较「和上次是不是同一个」**,不用于任何安全用途,所以不需要密码学哈希,
+/// 也就不必为此引一个依赖。取哈希而非原值是为了不让账号 id 的原文进库
+/// （`meta` 的红线是不存凭据类原文）。
+pub fn fingerprint(id: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.trim().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// 账号掩码：保留前 3 字符 + ***（不足以 1 字符;绝不透出完整标识）。

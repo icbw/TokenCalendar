@@ -91,6 +91,9 @@ impl CodexAdapter {
                             access_expired: false,
                             account_hint: cred.account_hint,
                             plan_hint: None,
+                            plan_tier: None,
+                            // 刷新换的是同一个账号的 token,指纹照搬
+                            account_fp: cred.account_fp.clone(),
                         });
                     }
                 }
@@ -105,6 +108,8 @@ impl CodexAdapter {
                     account_hint: cred.account_hint,
                     // Codex 的 plan 在 usage 响应里（plan_type），凭据侧不提供
                     plan_hint: None,
+                    plan_tier: None,
+                    account_fp: cred.account_fp.clone(),
                 })
             }
             RefreshOutcome::Dead => {
@@ -118,6 +123,9 @@ impl CodexAdapter {
                             access_expired: false,
                             account_hint: cred.account_hint,
                             plan_hint: None,
+                            plan_tier: None,
+                            // 刷新换的是同一个账号的 token,指纹照搬
+                            account_fp: cred.account_fp.clone(),
                         });
                     }
                 }
@@ -234,6 +242,18 @@ fn account_id_from_jwt(access_token: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// **响应里看到的账号指纹**。
+///
+/// 这是最权威的一路——它就是**服务端把这次用量记在谁头上**,与读数在同一个响应里,
+/// 零额外请求。但 `parse_usage` 是纯解析、拿不到 store,所以先放在这个格子里,
+/// 由轮询线程落库时取走（与 `cost:set_plan` 同一套办法）。
+static SEEN_ACCOUNT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 取走上一次解析看到的账号指纹（取完即清;没看到 → None）。
+pub fn take_seen_account() -> Option<String> {
+    SEEN_ACCOUNT.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// 解析 wham/usage 响应（字段缺省容错——逆向接口,结构可能漂移）。
 pub fn parse_usage(
     platform: Platform,
@@ -245,6 +265,13 @@ pub fn parse_usage(
         Ok(v) => v,
         Err(_) => return snapshot_error(platform, cred, FetchStatus::ParseFailed, now),
     };
+
+    // 账号指纹：响应顶层就带 `account_id`（与 `user_id` / `email` 并列）——**不存原值**,
+    // 只把哈希放进格子,由轮询线程取走（见 SEEN_ACCOUNT）。
+    if let Some(id) = v.get("account_id").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        *SEEN_ACCOUNT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(super::credentials::fingerprint(id));
+    }
 
     // plan_type:缺省 "unknown"（不判 parse 失败——字段降级容忍)
     let plan_type = v

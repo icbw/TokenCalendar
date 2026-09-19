@@ -197,6 +197,12 @@ pub fn parse_usage(cred: &super::credentials::RawCredential, body: &str, now: i6
         return error_snapshot(FetchStatus::PlanInactive);
     }
 
+    // 限额档（`rateLimitTier`）只喂出厂预设的倍率表——`subscriptionType` 分不出
+    // Max 5x / 20x,而两档配额差 4 倍。它**不进库**,见 `RawCredential:plan_tier`。
+    if let Some(tier) = cred.plan_tier.as_deref() {
+        super::cost::set_plan_tier(Platform::Claude, tier);
+    }
+
     SubscriptionSnapshot {
         platform: Platform::Claude,
         // usage 端点**不返回** plan 名 → 取凭据侧 subscriptionType（"max"/"pro"）,

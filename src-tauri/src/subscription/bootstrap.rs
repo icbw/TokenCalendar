@@ -47,6 +47,9 @@ use super::store::SubStore;
 /// 采集源 id（Claude 订阅对应的本地源）。
 const CLAUDE_SOURCE: &str = "claude-code";
 
+/// 5h 滚动窗口的长度（秒）——算「这段时间从窗尾老掉的代价」要用它回看。
+const WINDOW_SECS: i64 = 5 * 3_600;
+
 /// 回溯上限（天）：一轮最多往回看这么久——越久远的样本越可能跨套餐变更,
 /// 也把没有本地轮记录的空档反复重扫的成本兜住。
 const HORIZON_DAYS: i64 = 14;
@@ -167,16 +170,12 @@ pub fn build_pairs(
         *hour_base.entry((day, hour, t.model.clone())).or_insert(0) += t.base();
     }
 
-    let mut out = vec![];
-    for w in samples.windows(2) {
-        let (t0, used5_0, used7_0) = w[0];
-        let (t1, used5_1, used7_1) = w[1];
-        // 区间内结束的轮（左开右闭,与「两次读数之间」的语义一致）
-        let mut breakdown: BTreeMap<String, [i64; 4]> = BTreeMap::new();
-        for t in turns.iter().filter(|t| t.ended_at > t0 && t.ended_at <= t1) {
+    // 某个时间区间 （lo, hi] 内结束的轮 → 分模型的四项 token（缓存按体量占比摊回）
+    let slice = |lo: i64, hi: i64| -> BTreeMap<String, [i64; 4]> {
+        let mut b: BTreeMap<String, [i64; 4]> = BTreeMap::new();
+        for t in turns.iter().filter(|t| t.ended_at > lo && t.ended_at <= hi) {
             let (day, hour) = t.hour_key();
             let key = (day, hour, t.model.clone());
-            // 缓存按在该小时内的体量占比摊回
             let (cr, cw) = match (hour_cache.get(&key), hour_base.get(&key)) {
                 (Some(c), Some(base)) if *base > 0 => {
                     let share = t.base() as f64 / *base as f64;
@@ -184,26 +183,43 @@ pub fn build_pairs(
                 }
                 _ => (0, 0),
             };
-            let slot = breakdown.entry(t.model.clone()).or_insert([0; 4]);
+            let slot = b.entry(t.model.clone()).or_insert([0; 4]);
             slot[0] += t.input;
             slot[1] += t.output;
             slot[2] += cr;
             slot[3] += cw;
         }
+        b
+    };
+    // 分模型 token → （总代价, 其中未知模型的代价)；`at` = 取价时刻
+    let price = |b: &BTreeMap<String, [i64; 4]>, at: i64| -> (f64, f64) {
+        let (mut total, mut unknown) = (0.0, 0.0);
+        for (model, v) in b {
+            let tokens = Tokens { input: v[0], output: v[1], cache_read: v[2], cache_write: v[3] };
+            let (c, known) = cost::cost_of(Platform::Claude, model, &tokens, at);
+            total += c;
+            if !known {
+                unknown += c;
+            }
+        }
+        (total, unknown)
+    };
+
+    let mut out = vec![];
+    for w in samples.windows(2) {
+        let (t0, used5_0, used7_0) = w[0];
+        let (t1, used5_1, used7_1) = w[1];
+        // 区间内结束的轮（左开右闭,与「两次读数之间」的语义一致）
+        let breakdown = slice(t0, t1);
         if breakdown.is_empty() {
             continue;
         }
-        let mut c_total = 0.0;
-        let mut c_unknown = 0.0;
-        for (model, v) in &breakdown {
-            let tokens = Tokens { input: v[0], output: v[1], cache_read: v[2], cache_write: v[3] };
-            // at = t1：该区间右端点,与 store:recompute_stale_costs 同口径
-            let (c, known) = cost::cost_of(Platform::Claude, model, &tokens, t1);
-            c_total += c;
-            if !known {
-                c_unknown += c;
-            }
-        }
+        // at = t1：该区间右端点,与 store:recompute_stale_costs 同口径
+        let (c_total, c_unknown) = price(&breakdown, t1);
+        // **老掉的**：发生在 （t0−5h, t1−5h] 的那些轮——5h 是滚动窗口,计数器的变化是
+        // 「新花的 − 老掉的」。轮记录读得不够早时这里自然
+        // 算成 0 = 不做正,不会算错方向。
+        let aged = price(&slice(t0 - WINDOW_SECS, t1 - WINDOW_SECS), t1).0;
         // 桌面端那份采样历史只有两个百分比,没有窗口重置时刻 ⇒ 两端都是 None,
         // 重置只能退回「读数变小了」去判（语义见 calib:Pair:window_reset）。
         let pair = Pair {
@@ -215,6 +231,7 @@ pub fn build_pairs(
             resets5_1: None,
             cost: c_total,
             unknown_cost: c_unknown,
+            aged_cost: aged,
         };
         if !pair.usable(super::calib::scale(Platform::Claude)) {
             continue; // 重置轮 / 间隔越界 / 零代价,与在线样本同一套筛选
@@ -222,6 +239,21 @@ pub fn build_pairs(
         out.push((pair, (used7_0, used7_1), breakdown));
     }
     out
+}
+
+/// 一条待落库的标定样本：`（样本, （7d 两端), breakdown JSON)`。
+type PairItem = (Pair, (f64, f64), String);
+
+/// 按**当前套餐的起始观测时刻**把一批样本切成「标真套餐」与「标套餐未知」两摞。
+///
+/// 边界取 `t0`（区间**开始**的时刻）：跨在边界上的那一条,它的消耗有一部分发生在旧套餐
+/// 下 ⇒ 归到「未知」这一摞才不会把旧套餐的量记到新套餐头上。
+/// `since = None`（没有已知边界）→ 整批归「真套餐」,与加这条之前的行为逐条相同。
+fn split_by_plan_since(items: Vec<PairItem>, since: Option<i64>) -> (Vec<PairItem>, Vec<PairItem>) {
+    match since {
+        Some(b) => items.into_iter().partition(|(p, _, _)| p.t0 >= b),
+        None => (items, vec![]),
+    }
 }
 
 /// 读 collector.db 里近 `HORIZON_DAYS` 天的轮记录（只读连接;库不存在 → 空）。
@@ -303,12 +335,14 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
     // 轮记录读一次覆盖两处用途：标定按水位线切,证据统计按固定 24 小时窗——取两者较早的
     // 起点一次读完,免得同一张表在一轮里扫两遍。
     let win_since = now - FOREIGN_WINDOW_HOURS * 3600;
-    let turns = read_turns(collector_db, since.min(win_since));
+    // 再往前一个窗长：老化量的原料在 `（t0−5h, …]`,少读这一段会把最早那批区间的
+    // 老化量算成 0（见 build_pairs）。
+    let turns = read_turns(collector_db, since.min(win_since) - WINDOW_SECS);
 
     let samples = sub_store.samples_since(Platform::Claude, since);
     let mut n = 0;
     if samples.len() >= 2 {
-        let hour_cache = read_hour_cache(collector_db, &day_of(since));
+        let hour_cache = read_hour_cache(collector_db, &day_of(since - WINDOW_SECS));
         // 首轮（空库 / 刚升级）一次能建上千条 ⇒ 一次事务写完,不逐条提交
         // breakdown 写**规范的裸 map**（与在线路同形状）——旧版在这里包了一层
         // `{"src":…,"models":{…}}`,而 src 现已是独立列。形状统一,将来按新权重
@@ -320,8 +354,15 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
                 (pair, used7, json)
             })
             .collect();
-        // 套餐只能取「当前快照的套餐」这一个已知量:桌面端样本不带 plan。回补历史
-        // 区间时若期间升过档会标错,但这与完全不标相比不会更糟,新样本从此刻起是准的。
+        // 套餐标注：桌面端的采样历史**不带套餐**,本机只有
+        // 「当前快照的套餐」这一个已知量。旧版拿它硬套整段回补区间——换过档的人会被
+        // 把旧套餐的历史标成新套餐,而 `pairs_for_fit` 按套餐筛之后,**标错比不标更糟**
+        // （它会把新套餐的估计往旧套餐拖）。
+        //
+        // 故以 store 记下的**当前套餐起始观测时刻**为界一分为二：从它之后开始的区间标
+        // 真套餐,之前的标空串 = **套餐未知**（`pairs_for_fit` 放行,但不会被算成别的
+        // 套餐的账）。没有边界——存量库升上来、或从未成功取过一次数——就沿用旧行为
+        // 整批标当前套餐,免得升级当天把刚建的样本全标成未知。
         let plan = sub_store
             .load_snapshot(Platform::Claude)
             .map(|s| s.plan_type)
@@ -337,9 +378,21 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
         } else {
             None
         };
+        let (current, unknown) = split_by_plan_since(items, sub_store.plan_since(Platform::Claude));
         n = sub_store
-            .insert_pairs(Platform::Claude, &items, PAIR_SRC, &plan)
-            .unwrap_or(0);
+            .insert_pairs(Platform::Claude, &current, PAIR_SRC, &plan)
+            .unwrap_or(0)
+            + sub_store
+                .insert_pairs(Platform::Claude, &unknown, PAIR_SRC, "")
+                .unwrap_or(0);
+        if !unknown.is_empty() {
+            crate::dev_log!(
+                "[subscription] claude desktop pairs: {} before plan boundary marked plan-unknown, {} as '{}'",
+                unknown.len(),
+                current.len(),
+                plan
+            );
+        }
         if let Some((r, lo, hi)) = removed {
             crate::dev_log!(
                 "[subscription] claude desktop pairs rebuilt under admission rule v{}: \
@@ -513,5 +566,44 @@ mod tests {
         // 预计要涨好几个百分点却纹丝不动 ⇒ 不是量化,是账目不对,照丢
         let heavy = vec![turn(10_500, "claude-sonnet-5", 100_000_000, 0)];
         assert!(build_pairs(&flat, &heavy, &HourCache::new()).is_empty());
+    }
+
+    /// 套餐边界（设计 §9-10 ②）：边界之前**开始**的区间标「套餐未知」,
+    /// 之后的才标真套餐;没有边界 = 整批标真套餐（存量库升上来的行为不变）。
+    #[test]
+    fn pairs_starting_before_the_plan_boundary_are_marked_plan_unknown() {
+        let item = |t0: i64| -> PairItem {
+            (
+                Pair {
+                    t0,
+                    t1: t0 + 900,
+                    used5_0: 10.0,
+                    used5_1: 11.0,
+                    resets5_0: None,
+                    resets5_1: None,
+                    cost: 1.0,
+                    unknown_cost: 0.0,
+                    aged_cost: 0.0,
+                },
+                (4.0, 4.0),
+                "{}".into(),
+            )
+        };
+        let batch = || vec![item(1_000), item(2_000), item(3_000)];
+
+        // 边界落在第二条的起点:它和之后的算当前套餐,更早的算未知
+        let (current, unknown) = split_by_plan_since(batch(), Some(2_000));
+        assert_eq!(current.iter().map(|(p, _, _)| p.t0).collect::<Vec<_>>(), [2_000, 3_000]);
+        assert_eq!(unknown.iter().map(|(p, _, _)| p.t0).collect::<Vec<_>>(), [1_000]);
+
+        // 跨在边界上的区间（t0 < 边界 <= t1）归「未知」——它的消耗有一部分发生在旧套餐下
+        let (current, unknown) = split_by_plan_since(batch(), Some(2_500));
+        assert_eq!(current.iter().map(|(p, _, _)| p.t0).collect::<Vec<_>>(), [3_000]);
+        assert_eq!(unknown.len(), 2);
+
+        // 没有边界 → 一条都不标未知
+        let (current, unknown) = split_by_plan_since(batch(), None);
+        assert_eq!(current.len(), 3);
+        assert!(unknown.is_empty());
     }
 }

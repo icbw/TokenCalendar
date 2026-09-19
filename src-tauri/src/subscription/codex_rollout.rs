@@ -98,6 +98,11 @@ const SCAN_LAG_SECS: i64 = 3600;
 const WINDOW_5H_MINUTES: i64 = 300;
 const WINDOW_7D_MINUTES: i64 = 10080;
 
+/// 5h 滚动窗口的长度（秒）——算「这段时间从窗尾老掉的代价」要用它回看。
+const WINDOW_SECS: i64 = 5 * 3_600;
+
+/// 扫描要比建样本的下界再往前 `WINDOW_SECS`：`（t0−5h, t1−5h]` 里的调用是算老化量的
+/// 原料,少扫这一段会把最早那批区间的老化量算成 0（偏保守但不对）。
 /// 拿不到模型名时的占位（匹配不上任何价目键 ⇒ 走回落价并标 unknown,与采集器同名）。
 const UNKNOWN_MODEL: &str = "unknown";
 
@@ -170,7 +175,8 @@ pub fn newest_mtime() -> Option<i64> {
 }
 
 /// 扫描 mtime 不早于 `mtime_floor` 的文件,取出 `t >= since` 的读数与调用。
-fn scan(since: i64, mtime_floor: i64) -> Scan {
+/// （`pub（super)` 是给 `smoke` 的直接测量用的——它要的是原始读数与调用,不是样本。）
+pub(super) fn scan(since: i64, mtime_floor: i64) -> Scan {
     let files = rollout_files();
     let mut out = Scan { files_total: files.len(), ..Default::default() };
     for (path, mtime) in files {
@@ -303,6 +309,7 @@ fn parse_call(payload: &Value, t: i64, model: &str) -> Option<Call> {
 pub fn build_pairs(
     readings: &[Reading],
     calls: &[Call],
+    account_since: Option<i64>,
 ) -> Vec<(Pair, (f64, f64), BTreeMap<String, [i64; 4]>, String)> {
     // 端点链：相邻端点至少相隔 MIN_PAIR_SECS。被跳过的读数成为区间内点,
     // 它们对应的调用照常计入该区间的代价——**一笔 token 都不丢**。
@@ -336,8 +343,31 @@ pub fn build_pairs(
         if a.plan != b.plan || breakdown.is_empty() {
             continue;
         }
+        // **跨账号切换点的区间也不建样本**。每个账号有自己独立的额度窗口
+        // ⇒ 跨在切换点上的 Δ 是拿两个账号的读数相减出来的,毫无意义。`plan_type` 挡不住
+        // 这件事:本机 2026-07 出现过**两个都是 plus** 的账号交替使用。边界只对
+        // 「从现在往后」有效（rollout 里一个账号字段都没有,历史补不回来）,更早的区间
+        // 仍靠套餐与窗尾判据兜着。
+        if account_since.is_some_and(|t| a.t < t && t <= b.t) {
+            continue;
+        }
         // at = t1：区间右端点,与 store:recompute_stale_costs / bootstrap 同口径
         let (total, unknown) = cost::cost_of_breakdown(Platform::Codex, &breakdown, b.t);
+        // **老掉的**：发生在 （t0−5h, t1−5h] 的那些调用——5h 是滚动窗口,计数器的变化
+        // 是「新花的 − 老掉的」。调用按时刻有序,二分定位。
+        let aged = {
+            let (lo, hi) = (a.t - WINDOW_SECS, b.t - WINDOW_SECS);
+            let i = calls.partition_point(|c| c.t <= lo);
+            let j = calls.partition_point(|c| c.t <= hi);
+            let mut old_b: BTreeMap<String, [i64; 4]> = BTreeMap::new();
+            for c in &calls[i..j] {
+                let slot = old_b.entry(c.model.clone()).or_insert([0; 4]);
+                for (k, v) in c.tokens.iter().enumerate() {
+                    slot[k] += v;
+                }
+            }
+            cost::cost_of_breakdown(Platform::Codex, &old_b, hi).0
+        };
         let pair = Pair {
             t0: a.t,
             t1: b.t,
@@ -349,6 +379,7 @@ pub fn build_pairs(
             resets5_1: b.resets5,
             cost: total,
             unknown_cost: unknown,
+            aged_cost: aged,
         };
         if !pair.usable(calib::scale(Platform::Codex)) {
             continue; // 跨重置 / 间隔越界 / 零代价 / 比值离谱,与另外两路同一套筛选
@@ -434,18 +465,27 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
             .max(store.meta_i64(META_SCANNED_MTIME).unwrap_or(0))
             .max(floor)
     };
-    let scan = scan(since, since - SCAN_LAG_SECS);
+    // 数据下界再往前推一个窗长：老化量的原料在 `（t0−5h, …]`,少扫这一段会把最早那批
+    // 区间的老化量算成 0。读数仍按 `since` 切（下面 build_pairs 之前过滤）,只多要调用。
+    let scan = scan(since - WINDOW_SECS, since - SCAN_LAG_SECS - WINDOW_SECS);
     if scan.files_read == 0 {
         return (0, 0, false);
     }
 
+    // 读数回到原来的下界：多扫出来的那一个窗长只是老化量的原料,不该让它把水位线
+    // 之前的区间重新建一遍（收割本身是幂等的,多收几条只会让历史更全,照收）。
+    let readings: Vec<Reading> =
+        scan.readings.iter().filter(|r| r.t >= since).cloned().collect();
     let samples: Vec<_> =
         scan.readings.iter().map(|r| (r.t, r.used5, r.used7, r.plan.clone())).collect();
     let harvested = store.insert_samples_of(Platform::Codex, &samples).unwrap_or(0);
 
     // 样本按套餐分组落库：insert_pairs 一次只带一个 plan_type,而回溯窗里可能跨过套餐变更。
     let mut by_plan: BTreeMap<String, Vec<(Pair, (f64, f64), String)>> = BTreeMap::new();
-    for (pair, used7, breakdown, plan) in build_pairs(&scan.readings, &scan.calls) {
+    let account_since = store.account_since(Platform::Codex);
+    for (pair, used7, breakdown, plan) in
+        build_pairs(&readings, &scan.calls, account_since)
+    {
         let json = serde_json::to_string(&breakdown).unwrap_or_else(|_| "{}".into());
         by_plan.entry(plan).or_default().push((pair, used7, json));
     }
@@ -710,7 +750,7 @@ mod tests {
             call(1_030, "gpt-5.6-sol", 60_000),  // 内点之后
             call(1_060, "gpt-5.6-sol", 60_000),  // 端点那一笔,算在区间内
         ];
-        let out = build_pairs(&readings, &calls);
+        let out = build_pairs(&readings, &calls, None);
         assert_eq!(out.len(), 1, "端点链只出一条样本（1000 → 1060）");
         assert_eq!(out[0].0.t0, 1_000);
         assert_eq!(out[0].0.t1, 1_060);
@@ -724,7 +764,7 @@ mod tests {
         // (t0, t1]：t0 那一笔属于**上一个**区间,t1 那一笔属于本区间
         let readings = vec![reading(1_000, 0.0, "edu"), reading(1_060, 2.0, "edu"), reading(1_120, 4.0, "edu")];
         let calls = vec![call(1_000, "gpt-5.6-sol", 90_000), call(1_060, "gpt-5.6-sol", 60_000)];
-        let out = build_pairs(&readings, &calls);
+        let out = build_pairs(&readings, &calls, None);
         assert_eq!(out.len(), 1, "第二个区间没有调用 ⇒ 零代价,不建样本");
         assert_eq!(out[0].0.t1, 1_060);
         assert_eq!(out[0].2["gpt-5.6-sol"][0], 60_000, "t0 那一笔不算进来");
@@ -738,7 +778,7 @@ mod tests {
             reading(1_120, 6.0, "edu"),
         ];
         let calls = vec![call(1_030, "gpt-5.6-sol", 60_000), call(1_100, "gpt-5.6-sol", 60_000)];
-        let out = build_pairs(&readings, &calls);
+        let out = build_pairs(&readings, &calls, None);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].0.t0, out[0].0.t1), (1_060, 1_120));
         assert_eq!(out[0].3, "edu");
@@ -749,19 +789,38 @@ mod tests {
         let calls = vec![call(1_030, "gpt-5.6-sol", 60_000)];
         // 掉了 = 窗口重置（没有窗尾时的兜底判据）
         let reset = vec![reading(1_000, 30.0, "edu"), reading(1_060, 2.0, "edu")];
-        assert!(build_pairs(&reset, &calls).is_empty());
+        assert!(build_pairs(&reset, &calls, None).is_empty());
         // **窗尾前移 = 重置的直接证据**,哪怕读数看着还在涨（2026-09-19）
         let crossed = vec![
             Reading { resets5: Some(1_050), ..reading(1_000, 5.0, "edu") },
             Reading { resets5: Some(19_050), ..reading(1_060, 8.0, "edu") },
         ];
-        assert!(build_pairs(&crossed, &calls).is_empty());
+        assert!(build_pairs(&crossed, &calls, None).is_empty());
         // 同一个窗口内（窗尾没动）照常建样本
         let same = vec![
             Reading { resets5: Some(19_050), ..reading(1_000, 5.0, "edu") },
             Reading { resets5: Some(19_050), ..reading(1_060, 8.0, "edu") },
         ];
-        assert_eq!(build_pairs(&same, &calls).len(), 1);
+        assert_eq!(build_pairs(&same, &calls, None).len(), 1);
+    }
+
+    /// **跨账号切换点的区间不建样本**（2026-09-19）：每个账号有自己独立的额度窗口,
+    /// 跨在切换点上的 Δ 是拿两个账号的读数相减出来的。边界之外的区间照常建。
+    #[test]
+    fn intervals_straddling_an_account_switch_are_dropped() {
+        let readings =
+            vec![reading(1_000, 5.0, "plus"), reading(1_060, 8.0, "plus"), reading(1_120, 11.0, "plus")];
+        let calls = vec![call(1_030, "gpt-5.6-sol", 20_000), call(1_090, "gpt-5.6-sol", 20_000)];
+        assert_eq!(build_pairs(&readings, &calls, None).len(), 2, "没有边界 → 两条都建");
+        // 边界落在第一个区间内部 ⇒ 只剩第二条
+        let out = build_pairs(&readings, &calls, Some(1_030));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.t0, 1_060);
+        // 边界正好落在端点上：(t0, t1] 左开右闭 ⇒ t == t0 不算跨,t == t1 算
+        assert_eq!(build_pairs(&readings, &calls, Some(1_000)).len(), 2, "边界=区间起点,不算跨");
+        assert_eq!(build_pairs(&readings, &calls, Some(1_060)).len(), 1, "边界=区间终点,算跨");
+        // 边界比所有读数都晚（刚记下账号）⇒ 一条都不跨
+        assert_eq!(build_pairs(&readings, &calls, Some(9_999)).len(), 2);
     }
 
     /// 没涨的读数**收**,只要这段消耗本来就不该动一格（PHASE15 §9-8 定案）。
@@ -771,15 +830,15 @@ mod tests {
         // 按 Codex 的出厂预设,这一笔的预计涨幅约 0.7 个百分点 ⇒ 不够动一格是正常的
         // （配对用的那笔 60k 折合约 2.1 个百分点,已经越过 ZERO_DELTA_SLACK 的上限）
         let small = vec![call(1_030, "gpt-5.6-sol", 20_000)];
-        let out = build_pairs(&flat, &small);
+        let out = build_pairs(&flat, &small, None);
         assert_eq!(out.len(), 1, "Δ=0 的有效样本计回分母");
         assert_eq!(out[0].0.used5_1 - out[0].0.used5_0, 0.0);
         // 预计要涨好几个百分点却纹丝不动 ⇒ 账目不对,照丢
         let huge = vec![call(1_030, "gpt-5.6-sol", 60_000_000)];
-        assert!(build_pairs(&flat, &huge).is_empty());
+        assert!(build_pairs(&flat, &huge, None).is_empty());
         // 没有调用 = 别处在用,不能拿来标定本地换算
         let no_call = vec![reading(1_000, 5.0, "edu"), reading(1_060, 9.0, "edu")];
-        assert!(build_pairs(&no_call, &[]).is_empty());
+        assert!(build_pairs(&no_call, &[], None).is_empty());
     }
 
     #[test]
@@ -787,6 +846,6 @@ mod tests {
         // codex-auto-review 是路由标签不是模型名 ⇒ 折价但标 unknown;过半即不参与标定
         let readings = vec![reading(1_000, 0.0, "edu"), reading(1_060, 2.0, "edu")];
         let calls = vec![call(1_030, "codex-auto-review", 200_000)];
-        assert!(build_pairs(&readings, &calls).is_empty(), "未知模型占比过半 ⇒ 不建样本");
+        assert!(build_pairs(&readings, &calls, None).is_empty(), "未知模型占比过半 ⇒ 不建样本");
     }
 }

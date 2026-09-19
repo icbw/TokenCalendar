@@ -375,6 +375,10 @@ fn record_pair(
         resets5_0: resets(prev),
         resets5_1: resets(snap),
         cost: acc.cost,
+        // 在线路**给不出老化量**：`demand` 的账目只从上一次成功轮累加,没有「5 小时前
+        // 那一段」的历史。填 0 = 不做正,与加这一列之前逐位相同（两条回溯路有历史,
+        // 它们会填真值）。本机这一路统共只有几十行,影响可忽略。
+        aged_cost: 0.0,
         unknown_cost: acc.unknown_cost,
     };
     let used7 = (used(prev, "7d").unwrap_or(0.0), used(snap, "7d").unwrap_or(0.0));
@@ -440,6 +444,19 @@ fn rate_limited_snapshot(platform: Platform) -> SubscriptionSnapshot {
     }
 }
 
+/// 文件 mtime（unix 秒;取不到 → None）——冷启动期间给 Claude 收割当闸门用。
+///
+/// collector.db 开着 WAL：首扫的写入往往先落在 `-wal` 上,主库文件的 mtime 要等
+/// checkpoint 才动 ⇒ 两个文件一起看,取较新的那个,否则首扫写完了闸门还是不动。
+fn file_mtime(db: &std::path::Path) -> Option<i64> {
+    [db.to_path_buf(), db.with_extension("db-wal")]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .filter_map(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .max()
+}
+
 fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     crate::dev_log!("[subscription] thread started");
     // 本地读数的收割 + 增量标定路径（零网络零凭据）：
@@ -448,7 +465,9 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     // collector.db 的路径取一次:数据根在运行期不变,每轮重取只是白跑。
     let collector_db = crate::data_root::current(&app).ok().map(|r| r.db_path());
     // 上次收割时看到的源文件 mtime（None = 还没看过;文件没动就不重新解析）。
-    let mut last_harvest_mtime: Option<i64> = None;
+    // Claude 那一路的闸门是一对：（桌面端历史文件 mtime, 冷启动期间的 collector.db mtime)
+    // ——理由见下面的注释。
+    let mut last_harvest_mtime: (Option<i64>, Option<i64>) = (None, None);
     let mut last_rollout_mtime: Option<i64> = None;
     let mut last_mtime: std::collections::HashMap<Platform, Option<i64>> =
         std::collections::HashMap::new();
@@ -464,8 +483,21 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         // 而收割本身只是本机文件读 + 幂等写。
         if let Some(db) = collector_db.as_ref() {
             let mtime = claude_desktop::history_mtime();
-            if mtime.is_some() && mtime != last_harvest_mtime {
-                last_harvest_mtime = mtime;
+            // **冷启动次序**：这一路要两份数据
+            // ——桌面端的读数历史**和** collector.db 里的本地轮——而闸门只看前者的
+            // mtime,两者的到位时刻毫不相关。全新安装的第一轮里 collector 首扫还没写盘,
+            // 读数收割进去了却一条样本都建不出来,mtime 却已经锁存 ⇒ 要等桌面应用再写
+            // 一次采样（约 15 分钟,且它得在运行）或下次启动应用才补得上。
+            //
+            // 所以在「这一路还没建出过任何样本」期间,把 collector.db 的 mtime 一并计入
+            // 闸门：首扫一写盘就立刻重试。建出第一条样本之后第二格恒为 None,闸门退回
+            // 只看历史文件,稳态下不多一次 stat 也不多一次解析。
+            // （本机从不用 Claude Code 的人会一直停在冷启动态、跟着 collector 写盘重试
+            // ——那正是要一直等的情形,而每次重试也只是一次本地文件解析。）
+            let cold = write_store.latest_pair_t1(Platform::Claude, bootstrap::PAIR_SRC).is_none();
+            let gate = (mtime, if cold { file_mtime(db) } else { None });
+            if mtime.is_some() && gate != last_harvest_mtime {
+                last_harvest_mtime = gate;
                 bootstrap::ingest(&write_store, db, chrono::Utc::now().timestamp());
             }
         }
@@ -526,6 +558,14 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                         Platform::Codex => adapters.codex.invalidate(*platform),
                         Platform::Claude => adapters.claude.invalidate(*platform),
                     }
+                    // **账号纪元**：换账号就是改这个文件,所以只在它真的动了的时候读一次,
+                    // 把账号指纹记下来（Codex 的 auth.json 带 `tokens.account_id`;
+                    // Claude 的凭据没有等价字段,`account_fp` 是 None,note_account 不动）。
+                    if let Some(fp) =
+                        credentials::read_credential(*platform).and_then(|c| c.account_fp)
+                    {
+                        write_store.note_account(*platform, &fp, now);
+                    }
                 }
                 last_mtime.insert(*platform, mtime);
 
@@ -568,6 +608,11 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     let _lease = adapters.lock_fetch(*platform);
                     let snap = fetch_one(&adapters, *platform, via);
                     drop(_lease);
+                    // 响应顶层的 `account_id` 是最权威的一路——服务端把这次用量记在谁
+                    // 头上,与读数同一个响应、零额外请求（见 codex:SEEN_ACCOUNT）。
+                    if let Some(fp) = codex::take_seen_account() {
+                        write_store.note_account(Platform::Codex, &fp, now);
+                    }
                     let _ = write_store.save_snapshot(&snap);
                     snap
                 };

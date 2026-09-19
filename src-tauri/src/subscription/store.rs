@@ -80,7 +80,12 @@ impl SubStore {
                  -- 这段消耗涨出来的 ⇒ 不参与拟合（判据见 calib::Pair::window_reset）。
                  -- **存原值而不是存「重置过没有」**：判据将来要改,这两个数还能重新判一遍。
                  resets5_0    INTEGER,
-                 resets5_1    INTEGER
+                 resets5_1    INTEGER,
+                 -- 这段时间从 5h 窗尾**老掉**的代价（2026-09-19;发生在 (t0−5h, t1−5h]
+                 -- 的那些调用）。5h 是滚动窗口 ⇒ 计数器的变化是「新花的 − 老掉的」,
+                 -- 而不是 cost 本身。**存原始观测不存差值**：判据要改时两个数都还在。
+                 -- 0 = 该来源给不出（在线路没有历史窗口）或是升级前的存量行 ⇒ 不做修正。
+                 aged_cost    REAL NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS usage_pair_by_platform ON usage_pair (platform, t1);
              -- **本地读数收割表**（2026-09-18 用户定案;2026-09-19 起两个平台都用）：
@@ -185,11 +190,13 @@ impl SubStore {
         let need_pair_epoch = !Self::has_column(conn, "usage_pair", "weight_ver");
         let need_sample_plan = !Self::has_column(conn, "desktop_sample", "plan_type");
         let need_pair_resets = !Self::has_column(conn, "usage_pair", "resets5_0");
+        let need_pair_aged = !Self::has_column(conn, "usage_pair", "aged_cost");
         if !need_pair_src
             && !need_snapshot_source
             && !need_pair_epoch
             && !need_sample_plan
             && !need_pair_resets
+            && !need_pair_aged
             && !price_table_added
         {
             return Ok(());
@@ -248,6 +255,16 @@ impl SubStore {
             )
             .map_err(|e| e.to_string())?;
         }
+        if need_pair_aged {
+            // 存量行留 0 = **不做正**,不是「老掉的正好是 0」：那时根本没记这个数。
+            // `effective_cost` 于是退化成 `cost`,与升级前的行为逐位相同
+            // ⇒ **一行都不动、一行都不删**;判据升版后两条回溯路会把源还在的那一段
+            // 重建出来,真实的老化量随之填上（见 calib:ADMISSION_RULE_VERSION）。
+            conn.execute_batch(
+                "ALTER TABLE usage_pair ADD COLUMN aged_cost REAL NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| e.to_string())?;
+        }
         if price_table_added {
             // price_model 由上面的 CREATE TABLE IF NOT EXISTS 建好,这里只记一笔。
             // **既有行一个都没动**：新表是加的;usage_pair 的 cost 要等启动时的
@@ -255,7 +272,7 @@ impl SubStore {
             crate::dev_log!("[subscription] price_model table added (existing rows untouched)");
         }
         crate::dev_log!(
-            "[subscription] store schema upgraded in place (pair.src / snapshot.source / pair epoch / price_model / sample.plan_type / pair.resets)"
+            "[subscription] store schema upgraded in place (pair.src / snapshot.source / pair epoch / price_model / sample.plan_type / pair.resets / pair.aged_cost)"
         );
         Ok(())
     }
@@ -456,6 +473,8 @@ impl SubStore {
 
     fn insert_snapshot(&self, snap: &SubscriptionSnapshot) -> Result<(), String> {
         let windows = serde_json::to_string(&snap.windows).map_err(|e| e.to_string())?;
+        self.note_plan(snap);
+        super::cost::set_plan(snap.platform, &snap.plan_type);
         self.conn
             .execute(
                 "INSERT INTO snapshot (platform, plan_type, windows, fetched_at, status, source)
@@ -475,6 +494,44 @@ impl SubStore {
         Ok(())
     }
 
+    /// meta 键：**当前套餐是从哪一刻起被观测到的**（unix 秒）。
+    fn plan_since_key(platform: Platform) -> String {
+        format!("plan_since_{}", platform.as_str())
+    }
+
+    /// 当前套餐的起始观测时刻。`None` = 没有已知边界（存量库升上来的常态）——
+    /// 调用方此时按「一直是这个套餐」处理,与加这条之前的行为一致。
+    pub fn plan_since(&self, platform: Platform) -> Option<i64> {
+        self.meta_i64(&Self::plan_since_key(platform))
+    }
+
+    /// 套餐名与上一条快照不同（含**从无到有**）就把边界推到取数时刻。
+    ///
+    /// 这条边界是给 `bootstrap` 用的：Claude 桌面端的采样历史不带套餐,回补区间只能
+    /// 拿「当前快照的套餐」硬套,换过档就会把旧套餐的历史标成新套餐——而 `pairs_for_fit`
+    /// 按套餐筛之后,**标错比不标更糟**（会把新套餐的估计往旧套餐拖）。有了边界,
+    /// 边界之前的区间标「未知」放行、之后的才标真套餐。
+    ///
+    /// 只认成功轮（`fetched_at` 有值）且套餐名真的说得出来——失败轮的 "unknown"
+    /// 不是换档,不能拿它把边界推到现在。
+    fn note_plan(&self, snap: &SubscriptionSnapshot) {
+        let Some(now) = snap.fetched_at else { return };
+        if matches!(snap.plan_type.as_str(), "" | "unknown") {
+            return;
+        }
+        let prev: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT plan_type FROM snapshot WHERE platform = ?1",
+                [snap.platform.as_str()],
+                |r| r.get(0),
+            )
+            .ok();
+        if prev.as_deref() != Some(snap.plan_type.as_str()) {
+            let _ = self.set_meta_i64(&Self::plan_since_key(snap.platform), now);
+        }
+    }
+
     pub fn load_snapshot(&self, platform: Platform) -> Option<SubscriptionSnapshot> {
         let (plan, windows, fetched_at, status, source): (String, String, Option<i64>, String, String) =
             self.conn
@@ -484,6 +541,9 @@ impl SubStore {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .ok()?;
+        // 出厂预设按套餐折算,而 `cost:prior_scale` 的调用方（`calib:scale`）拿不到
+        // store ⇒ 每次读写快照顺手把套餐名同步进 cost 的进程内单一源。
+        super::cost::set_plan(platform, &plan);
         Some(SubscriptionSnapshot {
             platform,
             plan_type: plan,
@@ -517,8 +577,8 @@ impl SubStore {
             .execute(
                 "INSERT INTO usage_pair
                    (platform, t0, t1, used5_0, used5_1, used7_0, used7_1, cost, unknown_cost,
-                    breakdown, src, weight_ver, plan_type, resets5_0, resets5_1)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    breakdown, src, weight_ver, plan_type, resets5_0, resets5_1, aged_cost)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     platform.as_str(),
                     pair.t0,
@@ -535,6 +595,7 @@ impl SubStore {
                     plan_type,
                     pair.resets5_0,
                     pair.resets5_1,
+                    pair.aged_cost,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -561,8 +622,8 @@ impl SubStore {
                 .prepare(
                     "INSERT INTO usage_pair
                        (platform, t0, t1, used5_0, used5_1, used7_0, used7_1, cost, unknown_cost,
-                        breakdown, src, weight_ver, plan_type, resets5_0, resets5_1)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        breakdown, src, weight_ver, plan_type, resets5_0, resets5_1, aged_cost)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 )
                 .map_err(|e| e.to_string())?;
             for (pair, used7, breakdown) in items {
@@ -583,6 +644,7 @@ impl SubStore {
                         plan_type,
                         pair.resets5_0,
                         pair.resets5_1,
+                        pair.aged_cost,
                     ])
                     .is_ok()
                 {
@@ -626,8 +688,21 @@ impl SubStore {
     /// 两道筛选：
     /// - **排除存疑行**（`weight_ver = 0`）——`breakdown` 缺失 / 解析不出模型,`cost`
     ///   恢复不了,不能拿去推断;行留在库里当档案;
-    /// - `plan_type` 必须是当前套餐（或空 = 存量未知,放行免得升级当天丢光历史标定）。
-    ///   当前套餐本身未知时不按套餐筛——否则新装 / 取数失败期间会一条样本都取不到。
+    /// - `plan_type` 必须与当前套餐**同一倍率类**（或空 = 存量未知,放行免得升级当天
+    ///   丢光历史标定）。当前套餐本身未知时不按套餐筛——否则新装 / 取数失败期间会
+    ///   一条样本都取不到。
+    ///
+    /// **按倍率类而不是按套餐名筛**。`scale` 是
+    /// 「这个套餐一个窗口有多大」,所以分代要分的是**窗口大小**,而套餐名只是它的代号
+    /// ——出厂倍率表里同一类的两个档（Codex 的 `plus` 与 `edu`）我们自己就认为窗口一样
+    /// 大,它们的样本本来就可比。本机：一台机器登录两个 Codex 账号（edu / plus）
+    /// 轮换使用，按名字筛会让生效系数跟着「上次用的是哪个账号」在 **8.89 ↔ 7.63**
+    /// 之间跳（16%），而直接测量说两个账号的满窗只差 2%（$13.70 / $13.96）——
+    /// 那个跳幅是把数据劈成两半之后各自的抽样噪声,不是真实差异。合并之后是 8.13。
+    ///
+    /// 倍率类的判据见 [`super:cost:same_plan_class`]：**两边都得在倍率表里查得到**
+    /// 才算同类,否则退回按名字精确比——表外的档拿到的是「回落基准档」那个占位值,
+    /// 拿它当依据会把一堆互不相干的档归成一类。
     ///
     /// **不再按 `weight_ver` 等于当前订号筛**。原因：价格
     /// 世代按模型走之后,每个模型按自己的时间线取价,各订号下算出来的 `cost` 都是
@@ -638,16 +713,41 @@ impl SubStore {
     /// 被筛掉的行**留在库里**：它们是档案（将来回看套餐差异 / 价格变更前后的对比）,
     /// 只是不参与当前这一版系数的推断。
     pub fn pairs_for_fit(&self, platform: Platform, plan_type: &str) -> Vec<super::calib::Pair> {
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT t0, t1, used5_0, used5_1, cost, unknown_cost, resets5_0, resets5_1
+        // 倍率类是 Rust 侧的判断（子串匹配 + 倍率相等）,SQL 表达不了 ⇒ 先把库里出现过的
+        // 套餐名取出来判一遍,再把同类的那几个绑进 IN。库里的 distinct 套餐名至多几个。
+        let allow: Option<Vec<String>> = match plan_type.trim() {
+            "" | "unknown" => None,
+            plan => {
+                let mut v: Vec<String> = self
+                    .distinct_plans(platform)
+                    .into_iter()
+                    .filter(|p| p.is_empty() || super::cost::same_plan_class(platform, plan, p))
+                    .collect();
+                // 空串 = 存量未知,永远放行（库里一条都没有时也要带上,否则 IN 为空）
+                if !v.iter().any(|p| p.is_empty()) {
+                    v.push(String::new());
+                }
+                Some(v)
+            }
+        };
+        let filter = match &allow {
+            None => String::new(),
+            Some(list) => format!(
+                " AND plan_type IN ({})",
+                std::iter::repeat("?").take(list.len()).collect::<Vec<_>>().join(",")
+            ),
+        };
+        let Ok(mut stmt) = self.conn.prepare(&format!(
+            "SELECT t0, t1, used5_0, used5_1, cost, unknown_cost, resets5_0, resets5_1, aged_cost
                FROM usage_pair
-              WHERE platform = ?1 AND weight_ver <> 0
-                AND (?2 = '' OR ?2 = 'unknown' OR plan_type = ?2 OR plan_type = '')",
-        ) else {
+              WHERE platform = ? AND weight_ver <> 0{filter}"
+        )) else {
             return vec![];
         };
+        let mut params: Vec<String> = vec![platform.as_str().to_string()];
+        params.extend(allow.unwrap_or_default());
         let rows = stmt.query_map(
-            rusqlite::params![platform.as_str(), plan_type],
+            rusqlite::params_from_iter(params),
             |r| {
             Ok(super::calib::Pair {
                 t0: r.get(0)?,
@@ -658,10 +758,24 @@ impl SubStore {
                 unknown_cost: r.get(5)?,
                 resets5_0: r.get(6)?,
                 resets5_1: r.get(7)?,
+                aged_cost: r.get(8)?,
             })
         },
         );
         rows.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 库里这个平台出现过的套餐名（含空串;至多几个）。
+    fn distinct_plans(&self, platform: Platform) -> Vec<String> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT DISTINCT plan_type FROM usage_pair WHERE platform = ?1")
+        else {
+            return vec![];
+        };
+        stmt.query_map([platform.as_str()], |r| r.get::<_, String>(0))
+            .map(|rs| rs.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// 价格数据集升订号后的**就地重算**。
@@ -761,6 +875,60 @@ impl SubStore {
             .query_row("SELECT v FROM meta WHERE k = ?1", [key], |r| r.get::<_, String>(0))
             .ok()
             .and_then(|v| v.parse().ok())
+    }
+
+    /// 读一个字符串标量。
+    pub fn meta_str(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT v FROM meta WHERE k = ?1", [key], |r| r.get::<_, String>(0))
+            .ok()
+    }
+
+    /// 写一个字符串标量（覆盖式）。**不写任何凭据原文**——账号只存指纹。
+    pub fn set_meta_str(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                rusqlite::params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// **当前账号是从哪一刻起被观测到的**（unix 秒;从没观测过 → None）。
+    ///
+    /// 这条边界是给 `codex_rollout` 用的：一台机器可以登录多个账号来回切,而每个账号
+    /// 有**自己独立的额度窗口** ⇒ 跨在切换点上的区间,它的 Δ 是拿两个账号的读数相减
+    /// 出来的,毫无意义,必须整条丢掉。`plan_type` 挡不住这件事——本机 2026-07 就出现过
+    /// **两个都是 plus** 的账号交替使用。
+    ///
+    /// 历史补不回来,所以这条边界只对
+    /// **从现在往后**有效;边界之前仍靠 `plan_type` 与窗尾判据兜着。
+    pub fn account_since(&self, platform: Platform) -> Option<i64> {
+        self.meta_i64(&format!("account_since_{}", platform.as_str()))
+    }
+
+    /// 记下当前账号指纹；**和上次不同**（含从无到有）就把边界推到 `now`。
+    ///
+    /// 两个调用点都在链路上、都不花额外开销：在线取数时从 `wham/usage` 响应的
+    /// `account_id` 取，本地则从凭据文件（Codex 的 `auth.json`）取。
+    pub fn note_account(&self, platform: Platform, fp: &str, now: i64) {
+        if fp.is_empty() {
+            return;
+        }
+        let key = format!("account_fp_{}", platform.as_str());
+        if self.meta_str(&key).as_deref() == Some(fp) {
+            return;
+        }
+        let first = self.meta_str(&key).is_none();
+        let _ = self.set_meta_str(&key, fp);
+        let _ = self.set_meta_i64(&format!("account_since_{}", platform.as_str()), now);
+        crate::dev_log!(
+            "[subscription] {} account {} at {now}",
+            platform.as_str(),
+            if first { "first seen" } else { "**changed**" }
+        );
     }
 
     /// 写一个整数标量（覆盖式）。
@@ -941,6 +1109,44 @@ mod tests {
         assert_eq!(loaded.status, FetchStatus::Ok);
     }
 
+    /// 套餐边界（设计 §9-10 ②）：套餐名变了（含从无到有）才推进,失败轮的 "unknown"
+    /// 与重复的同名成功轮都不推进。
+    #[test]
+    fn plan_boundary_moves_only_when_the_plan_name_really_changes() {
+        let s = mem_store();
+        let p = Platform::Claude;
+        let snap = |plan: &str, at: Option<i64>, status| SubscriptionSnapshot {
+            platform: p,
+            plan_type: plan.into(),
+            windows: if at.is_some() {
+                vec![QuotaWindow { kind: "5h".into(), used_percent: 1.0, resets_at: None }]
+            } else {
+                vec![]
+            },
+            fetched_at: at,
+            status,
+            source: SnapshotSource::Api,
+        };
+        assert_eq!(s.plan_since(p), None, "没取过数 → 没有边界");
+
+        // 第一次成功取数 = 从无到有,边界落在这一刻
+        s.save_snapshot(&snap("max", Some(1_000), FetchStatus::Ok)).unwrap();
+        assert_eq!(s.plan_since(p), Some(1_000));
+
+        // 同一个套餐再取数多少次都不动边界
+        s.save_snapshot(&snap("max", Some(2_000), FetchStatus::Ok)).unwrap();
+        assert_eq!(s.plan_since(p), Some(1_000));
+
+        // 失败轮（unknown + 无 fetched_at）不是换档,不能把边界推到现在
+        s.save_snapshot(&snap("unknown", None, FetchStatus::NetworkFailed)).unwrap();
+        assert_eq!(s.plan_since(p), Some(1_000));
+
+        // 真换档 → 边界前移
+        s.save_snapshot(&snap("pro", Some(3_000), FetchStatus::Ok)).unwrap();
+        assert_eq!(s.plan_since(p), Some(3_000));
+        assert_eq!(s.plan_since(Platform::Codex), None, "按平台分开");
+    }
+
     #[test]
     fn desktop_samples_accumulate_idempotently() {
         let s = mem_store();
@@ -1075,6 +1281,7 @@ mod tests {
             used5_1: 12.0,
             cost: 1.0,
             unknown_cost: 0.0,
+            aged_cost: 0.0,
             resets5_0: r0,
             resets5_1: r1,
         };
@@ -1105,6 +1312,7 @@ mod tests {
             used5_1: 12.0,
             cost: 1.0,
             unknown_cost: 0.0,
+            aged_cost: 0.0,
             resets5_0: None,
             resets5_1: None,
         };
@@ -1126,7 +1334,7 @@ mod tests {
         let s = mem_store();
         let p = Platform::Claude;
         let mk = |t0: i64, t1: i64| super::super::calib::Pair {
-            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 100.0, unknown_cost: 0.0,
+            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 100.0, unknown_cost: 0.0, aged_cost: 0.0,
             resets5_0: None, resets5_1: None,
         };
         assert_eq!(s.latest_pair_t1(p, "desktop"), None, "空库无水位线");
@@ -1236,7 +1444,7 @@ mod tests {
         let s = mem_store();
         let p = Platform::Claude;
         let mk = |t0: i64, t1: i64| super::super::calib::Pair {
-            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 100.0, unknown_cost: 0.0,
+            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 100.0, unknown_cost: 0.0, aged_cost: 0.0,
             resets5_0: None, resets5_1: None,
         };
         s.insert_pair(p, &mk(1_000, 1_900), (4.0, 4.0), "{}", "online", "max").unwrap();
@@ -1244,6 +1452,8 @@ mod tests {
         s.insert_pair(p, &mk(3_000, 3_900), (4.0, 4.0), "{}", "online", "").unwrap();
         assert_eq!(s.pairs_for_fit(p, "max").len(), 2, "当前套餐 + 存量未标记的放行");
         assert_eq!(s.pairs_for_fit(p, "pro").len(), 2);
+        // Claude 的 max 与 pro 倍率不同（1.0 / 5.0）⇒ 仍然分代,不许互相串
+        assert_eq!(s.pairs_for_fit(p, "max_20x").len(), 1, "0.25 那一类只剩存量未知的");
         assert_eq!(s.pairs_for_fit(p, "unknown").len(), 3, "套餐未知时不按套餐筛");
         assert_eq!(s.pairs_for_fit(p, "").len(), 3);
         // 旧修订号的行**照常参与**：价格世代按模型走之后,各修订号下的 cost 都是
@@ -1257,13 +1467,40 @@ mod tests {
         assert_eq!(kept, 3, "被筛掉的行仍留在库里当档案");
     }
 
+    /// 按**倍率类**筛而不是按套餐名（2026-09-19 用户定案）：出厂倍率表认为窗口一样大的
+    /// 两个档（Codex 的 plus / edu / business）样本可比,合成一代;倍率不同的仍分代。
+    #[test]
+    fn pairs_for_fit_pools_plans_of_the_same_multiplier_class() {
+        let s = mem_store();
+        let p = Platform::Codex;
+        let mk = |t0: i64, t1: i64| super::super::calib::Pair {
+            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 100.0, unknown_cost: 0.0, aged_cost: 0.0,
+            resets5_0: None, resets5_1: None,
+        };
+        s.insert_pair(p, &mk(1_000, 1_900), (4.0, 4.0), "{}", "rollout", "edu").unwrap();
+        s.insert_pair(p, &mk(2_000, 2_900), (4.0, 4.0), "{}", "rollout", "plus").unwrap();
+        s.insert_pair(p, &mk(3_000, 3_900), (4.0, 4.0), "{}", "rollout", "business").unwrap();
+        s.insert_pair(p, &mk(4_000, 4_900), (4.0, 4.0), "{}", "rollout", "pro").unwrap();
+        s.insert_pair(p, &mk(5_000, 5_900), (4.0, 4.0), "{}", "rollout", "").unwrap();
+        // 1.0 那一类：edu + plus + business + 存量未知
+        assert_eq!(s.pairs_for_fit(p, "edu").len(), 4, "同倍率的三个档合成一代");
+        assert_eq!(s.pairs_for_fit(p, "plus").len(), 4, "从哪个档看过去都是同一代");
+        // 0.2 那一类：pro + 存量未知
+        assert_eq!(s.pairs_for_fit(p, "pro").len(), 2, "倍率不同的仍然分代");
+        assert_eq!(s.pairs_for_fit(p, "unknown").len(), 5, "套餐未知时不按套餐筛");
+        // 表里没有的档（官方没给可比限额）退回按名字精确比,不许靠回落值归类
+        s.insert_pair(p, &mk(6_000, 6_900), (4.0, 4.0), "{}", "rollout", "team").unwrap();
+        assert_eq!(s.pairs_for_fit(p, "team").len(), 2, "team 只匹配自己 + 存量未知");
+        assert_eq!(s.pairs_for_fit(p, "edu").len(), 4, "team 不会被并进基准档那一类");
+    }
+
     /// 权重表升版 = 按原始 token 就地重算,不是丢样本重来。
     #[test]
     fn stale_costs_are_recomputed_in_place() {
         let s = mem_store();
         let p = Platform::Claude;
         let mk = |t0: i64, t1: i64| super::super::calib::Pair {
-            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 999.0, unknown_cost: 999.0,
+            t0, t1, used5_0: 10.0, used5_1: 12.0, cost: 999.0, unknown_cost: 999.0, aged_cost: 0.0,
             resets5_0: None, resets5_1: None,
         };
         // 一条有原始明细（可恢复）、一条 breakdown 是空的（恢复不了）
@@ -1333,6 +1570,7 @@ mod tests {
                     resets5_1: None,
                     cost: c,
                     unknown_cost: u,
+                    aged_cost: 0.0,
                 };
                 s.insert_pair(p, &pair, (4.0, 4.0), detail, "online", "max").unwrap();
             }
