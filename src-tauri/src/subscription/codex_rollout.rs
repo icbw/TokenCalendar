@@ -52,6 +52,11 @@
 //! 否则会拿"读数齐全但调用缺了一半"的区间去建样本,代价系统性偏低。
 //! 代价是每次扫描丢掉一个跨扫描边界的区间,按每次扫描进来几百条读数算可以忽略。
 //!
+//! **哪些文件要读,与水位线是两件事**：水位线管"要哪一段读数",要不要打开一个文件只看
+//! 它**有没有变长**（`META_FILE_SIZES`,跨重启持久）。文件下界那一路只在记录里没有
+//! 这个文件时兜底——rollout 的 mtime 在 Windows 上停在创建时刻,拿它判正在写的文件
+//! 会漏掉整个当前会话。
+//!
 //! 读数照常收割进 `desktop_sample` 永久留着（rollout 会被 Codex 归档 / 被用户清掉 /
 //! `CODEX_HOME` 改指向,源没了历史也不能跟着丢）。
 
@@ -74,6 +79,13 @@ pub const PAIR_SRC: &str = "rollout";
 /// 没有它,"本机有 rollout 但一条 5h 读数都没有"这种账号（老版 CLI 只回报周窗）
 /// 每次启动都会把整个回溯窗重扫一遍——水位线靠 `usage_pair` 推进,而它一条都建不出来。
 const META_SCANNED_MTIME: &str = "codex_rollout_scanned_mtime";
+
+/// 上次扫到每个 rollout 文件时它有多大（`meta` 表的键,JSON `{"路径": 字节数}`）。
+///
+/// 持久化是必需的而不是优化：一个长会话的文件 mtime 停在它**开始**的时刻
+/// （见 `rollout_files`）,重启之后要是认不出"它比上次长了",那道 mtime 下界就会
+/// 把整个文件跳过去,那段读数再也进不来。
+const META_FILE_SIZES: &str = "codex_rollout_file_sizes";
 
 /// 这一路上次是按哪一版准入判据建的样本（见 `calib:ADMISSION_RULE_VERSION`）。
 const META_RULE_VER: &str = "codex_rollout_pair_rule";
@@ -140,6 +152,9 @@ pub struct Scan {
     pub files_read: usize,
     pub files_total: usize,
     pub bytes_read: u64,
+    /// 见到的每个候选文件有多大（读了的是读完时的大小,跳过的原样带回）。
+    /// `ingest` 把它整份写回 `meta`,当作下一轮"这个文件长了没有"的比较基准。
+    pub seen: BTreeMap<String, u64>,
     /// 有 `rate_limits` 但**不含 5h 窗口**的读数条数（老版 CLI 只回报周窗;
     /// 它们进不了标定——`Pair` 的两端是 5h 已用百分比——但这件事要在日志里看得）。
     pub weekly_only: usize,
@@ -152,8 +167,18 @@ fn codex_home() -> Option<PathBuf> {
         .or_else(|| crate::collector::home_dir().map(|h| h.join(".codex")))
 }
 
-/// 全部候选 rollout 文件及其 mtime（unix 秒）。
-fn rollout_files() -> Vec<(PathBuf, i64)> {
+/// 全部候选 rollout 文件及其**世代** `（mtime 秒, 字节数)`。
+///
+/// **mtime 单独用不得**：Windows 上 Codex 追加写 rollout 时 mtime 不跟着动——本机
+///  的会话文件内容已写到 22:45,mtime 仍停在创建时刻 22:23:43;
+/// 会话结束、进程退出之后也不补（中午那个 12:04 的文件内容到 12:25,十小时后
+/// mtime 依然是 12:04:33）。只看 mtime 的闸门于是会在**正在用的那个会话**上彻底
+/// 瞎掉,而那正是最需要实时读数的时候（[]）。
+///
+/// 字节数是准的（同一次 `stat` 里就能拿到,不多一次系统调用）,而 rollout 是**追加
+/// 写**的 ⇒ **字节数变了就是有新行,没变就没有**。这与 `collector:jsonl:generation`
+/// 的 `（size, mtime)` 是同一套判据——采集那一路一直是对的,订阅这一路照抄。
+fn rollout_files() -> Vec<(PathBuf, i64, u64)> {
     let Some(home) = codex_home() else { return vec![] };
     let mut paths = vec![];
     crate::collector::jsonl::discover(&home.join("sessions"), true, &mut paths);
@@ -161,37 +186,75 @@ fn rollout_files() -> Vec<(PathBuf, i64)> {
     paths
         .into_iter()
         .filter_map(|p| {
-            let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+            let md = std::fs::metadata(&p).ok()?;
+            let m = md.modified().ok()?;
             let secs = m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
-            Some((p, secs))
+            Some((p, secs, md.len()))
         })
         .collect()
 }
 
-/// 候选文件里最新的 mtime（unix 秒;无文件 → None）。收割前的廉价闸门：
-/// 只 stat 不读内容,mtime 没动就不必再走一遍解析。
-pub fn newest_mtime() -> Option<i64> {
-    rollout_files().into_iter().map(|(_, m)| m).max()
+/// 收割前的廉价闸门（只 stat 不读内容）：`（最新 mtime, 全部候选文件的总字节数)`。
+/// 无文件 → None。**总字节数是主信号**（理由见 `rollout_files`）;mtime 一并带上
+/// 只为兜住「文件被换成同样大小的另一份」这种极端情形。
+pub fn generation() -> Option<(i64, u64)> {
+    let files = rollout_files();
+    if files.is_empty() {
+        return None;
+    }
+    let newest = files.iter().map(|(_, m, _)| *m).max().unwrap_or(0);
+    let bytes = files.iter().map(|(_, _, n)| *n).sum();
+    Some((newest, bytes))
 }
 
-/// 扫描 mtime 不早于 `mtime_floor` 的文件,取出 `t >= since` 的读数与调用。
+/// 候选文件里最新的 mtime（unix 秒;无文件 → None）——只给水位线
+/// （`META_SCANNED_MTIME`）用,**不再当闸门**。
+pub fn newest_mtime() -> Option<i64> {
+    rollout_files().into_iter().map(|(_, m, _)| m).max()
+}
+
+/// 扫描有新内容的文件,取出 `t >= since` 的读数与调用。
+///
+/// `seen` = 上次扫到每个文件时它有多大（`ingest` 从 `meta` 取、扫完写回;
+/// 跨重启持久,所以一个长会话在重启之后照样认得出"它又长了"）。
+/// **跳过一个文件的唯一理由是它没长**；`mtime_floor` 只在**记录里没有这个文件**
+/// （首扫 / 新装 / 换了 `CODEX_HOME`）时兜底,它的职责仅仅是给首扫的 I/O 封顶,
+/// 判不了一个正在被追加的文件（mtime 不动,见 `rollout_files`）。
+///
 /// （`pub（super)` 是给 `smoke` 的直接测量用的——它要的是原始读数与调用,不是样本。）
-pub(super) fn scan(since: i64, mtime_floor: i64) -> Scan {
+pub(super) fn scan(since: i64, mtime_floor: i64, seen: &BTreeMap<String, u64>) -> Scan {
     let files = rollout_files();
     let mut out = Scan { files_total: files.len(), ..Default::default() };
-    for (path, mtime) in files {
-        // 文件是追加写的 ⇒ 里面每一行的时刻都 ≤ 它的 mtime。mtime 比下界还早的文件
-        // 不可能含有要的行,连打开都不必。
-        if mtime < mtime_floor {
+    for (path, mtime, size) in files {
+        let key = path.to_string_lossy().to_string();
+        // 跳过的也要把当前大小记进 `seen`：它是下一轮的比较基准,也让被删掉的文件
+        // 自然从记录里掉出去（只登记这一轮真实存在的文件）。
+        if !needs_read(seen.get(&key).copied(), size, mtime, mtime_floor) {
+            out.seen.insert(key, size);
             continue;
         }
         out.files_read += 1;
-        out.bytes_read += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        out.bytes_read += size;
         scan_file(&path, since, &mut out);
+        out.seen.insert(key, size);
     }
     out.readings.sort_by_key(|r| r.t);
     out.calls.sort_by_key(|c| c.t);
     out
+}
+
+/// 这个文件要不要打开。`known` = 上次扫到它时它有多大（`None` = 没见过）。
+///
+/// 抽成纯函数是因为它是这条路**唯一的漏读风险点**：判错一次,一个正在写的会话
+/// 就整段进不来,而那段读数在源文件被清掉之后再也拿不回来。
+fn needs_read(known: Option<u64>, size: u64, mtime: i64, mtime_floor: i64) -> bool {
+    match known {
+        // 追加写 ⇒ 字节数没变就没有新行;变了（含被截断重写,`size` 变小）就得读。
+        // **不看 mtime**——它在 Windows 上停在文件创建时刻。
+        Some(prev) => prev != size,
+        // 没见过：只剩 mtime 这一个线索,拿它给首扫的 I/O 封顶。
+        None => mtime >= mtime_floor,
+    }
 }
 
 /// 扫一个 rollout 文件（行式流读;先做子串预筛再解析 JSON）。
@@ -467,7 +530,12 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     };
     // 数据下界再往前推一个窗长：老化量的原料在 `（t0−5h, …]`,少扫这一段会把最早那批
     // 区间的老化量算成 0。读数仍按 `since` 切（下面 build_pairs 之前过滤）,只多要调用。
-    let scan = scan(since - WINDOW_SECS, since - SCAN_LAG_SECS - WINDOW_SECS);
+    // 上一轮各文件的大小（坏 JSON / 没有这个键 ⇒ 空表,退化成"按文件下界首扫一遍"）。
+    let seen: BTreeMap<String, u64> = store
+        .meta_str(META_FILE_SIZES)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let scan = scan(since - WINDOW_SECS, since - SCAN_LAG_SECS - WINDOW_SECS, &seen);
     if scan.files_read == 0 {
         return (0, 0, false);
     }
@@ -551,6 +619,13 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     if let Some(m) = newest_mtime() {
         let _ = store.set_meta_i64(META_SCANNED_MTIME, m);
     }
+    // 同理写在建样本之后。真变了才写——稳态下每 5 分钟一轮,没必要为一份没动的表
+    // 反复打 WAL。
+    if scan.seen != seen {
+        if let Ok(json) = serde_json::to_string(&scan.seen) {
+            let _ = store.set_meta_str(META_FILE_SIZES, &json);
+        }
+    }
 
     if harvested > 0 || pairs > 0 || scan.weekly_only > 0 {
         log_scan(store, &scan, harvested, pairs);
@@ -595,6 +670,35 @@ fn log_scan(store: &SubStore, scan: &Scan, harvested: usize, pairs: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 追加写的文件：字节数没变 = 没有新行,不必打开。
+    #[test]
+    fn unchanged_file_is_skipped() {
+        assert!(!needs_read(Some(100), 100, 0, i64::MIN));
+    }
+
+    /// Windows 上正在被 Codex 追加的 rollout：mtime 冻在会话开始的时刻
+    /// （远早于文件下界）,但它一直在长。只看 mtime 的判据会让整个当前会话
+    /// 一条读数都进不来——而那正是最需要实时读数的时候。
+    #[test]
+    fn growing_file_with_frozen_old_mtime_is_read() {
+        let session_start = 1_000;
+        let floor = session_start + 7_200; // 会话已经跑了两小时,早过了文件下界
+        assert!(needs_read(Some(100), 4_096, session_start, floor));
+    }
+
+    /// 被截断 / 重写（字节数变小）也要重读——幂等,重复的读数会被主键挡掉。
+    #[test]
+    fn truncated_file_is_read() {
+        assert!(needs_read(Some(4_096), 100, 0, i64::MIN));
+    }
+
+    /// 没见过的文件只剩 mtime 一个线索：它就是首扫的 I/O 闸,该拦的还得拦。
+    #[test]
+    fn unknown_file_falls_back_to_mtime_floor() {
+        assert!(!needs_read(None, 4_096, 100, 200));
+        assert!(needs_read(None, 4_096, 300, 200));
+    }
 
     fn reading(t: i64, used5: f64, plan: &str) -> Reading {
         Reading { t, used5, used7: 10.0, plan: plan.into(), resets5: None, resets7: None }

@@ -996,7 +996,7 @@ fn codex_window_dollars_by_plan_on_real_db() {
     const MIN_CLIMB_PCT: f64 = 50.0;
 
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     println!(
         "扫到 {} 条读数 / {} 次调用（{}/{} 个文件, {:.1} MB）",
         scan.readings.len(),
@@ -1190,7 +1190,7 @@ fn codex_fit_by_plan_on_real_db() {
 #[ignore]
 fn codex_pair_sampling_bias_by_plan_on_real_db() {
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     if let Some(src) = real_db() {
         let out = std::env::var_os("TC_SMOKE_OUT")
             .map(PathBuf::from)
@@ -1342,7 +1342,7 @@ fn codex_account_fingerprint_from_real_auth_json() {
 #[ignore]
 fn codex_same_plan_two_accounts_trace() {
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 200 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 200 * 86_400, 0, &Default::default());
     println!(
         "扫到 {} 条读数（{}/{} 个文件）",
         scan.readings.len(),
@@ -1533,7 +1533,7 @@ fn codex_same_plan_two_accounts_trace() {
 #[ignore]
 fn codex_rejected_intervals_by_reason_on_real_db() {
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     if let Some(src) = real_db() {
         let out = std::env::var_os("TC_SMOKE_OUT")
             .map(PathBuf::from)
@@ -1736,7 +1736,7 @@ fn codex_rolling_window_correction_on_real_db() {
     const SATURATED: f64 = 99.0;
 
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     if let Some(src) = real_db() {
         let out = std::env::var_os("TC_SMOKE_OUT")
             .map(PathBuf::from)
@@ -1853,7 +1853,7 @@ fn codex_cache_read_quota_coefficient_on_real_db() {
     const WINDOW: i64 = 5 * 3_600;
 
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     if let Some(src) = real_db() {
         let out = std::env::var_os("TC_SMOKE_OUT")
             .map(PathBuf::from)
@@ -2164,7 +2164,7 @@ fn codex_quota_token_weights_on_real_db() {
     const DOMINANT: f64 = 0.90;
 
     let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0);
+    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
     if let Some(src) = real_db() {
         let out = std::env::var_os("TC_SMOKE_OUT")
             .map(PathBuf::from)

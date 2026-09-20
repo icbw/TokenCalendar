@@ -469,7 +469,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     // Claude 那一路的闸门是一对：（桌面端历史文件 mtime, 冷启动期间的 collector.db mtime)
     // ——理由见下面的注释。
     let mut last_harvest_mtime: (Option<i64>, Option<i64>) = (None, None);
-    let mut last_rollout_mtime: Option<i64> = None;
+    let mut last_rollout_gen: Option<(i64, u64)> = None;
     let mut last_mtime: std::collections::HashMap<Platform, Option<i64>> =
         std::collections::HashMap::new();
     // wake 代际：wait 返回后代际有变 = 手动刷新/bind/间隔调整唤醒 → 全量一轮
@@ -508,10 +508,15 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         // 它还会**零请求地推进 Codex 快照**：rollout 里的 rate_limits 与 usage 端点
         // 同源同精度,只是走本地文件到手。真改了就立刻广播,不等下面的取数轮
         // ——用贵模型时一个轮次能吃掉 5h 窗十几二十个点,那正是最不该显示旧数的时候。
+        //
+        // 闸门是 `（mtime, 总字节数)` 而**不是 mtime**：Windows 上正在被追加的 rollout
+        // 文件 mtime 不动（见 `codex_rollout:rollout_files`）,只看 mtime 会让这条路在
+        // 当前会话上一直不触发—— 22:30 之后整段爆发全靠 60 秒一次的
+        // API 轮询顶着,显示落后到 8 个百分点,而磁盘上躺着 49 条没人读的读数。
         {
-            let mtime = codex_rollout::newest_mtime();
-            if mtime.is_some() && mtime != last_rollout_mtime {
-                last_rollout_mtime = mtime;
+            let gen = codex_rollout::generation();
+            if gen.is_some() && gen != last_rollout_gen {
+                last_rollout_gen = gen;
                 let (_, _, snapshot_changed) =
                     codex_rollout::ingest(&write_store, chrono::Utc::now().timestamp());
                 if snapshot_changed {
