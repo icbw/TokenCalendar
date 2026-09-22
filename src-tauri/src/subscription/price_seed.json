@@ -70,6 +70,17 @@
     },
     {
       "platform": "claude",
+      "match_key": "opus-5-5",
+      "effective_from": 1790035200,
+      "display_name": "Claude Opus 5.5",
+      "usd_input": 4,
+      "usd_output": 20,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 5,
+      "source_note": "models.dev/anthropic · claude-opus-5-5 · 上游 last_updated 2026-09-22"
+    },
+    {
+      "platform": "claude",
       "match_key": "sonnet",
       "effective_from": 1759104000,
       "display_name": "Claude Sonnet 4.5〜4.6",
@@ -298,6 +309,28 @@
       "usd_cache_read": 1,
       "usd_cache_write": 12.5,
       "source_note": "models.dev/openai · gpt-6-astra · 上游 last_updated 2026-09-04 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-luna",
+      "effective_from": 1790035200,
+      "display_name": "GPT-6 Luna",
+      "usd_input": 0.1,
+      "usd_output": 0.5,
+      "usd_cache_read": 0.01,
+      "usd_cache_write": 0.125,
+      "source_note": "models.dev/openrouter · openai/gpt-6-luna · 上游 last_updated 2026-09-22 · 长上下文档位 272k:上游有,本版未实现"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-sol",
+      "effective_from": 1790035200,
+      "display_name": "GPT-6 Sol",
+      "usd_input": 2,
+      "usd_output": 10,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/openrouter · openai/gpt-6-sol · 上游 last_updated 2026-09-22 · 长上下文档位 272k:上游有,本版未实现"
     }
   ]
 }

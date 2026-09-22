@@ -35,7 +35,7 @@ use super::price;
 ///
 /// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
 /// 基准）,存量行不变,下一次 refit 自动用新先验。
-pub const WEIGHT_VERSION: u32 = 3;
+pub const WEIGHT_VERSION: u32 = 4;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
@@ -425,6 +425,33 @@ mod tests {
         assert!(known_o && known_s && known_f, "三个都在价目表里");
         assert!((opus / sonnet - 2.5).abs() < 1e-9, "Opus 每 token 是 Sonnet 的 2.5 倍");
         assert!((fable / sonnet - 5.0).abs() < 1e-9, "Fable 是 5 倍");
+    }
+
+    #[test]
+    fn opus_5_5_is_priced_apart_from_the_opus_family() {
+        // Opus 5.5 是 4/20/0.2/5,不能落到 'opus' 键的 5/25/0.5/6.25
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        let after = 1_790_035_200 + 3_600;
+        let (c, known) = cost_of(Platform::Claude, "claude-opus-5-5", &t, after);
+        assert!(known && (c - 29.2).abs() < 1e-12, "得到 {c}");
+        let (c, _) = cost_of(Platform::Claude, "claude-opus-5", &t, after);
+        assert!((c - 36.75).abs() < 1e-12, "Opus 5 仍按原价,得到 {c}");
+    }
+
+    #[test]
+    fn gpt_6_sizes_are_not_confused_with_5_6() {
+        // 键 gpt-6-sol / gpt-5-6-sol 互不包含;每项 100 万 token 求和对账官网短上下文档
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        let after = 1_790_035_200 + 3_600;
+        for (model, want) in [
+            ("gpt-6-sol", 2.0 + 10.0 + 0.2 + 2.5),
+            ("gpt-6-luna", 0.1 + 0.5 + 0.01 + 0.125),
+            ("gpt-5.6-sol", 4.0 + 20.0 + 0.4 + 5.0),
+            ("gpt-5.6-luna", 0.2 + 1.2 + 0.02 + 0.25),
+        ] {
+            let (c, known) = cost_of(Platform::Codex, model, &t, after);
+            assert!(known && (c - want).abs() < 1e-9, "{model}: 得到 {c},应为 {want}");
+        }
     }
 
     #[test]
