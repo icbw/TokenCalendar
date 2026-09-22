@@ -108,6 +108,14 @@ pub fn note_local_tokens(
             (due - now).max(0)
         );
     }
+    // Codex 的 rate_limits 与这批 token 写在同一份 rollout 里 ⇒ 读数此刻已在本地文件上。
+    // 让主轮询醒来零请求收割一次,快照跟着每批 token 走,不必等预计消耗攒到阈值
+    // （阈值那一路只决定**要不要发请求**）。`reschedule` 不推进代际 = 不触发全量取数轮;
+    // 收割有 rollout 世代闸门,文件没长就只是一次 stat。排在 `note_tokens` 之后:
+    // 收割推进快照会清掉刚记进去的这批账目,不会重复计。
+    if platform == Platform::Codex {
+        reschedule();
+    }
 }
 
 /// 该平台最近一次读数的 5h 剩余百分比（拿不到 → None,按原阈值处理）。
