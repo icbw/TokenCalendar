@@ -22,8 +22,6 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use serde::Serialize;
-
 use super::model::Platform;
 
 /// 进入待机所需的安静时长 = demand 的「离开」判据（单一源,勿再定义第二个）。
@@ -163,22 +161,11 @@ pub fn emit_idle(app: &tauri::AppHandle) {
 
 // ---------- 命令面 ----------
 
-/// 单平台待机态（前端 orb 窗口消费）。待机是全局视觉态,两条记录的 `idle` 恒相同
-/// ——形状按平台给是为了前端「全部已绑定平台都待机才减淡」的判据不必特判。
-#[derive(Debug, Clone, Serialize)]
-pub struct PlatformIdleState {
-    pub platform: Platform,
-    pub idle: bool,
-}
-
 /// 当前待机态（前端 orb 窗口初查口;事件 `subscription:idle` 翻转后重查）。
+/// 待机是**全局**视觉态（安静起点只有一个,不分平台）,契约就是一个布尔。
 #[tauri::command]
-pub fn get_subscription_idle() -> Result<Vec<PlatformIdleState>, String> {
-    let idle = standby().on;
-    Ok([Platform::Codex, Platform::Claude]
-        .into_iter()
-        .map(|platform| PlatformIdleState { platform, idle })
-        .collect())
+pub fn get_subscription_idle() -> Result<bool, String> {
+    Ok(standby().on)
 }
 
 /// 下发待机开关（持久化由前端 designPrefs 承担,orb 窗口装载时再调本命令恢复）。

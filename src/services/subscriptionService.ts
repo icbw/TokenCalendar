@@ -125,19 +125,11 @@ export async function getEstimator(): Promise<EstimatorState[] | null> {
   return tryInvoke<EstimatorState[]>('get_subscription_estimator')
 }
 
-/** 待机监控状态（Rust subscription/idle.rs 出口形状,snake_case 契约）。
- * idle = 已进入待机（安静起点距今满 10 分钟;安静起点 = 最近一次本地 agent 活动
- * 或用户注意）。**待机是全局视觉态**,两条记录的 idle 恒相同——按平台给形状只是
- * 让前端「所有已绑定平台都待机才减淡」的判据不必特判。
- * 待机只管减淡,**不改变取数频次**。 */
-export interface PlatformIdleState {
-  platform: SubscriptionPlatform
-  idle: boolean
-}
-
-/** 当前待机态（orb 窗口初查口;事件 subscription:idle 翻转后重查）。 */
-export async function getIdle(): Promise<PlatformIdleState[] | null> {
-  return tryInvoke<PlatformIdleState[]>('get_subscription_idle')
+/** 当前待机态（orb 窗口初查口;事件 subscription:idle 翻转后重查）。
+ * true = 已进入待机（安静起点距今满 10 分钟;安静起点 = 最近一次本地 agent 活动
+ * 或用户注意）。**待机是全局视觉态**,不分平台;只管减淡,**不改变取数频次**。 */
+export async function getIdle(): Promise<boolean | null> {
+  return tryInvoke<boolean>('get_subscription_idle')
 }
 
 /** 下发待机开关（持久化由 designPrefs 承担,这里只改运行时值）。

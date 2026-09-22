@@ -19,7 +19,7 @@
 // （orb 无毛玻璃材质档）。
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
-import { events, subscriptionService, windowService, type OrbDockState, type PlatformIdleState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
+import { events, subscriptionService, windowService, type OrbDockState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
 import { getDesignPrefs, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
@@ -399,10 +399,10 @@ export default function OrbWindow() {
 
   // 待机监控：Rust 侧待机态翻转（进入/退出）时发 subscription:idle,这里重查;
   // 待机态在 Rust 内存,重启即全亮无需恢复。
-  const [idleStates, setIdleStates] = useState<PlatformIdleState[]>([])
+  const [idle, setIdle] = useState(false)
   useEffect(() => {
     const query = () => {
-      subscriptionService.getIdle().then((s) => s && setIdleStates(s)).catch(() => {})
+      subscriptionService.getIdle().then((v) => v !== null && setIdle(v)).catch(() => {})
     }
     let off: (() => void) | null = null
     let disposed = false
@@ -429,9 +429,7 @@ export default function OrbWindow() {
   // 用户注意（手动刷新 / 展开 / 切换平台 = 用户注意到悬浮球 → 退出待机）。本地先摘掉
   // 待机态立即恢复亮度,不等 Rust 翻转事件往返;Rust 侧清零安静计数后广播
   // subscription:idle,重查结果为权威。
-  const clearStandbyLocally = useCallback(() => {
-    setIdleStates((s) => (s.some((x) => x.idle) ? s.map((x) => ({ ...x, idle: false })) : s))
-  }, [])
+  const clearStandbyLocally = useCallback(() => setIdle(false), [])
   const noteAttention = useCallback(() => {
     clearStandbyLocally()
     subscriptionService.noteAttention().catch(() => {})
@@ -447,14 +445,9 @@ export default function OrbWindow() {
   // 取数由本地 token 探针驱动（本机一有新 token 就取）+ 兜底间隔覆盖网页用量,
   // 两条触发源在 Rust 侧汇成同一份快照,前端不做多通道择新。
   // 待机（standby,判据「安静起点距今满 10 分钟」）：安静起点 = 最近一次本地 agent 活动 /
-  // 用户注意,Rust 侧是**全局**一个数,两个平台的 idle 恒相同（idle.rs）。这里仍按「所有
-  // 已绑定平台都待机」判,是为了不依赖那个实现细节——整体待机才减淡 50%（.is-standby,
-  // orb.css）;不按显示中平台判定,切换平台不会亮度跳变。
-  const idleMap = new Map(idleStates.map((s) => [s.platform, s.idle]))
-  const standby =
-    idleOn &&
-    boundSnaps.length > 0 &&
-    boundSnaps.every((s) => idleMap.get(s.platform) === true)
+  // 用户注意,Rust 侧是**全局**一个布尔（idle.rs）——待机即整体减淡 50%（.is-standby,
+  // orb.css）;不分平台,切换平台不会亮度跳变。
+  const standby = idleOn && boundSnaps.length > 0 && idle
   const w5h = windowOf(snap, '5h')
   const w7d = windowOf(snap, '7d') ?? windowOf(snap, '7d_opus')
   // 「剩余 = 100 − 已用」换算（口径单侧）。

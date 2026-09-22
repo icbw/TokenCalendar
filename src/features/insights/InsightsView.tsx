@@ -1,9 +1,11 @@
-// 数据洞察视图。
-// 布局: 1) 主图卡（曲线⇄堆叠 + 口径控件 + 图例筛选）; 2) 同口径占比环（环居中
-// 图例分列左右）; 3) 异常日 31 格单行热力条; 4) 价格面板（PricingBlock）;
-// 5) tokens × 积分双组图（双段堆叠柱 + credit 曲线,区分模型开关;可选组件）。
+// 数据洞察视图。三个并列模块,顶部常驻一行切换按钮（Usage trend / Pricing / Credit）,
+// 点哪个就把滚动区滚到该模块顶部;各模块自己的工具栏在模块内 sticky,滚到哪个模块
+// 哪个模块的工具栏就停在顶部。滚动时按位置回写当前模块（scroll spy）。
+//   · Usage trend:主图卡（曲线⇄堆叠 + 口径控件 + 图例筛选）+ 同口径占比环 + 异常日 31 格热力条;
+//   · Pricing:价格面板（PricingBlock）;
+//   · Credit:tokens × 积分双组图——可选模块,设置里打开才出现（按钮与模块一起出现）。
 // 手写 SVG 图表见 charts.tsx。
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, usageService } from '../../services'
 import type { CreditSummary, RangeSeriesResult, TokenMetric } from '../../services'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
@@ -188,7 +190,7 @@ function useTrendBlock() {
   // 范围控件（含自定义日期与区间文字）单列第二行,工具栏主行仍保持单行不换行。
   return {
     toolbar: (
-      <>
+      <div className="insight-module-bar">
       <header className="insight-toolbar">
         <span className="insight-card-title">Usage trend</span>
         <Seg
@@ -239,7 +241,7 @@ function useTrendBlock() {
       <div className="insight-rangebar">
         <RangeControl selection={rangeSelection} noun="Usage" />
       </div>
-      </>
+      </div>
     ),
     card: (
       <section className="insight-card">
@@ -462,7 +464,8 @@ function CreditBlock() {
 
   return (
     <>
-      {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不 auto 靠右*/}
+      {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不 auto 靠右;模块内 sticky*/}
+      <div className="insight-module-bar">
       <header className="insight-toolbar">
         <span className="insight-card-title">tokens × credit · CodeBuddy</span>
         <Seg
@@ -483,6 +486,7 @@ function CreditBlock() {
         />
         {loading && <span className="matrix-loading">Loading…</span>}
       </header>
+      </div>
 
       <section className="insight-card">
         {summary === null ? (
@@ -668,24 +672,77 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   )
 }
 
+type ModuleId = 'trend' | 'pricing' | 'credit'
+
+const MODULES: { id: ModuleId; label: string; hint: string }[] = [
+  { id: 'trend', label: 'Usage trend', hint: 'Token usage over time, share by series and anomaly days' },
+  { id: 'pricing', label: 'Pricing', hint: 'Equivalent API value and official list prices' },
+  { id: 'credit', label: 'Credit', hint: 'Tokens × credit (CodeBuddy / WorkBuddy)' },
+]
+
 export default function InsightsView() {
-  // CodeBuddy 积分卡是可选组件（设置·General 开,默认关）:
-  // 没用过 CodeBuddy 的用户不应看到常驻空引导卡。
+  // CodeBuddy 积分卡是可选模块（设置·Data 打开,默认关）:没用过 CodeBuddy 的用户
+  // 不应看到常驻空引导卡——关着时模块与切换按钮一起不出现。
   const [showCredit, setShowCredit] = useState(() => getDesignPrefs().insightsCredit)
   useEffect(() => subscribeDesignPrefs((p) => setShowCredit(p.insightsCredit)), [])
 
   const trend = useTrendBlock()
+  const modules = MODULES.filter((m) => m.id !== 'credit' || showCredit)
 
-  // 工具栏固定不随滚动（与设置页同构）:工具栏行在滚动区外（flex-shrink:0）,
-  // 只有 .insights-scroll 包着卡片做内容滚动。
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [active, setActive] = useState<ModuleId>('trend')
+  // 点击触发的平滑滚动期间不让 scroll spy 回写（否则高亮会沿途闪过中间模块）
+  const jumping = useRef<number>(0)
+
+  // 当前模块 = 顶边已经越过滚动区顶部的最后一个模块;滚到底时取最后一个
+  const spy = useCallback(() => {
+    const box = scrollRef.current
+    if (!box || jumping.current) return
+    const top = box.getBoundingClientRect().top
+    const sections = Array.from(box.querySelectorAll<HTMLElement>('[data-module]'))
+    let cur = sections[0]?.dataset.module as ModuleId | undefined
+    for (const s of sections) if (s.getBoundingClientRect().top - top <= 8) cur = s.dataset.module as ModuleId
+    if (box.scrollTop + box.clientHeight >= box.scrollHeight - 2) cur = sections[sections.length - 1]?.dataset.module as ModuleId
+    if (cur) setActive(cur)
+  }, [])
+
+  const jump = (id: ModuleId) => {
+    const box = scrollRef.current
+    const el = box?.querySelector<HTMLElement>(`[data-module="${id}"]`)
+    if (!box || !el) return
+    setActive(id)
+    window.clearTimeout(jumping.current)
+    jumping.current = window.setTimeout(() => {
+      jumping.current = 0
+    }, 700)
+    box.scrollTo({ top: box.scrollTop + el.getBoundingClientRect().top - box.getBoundingClientRect().top, behavior: 'smooth' })
+  }
+
+  // Credit 模块关掉时,高亮不能停在不存在的模块上
+  useEffect(() => {
+    if (!showCredit && active === 'credit') setActive('trend')
+  }, [showCredit, active])
+
+  // 切换行固定在滚动区外（flex-shrink:0）;模块工具栏在各自 section 内 sticky。
   return (
     <div className="insights-view">
-      {trend.toolbar}
-      <div className="insights-scroll">
-        {trend.card}
-        <AnomalyBlock />
-        <PricingBlock />
-        {showCredit && <CreditBlock />}
+      <nav className="insight-toolbar insight-module-nav" aria-label="Insights modules">
+        <Seg value={active} options={modules.map((m) => ({ v: m.id, label: m.label, hint: m.hint }))} onChange={jump} />
+      </nav>
+      <div className="insights-scroll insights-modules" ref={scrollRef} onScroll={spy}>
+        <section className="insight-module" data-module="trend">
+          {trend.toolbar}
+          {trend.card}
+          <AnomalyBlock />
+        </section>
+        <section className="insight-module" data-module="pricing">
+          <PricingBlock />
+        </section>
+        {showCredit && (
+          <section className="insight-module" data-module="credit">
+            <CreditBlock />
+          </section>
+        )}
       </div>
     </div>
   )

@@ -725,3 +725,35 @@ button.price-change {
   text-overflow: ellipsis;
   min-width: 0;
 }
+
+/* ---- 三模块并列切换（Usage trend / Pricing / Credit） ----
+   顶部切换行固定在滚动区外;每个模块一个 section,模块工具栏（+ 范围条）在 section 内 sticky:
+   滚到哪个模块,哪个模块的工具栏就停在滚动区顶部,离开该模块时随 section 一起被推走。 */
+.insights-modules {
+  gap: 0;
+}
+
+.insight-module {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+  padding-bottom: 10px;
+}
+
+/* 最后一个模块至少一屏高:点它时也能滚到顶,不会因内容太短而停在半路 */
+.insight-module:last-child {
+  min-height: 100%;
+  padding-bottom: 0;
+}
+
+.insight-module-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 2px;
+  background: var(--panel);
+}

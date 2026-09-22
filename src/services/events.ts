@@ -69,7 +69,7 @@ export function onSubscriptionChanged(cb: () => void): Promise<Unlisten> {
 }
 
 // 待机监控（Rust 侧待机态翻转后发:进入 = 安静满 demand.rs QUIET_SECS（10 分钟）,
-// 退出 = 本地 agent 活动 / 用户注意）。载荷恒为 true——前端收到后重查 get_subscription_idle。
+// 退出 = 本地 agent 活动 / 用户注意）。载荷恒为 true——前端收到后重查 get_subscription_idle（单个布尔）。
 export function onSubscriptionIdle(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('subscription:idle', () => cb())
 }

@@ -113,6 +113,10 @@ export interface DesignPrefs {
   /** 低余量收紧（undefined = 开）：5h 窗口剩余 ≤ 20% 时把上面的阈值减半,
    * 额度见底那段时间读数更密。与 subscriptionFetchPct 同一条下发命令。 */
   subscriptionTightenLow?: boolean
+  /** 用户自己那一档的订阅月费（美元,按平台;缺键 = 未填）。**不维护官方月费表**——只用于
+   * Insights 价格面板的「回本倍数」行:区间美元当量 ÷（月费 × 区间天数 / 月均天数）。
+   * 未填的平台面板不显示该行。 */
+  subscriptionMonthlyUsd?: Partial<Record<SubscriptionPlatform, number>>
   /** 待机（Rust subscription/idle.rs）：本地 agent 静默满「离开」时长即进入待机,悬浮球整体减淡;
    * 新 token / 用户注意（手动刷新等）立即退出。只影响视觉,不改变取数频次。
    * **默认开**（undefined = 开）。运行时经 set_subscription_idle_enabled 下发,orb 窗口装载时恢复。 */
@@ -250,6 +254,19 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   // 低余量收紧开关：非布尔视为未设置（回默认开）。
   if (p.subscriptionTightenLow !== undefined && typeof p.subscriptionTightenLow !== 'boolean') delete p.subscriptionTightenLow
+  // 订阅月费:只留 codex / claude 两键里 （0, MONTHLY_USD_MAX] 的有限数,其余键 / 非法值丢弃。
+  if (p.subscriptionMonthlyUsd !== undefined) {
+    const src = p.subscriptionMonthlyUsd as Record<string, unknown> | null
+    const clean: Partial<Record<SubscriptionPlatform, number>> = {}
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      for (const k of ['codex', 'claude'] as SubscriptionPlatform[]) {
+        const v = src[k]
+        if (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= MONTHLY_USD_MAX) clean[k] = v
+      }
+    }
+    if (Object.keys(clean).length > 0) p.subscriptionMonthlyUsd = clean
+    else delete p.subscriptionMonthlyUsd
+  }
   // 待机退档开关：非布尔视为未设置（回默认开）。
   if (p.orbIdleEnabled !== undefined && typeof p.orbIdleEnabled !== 'boolean') delete p.orbIdleEnabled
   if (p.orbPlatform !== undefined && p.orbPlatform !== 'codex' && p.orbPlatform !== 'claude') {
@@ -470,6 +487,9 @@ export function orbIdleEnabled(p: DesignPrefs): boolean {
 }
 
 /** designPrefs → 取数阈值（百分点;undefined = SUBSCRIPTION_FETCH_PCT.default）。 */
+/** 订阅月费输入上限（美元）:防手滑多打几个零,远高于任何现行个人档。 */
+export const MONTHLY_USD_MAX = 10_000
+
 export function subscriptionFetchPct(p: DesignPrefs): number {
   return p.subscriptionFetchPct ?? SUBSCRIPTION_FETCH_PCT.default
 }

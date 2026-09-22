@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from 'react'
 import { HexColorPicker, HexColorInput } from 'react-colorful'
 import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type EstimatorState, type ExportResult, type DataInfo, type SubscriptionSnapshot, type ReadyUpdate, type UpdateCheck, type UpdateProgress } from '../../services'
 import { currentMonth } from '../../lib/time'
-import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
+import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, MONTHLY_USD_MAX, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
 import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
@@ -1015,7 +1015,7 @@ function DataTab() {
         </div>
         <ToggleRow
           label="Show credit card in Insights"
-          title="Tokens × credit card at the bottom of the Chart view"
+          title="Adds a Credit module (tokens × credit) to Insights, with its own button in the module switcher"
           checked={design.insightsCredit}
           onChange={(v) => setDesignPrefs({ insightsCredit: v })}
         />
@@ -1289,6 +1289,13 @@ function SubscriptionsTab() {
                 {e.platform === 'claude' ? 'Claude' : 'Codex'} ·{' '}
                 {e.calibrated ? 'calibrated' : 'calibrating — factory weights'} ({e.pairs}{' '}
                 {e.pairs === 1 ? 'sample' : 'samples'})
+                {/* 出厂预设是在某一档上、再按官方限额比折到用户这一档的 → 没校准前可能偏一点
+                    （-10）。已校准后不再相关,不显示。*/}
+                {!e.calibrated ? (
+                  <span>
+                    {` · preset measured on ${e.platform === 'claude' ? 'Max 5x' : 'Plus'} and scaled to your plan, so it may run a little off until your own readings calibrate it`}
+                  </span>
+                ) : null}
                 {/* 收割留存的本地读数条数（Claude = 桌面端采样;Codex = 会话 rollout 里的
                     rate_limits;0 / 缺字段时整段不显示）——两个源自己都会滚掉旧数据,
                     这个数越过源的保留线继续涨就是密度在累积。*/}
@@ -1406,7 +1413,70 @@ function SubscriptionsTab() {
           Credentials stay local — read from agent CLI files on this machine, never uploaded.
         </div>
       </div>
+
+      <div className="setting-section">Plan fees</div>
+      <div className="setting-block">
+        {(['codex', 'claude'] as const).map((p) => (
+          <MonthlyFeeRow key={p} platform={p} value={design.subscriptionMonthlyUsd?.[p]} onNotice={setNotice} />
+        ))}
+        <div className="setting-note">
+          Optional. What you pay per month for your own plan, in US dollars. Only used by Insights › Pricing to show the
+          equivalent API value as a multiple of the fee for the same days — a value multiple, not money saved. Leave empty
+          to hide it.
+        </div>
+      </div>
     </>
+  )
+}
+
+/** 一个平台的订阅月费输入（draft + onBlur 提交,与取数阈值同款）:空 = 清掉该平台的键。 */
+function MonthlyFeeRow({ platform, value, onNotice }: {
+  platform: 'codex' | 'claude'
+  value: number | undefined
+  onNotice: (text: string | null) => void
+}) {
+  const [draft, setDraft] = useState(value === undefined ? '' : String(value))
+  useEffect(() => setDraft(value === undefined ? '' : String(value)), [value])
+  const commit = () => {
+    const text = draft.trim()
+    const all = { ...(getDesignPrefs().subscriptionMonthlyUsd ?? {}) }
+    if (text === '') {
+      onNotice(null)
+      if (value === undefined) return
+      delete all[platform]
+      setDesignPrefs({ subscriptionMonthlyUsd: all })
+      return
+    }
+    const n = Number(text)
+    if (!Number.isFinite(n) || n <= 0 || n > MONTHLY_USD_MAX) {
+      onNotice(`Monthly fee must be a positive amount up to $${MONTHLY_USD_MAX.toLocaleString('en-US')}`)
+      setDraft(value === undefined ? '' : String(value))
+      return
+    }
+    onNotice(null)
+    if (n === value) return
+    setDesignPrefs({ subscriptionMonthlyUsd: { ...all, [platform]: n } })
+  }
+  const label = platform === 'claude' ? 'Claude' : 'Codex'
+  return (
+    <div className="setting-row">
+      <span title={`What you pay per month for your ${label} plan (USD). Empty = not shown in Insights.`}>{label} monthly fee</span>
+      <span>
+        <input
+          className="setting-num"
+          type="number"
+          aria-label={`${label} monthly fee`}
+          placeholder="—"
+          value={draft}
+          min={0}
+          step={1}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
+        <span className="setting-unit">USD / month</span>
+      </span>
+    </div>
   )
 }
 

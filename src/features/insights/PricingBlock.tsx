@@ -12,6 +12,9 @@
 //   机会成本,所以一律说「equivalent」「would cost」,绝不说「you spent」。
 // - `usd_unknown` 是「这部分价目是估的」的提示,**不是误差棒**。
 // - 缓存写按**常用档**估算（部分平台按 TTL 分档,采集层只有一个桶）。
+// - 回本倍数（Value vs. fee）= 区间美元当量 ÷（用户自填月费 × 区间天数 / 月均天数）,
+//   讲的是**等价价值的倍数**,不是「省了多少钱」。月费只来自设置里用户自己填的数
+//   （designPrefs.subscriptionMonthlyUsd）,不维护官方月费表;未填 → 整项不显示。
 //
 // 取数全部经 subscriptionService 的五条只读命令,零网络、不唤醒取数轮。
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -22,8 +25,9 @@ import { formatCompact, formatFull } from '../matrix/matrixScale'
 import { colorFor } from './charts'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
-import { formatSpan } from './range'
+import { formatSpan, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
+import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 
 const PLATFORMS: SubscriptionPlatform[] = ['codex', 'claude']
 const PLATFORM_LABEL: Record<SubscriptionPlatform, string> = { codex: 'Codex', claude: 'Claude' }
@@ -59,6 +63,11 @@ interface Sort {
   key: SortKey
   desc: boolean
 }
+/** 月均天数（365.25 / 12）:月费按区间天数折算用。 */
+const DAYS_PER_MONTH = 365.25 / 12
+/** 倍数:10× 以下一位小数,以上取整。 */
+const multiple = (v: number): string => (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString('en-US')) + '×'
+
 /** 默认 Since 降序：最新上架 / 最近改价的模型排在最上。 */
 const DEFAULT_SORT: Sort = { key: 'since', desc: true }
 
@@ -76,6 +85,8 @@ export default function PricingBlock() {
   const [now, setNow] = useState<{ at: number; rows: PriceModelRow[] } | null>(null)
   const [scale, setScale] = useState<Partial<Record<SubscriptionPlatform, number>>>({})
   const [loading, setLoading] = useState(false)
+  const [fees, setFees] = useState(() => getDesignPrefs().subscriptionMonthlyUsd ?? {})
+  useEffect(() => subscribeDesignPrefs((p) => setFees(p.subscriptionMonthlyUsd ?? {})), [])
 
   const selection = useRangeSelection('', refreshTick)
   const { startDay, endDay } = selection.range
@@ -163,6 +174,9 @@ export default function PricingBlock() {
   const perDollar = scale[platform]
   const totalTurns = cur === null ? 0 : cur.rows.reduce((s, r) => s + r.requests, 0)
   const totalTokens = cur === null ? 0 : cur.rows.reduce((s, r) => s + r.total_tokens, 0)
+  const fee = fees[platform]
+  const rangeDays = spanDays(selection.range)
+  const feeForRange = fee !== undefined && rangeDays > 0 ? (fee * rangeDays) / DAYS_PER_MONTH : null
 
   // 每个现行价目行的「上一段」：同一 match_key 里生效期早于它的最近一行。
   // 两段都公布了该项单价（> 0）且不相等才算变动——「从没公布到公布」不是涨价。
@@ -223,6 +237,7 @@ export default function PricingBlock() {
 
   return (
     <>
+      <div className="insight-module-bar">
       <header className="insight-toolbar">
         <span className="insight-card-title">Pricing</span>
         <Seg
@@ -238,6 +253,7 @@ export default function PricingBlock() {
       </header>
       <div className="insight-rangebar">
         <RangeControl selection={selection} noun="Usage" />
+      </div>
       </div>
 
       {/* ---- 1) 美元当量 + 用量 × 价格 ----*/}
@@ -260,6 +276,15 @@ export default function PricingBlock() {
                 <span className="price-total-label">Equivalent API value</span>
                 <span className="price-total-value">≈ {usd(cur.usd_total)}</span>
               </div>
+              {feeForRange !== null && cur.usd_total > 0 && (
+                <div
+                  className="price-total-item"
+                  title={`Equivalent API value ÷ your ${PLATFORM_LABEL[platform]} fee for these ${rangeDays} days (${usd(fee ?? 0)}/month → ${usd(feeForRange)}). How much list-price usage the subscription bought, as a multiple — not money saved. Set the fee in Settings › Subscriptions.`}
+                >
+                  <span className="price-total-label">Value vs. fee</span>
+                  <span className="price-total-value">≈ {multiple(cur.usd_total / feeForRange)}</span>
+                </div>
+              )}
               <div className="price-total-item" title="User-initiated turns, summed over the range">
                 <span className="price-total-label">Turns</span>
                 <span className="price-total-value">{formatFull(totalTurns)}</span>
