@@ -357,3 +357,112 @@ button.task-th:hover,
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- Time 卡 · Time spent（Task / Human 固定两色,不套 token 分项的价格色阶） ---- */
+
+.tasks-view {
+  --time-task: var(--accent);
+  --time-human: color-mix(in srgb, var(--accent) 38%, var(--panel));
+}
+
+.tspent-legend {
+  display: inline-flex;
+  gap: 12px;
+  margin-left: 4px;
+}
+
+.tspent-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 4px 0 6px;
+  font-size: var(--font-size-xs);
+}
+
+.tspent-row {
+  display: grid;
+  grid-template-columns: minmax(0, 240px) minmax(0, 1fr) 64px;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px;
+  border-radius: var(--radius);
+}
+
+.tspent-row:hover {
+  background: var(--accent-weak);
+}
+
+.tspent-row.is-clickable {
+  cursor: pointer;
+}
+
+.tspent-row.is-others .tspent-name {
+  color: var(--text-muted);
+}
+
+.tspent-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tspent-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.tspent-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+.tspent-track {
+  display: flex;
+  height: 12px;
+  min-width: 0;
+}
+
+.tspent-seg {
+  height: 100%;
+  min-width: 1px;
+}
+
+.tspent-seg.is-task {
+  background: var(--time-task);
+}
+
+.tspent-seg.is-human {
+  background: var(--time-human);
+}
+
+.tspent-track > .tspent-seg:first-child {
+  border-radius: 2px 0 0 2px;
+}
+
+.tspent-track > .tspent-seg:last-child {
+  border-radius: 0 2px 2px 0;
+}
+
+.tspent-track > .tspent-seg:only-child {
+  border-radius: 2px;
+}
+
+.tspent-value {
+  text-align: right;
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tspent-notice {
+  margin-bottom: 4px;
+}

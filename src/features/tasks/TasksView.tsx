@@ -1,5 +1,6 @@
 // Tasks 视图:主窗口第三个视图按钮（与 Matrix / Insights 三态互斥）。
-// 结构:工具栏（固定,洞察页同款 .insight-toolbar + Seg）/ 滚动区 = 离开阈值 + 空档直方图卡、任务列表卡。
+// 结构:工具栏（固定,洞察页同款 .insight-toolbar + Seg）/ 滚动区 = Time 卡（Idle gaps ⇄ Time spent）、任务列表卡。
+// 两个口径并列:Time 卡按轮所在的本地日（这段时间花在哪）,任务列表按会话开始时间（这段时间开始了哪些任务）。
 // 数据:get_task_list（分页 50、表头排序、范围 / Agent / 项目过滤全在 SQL）;行展开 get_task_turns;
 // 筛选候选取 get_effort_series（turns) 的系列键:Agent = 当前范围内有轮的;项目 = 全部数据跨度内有轮的
 // （选项目即切到其生命周期,候选不能被当前范围截掉）。
@@ -10,7 +11,7 @@
 // 项目:列表 / 筛选 / 下拉候选全部是解析层的有效项目键（合并目标 / Scratch;隐藏项目不出现）;
 // 下拉末尾「Manage projects…」打开主窗口内的项目管理弹出层,不改变当前筛选。
 // 内容列约束:TaskRow.title 只在本文件的列表单元格渲染（标签开关 = title 时）,不进入展开、导出或其它视图。
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { events, taskService, usageService } from '../../services'
 import type { TaskPage, TaskRow, TaskSort, TaskSortField, TaskTurn } from '../../services'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
@@ -20,7 +21,7 @@ import RangeControl from '../insights/RangeControl'
 import { useRangeSelection } from '../insights/useRangeSelection'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import TaskTurns from './TaskTurns'
-import GapHistogramCard from './GapHistogramCard'
+import TimeCard from './TimeCard'
 import { openProjectManager } from '../projects/projectManagerStore'
 import '../insights/insights.css'
 import './tasks.css'
@@ -54,7 +55,7 @@ const COLUMNS: Column[] = [
   { id: 'turns', label: 'Turns', hint: 'User turns, including aborted ones', sort: 'turns' },
   { id: 'steps', label: 'Steps', hint: 'Model calls, including subagents', sort: 'steps' },
   { id: 'tools', label: 'Tools', hint: 'Tool calls', sort: 'tool_calls' },
-  { id: 'wait', label: 'Wait', hint: 'Sum of turn wall-clock time', sort: 'wall_ms' },
+  { id: 'wait', label: 'Wait', hint: 'Sum of turn wall-clock time (same quantity as Task in Time spent)', sort: 'wall_ms' },
   { id: 'model', label: 'Model', hint: 'Model time (estimated for JSONL sources)', sort: 'model_ms' },
   { id: 'tool', label: 'Tool', hint: 'Tool time (estimated for JSONL sources)', sort: 'tool_ms' },
   { id: 'errors', label: 'Errors', hint: 'API and tool errors (aborted turns are not errors)', sort: 'error_count' },
@@ -198,6 +199,22 @@ export default function TasksView() {
   }, [data, page])
 
   const agentLabel = useMemo(() => new Map(options.agents.map((a) => [a.key, a.label])), [options.agents])
+  const labelOfAgent = useCallback((k: string) => agentLabel.get(k) ?? k, [agentLabel])
+
+  // Time spent 的 Task 维点击:当前页有该任务 → 展开并滚到该行;没有 → 返回 false 由卡片提示（不改列表筛选）
+  const pickTask = useCallback(
+    (a: string, sid: string): boolean => {
+      const k = taskKey({ agent: a, sessionId: sid })
+      if (!data?.rows.some((r) => taskKey(r) === k)) return false
+      setExpanded(k)
+      window.requestAnimationFrame(() => {
+        const el = Array.from(document.querySelectorAll<HTMLElement>('.task-row')).find((n) => n.dataset.taskKey === k)
+        el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      })
+      return true
+    },
+    [data],
+  )
   const outliers = useMemo(() => outliersOf(data?.rows ?? []), [data])
 
   const resetPaging = () => {
@@ -273,17 +290,29 @@ export default function TasksView() {
         {loading && <span className="matrix-loading">Loading…</span>}
       </header>
       <div className="insight-rangebar">
-        <RangeControl selection={selection} noun="Tasks started" />
+        <RangeControl
+          selection={selection}
+          noun="Turns"
+          note="Time card: turns in range · Task list: tasks started in range"
+        />
       </div>
 
       <div className="insights-scroll">
-        <GapHistogramCard range={range} refreshTick={refreshTick} />
+        <TimeCard
+          range={range}
+          agent={agent}
+          project={project}
+          labelMode={labelMode}
+          agentLabel={labelOfAgent}
+          refreshTick={refreshTick}
+          onPickTask={pickTask}
+        />
 
         <section className="insight-card">
           <header className="insight-card-header">
             <span className="insight-card-title">Task list</span>
             <span className="insight-card-sub">
-              {data ? `${formatFull(total)} tasks · click a row for per-turn bars` : ''}
+              {data ? `${formatFull(total)} tasks started in range · click a row for per-turn bars` : ''}
             </span>
           </header>
           {data === undefined ? (
@@ -329,6 +358,7 @@ export default function TasksView() {
                         <Fragment key={k}>
                           <tr
                             className={`task-row${isOpen ? ' is-expanded' : ''}${flag ? ' is-outlier' : ''}`}
+                            data-task-key={k}
                             onClick={() => setExpanded(isOpen ? null : k)}
                             aria-expanded={isOpen}
                           >

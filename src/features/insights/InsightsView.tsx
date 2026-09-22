@@ -9,7 +9,7 @@ import type { CreditSummary, RangeSeriesResult, TokenMetric } from '../../servic
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, colorShades, shadeLadder, COMBO_CREDIT, COMBO_PART_SHADES, UNITEMIZED_COLOR, type ComboCredit, type ComboGroup, type ComboPart, type SeriesSpec } from './charts'
 import { formatFull } from '../matrix/matrixScale'
-import { OUTLIER_Z, TIME_METRIC_LABELS, PART_PRICE_ORDER, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_PARTS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
+import { OUTLIER_Z, PART_PRICE_ORDER, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_PARTS, projectDisplayName, projectTooltip, zScores } from './analytics'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import PricingBlock from './PricingBlock'
@@ -33,9 +33,10 @@ const fullMonthLabel = (m: string) => {
 // ---- 口径控件（分段控件,样式复用 .seg） ----
 
 type Bucket = 'day' | 'hour'
-/** project 维 / 时间指标走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series。 */
+/** project 维走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series。
+ * 只出 token:时间统计（Task / Human）已迁到 Tasks 视图的 Time spent。 */
 type Dimension = 'agent' | 'model' | 'project' | 'total'
-type Metric = TokenMetric | 'wait' | 'human'
+type Metric = TokenMetric
 type ChartKind = 'line' | 'stack'
 
 // ---- 主图卡 ----
@@ -45,9 +46,7 @@ type ChartKind = 'line' | 'stack'
 function useTrendBlock() {
   const [bucket, setBucket] = useState<Bucket>('day')
   const [dimension, setDimension] = useState<Dimension>('model')
-  const [metricPick, setMetric] = useState<Metric>('total')
-  // 时间指标只在 project / total 维有数据:其它维回落 Tokens（切维时也显式复位）
-  const metric: Metric = isTimeMetric(metricPick) && (dimension === 'agent' || dimension === 'model') ? 'total' : metricPick
+  const [metric, setMetric] = useState<Metric>('total')
   const [kind, setKind] = useState<ChartKind>('line')
   const [filterKey, setFilterKey] = useState<string>('') // '' = 全部
   const [data, setData] = useState<RangeSeriesResult | null>(null)
@@ -77,8 +76,8 @@ function useTrendBlock() {
   const selection = useRangeSelection(dimension === 'project' ? filterKey : '', refreshTick)
   const { startDay, endDay } = selection.range
 
-  // project 维或时间指标 → daily_project 曲线（get_effort_series,无小时表）
-  const useEffort = dimension === 'project' || isTimeMetric(metric)
+  // project 维 → daily_project 曲线（get_effort_series,无小时表）
+  const useEffort = dimension === 'project'
   // 范围 × 粒度合法性:小时粒度只在 ≤ 31 天的范围给（更长范围小时点数无意义）;effort 曲线仅 day
   const hourTooLong = spanDays(selection.range) > HOUR_BUCKET_MAX_DAYS
   const effectiveBucket: Bucket = hourTooLong || useEffort ? 'day' : bucket
@@ -109,13 +108,13 @@ function useTrendBlock() {
         )
       : Promise.resolve(null)
     const req =
-      dimension === 'project' || isTimeMetric(metric)
+      useEffort
         ? usageService.getEffortSeries({
             startDay,
             endDay,
             dimension,
             metric,
-            filter: dimension === 'total' || !filterKey ? undefined : { dimension, key: filterKey },
+            filter: filterKey ? { dimension, key: filterKey } : undefined,
           })
         : usageService.getRangeSeries({
             startDay,
@@ -137,7 +136,7 @@ function useTrendBlock() {
     return () => {
       cancelled = true
     }
-  }, [startDay, endDay, effectiveBucket, dimension, metric, filterKey, refreshTick, partsMode])
+  }, [startDay, endDay, effectiveBucket, dimension, metric, filterKey, refreshTick, partsMode, useEffort])
 
   const partsView = partsMode && parts !== null
   const series: SeriesSpec[] = useMemo(() => {
@@ -151,7 +150,6 @@ function useTrendBlock() {
       color: dataDim === 'project' ? projectColor(k) : undefined,
     }))
   }, [data, parts, partsMode, filterKey, seriesLabel, dataDim])
-  const timeFmt = isTimeMetric(metric) ? formatDuration : undefined
   const buckets = data?.points.map((p) => p.bucket) ?? []
 
   // 占比环数据:主图范围内各系列合计
@@ -164,9 +162,7 @@ function useTrendBlock() {
         .sort((a, b) => (partsView ? 0 : b.value - a.value)),
     [series, dimension, partsView],
   )
-  const donutUnit = isTimeMetric(metric)
-    ? TIME_METRIC_LABELS[metric].unit
-    : TOKEN_METRIC_LABELS[metric].unit
+  const donutUnit = TOKEN_METRIC_LABELS[metric].unit
 
   const pickFilter = useCallback(
     (k: string) => {
@@ -211,7 +207,7 @@ function useTrendBlock() {
               v: 'hour' as Bucket,
               label: 'Hour',
               hint: useEffort
-                ? 'Hourly buckets are not available for projects or time metrics'
+                ? 'Hourly buckets are not available for projects'
                 : hourTooLong
                   ? `Hourly buckets need a range of ${HOUR_BUCKET_MAX_DAYS} days or less`
                   : 'Group by hour',
@@ -231,23 +227,11 @@ function useTrendBlock() {
           onChange={(v) => {
             setDimension(v)
             setFilterKey('')
-            if ((v === 'agent' || v === 'model') && isTimeMetric(metricPick)) setMetric('total')
           }}
         />
         <Seg
           value={metric}
-          options={[
-            ...TOKEN_METRICS.map((m) => ({ v: m as Metric, label: TOKEN_METRIC_LABELS[m].short, hint: TOKEN_METRIC_LABELS[m].hint })),
-            ...(['wait', 'human'] as const).map((m) => {
-              const off = dimension === 'agent' || dimension === 'model'
-              return {
-                v: m as Metric,
-                label: TIME_METRIC_LABELS[m].label,
-                hint: off ? `${TIME_METRIC_LABELS[m].label}: time data is only available in Project or Total` : TIME_METRIC_LABELS[m].hint,
-                disabled: off,
-              }
-            }),
-          ]}
+          options={TOKEN_METRICS.map((m) => ({ v: m as Metric, label: TOKEN_METRIC_LABELS[m].short, hint: TOKEN_METRIC_LABELS[m].hint }))}
           onChange={setMetric}
         />
         {loading && <span className="matrix-loading">Loading…</span>}
@@ -287,9 +271,9 @@ function useTrendBlock() {
         ) : series.length === 0 || series.every((s) => s.values.every((v) => v === 0)) ? (
           <div className="insight-empty">No usage records in this range</div>
         ) : kind === 'line' ? (
-          <LineChart series={series} buckets={buckets} formatValue={timeFmt} ordered={partsView} />
+          <LineChart series={series} buckets={buckets} ordered={partsView} />
         ) : (
-          <StackedBarChart series={series} buckets={buckets} formatValue={timeFmt} ordered={partsView} />
+          <StackedBarChart series={series} buckets={buckets} ordered={partsView} />
         )}
 
         {/* 占比环:与主图同口径（维度/指标/范围/筛选）*/}
@@ -299,7 +283,6 @@ function useTrendBlock() {
               items={donutItems}
               centerLabel={rangeShortLabel(selection.sel) + ' · ' + donutUnit}
               unitLabel={donutUnit}
-              formatValue={timeFmt}
               titleFor={dimension === 'project' ? (k) => projectTooltip(k) : undefined}
             />
           </div>

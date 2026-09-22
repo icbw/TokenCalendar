@@ -151,6 +151,31 @@ export interface GapHistogram {
   beyondMs: number
 }
 
+export type TimeSpentGroup = 'project' | 'task' | 'day'
+
+export interface TimeSpentRow {
+  key: string
+  label: string
+  taskMs: number
+  humanMs: number
+  turns: number
+  agent?: string
+  sessionId?: string
+  startedAt?: number
+  /** 内容列:只在 Tasks 视图本地渲染。 */
+  title?: string
+  project?: string
+  lifetimeTaskMs?: number
+  lifetimeHumanMs?: number
+}
+
+export interface TimeSpent {
+  thresholdMs: number
+  rows: TimeSpentRow[]
+  others: { count: number; taskMs: number; humanMs: number; turns: number } | null
+  total: { taskMs: number; humanMs: number; turns: number }
+}
+
 export interface IdleThresholdInfo {
   minutes: number
   defaultMinutes: number

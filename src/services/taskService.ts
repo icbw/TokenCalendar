@@ -1,4 +1,4 @@
-// 任务分析契约封装:任务列表 / 逐轮明细 / 空档直方图 / 离开阈值。
+// 任务分析契约封装:任务列表 / 逐轮明细 / 空档直方图 / 时间统计 / 离开阈值。
 // snake_case 契约（contract.ts）→ 驼峰内部形状（types.ts）一次映射;失败返回 null（tryInvoke 口径）。
 // TaskRow.title 是内容列:只供 Tasks 列表本地渲染,不得进入导出 / 日志 / 其它视图。
 
@@ -11,8 +11,10 @@ import type {
   TaskPageContract,
   TaskTurnContract,
   TaskTurnsArgs,
+  TimeSpentArgs,
+  TimeSpentResultContract,
 } from './contract'
-import type { DayRange, DaySpan, GapHistogram, IdleThresholdApplied, IdleThresholdInfo, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn } from './types'
+import type { DayRange, DaySpan, GapHistogram, IdleThresholdApplied, IdleThresholdInfo, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn, TimeSpent, TimeSpentGroup } from './types'
 import { tryInvoke } from './tauri'
 import { rememberProjectLabels } from './projectLabels'
 
@@ -91,8 +93,13 @@ export async function getProjectSpan(project?: string): Promise<DaySpan | null> 
   return { firstDay: res.first_day, lastDay: res.last_day }
 }
 
-export async function getGapHistogram(range: DayRange): Promise<GapHistogram | null> {
-  const res = await tryInvoke<GapHistogramContract>('get_gap_histogram', { range: { start_day: range.startDay, end_day: range.endDay } })
+const filtersArg = (f: TaskFilters) => ({ agent: f.agent || undefined, project: f.project || undefined })
+
+export async function getGapHistogram(range: DayRange, filters: TaskFilters = {}): Promise<GapHistogram | null> {
+  const res = await tryInvoke<GapHistogramContract>('get_gap_histogram', {
+    range: { start_day: range.startDay, end_day: range.endDay },
+    filters: filtersArg(filters),
+  })
   if (!res) return null
   return {
     thresholdMs: res.threshold_ms,
@@ -102,6 +109,33 @@ export async function getGapHistogram(range: DayRange): Promise<GapHistogram | n
     withinMs: res.within_ms,
     beyondCount: res.beyond_count,
     beyondMs: res.beyond_ms,
+  }
+}
+
+/** 时间统计（按轮的本地日归日;Task = Σ wall_ms,Human = Σ gap_ms ≤ 当前阈值）。 */
+export async function getTimeSpent(range: DayRange, group: TimeSpentGroup, filters: TaskFilters, limit?: number): Promise<TimeSpent | null> {
+  const args: TimeSpentArgs = { range: { start_day: range.startDay, end_day: range.endDay }, group, filters: filtersArg(filters), limit }
+  const res = await tryInvoke<TimeSpentResultContract>('get_time_spent', { ...args })
+  if (!res) return null
+  if (group === 'project') rememberProjectLabels((res.rows ?? []).map((r) => [r.key, r.label]))
+  return {
+    thresholdMs: res.threshold_ms,
+    rows: (res.rows ?? []).map((r) => ({
+      key: r.key,
+      label: r.label,
+      taskMs: r.task_ms,
+      humanMs: r.human_ms,
+      turns: r.turns,
+      agent: r.agent,
+      sessionId: r.session_id,
+      startedAt: r.started_at,
+      title: r.title,
+      project: r.project,
+      lifetimeTaskMs: r.lifetime_task_ms,
+      lifetimeHumanMs: r.lifetime_human_ms,
+    })),
+    others: res.others ? { count: res.others.count, taskMs: res.others.task_ms, humanMs: res.others.human_ms, turns: res.others.turns } : null,
+    total: { taskMs: res.total.task_ms, humanMs: res.total.human_ms, turns: res.total.turns },
   }
 }
 

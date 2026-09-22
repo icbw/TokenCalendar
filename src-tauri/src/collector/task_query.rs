@@ -8,6 +8,8 @@
 //! - 任务列表 / 逐轮明细读物化层 `turn`（只含根会话,子会话已并入父轮）;任务 = 有轮的根会话,
 //!   `turns` = 物化轮行数（含零调用轮）,`steps` = Σ model_calls。
 //! - 空档直方图读 `turn.gap_ms`（原始值）,within = gap ≤ 阈值（与 daily_project.idle_ms 同判据）。
+//! - 时间统计（`time_spent`）读 `turn`,**按轮的本地日**归日:Task = Σ wall_ms,Human = Σ gap_ms ≤ 阈值,
+//!   与 daily_project.wall_ms / idle_ms 同筛选下守恒;项目归属与筛选按**逐轮**有效项目键。
 //! - 数据跨度（时间过滤用）:单个项目 = daily_project 中该键的首末日（项目生命周期,
 //!   按轮的本地日）;不指定项目 = daily_usage ∪ daily_project 的首末日（「All」范围起点）。
 //! - 中止与错误分列:TaskRow.aborted_count / TaskTurn.aborted 与 error_count 互不计入。
@@ -263,6 +265,69 @@ pub struct GapHistogram {
     pub beyond_ms: i64,
 }
 
+/// 时间统计三量合计。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TimeTotals {
+    pub task_ms: i64,
+    pub human_ms: i64,
+    pub turns: i64,
+}
+
+/// 超出 Top N 的合并项。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TimeSpentOthers {
+    pub count: i64,
+    pub task_ms: i64,
+    pub human_ms: i64,
+    pub turns: i64,
+}
+
+/// 时间统计一行（project = 有效项目键 / task = 根会话 / day = 本地日）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TimeSpentRow {
+    /// project = 有效项目键;task = `agent + \u{1f} + session_id`;day = YYYY-MM-DD。
+    pub key: String,
+    /// project = alias 优先的展示名;task / day = 空（前端格式化）。
+    pub label: String,
+    pub task_ms: i64,
+    pub human_ms: i64,
+    pub turns: i64,
+    // ---- 仅 task 维 ----
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// 【内容列】仅本地可视化,禁止进入导出 / 文件序列化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 会话首轮的有效项目键（与任务列表同源;该键被隐藏 → None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// 全程合计（不受 range 限制,受 agent / project 筛选）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifetime_task_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifetime_human_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimeSpentResult {
+    /// 本次判 Human 用的阈值。
+    pub threshold_ms: i64,
+    /// project / task 维按 total 降序（Top N）;day 维逐日全列（无轮日为 0）。
+    pub rows: Vec<TimeSpentRow>,
+    /// 超出 Top N 的合并项（day 维或未超出时为 None）。
+    pub others: Option<TimeSpentOthers>,
+    /// 全部行（含 others）合计。
+    pub total: TimeTotals,
+}
+
+/// `time_spent` Top N 缺省值与上限。
+pub const TIME_SPENT_TOP_DEFAULT: usize = 15;
+pub const TIME_SPENT_TOP_MAX: usize = 200;
+
 /// 对数分桶边界（毫秒）:1s × 10^（k/4),k = 0..=24（1 秒 → 约 11.6 天,每十倍 4 桶）。
 /// 桶 = [0, 1s)、[e_k, e_{k+1})…、[e_24, ∞),共 26 个。
 pub fn gap_bucket_edges() -> Vec<i64> {
@@ -285,6 +350,21 @@ fn sort_col(field: &str) -> Option<&'static str> {
         "total_tokens" => "total_tokens",
         _ => return None,
     })
+}
+
+/// 轮级筛选 SQL 片段（接在 `WHERE` 之后,以 ` AND` 开头;表别名 `t` = turn,`p` = pmap）。
+/// 参数按序追加到 `params`,占位号取追加后的长度。空串视同不筛。
+fn turn_filter_sql(filters: &TaskFilters, params: &mut Vec<rusqlite::types::Value>) -> String {
+    let mut sql = String::new();
+    if let Some(agent) = filters.agent.as_ref().filter(|a| !a.is_empty()) {
+        params.push(agent.clone().into());
+        sql.push_str(&format!(" AND t.agent_key = ?{}", params.len()));
+    }
+    if let Some(project) = filters.project.as_ref().filter(|p| !p.is_empty()) {
+        params.push(project.clone().into());
+        sql.push_str(&format!(" AND p.eff_key = ?{}", params.len()));
+    }
+    sql
 }
 
 fn day_axis(start_day: &str, end_day: &str) -> Option<Vec<String>> {
@@ -626,8 +706,9 @@ impl Store {
     }
 
     /// 空档直方图:范围内（按轮的日）根会话轮的 gap_ms 对数分桶 + 阈值两侧合计;隐藏项目的轮不计。
+    /// filters:agent = `turn.agent_key`,project = 轮的有效项目键（空串视同不筛）。
     /// 日期非法 → None。
-    pub fn gap_histogram(&self, start_day: &str, end_day: &str, threshold_ms: i64, rule: &ScratchRule) -> Option<GapHistogram> {
+    pub fn gap_histogram(&self, start_day: &str, end_day: &str, threshold_ms: i64, filters: &TaskFilters, rule: &ScratchRule) -> Option<GapHistogram> {
         NaiveDate::parse_from_str(start_day, "%Y-%m-%d").ok()?;
         NaiveDate::parse_from_str(end_day, "%Y-%m-%d").ok()?;
         let edges = gap_bucket_edges();
@@ -635,15 +716,17 @@ impl Store {
             .chain(edges.iter().enumerate().map(|(i, lo)| GapBucket { lo_ms: *lo, hi_ms: edges.get(i + 1).copied(), count: 0 }))
             .collect();
         let mut h = GapHistogram { threshold_ms, buckets: Vec::new(), total: 0, within_count: 0, within_ms: 0, beyond_count: 0, beyond_ms: 0 };
+        let mut params: Vec<rusqlite::types::Value> = vec![start_day.to_string().into(), end_day.to_string().into()];
+        let filter_sql = turn_filter_sql(filters, &mut params);
         let mut stmt = self
             .conn()
             .prepare(&format!(
                 "WITH {} SELECT t.gap_ms FROM turn t JOIN pmap p ON p.raw_key = t.project_key
-                 WHERE t.day >= ?1 AND t.day <= ?2 AND t.gap_ms IS NOT NULL",
+                 WHERE t.day >= ?1 AND t.day <= ?2 AND t.gap_ms IS NOT NULL{filter_sql}",
                 resolve_cte(rule)
             ))
             .ok()?;
-        let rows = stmt.query_map([start_day, end_day], |r| r.get::<_, i64>(0)).ok()?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| r.get::<_, i64>(0)).ok()?;
         for gap in rows.flatten() {
             let gap = gap.max(0);
             let idx = edges.iter().rposition(|e| *e <= gap).map_or(0, |i| i + 1);
@@ -659,6 +742,143 @@ impl Store {
         }
         h.buckets = buckets;
         Some(h)
+    }
+
+    /// 时间统计（按轮的本地日）:group = project | task | day;filters 同 `gap_histogram`;
+    /// `top` = project / task 维保留的条数（其余并入 others,day 维忽略）。日期非法 / 未知维度 → None。
+    #[allow(clippy::too_many_arguments)]
+    pub fn time_spent(
+        &self,
+        start_day: &str,
+        end_day: &str,
+        group: &str,
+        filters: &TaskFilters,
+        top: usize,
+        threshold_ms: i64,
+        rule: &ScratchRule,
+    ) -> Option<TimeSpentResult> {
+        let axis = day_axis(start_day, end_day)?;
+        let key_sql = match group {
+            "project" => "p.eff_key",
+            "task" => "t.agent_key || char(31) || t.session_id",
+            "day" => "t.day",
+            _ => return None,
+        };
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![threshold_ms.into(), start_day.to_string().into(), end_day.to_string().into()];
+        let filter_sql = turn_filter_sql(filters, &mut params);
+        let sql = format!(
+            "WITH {} SELECT {key_sql} AS k, SUM(COALESCE(t.wall_ms, 0)),
+                    SUM(CASE WHEN t.gap_ms IS NOT NULL AND t.gap_ms <= ?1 THEN t.gap_ms ELSE 0 END), COUNT(*)
+             FROM turn t JOIN pmap p ON p.raw_key = t.project_key
+             WHERE t.day >= ?2 AND t.day <= ?3{filter_sql}
+             GROUP BY k",
+            resolve_cte(rule)
+        );
+        let mut agg: Vec<(String, TimeTotals)> = {
+            let mut stmt = self.conn().prepare(&sql).ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, TimeTotals { task_ms: r.get(1)?, human_ms: r.get(2)?, turns: r.get(3)? }))
+                })
+                .ok()?;
+            rows.flatten().collect()
+        };
+        let mut total = TimeTotals::default();
+        for (_, v) in &agg {
+            total.task_ms += v.task_ms;
+            total.human_ms += v.human_ms;
+            total.turns += v.turns;
+        }
+        let row = |key: String, v: &TimeTotals| TimeSpentRow {
+            key,
+            label: String::new(),
+            task_ms: v.task_ms,
+            human_ms: v.human_ms,
+            turns: v.turns,
+            agent: None,
+            session_id: None,
+            started_at: None,
+            title: None,
+            project: None,
+            lifetime_task_ms: None,
+            lifetime_human_ms: None,
+        };
+        if group == "day" {
+            let by_day: HashMap<String, TimeTotals> = agg.into_iter().collect();
+            let zero = TimeTotals::default();
+            let rows = axis.into_iter().map(|d| { let v = by_day.get(&d).unwrap_or(&zero).clone(); row(d, &v) }).collect();
+            return Some(TimeSpentResult { threshold_ms, rows, others: None, total });
+        }
+        agg.sort_by(|a, b| (b.1.task_ms + b.1.human_ms).cmp(&(a.1.task_ms + a.1.human_ms)).then(a.0.cmp(&b.0)));
+        let top = top.clamp(1, TIME_SPENT_TOP_MAX);
+        let others = (agg.len() > top).then(|| {
+            let mut o = TimeSpentOthers { count: (agg.len() - top) as i64, ..Default::default() };
+            for (_, v) in &agg[top..] {
+                o.task_ms += v.task_ms;
+                o.human_ms += v.human_ms;
+                o.turns += v.turns;
+            }
+            o
+        });
+        agg.truncate(top);
+        let mut rows: Vec<TimeSpentRow> = agg.iter().map(|(k, v)| row(k.clone(), v)).collect();
+        if group == "project" {
+            let keys: Vec<String> = rows.iter().map(|r| r.key.clone()).collect();
+            for (r, label) in rows.iter_mut().zip(project_labels(&keys, &self.project_aliases())) {
+                r.label = label;
+            }
+        } else {
+            self.fill_task_rows(&mut rows, filters, threshold_ms, rule)?;
+        }
+        Some(TimeSpentResult { threshold_ms, rows, others, total })
+    }
+
+    /// task 维补会话元数据（开始时间 / 标题 / 首轮有效项目）与全程合计（同筛选,不限日期）。
+    fn fill_task_rows(&self, rows: &mut [TimeSpentRow], filters: &TaskFilters, threshold_ms: i64, rule: &ScratchRule) -> Option<()> {
+        if rows.is_empty() {
+            return Some(());
+        }
+        let cte = resolve_cte(rule);
+        let mut meta = self
+            .conn()
+            .prepare(&format!(
+                "WITH {cte} SELECT s.started_at, s.title, p.eff_key,
+                        (SELECT MIN(t.started_at) FROM turn t WHERE t.agent_key = s.agent_key AND t.session_id = s.session_id)
+                 FROM session s LEFT JOIN pmap p ON p.raw_key = s.project_key
+                 WHERE s.agent_key = ?1 AND s.session_id = ?2"
+            ))
+            .ok()?;
+        let mut params: Vec<rusqlite::types::Value> = vec![threshold_ms.into(), String::new().into(), String::new().into()];
+        let filter_sql = turn_filter_sql(filters, &mut params);
+        let mut life = self
+            .conn()
+            .prepare(&format!(
+                "WITH {cte} SELECT COALESCE(SUM(COALESCE(t.wall_ms, 0)), 0),
+                        COALESCE(SUM(CASE WHEN t.gap_ms IS NOT NULL AND t.gap_ms <= ?1 THEN t.gap_ms ELSE 0 END), 0)
+                 FROM turn t JOIN pmap p ON p.raw_key = t.project_key
+                 WHERE t.agent_key = ?2 AND t.session_id = ?3{filter_sql}"
+            ))
+            .ok()?;
+        for r in rows.iter_mut() {
+            let (agent, sid) = r.key.split_once('\u{1f}')?;
+            let (agent, sid) = (agent.to_string(), sid.to_string());
+            if let Ok((started, title, project, first_turn)) = meta.query_row([&agent, &sid], |x| {
+                Ok((x.get::<_, Option<i64>>(0)?, x.get::<_, Option<String>>(1)?, x.get::<_, Option<String>>(2)?, x.get::<_, Option<i64>>(3)?))
+            }) {
+                r.started_at = started.or(first_turn);
+                r.title = title;
+                r.project = project;
+            }
+            params[1] = agent.clone().into();
+            params[2] = sid.clone().into();
+            let (lt, lh) = life.query_row(rusqlite::params_from_iter(params.iter()), |x| Ok((x.get::<_, i64>(0)?, x.get::<_, i64>(1)?))).ok()?;
+            r.lifetime_task_ms = Some(lt);
+            r.lifetime_human_ms = Some(lh);
+            r.agent = Some(agent);
+            r.session_id = Some(sid);
+        }
+        Some(())
     }
 
     /// 数据跨度:`project` = Some（有效项目键）→ 该项目（含合并成员,不含隐藏键）在 daily_project 的首末日;
@@ -1013,7 +1233,7 @@ mod tests {
         let page = s.task_list(0, i64::MAX, &TaskFilters::default(), &TaskSort::default(), &TaskPageReq::default(), OFF).unwrap();
         assert_eq!((page.total, page.rows.len()), (0, 0));
         assert!(s.task_turns("claude-code", "nope").unwrap().is_empty());
-        let h = s.gap_histogram("2026-09-01", "2026-09-30", 1_800_000, OFF).unwrap();
+        let h = s.gap_histogram("2026-09-01", "2026-09-30", 1_800_000, &TaskFilters::default(), OFF).unwrap();
         assert_eq!((h.total, h.buckets.len()), (0, 26));
     }
 
@@ -1145,7 +1365,7 @@ mod tests {
         let tokens_turns = |s: &Store| -> (i64, i64) {
             s.conn().query_row("SELECT SUM(total_tokens), SUM(turns) FROM daily_project", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
         };
-        let h = s.gap_histogram(&d1, &d2, IDLE_DEFAULT, OFF).unwrap();
+        let h = s.gap_histogram(&d1, &d2, IDLE_DEFAULT, &TaskFilters::default(), OFF).unwrap();
         assert_eq!(h.total, 2, "根会话有 gap 的轮;子会话不计");
         assert_eq!(h.buckets.iter().map(|b| b.count).sum::<i64>(), 2);
         assert_eq!((h.within_count, h.within_ms, h.beyond_count, h.beyond_ms), (1, 58_000, 1, 7_198_000));
@@ -1160,7 +1380,7 @@ mod tests {
         let n = s.recompute_projects(3 * 3_600_000).unwrap();
         assert!(n >= 2);
         assert_eq!(s.project_threshold_marker(), Some(3 * 3_600_000));
-        let h3 = s.gap_histogram(&d1, &d2, 3 * 3_600_000, OFF).unwrap();
+        let h3 = s.gap_histogram(&d1, &d2, 3 * 3_600_000, &TaskFilters::default(), OFF).unwrap();
         assert_eq!((h3.within_count, h3.within_ms), (2, 58_000 + 7_198_000));
         assert_eq!(idle_sum(&s), h3.within_ms);
         assert_eq!(tokens_turns(&s), before, "阈值重算不动 token / turns");
@@ -1168,13 +1388,116 @@ mod tests {
         assert!(mismatches.iter().all(|m| m.contains("codebuddy")), "只剩无项目维的 codebuddy 格:{mismatches:?}");
         // 调到 1 分钟:两条都超阈值
         s.recompute_projects(60_000).unwrap();
-        assert_eq!((idle_sum(&s), s.gap_histogram(&d1, &d2, 60_000, OFF).unwrap().within_ms), (58_000, 58_000));
+        assert_eq!((idle_sum(&s), s.gap_histogram(&d1, &d2, 60_000, &TaskFilters::default(), OFF).unwrap().within_ms), (58_000, 58_000));
         s.recompute_projects(30_000).unwrap();
         assert_eq!(idle_sum(&s), 0);
-        assert!(s.gap_histogram("bad", &d2, 1, OFF).is_none());
+        assert!(s.gap_histogram("bad", &d2, 1, &TaskFilters::default(), OFF).is_none());
     }
 
     const IDLE_DEFAULT: i64 = crate::collector::store::IDLE_THRESHOLD_MS;
+
+    fn filt(agent: Option<&str>, project: Option<&str>) -> TaskFilters {
+        TaskFilters { agent: agent.map(str::to_string), project: project.map(str::to_string) }
+    }
+
+    /// daily_project 同范围同筛选的 (Σ wall_ms, Σ idle_ms)（守恒核对的对照面）。
+    fn daily_wall_idle(s: &Store, d1: &str, d2: &str, f: &TaskFilters) -> (i64, i64) {
+        let mut params: Vec<rusqlite::types::Value> = vec![d1.to_string().into(), d2.to_string().into()];
+        let mut sql = format!(
+            "WITH {} SELECT COALESCE(SUM(d.wall_ms), 0), COALESCE(SUM(d.idle_ms), 0) FROM daily_project d
+             JOIN pmap p ON p.raw_key = d.project_key WHERE d.day >= ?1 AND d.day <= ?2",
+            resolve_cte(OFF)
+        );
+        if let Some(a) = &f.agent {
+            params.push(a.clone().into());
+            sql.push_str(&format!(" AND d.agent_key = ?{}", params.len()));
+        }
+        if let Some(p) = &f.project {
+            params.push(p.clone().into());
+            sql.push_str(&format!(" AND p.eff_key = ?{}", params.len()));
+        }
+        s.conn().query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn time_spent_groups_conserve_with_daily_project_and_histogram() {
+        let s = fixture();
+        let (d1, d2) = (day_of(T), day_of(T + 86_400_000));
+        for f in [filt(None, None), filt(Some("codex"), None), filt(None, Some("e:/work/app")), filt(Some("claude-code"), Some("e:/work/app")), filt(Some("codex"), Some("e:/work/app"))] {
+            let (wall, idle) = daily_wall_idle(&s, &d1, &d2, &f);
+            let within = s.gap_histogram(&d1, &d2, IDLE_DEFAULT, &f, OFF).unwrap().within_ms;
+            for group in ["project", "task", "day"] {
+                let r = s.time_spent(&d1, &d2, group, &f, 15, IDLE_DEFAULT, OFF).unwrap();
+                let sum = |g: fn(&TimeSpentRow) -> i64| r.rows.iter().map(g).sum::<i64>();
+                let o = r.others.clone().unwrap_or_default();
+                assert_eq!((sum(|x| x.task_ms) + o.task_ms, r.total.task_ms), (wall, wall), "{group} {f:?} task = Σ daily_project.wall_ms");
+                assert_eq!((sum(|x| x.human_ms) + o.human_ms, r.total.human_ms), (idle, idle), "{group} {f:?} human = Σ idle_ms");
+                assert_eq!(idle, within, "{f:?} idle = 直方图 within");
+            }
+        }
+        let p = s.time_spent(&d1, &d2, "project", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!(
+            p.rows.iter().map(|r| (r.key.as_str(), r.label.as_str(), r.task_ms, r.human_ms, r.turns)).collect::<Vec<_>>(),
+            vec![("e:/work/app", "e:/work/app", 6_000, 58_000, 3), ("d:/other/app", "d:/other/app", 2_000, 0, 1)],
+            "按 total 降序;子会话与超阈值 gap 不计;同名末段退回完整路径"
+        );
+        assert_eq!((p.threshold_ms, p.others.is_none()), (IDLE_DEFAULT, true));
+        let top1 = s.time_spent(&d1, &d2, "project", &TaskFilters::default(), 1, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!((top1.rows.len(), top1.others), (1, Some(TimeSpentOthers { count: 1, task_ms: 2_000, human_ms: 0, turns: 1 })));
+        let day = s.time_spent("2026-09-01", &d2, "day", &TaskFilters::default(), 1, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!(day.rows.first().map(|r| (r.key.as_str(), r.task_ms, r.turns)), Some(("2026-09-01", 0, 0)), "day 维逐日全列,无轮日为 0,忽略 top");
+        assert_eq!(day.rows.iter().find(|r| r.key == d1).map(|r| (r.task_ms, r.human_ms)), Some((6_000, 58_000)));
+        assert!(day.others.is_none());
+        // 阈值现场判:调到 3 小时,2h gap 也计入 Human（不依赖 daily_project 是否重算）
+        let wide = s.time_spent(&d1, &d2, "project", &TaskFilters::default(), 15, 3 * 3_600_000, OFF).unwrap();
+        assert_eq!((wide.threshold_ms, wide.total.human_ms), (3 * 3_600_000, 58_000 + 7_198_000));
+        assert!(s.time_spent(&d1, &d2, "model", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).is_none());
+        assert!(s.time_spent("bad", &d2, "day", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).is_none());
+    }
+
+    #[test]
+    fn time_spent_task_rows_carry_meta_and_lifetime_across_days() {
+        let mut s = fixture();
+        // 跨天任务:s3 在 d0 两轮、d1 一轮;查 d1 当天 → 范围内只含 d1 的轮,全程含全部
+        let mut b = Batch::default();
+        session(&mut b, "codex", "s3", "e:/work/app", None, Some("long task"));
+        add(&mut b, Turn { agent: "codex", sid: "s3", seq: 1, start: T + 1_000, gap: None, project: "e:/work/app", model: "m", tokens: 1, mark: 1 });
+        add(&mut b, Turn { agent: "codex", sid: "s3", seq: 2, start: T + 10_000, gap: Some(7_000), project: "e:/work/app", model: "m", tokens: 1, mark: 1 });
+        add(&mut b, Turn { agent: "codex", sid: "s3", seq: 3, start: T + 86_400_000 + 5_000, gap: Some(20_000), project: "d:/other/app", model: "m", tokens: 1, mark: 1 });
+        s.commit("codex", &b).unwrap();
+        let d1 = day_of(T + 86_400_000);
+        let r = s.time_spent(&d1, &d1, "task", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap();
+        let s3 = r.rows.iter().find(|x| x.session_id.as_deref() == Some("s3")).unwrap();
+        assert_eq!((s3.key.as_str(), s3.task_ms, s3.human_ms, s3.turns), ("codex\u{1f}s3", 2_000, 20_000, 1));
+        assert_eq!((s3.lifetime_task_ms, s3.lifetime_human_ms), (Some(6_000), Some(27_000)), "全程不受 range 限制");
+        assert_eq!((s3.agent.as_deref(), s3.title.as_deref(), s3.started_at, s3.project.as_deref()), (Some("codex"), Some("long task"), Some(T + 1_000), Some("e:/work/app")));
+        assert!(r.rows.iter().all(|x| x.session_id.as_deref() != Some("s1")), "范围外的任务不出现");
+        // 项目筛选按轮:d:/other/app 下 s3 只算第 3 轮,全程也同筛选
+        let pf = s.time_spent(&day_of(T), &d1, "task", &filt(None, Some("d:/other/app")), 15, IDLE_DEFAULT, OFF).unwrap();
+        let s3p = pf.rows.iter().find(|x| x.session_id.as_deref() == Some("s3")).unwrap();
+        assert_eq!((s3p.task_ms, s3p.lifetime_task_ms, s3p.turns), (2_000, Some(2_000), 1));
+        // 项目维按逐轮归属:s3 的轮分到两个项目
+        let pr = s.time_spent(&day_of(T), &d1, "project", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap();
+        let other = pr.rows.iter().find(|x| x.key == "d:/other/app").unwrap();
+        assert_eq!((other.task_ms, other.turns), (4_000, 2));
+    }
+
+    #[test]
+    fn time_spent_hidden_absent_and_merged_into_target() {
+        let mut s = fixture();
+        let (d1, d2) = (day_of(T), day_of(T + 86_400_000));
+        s.set_project_meta(&ProjectMetaInput { project_key: "d:/other/app".into(), hidden: true, ..Default::default() }).unwrap();
+        let hidden = s.time_spent(&d1, &d2, "project", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!(hidden.rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["e:/work/app"]);
+        assert_eq!(hidden.total.task_ms, 6_000, "隐藏项目的轮不计入合计");
+        assert!(s.time_spent(&d1, &d2, "task", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap().rows.iter().all(|r| r.agent.as_deref() != Some("codex")));
+        s.set_project_meta(&ProjectMetaInput { project_key: "d:/other/app".into(), hidden: false, ..Default::default() }).unwrap();
+        s.merge_projects(&["d:/other/app".to_string()], "e:/work/app").unwrap();
+        let merged = s.time_spent(&d1, &d2, "project", &TaskFilters::default(), 15, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!(merged.rows.iter().map(|r| (r.key.as_str(), r.label.as_str(), r.task_ms)).collect::<Vec<_>>(), vec![("e:/work/app", "app", 8_000)]);
+        let by_target = s.time_spent(&d1, &d2, "day", &filt(None, Some("e:/work/app")), 15, IDLE_DEFAULT, OFF).unwrap();
+        assert_eq!(by_target.total.task_ms, 8_000, "筛合并目标含成员的轮");
+    }
 
     #[test]
     fn data_span_for_project_and_all() {

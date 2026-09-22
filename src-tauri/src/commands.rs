@@ -373,7 +373,7 @@ pub fn get_range_series(query: RangeSeriesQuery, state: State<'_, AppState>) -> 
 // 口径见 collector/task_query.rs 文件头。任务类型里的 `title` 是内容列:只随 IPC 回 UI,
 // 任何导出 / 文件序列化路径一律不得引用这些类型（export_month 只读 daily_usage）。
 
-pub use crate::collector::task_query::{DaySpan, GapHistogram, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn, TimelineResult};
+pub use crate::collector::task_query::{DaySpan, GapHistogram, TaskFilters, TaskPage, TaskPageReq, TaskSort, TaskTurn, TimeSpentResult, TimelineResult};
 use crate::collector::project_meta::{self, ProjectMetaInput, ProjectMetaList, ScratchRule};
 use crate::collector::task_store;
 
@@ -554,11 +554,38 @@ pub fn ack_attention(agent: String, session_id: String, app: AppHandle, state: S
 }
 
 /// 轮间空档直方图（gap_ms 对数分桶 + 当前阈值两侧合计;按轮的本地日过滤）。
+/// filters 可选:agent = agent 键,project = 轮的有效项目键;省略时与不筛逐位一致。
 #[tauri::command]
-pub fn get_gap_histogram(range: DayRange, state: State<'_, AppState>) -> Result<GapHistogram, String> {
+pub fn get_gap_histogram(range: DayRange, filters: Option<TaskFilters>, state: State<'_, AppState>) -> Result<GapHistogram, String> {
     parse_range(&range)?;
-    with_reader(&state, |store| Ok(store.gap_histogram(&range.start_day, &range.end_day, task_store::idle_threshold_ms(), &project_meta::scratch_rule())))?
-        .ok_or_else(|| "invalid range".to_string())
+    let filters = filters.unwrap_or_default();
+    with_reader(&state, |store| {
+        Ok(store.gap_histogram(&range.start_day, &range.end_day, task_store::idle_threshold_ms(), &filters, &project_meta::scratch_rule()))
+    })?
+    .ok_or_else(|| "invalid range".to_string())
+}
+
+/// 时间统计（按轮的本地日归日）:group = project | task | day;Task = Σ wall_ms,
+/// Human = Σ gap_ms ≤ 当前离开阈值（与 daily_project.wall_ms / idle_ms 同口径）。
+/// limit = project / task 维 Top N（缺省 15,其余并入 others）;day 维忽略。只读。
+#[tauri::command]
+pub fn get_time_spent(
+    range: DayRange,
+    group: String,
+    filters: Option<TaskFilters>,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<TimeSpentResult, String> {
+    if !matches!(group.as_str(), "project" | "task" | "day") {
+        return Err(format!("unsupported group: {group}"));
+    }
+    parse_range(&range)?;
+    let filters = filters.unwrap_or_default();
+    let top = limit.unwrap_or(crate::collector::task_query::TIME_SPENT_TOP_DEFAULT);
+    with_reader(&state, |store| {
+        Ok(store.time_spent(&range.start_day, &range.end_day, &group, &filters, top, task_store::idle_threshold_ms(), &project_meta::scratch_rule()))
+    })?
+    .ok_or_else(|| "invalid range".to_string())
 }
 
 #[derive(Debug, Serialize)]

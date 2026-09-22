@@ -8,10 +8,12 @@ import type { RangeSelection } from './useRangeSelection'
 
 type SegKey = '7' | '30' | '90' | 'all' | 'custom'
 
-export default function RangeControl({ selection, noun }: {
+export default function RangeControl({ selection, noun, note }: {
   selection: RangeSelection
-  /** 预设按钮 hover 文案的主语（"Tasks started" / "Usage"）。 */
+  /** 预设按钮 hover 文案的主语（"Turns" / "Usage"）。 */
   noun: string
+  /** 范围条末尾的口径说明（同页多个口径并列时写明,不隐藏差异）。 */
+  note?: string
 }) {
   const { sel, range, projectSpan, project, choose, applyProjectSpan } = selection
   const segValue: SegKey | '' = sel.kind === 'preset' ? (String(sel.days) as SegKey) : sel.kind === 'project' ? '' : sel.kind
@@ -86,6 +88,7 @@ export default function RangeControl({ selection, noun }: {
           Project span
         </button>
       )}
+      {note && <span className="range-note">{note}</span>}
     </div>
   )
 }

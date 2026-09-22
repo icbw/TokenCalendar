@@ -150,6 +150,7 @@ fn main() {
             commands::get_task_turns,
             commands::get_effort_series,
             commands::get_gap_histogram,
+            commands::get_time_spent,
             commands::get_project_span,
             commands::get_project_timeline,
             commands::get_attention,

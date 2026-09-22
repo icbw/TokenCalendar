@@ -63,6 +63,7 @@ NSIS 出包会为更新包签名（`src-tauri/tauri.conf.json` 的 `plugins.upda
 
 ## 版本
 
+- **0.8.4** —— **时间统计迁入 Tasks**:Tasks 空档卡升为 `Idle gaps ⇄ Time spent`,按项目 / 任务 / 日堆叠 Task 与 Human 时间,按每轮发生的本地日计入;热力图与 Insights 移除 Wait / Human,只看 token。不动数据。
 - **0.8.3** —— **价目新增三款模型**:Claude Opus 5.5(4/20,单独成行)、GPT-6 Sol、GPT-6 Luna;存量订阅样本按新价目就地重算,不删记录。
 - **0.8.2** —— **项目固定配色**:与 Agent 同一套色环,每个项目一个独立颜色,首次出现在图表时分配并保存,此后跨重启 / 时间范围 / 视图不变;Scratch / Hidden / Unknown 为中性灰。只改界面,不动数据。
 - **0.8.1** —— token 分项**配色按价格顺序**:Output 最深 → Input → Cache write → Cache read 最浅（最深 = 模型本色）;CodeBuddy 积分图改为四分项堆叠,**By model 时所有模型画在同一张图**(每模型并排柱 + 各自积分曲线)。只改界面,不动数据。

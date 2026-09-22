@@ -299,6 +299,46 @@ export interface GapHistogramContract {
   beyond_ms: number
 }
 
+/** get_time_spent 维度:project = 有效项目键 / task = 根会话 / day = 本地日。 */
+export type TimeSpentGroup = 'project' | 'task' | 'day'
+
+export interface TimeSpentArgs {
+  range: DayRangeContract
+  group: TimeSpentGroup
+  filters?: TaskFiltersContract
+  /** project / task 维 Top N（缺省 15）;day 维忽略。 */
+  limit?: number
+}
+
+/** 时间统计一行（按轮的本地日归日）:task_ms = Σ wall_ms,human_ms = Σ gap_ms ≤ 阈值。 */
+export interface TimeSpentRowContract {
+  /** project = 有效项目键;task = agent + U+001F + session_id;day = YYYY-MM-DD。 */
+  key: string
+  /** project = alias 优先展示名;task / day = 空串（前端格式化）。 */
+  label: string
+  task_ms: number
+  human_ms: number
+  turns: number
+  // 仅 task 维
+  agent?: string
+  session_id?: string
+  started_at?: number
+  /** 内容列:仅本地展示,不得进入导出。 */
+  title?: string
+  /** 会话首轮的有效项目键（与任务列表同源）。 */
+  project?: string
+  /** 全程合计（不受 range 限制,受 agent / project 筛选）。 */
+  lifetime_task_ms?: number
+  lifetime_human_ms?: number
+}
+
+export interface TimeSpentResultContract {
+  threshold_ms: number
+  rows: TimeSpentRowContract[]
+  others: { count: number; task_ms: number; human_ms: number; turns: number } | null
+  total: { task_ms: number; human_ms: number; turns: number }
+}
+
 /** get_project_span（project?) 返回:给定项目 = 生命周期（daily_project 首末日）;
  * 省略 = 全部数据首末日（All 范围起点）;无数据 = null。 */
 export interface DaySpanContract {

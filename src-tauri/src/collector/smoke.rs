@@ -193,7 +193,7 @@ fn real_sources_smoke() {
         let started = std::time::Instant::now();
         let days = store.recompute_projects(ms).expect("recompute");
         let elapsed = started.elapsed().as_millis();
-        let h = store.gap_histogram("2000-01-01", "2099-12-31", ms, &super::project_meta::ScratchRule::OFF).expect("histogram");
+        let h = store.gap_histogram("2000-01-01", "2099-12-31", ms, &super::task_query::TaskFilters::default(), &super::project_meta::ScratchRule::OFF).expect("histogram");
         let rows = store.project_month_rows(&month, "project", "human", today, &super::project_meta::ScratchRule::OFF).unwrap_or_default();
         let effort = store.effort_series("2000-01-01", "2099-12-31", "day", "total", "human", None, &super::project_meta::ScratchRule::OFF).expect("effort");
         let idle_all: i64 = effort.points.iter().map(|p| p.values[0]).sum();

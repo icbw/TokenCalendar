@@ -18,7 +18,7 @@ export type { TimelineResult, TimelineProject, TimelineCell, TimelineSession, At
 export { inTauri } from './tauri'
 export type { WindowVisibility, OrbDockState } from './windowService'
 export type { UsageResult, UsageRow, SourceSummary, ExportResult, QueryOptions } from './types'
-export type { DayRange, DaySpan, TaskFilters, TaskSort, TaskRow, TaskPage, TaskTurn, GapHistogram, GapBucket, IdleThresholdInfo, IdleThresholdApplied } from './types'
+export type { DayRange, DaySpan, TaskFilters, TaskSort, TaskRow, TaskPage, TaskTurn, GapHistogram, GapBucket, IdleThresholdInfo, IdleThresholdApplied, TimeSpent, TimeSpentRow, TimeSpentGroup } from './types'
 export type { ProjectGroupBy, ProjectMetric, TaskSortField, TokenMetric } from './contract'
 export type { BreakdownDay, BreakdownSlice, ChangedKeys } from './contract'
 export type { CreditSummary, CreditModelDaySlice } from './usageService'

@@ -135,6 +135,12 @@ export interface DesignPrefs {
   /** Tasks 列表标签:time（开始时间,默认）⇄ title（会话标题,空时回退 time）。
    * undefined = time。title 是内容列,只在 Tasks 列表渲染。 */
   taskLabelMode?: 'time' | 'title'
+  /** Tasks 时间卡模式:gaps（空档直方图,默认）⇄ spent（时间统计）。undefined = gaps。 */
+  taskTimeMode?: 'gaps' | 'spent'
+  /** 时间统计维度（undefined = project）。选定单个项目时界面自动切到 task,不写回本键。 */
+  taskTimeGroup?: 'project' | 'task' | 'day'
+  /** 时间统计指标:total（Task + Human 堆叠,默认）/ task / human。 */
+  taskTimeMetric?: 'total' | 'task' | 'human'
   /** 选定单个项目时,Tasks / Insights 的范围自动切到该项目生命周期（undefined = 开）。
    * 用户在项目生命周期模式下手改范围即写 false;范围控件的「Project span」按钮写回 true。 */
   projectAutoRange?: boolean
@@ -266,6 +272,15 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   }
   if (p.taskLabelMode !== undefined && p.taskLabelMode !== 'time' && p.taskLabelMode !== 'title') {
     delete p.taskLabelMode
+  }
+  if (p.taskTimeMode !== undefined && p.taskTimeMode !== 'gaps' && p.taskTimeMode !== 'spent') {
+    delete p.taskTimeMode
+  }
+  if (p.taskTimeGroup !== undefined && !['project', 'task', 'day'].includes(p.taskTimeGroup)) {
+    delete p.taskTimeGroup
+  }
+  if (p.taskTimeMetric !== undefined && !['total', 'task', 'human'].includes(p.taskTimeMetric)) {
+    delete p.taskTimeMetric
   }
   if (p.projectAutoRange !== undefined && typeof p.projectAutoRange !== 'boolean') {
     delete p.projectAutoRange

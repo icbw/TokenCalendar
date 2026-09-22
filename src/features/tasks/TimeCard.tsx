@@ -1,4 +1,6 @@
-// 离开阈值控件 + 空档分布直方图。
+// Tasks 视图的 Time 卡:卡头切换 Idle gaps ⇄ Time spent（记 designPrefs.taskTimeMode）,离开阈值控件两种模式都显示
+// （阈值直接决定 Human 的大小）。工具栏的 Agent / 项目 / 范围同时作用于两种模式与任务列表。
+// Idle gaps = 离开阈值控件 + 空档分布直方图;Time spent 见 TimeSpentPanel。
 // 直方图:get_gap_histogram 的 26 个对数桶等宽排布（横轴即对数刻度）,阈值竖线按桶内对数插值定位,
 // 两侧计数 / 时长与合计取后端 within / beyond（与 daily_project.idle_ms 同判据）。
 // 改阈值的唯一路径:set_idle_threshold（Rust 合并写 prefs.json + 同步重算 + emit usage:changed）,
@@ -7,6 +9,8 @@
 import { useEffect, useState } from 'react'
 import { taskService } from '../../services'
 import type { DayRange, GapHistogram } from '../../services'
+import { Seg } from '../insights/Seg'
+import TimeSpentPanel from './TimeSpentPanel'
 import { formatFull } from '../matrix/matrixScale'
 import { formatDuration } from '../insights/analytics'
 import { getDesignPrefs, setDesignPrefs } from '../settings/designPrefs'
@@ -101,7 +105,23 @@ function GapChart({ hist }: { hist: GapHistogram }) {
   )
 }
 
-export default function GapHistogramCard({ range, refreshTick }: { range: DayRange; refreshTick: number }) {
+type TimeMode = 'gaps' | 'spent'
+
+const SUBTITLES: Record<TimeMode, string> = {
+  gaps: 'Gaps between turns up to the threshold count as human time; longer gaps count as away',
+  spent: 'Where the time in this range went: each turn counts on its own local day',
+}
+
+export default function TimeCard({ range, agent, project, labelMode, agentLabel, refreshTick, onPickTask }: {
+  range: DayRange
+  agent: string
+  project: string
+  labelMode: 'time' | 'title'
+  agentLabel: (key: string) => string
+  refreshTick: number
+  onPickTask: (agent: string, sessionId: string) => boolean
+}) {
+  const [mode, setMode] = useState<TimeMode>(() => getDesignPrefs().taskTimeMode ?? 'gaps')
   const [info, setInfo] = useState(FALLBACK)
   const [input, setInput] = useState(() => String(getDesignPrefs().idleThresholdMin ?? FALLBACK.minutes))
   const [hist, setHist] = useState<GapHistogram | null | undefined>(undefined)
@@ -123,14 +143,20 @@ export default function GapHistogramCard({ range, refreshTick }: { range: DayRan
   }, [])
 
   useEffect(() => {
+    if (mode !== 'gaps') return
     let cancelled = false
-    void taskService.getGapHistogram(range).then((res) => {
+    void taskService.getGapHistogram(range, { agent, project }).then((res) => {
       if (!cancelled) setHist(res)
     })
     return () => {
       cancelled = true
     }
-  }, [range, refreshTick, histTick])
+  }, [mode, range, agent, project, refreshTick, histTick])
+
+  const pickMode = (m: TimeMode) => {
+    setMode(m)
+    setDesignPrefs({ taskTimeMode: m })
+  }
 
   const parsed = /^\d+$/.test(input.trim()) ? Number(input.trim()) : NaN
   const valid = Number.isInteger(parsed) && parsed >= info.minMinutes && parsed <= info.maxMinutes
@@ -161,8 +187,15 @@ export default function GapHistogramCard({ range, refreshTick }: { range: DayRan
   return (
     <section className="insight-card gap-card">
       <header className="insight-card-header gap-card-header">
-        <span className="insight-card-title">Idle gaps</span>
-        <span className="insight-card-sub">Gaps between turns up to the threshold count as human time; longer gaps count as away</span>
+        <Seg<TimeMode>
+          value={mode}
+          options={[
+            { v: 'gaps', label: 'Idle gaps', hint: 'Distribution of gaps between turns' },
+            { v: 'spent', label: 'Time spent', hint: 'Task and human time by project, task or day' },
+          ]}
+          onChange={pickMode}
+        />
+        <span className="insight-card-sub">{SUBTITLES[mode]}</span>
       </header>
       <div className="gap-controls">
         <label className="gap-threshold" title={`Idle threshold in minutes (${info.minMinutes}–${info.maxMinutes}, default ${info.defaultMinutes})`}>
@@ -196,7 +229,17 @@ export default function GapHistogramCard({ range, refreshTick }: { range: DayRan
         {valid && status && <span className={`gap-status${status.ok ? '' : ' is-error'}`}>{status.text}</span>}
       </div>
 
-      {hist === undefined ? (
+      {mode === 'spent' ? (
+        <TimeSpentPanel
+          range={range}
+          agent={agent}
+          project={project}
+          labelMode={labelMode}
+          agentLabel={agentLabel}
+          refreshTick={refreshTick + histTick}
+          onPickTask={onPickTask}
+        />
+      ) : hist === undefined ? (
         <div className="insight-empty">Loading…</div>
       ) : hist === null ? (
         <div className="insight-empty">Data unavailable (service not running)</div>

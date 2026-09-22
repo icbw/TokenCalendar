@@ -1,6 +1,6 @@
 [package]
 name = "tokencalendar"
-version = "0.8.3"
+version = "0.8.4"
 description = "TokenCalendar — desktop widget for AI agent token usage"
 license = "MIT"
 edition = "2021"

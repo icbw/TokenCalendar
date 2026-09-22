@@ -1,4 +1,4 @@
-// 共享口径工具:项目展示名、时间成本格式化、z-score 离群判定。
+// 共享口径工具:项目展示名、时长格式化、z-score 离群判定。
 // 矩阵（UsageMatrixView / MatrixPanel）、洞察（InsightsView）与 Tasks 视图共用,口径单一源。
 // 项目键是解析层的有效键（合并目标 / __scratch / 原键）,展示名优先取后端标签缓存（alias）。
 import { cachedProjectLabel } from '../../services/projectLabels'
@@ -30,9 +30,6 @@ export function projectTooltip(key: string): string {
   return name && name !== key && !key.endsWith(`/${name}`) ? `${name}\n${key}` : key
 }
 
-/** 时间成本指标（毫秒值;与 token 并列不相加）。 */
-export type TimeMetric = 'wait' | 'human'
-
 /** token 分项（互斥,相加 = Tokens 总量）。工具栏顺序:Tokens → Input → Cache write → Cache read → Output。
  * input = 未命中缓存的输入;cache_write = 写入提示缓存的输入（价格面板「缓存写」);
  * cache_read = 命中缓存、从缓存读出的输入（价格面板「缓存读」）。 */
@@ -50,15 +47,6 @@ export const TOKEN_METRIC_LABELS: Record<TokenMetric, { label: string; short: st
   output: { label: 'Output', short: 'Output', hint: 'Output tokens', unit: 'output tokens' },
 }
 export const TOKEN_METRICS: TokenMetric[] = ['total', ...TOKEN_PARTS]
-
-export function isTimeMetric(m: string): m is TimeMetric {
-  return m === 'wait' || m === 'human'
-}
-
-export const TIME_METRIC_LABELS: Record<TimeMetric, { label: string; hint: string; unit: string }> = {
-  wait: { label: 'Wait', hint: 'Wait time: sum of turn wall-clock durations', unit: 'wait' },
-  human: { label: 'Human', hint: 'Human time: sum of gaps between turns within the idle threshold', unit: 'human time' },
-}
 
 /** 毫秒 → "3h 12m" / "45m" / "<1m"（0 → "0m";null → "—"）。 */
 export function formatDuration(ms: number | null | undefined): string {
