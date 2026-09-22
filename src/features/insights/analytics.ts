@@ -38,6 +38,8 @@ export type TimeMetric = 'wait' | 'human'
  * cache_read = 命中缓存、从缓存读出的输入（价格面板「缓存读」）。 */
 export type TokenPart = 'input' | 'cache_write' | 'cache_read' | 'output'
 export const TOKEN_PARTS: TokenPart[] = ['input', 'cache_write', 'cache_read', 'output']
+/** 分项的价格顺序（单价从高到低）:图表色阶由深到浅、堆叠自下而上、图例与 tooltip 行都按此序。 */
+export const PART_PRICE_ORDER: TokenPart[] = ['output', 'input', 'cache_write', 'cache_read']
 
 /** label = 图表 / 图例全名;short = 工具栏按钮（Insights 工具栏单行不换行,默认 1120 宽窗口下放得下）。 */
 export const TOKEN_METRIC_LABELS: Record<TokenMetric, { label: string; short: string; hint: string; unit: string }> = {

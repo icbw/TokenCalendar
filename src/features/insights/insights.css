@@ -403,22 +403,6 @@
   gap: 8px;
 }
 
-.credit-combo-model {
-  border-top: 1px solid var(--border);
-  padding-top: 6px;
-}
-
-.credit-combo-model-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--font-size-xs);
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 2px;
-}
-
-/* 双组图固定语义色图例（与 charts COMBO_* 常量一一对应） */
 .combo-legend {
   display: flex;
   flex-wrap: wrap;
@@ -428,6 +412,10 @@
 .combo-legend .legend-item {
   cursor: default;
   padding: 0;
+}
+
+.combo-legend .combo-legend-note {
+  color: var(--text-faint);
 }
 
 .credit-total-item {

@@ -5,11 +5,11 @@
 // 手写 SVG 图表见 charts.tsx。
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { events, usageService } from '../../services'
-import type { CreditSummary, RangeSeriesPoint, RangeSeriesResult, TokenMetric } from '../../services'
+import type { CreditSummary, RangeSeriesResult, TokenMetric } from '../../services'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
-import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, colorShades, COMBO_IN, COMBO_OUT, COMBO_CREDIT, type ComboSeries, type SeriesSpec } from './charts'
+import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, colorShades, shadeLadder, COMBO_CREDIT, COMBO_PART_SHADES, UNITEMIZED_COLOR, type ComboCredit, type ComboGroup, type ComboPart, type SeriesSpec } from './charts'
 import { formatFull } from '../matrix/matrixScale'
-import { OUTLIER_Z, TIME_METRIC_LABELS, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_PARTS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
+import { OUTLIER_Z, TIME_METRIC_LABELS, PART_PRICE_ORDER, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_PARTS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import PricingBlock from './PricingBlock'
@@ -135,6 +135,7 @@ function useTrendBlock() {
     }
   }, [startDay, endDay, effectiveBucket, dimension, metric, filterKey, refreshTick, partsMode])
 
+  const partsView = partsMode && parts !== null
   const series: SeriesSpec[] = useMemo(() => {
     if (!data) return []
     if (partsMode && parts && data.seriesKeys.length > 0) return partSeries(data, parts, filterKey)
@@ -150,8 +151,8 @@ function useTrendBlock() {
         .filter(() => dimension !== 'total')
         .map((s) => ({ key: s.key, label: s.label, color: s.color, value: s.values.reduce((a, b) => a + b, 0) }))
         .filter((s) => s.value > 0)
-        .sort((a, b) => b.value - a.value),
-    [series, dimension],
+        .sort((a, b) => (partsView ? 0 : b.value - a.value)),
+    [series, dimension, partsView],
   )
   const donutUnit = isTimeMetric(metric)
     ? TIME_METRIC_LABELS[metric].unit
@@ -276,9 +277,9 @@ function useTrendBlock() {
         ) : series.length === 0 || series.every((s) => s.values.every((v) => v === 0)) ? (
           <div className="insight-empty">No usage records in this range</div>
         ) : kind === 'line' ? (
-          <LineChart series={series} buckets={buckets} formatValue={timeFmt} />
+          <LineChart series={series} buckets={buckets} formatValue={timeFmt} ordered={partsView} />
         ) : (
-          <StackedBarChart series={series} buckets={buckets} formatValue={timeFmt} />
+          <StackedBarChart series={series} buckets={buckets} formatValue={timeFmt} ordered={partsView} />
         )}
 
         {/* 占比环:与主图同口径（维度/指标/范围/筛选）*/}
@@ -298,22 +299,26 @@ function useTrendBlock() {
   }
 }
 
-/** 单模型的 token 分项序列:四个分项（+ 源里只报总量、无分项的余量）按范围总量从多到少排序,
- * 依次取该模型本色由深到浅——最多的分项与该模型的总量同色,堆叠柱最深的一段在底部。
- * 全零分项不出现;每个桶的分项和恒等于总量。 */
+/** 单模型的 token 分项序列:按价格从高到低（Output → Input → Cache write → Cache read）固定排列,
+ * 依次取该模型本色由深到浅——最深的 Output 与该模型总量同色,堆叠柱自下而上同序。
+ * 源里只报总量、无分项的余量（Codex）另列 Unitemized（中性灰,不在价格色阶内）。
+ * 全零分项不出现（颜色仍按固定档位,不因缺项而顺移）;每个桶的分项和恒等于总量。 */
 function partSeries(total: RangeSeriesResult, parts: (RangeSeriesResult | null)[], modelKey: string): SeriesSpec[] {
   const totals = total.points.map((p) => p.values[0] ?? 0)
-  const specs = TOKEN_PARTS.map((m, j) => ({
+  const valuesOf = (m: TokenMetric) => {
+    const r = parts[TOKEN_PARTS.indexOf(m as (typeof TOKEN_PARTS)[number])]
+    return totals.map((_, i) => r?.points[i]?.values[0] ?? 0)
+  }
+  const shades = colorShades(modelKey, PART_PRICE_ORDER.length)
+  const specs: SeriesSpec[] = PART_PRICE_ORDER.map((m, k) => ({
     key: `${modelKey}::${m}`,
     label: TOKEN_METRIC_LABELS[m].label,
-    values: totals.map((_, i) => parts[j]?.points[i]?.values[0] ?? 0),
+    values: valuesOf(m),
+    color: shades[k],
   }))
   const rest = totals.map((t, i) => Math.max(0, t - specs.reduce((a, s) => a + s.values[i], 0)))
-  specs.push({ key: `${modelKey}::unitemized`, label: 'Unitemized', values: rest })
-  const sum = (v: number[]) => v.reduce((a, b) => a + b, 0)
-  const shown = specs.filter((s) => sum(s.values) > 0).sort((a, b) => sum(b.values) - sum(a.values))
-  const shades = colorShades(modelKey, shown.length)
-  return shown.map((s, i) => ({ ...s, color: shades[i] }))
+  specs.push({ key: `${modelKey}::unitemized`, label: 'Unitemized', values: rest, color: UNITEMIZED_COLOR })
+  return specs.filter((s) => s.values.some((v) => v > 0))
 }
 
 // ---- 异常日（31 天 z-score） ----
@@ -511,7 +516,7 @@ function CreditBlock() {
             <div className="credit-total-item credit-total-note">
               <span className="credit-total-label">Local session credits · may run slightly below the official bill</span>
             </div>
-            <label className="credit-mode-toggle" title="Split token bars into per-model groups with one credit curve each">
+            <label className="credit-mode-toggle" title="One bar per model side by side in the same chart, with one credit curve per model">
               <input type="checkbox" checked={byModel} onChange={(e) => setByModel(e.target.checked)} />
               By model
             </label>
@@ -524,9 +529,11 @@ function CreditBlock() {
   )
 }
 
-/** 双组图装配:tokens 序列（get_range_series 月内 input/output;天/小时粒度可切）
+/** 双组图装配:tokens 分项序列（get_range_series 月内 total + 四分项;天/小时粒度可切）
  * + credit 日序列（credit_summary.by_day / by_model_day）。共享横轴:天粒度 =
  * 每日一组柱;小时粒度 = 每日内 24 根小时细柱（横轴仍按天分组,组内并排）。
+ * 按模型:所有模型画在同一张图里——天粒度每日每模型一根并排柱 + 每模型一条 credit 曲线;
+ * 小时粒度柱仍是全部合计（每模型 24 根细柱放不下）,credit 曲线按模型。
  * credit 只有日粒度（daily_usage.credit）,小时档下曲线保持按日对齐。
  * 无积分的日断线表达,不伪装成 0。 */
 function ComboBlock({ month, summary, byModel, bucket }: {
@@ -535,9 +542,10 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   byModel: boolean
   bucket: 'day' | 'hour'
 }) {
-  const [tokIn, setTokIn] = useState<RangeSeriesResult | null>(null)
-  const [tokOut, setTokOut] = useState<RangeSeriesResult | null>(null)
+  // [total, ...PART_PRICE_ORDER] 五条序列（total 用来算只报总量的余量）
+  const [tok, setTok] = useState<(RangeSeriesResult | null)[] | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
+  const modelBars = byModel && bucket === 'day'
 
   useEffect(() => {
     let timer = 0
@@ -555,7 +563,6 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   }, [])
 
   // tokens 侧:该月首日 → 月末（含未来日,tokens 轴恒整月;未来日无数据自然为 0）。
-  // input / output 各拉一条（合计维度也能拿到精确分项）。
   useEffect(() => {
     let cancelled = false
     const [y, m] = month.split('-').map(Number)
@@ -564,128 +571,108 @@ function ComboBlock({ month, summary, byModel, bucket }: {
       startDay: `${month}-01`,
       endDay: `${month}-${pad2(last)}`,
       bucket,
-      dimension: 'total' as const,
+      dimension: modelBars ? ('model' as const) : ('total' as const),
     }
-    void Promise.all([
-      usageService.getRangeSeries({ ...base, metric: 'input' }),
-      usageService.getRangeSeries({ ...base, metric: 'output' }),
-    ]).then(([i, o]) => {
-      if (cancelled) return
-      setTokIn(i)
-      setTokOut(o)
-    })
+    void Promise.all((['total', ...PART_PRICE_ORDER] as TokenMetric[]).map((metric) => usageService.getRangeSeries({ ...base, metric }))).then(
+      (res) => {
+        if (!cancelled) setTok(res)
+      },
+    )
     return () => {
       cancelled = true
     }
-  }, [month, bucket, refreshTick])
+  }, [month, bucket, modelBars, refreshTick])
 
-  // 横轴 = 积分轴（后端已补零至 min（月末, 今日)）;tokens 值按日并入
+  // 横轴 = 积分轴（后端已补零至 min（月末, 今日)）;tokens 与横轴同从月初起,按下标对齐
   const buckets = summary.byDay.map((d) => d.day)
-  // tokens 值表:day 粒度直接 day → 值;hour 粒度按天分桶（组内小时并排由
-  // ComboChart 的 hourPoints 承载,这里把 24 点聚到所属日）。
-  const tokInByDay = useMemo(() => {
-    const map = new Map<string, number[]>()
-    if (tokIn === null) return map
-    if (bucket === 'day') {
-      for (const p of tokIn.points) map.set(p.bucket, p.values)
-    } else {
-      for (const p of tokIn.points) {
-        const day = p.bucket.slice(0, 10)
-        map.set(day, [...(map.get(day) ?? []), ...p.values])
-      }
+  const parts: ComboPart[] = [
+    ...PART_PRICE_ORDER.map((m) => ({ key: m, label: TOKEN_METRIC_LABELS[m].label })),
+    { key: 'unitemized', label: 'Unitemized' },
+  ]
+
+  const view = useMemo(() => {
+    if (tok === null || tok.some((r) => r === null)) return null
+    const res = tok as RangeSeriesResult[]
+    const at = (r: RangeSeriesResult, key: string, point: number) => {
+      const idx = r.seriesKeys.indexOf(key)
+      return idx < 0 ? 0 : r.points[point]?.values[idx] ?? 0
     }
-    return map
-  }, [tokIn, bucket])
-  const tokOutByDay = useMemo(() => {
-    const map = new Map<string, number[]>()
-    if (tokOut === null) return map
-    if (bucket === 'day') {
-      for (const p of tokOut.points) map.set(p.bucket, p.values)
-    } else {
-      for (const p of tokOut.points) {
-        const day = p.bucket.slice(0, 10)
-        map.set(day, [...(map.get(day) ?? []), ...p.values])
-      }
+    // 一个桶（或小时点）的分项:价格顺序四项 + 余量（total − 四项和,仅 Codex 只报总量的调用会有）
+    const partVals = (key: string, point: number) => {
+      const vals = PART_PRICE_ORDER.map((_, j) => at(res[j + 1], key, point))
+      const rest = Math.max(0, at(res[0], key, point) - vals.reduce((a, b) => a + b, 0))
+      return [...vals, rest]
     }
-    return map
-  }, [tokOut, bucket])
-
-  // 合计模式:单组合图（in/out 两段柱 + 总 credit 曲线）
-  const comboSeries = useMemo<ComboSeries[]>(() => {
-    if (byModel) return []
-    return buckets.map((day) => ({
-      input: (tokInByDay.get(day) ?? [0]).reduce((a, b) => a + b, 0),
-      output: (tokOutByDay.get(day) ?? [0]).reduce((a, b) => a + b, 0),
-      credit: summary.byDay.find((d) => d.day === day)?.credit ?? null,
-      inputHours: bucket === 'hour' ? tokInByDay.get(day) : undefined,
-      outputHours: bucket === 'hour' ? tokOutByDay.get(day) : undefined,
-    }))
+    const groups: ComboGroup[] = modelBars
+      ? summary.byModelDay.map((m) => ({
+          key: m.key,
+          label: m.label,
+          colors: [...colorShades(m.key, PART_PRICE_ORDER.length), UNITEMIZED_COLOR],
+          values: buckets.map((_, bi) => partVals(m.key, bi)),
+        }))
+      : [
+          {
+            key: '__total__',
+            label: 'All sources',
+            colors: [...COMBO_PART_SHADES, UNITEMIZED_COLOR],
+            values: buckets.map((_, bi) =>
+              bucket === 'day'
+                ? partVals('__total__', bi)
+                : Array.from({ length: 24 }, (_, h) => partVals('__total__', bi * 24 + h)).reduce(
+                    (acc, v) => acc.map((a, k) => a + v[k]),
+                    new Array(parts.length).fill(0),
+                  ),
+            ),
+            hours: bucket === 'hour' ? buckets.map((_, bi) => Array.from({ length: 24 }, (_, h) => partVals('__total__', bi * 24 + h))) : undefined,
+          },
+        ]
+    const credits: ComboCredit[] = byModel
+      ? summary.byModelDay.map((m) => {
+          const byDay = new Map(m.byDay.map((d) => [d.day, d.credit]))
+          return { key: m.key, label: m.label, color: colorFor(m.key), values: buckets.map((day) => byDay.get(day) ?? null) }
+        })
+      : [{ key: 'credit', label: 'credit', color: COMBO_CREDIT, values: buckets.map((day) => summary.byDay.find((d) => d.day === day)?.credit ?? null) }]
+    const hasRest = groups.some((g) => g.values.some((v) => (v[PART_PRICE_ORDER.length] ?? 0) > 0))
+    return { groups, credits, hasRest }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [byModel, buckets.join(','), tokInByDay, tokOutByDay, summary, bucket])
+  }, [tok, buckets.join(','), summary, byModel, modelBars, bucket])
 
-  // 按模型模式:每模型一组并排柱（in/out 两段）+ 每模型一条 credit 曲线。
-  // tokens 按模型 = get_range_series（model 维) 的 in/out 两条序列按日并入;
-  // credit 按模型 = by_model_day。只列积分账本里出现过的模型（有 credit 的）,
-  // tokens-only 模型不单独成组（其用量已含在别处柱高,避免卡片爆炸）。
-  const perModel = useMemo(() => {
-    if (!byModel || tokIn === null || tokOut === null) return []
-    const inByKey = new Map(tokIn.seriesKeys.map((k, i) => [k, i]))
-    const outByKey = new Map(tokOut.seriesKeys.map((k, i) => [k, i]))
-    return summary.byModelDay.map((m) => {
-      const creditByDay = new Map(m.byDay.map((d) => [d.day, d.credit]))
-      const inIdx = inByKey.get(m.key)
-      const outIdx = outByKey.get(m.key)
-      const series: ComboSeries[] = buckets.map((day, bi) => ({
-        input: inIdx !== undefined ? dayValue(tokIn, inIdx, day, bi, bucket) : 0,
-        output: outIdx !== undefined ? dayValue(tokOut, outIdx, day, bi, bucket) : 0,
-        credit: creditByDay.get(day) ?? null,
-        inputHours: inIdx !== undefined && bucket === 'hour' ? splitDayHours(tokIn.points, bi, inIdx) : undefined,
-        outputHours: outIdx !== undefined && bucket === 'hour' ? splitDayHours(tokOut.points, bi, outIdx) : undefined,
-      }))
-      return { key: m.key, label: m.label, series }
-    })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [byModel, buckets.join(','), tokIn, tokOut, summary, bucket])
-
-  if (tokIn === null || tokOut === null) {
+  if (view === null) {
     return <div className="insight-empty">Loading…</div>
   }
 
+  // 按模型时图例:模型色（柱 = 该模型色阶,线 = 该模型 credit）+ 中性色阶说明分项深浅
+  const legendShades = modelBars ? shadeLadder(220, 0.1, 0.36, PART_PRICE_ORDER.length) : COMBO_PART_SHADES
   return (
     <div className="credit-combo">
-      {!byModel && comboSeries.length > 0 && (
-        <ComboChart series={comboSeries} buckets={buckets} />
-      )}
-      {byModel && perModel.map((g) => (
-        <div key={g.key} className="credit-combo-model">
-          <div className="credit-combo-model-label">
-            <span className="legend-swatch" style={{ background: colorFor(g.key) }} />
-            {g.label}
-          </div>
-          <ComboChart series={g.series} buckets={buckets} height={150} />
-        </div>
-      ))}
+      <ComboChart parts={parts} groups={view.groups} credits={view.credits} buckets={buckets} />
       <div className="combo-legend">
-        <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_IN }} />Input tokens</span>
-        <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_OUT }} />Output tokens</span>
-        <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_CREDIT }} />credit (right axis)</span>
+        {byModel &&
+          summary.byModelDay.map((m) => (
+            <span key={m.key} className="legend-item">
+              <span className="legend-swatch" style={{ background: colorFor(m.key) }} />
+              {m.label}
+            </span>
+          ))}
+        {PART_PRICE_ORDER.map((m, i) => (
+          <span key={m} className="legend-item" title={TOKEN_METRIC_LABELS[m].hint}>
+            <span className="legend-swatch" style={{ background: legendShades[i] }} />
+            {TOKEN_METRIC_LABELS[m].label}
+          </span>
+        ))}
+        {view.hasRest && (
+          <span className="legend-item" title="Tokens reported only as a total, without a breakdown">
+            <span className="legend-swatch" style={{ background: UNITEMIZED_COLOR }} />
+            Unitemized
+          </span>
+        )}
+        {!byModel && (
+          <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_CREDIT }} />credit (right axis)</span>
+        )}
+        {byModel && <span className="legend-item combo-legend-note">bars: tokens by model (dark → light = Output → Cache read) · lines: credit (right axis)</span>}
       </div>
     </div>
   )
-}
-
-/** hour 粒度:取某模型某日在 hour 轴上的 24 值。 */
-function splitDayHours(points: RangeSeriesPoint[], dayIdx: number, seriesIdx: number): number[] {
-  const base = dayIdx * 24
-  const out: number[] = []
-  for (let h = 0; h < 24; h++) out.push(points[base + h]?.values[seriesIdx] ?? 0)
-  return out
-}
-
-/** hour 粒度的日合计（in/out 总值）。 */
-function dayValue(res: RangeSeriesResult, seriesIdx: number, _day: string, dayIdx: number, bucket: 'day' | 'hour'): number {
-  if (bucket === 'day') return res.points[dayIdx]?.values[seriesIdx] ?? 0
-  return splitDayHours(res.points, dayIdx, seriesIdx).reduce((a, b) => a + b, 0)
 }
 
 export default function InsightsView() {

@@ -45,12 +45,21 @@ export function colorFor(key: string): string {
 }
 
 /** 同一系列的 n 级深浅（[0] = colorFor（key) 本色,逐级变浅到接近底色）。
- * 用于单模型的 token 分项:分项按量从多到少依次取色,最多的与该模型总量同色。 */
+ * 用于 token 分项:按价格从高到低（Output → Input → Cache write → Cache read）依次取色,
+ * 最深一级与该系列总量同色。 */
 export function colorShades(key: string, n: number): string[] {
   const { h, s, l } = colorParts(key)
-  const top = 0.88 // 最浅一级:白底上仍可辨
+  return shadeLadder(h, s, l, n)
+}
+
+/** 从 （h,s,l) 起逐级均匀变浅到 L=0.88 的 n 级色阶（最浅一级在白底上仍可辨）。 */
+export function shadeLadder(h: number, s: number, l: number, n: number): string[] {
+  const top = 0.88
   return Array.from({ length: n }, (_, i) => hsl(h, s, n <= 1 ? l : l + ((top - l) * i) / (n - 1)))
 }
+
+/** 分项之外的「只报总量、无拆分」余量（Codex）:不属于价格色阶,用中性灰。 */
+export const UNITEMIZED_COLOR = hsl(220, 0.08, 0.74)
 
 function colorParts(key: string): { h: number; s: number; l: number } {
   const fam = familyOf(key)
@@ -75,11 +84,10 @@ function seriesColor(s: { key: string; color?: string }): string {
   return s.color ?? colorFor(s.key)
 }
 
-// 双组图固定语义色:in=蓝 out=绿 credit=玫红——玫红与 tokens 合计曲线（红/粉族）
-// 同视觉家族,琥珀等暖黄与紫蓝系不协调;credit 曲线与主图同用 smoothPath。
-export const COMBO_IN = hsl(217, 0.72, 0.53) // blue-500 族
-export const COMBO_OUT = hsl(152, 0.66, 0.44) // green-600 族
-export const COMBO_CREDIT = hsl(348, 0.78, 0.58) // 玫红（tokens 合计曲线同族）
+// 双组图合计模式:tokens 四分项取蓝色阶（Output 最深 → Cache read 最浅）,credit = 玫红——
+// 玫红与紫蓝系协调,琥珀等暖黄不协调;credit 曲线与主图同用 smoothPath。
+export const COMBO_PART_SHADES = shadeLadder(217, 0.72, 0.45, 4)
+export const COMBO_CREDIT = hsl(348, 0.78, 0.58)
 
 // ---- 公共几何 ----
 
@@ -199,7 +207,7 @@ interface HoverState {
 
 // ---- 通用 hover 层（crosshair + 卡片 tooltip） ----
 
-function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, stackedTotal, scale = 1, fmt = formatFull }: {
+function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, stackedTotal, scale = 1, fmt = formatFull, ordered = false }: {
   hover: HoverState
   plot: { w: number; h: number }
   bucketLabels: string[]
@@ -212,6 +220,8 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
    * 格子缩小时 tooltip 保持真实 CSS 像素尺寸可读。 */
   scale?: number
   fmt?: ValueFormat
+  /** true = 行按系列原顺序（分项的价格顺序）,不按值降序。 */
+  ordered?: boolean
 }) {
   const i = hover.index
   const total = series.reduce((s, sr) => s + (sr.values[i] ?? 0), 0)
@@ -224,7 +234,7 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   const allRows = series
     .map((s) => ({ label: s.label, value: s.values[i] ?? 0, color: seriesColor(s) }))
     .filter((r) => r.value > 0)
-    .sort((a, b) => b.value - a.value)
+    .sort((a, b) => (ordered ? 0 : b.value - a.value))
   const availH = Math.max(HEAD_H + ROW_H, height - 10)
   const fitsAll = HEAD_H + allRows.length * ROW_H <= availH
   const shown = fitsAll ? allRows.length : Math.max(1, Math.floor((availH - HEAD_H - MORE_H) / ROW_H))
@@ -288,7 +298,9 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
 // showXAxis=false 再去底部日期刻度（面板与矩阵格子共用列模板,日期由表头行表达）;
 // 无 Y 轴时 margin 走 compactMargin,绘图区与格子列对齐,宽度随 --cells-w 等比缩放。
 
-export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns }: {
+export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns, ordered }: {
+  /** tooltip 行保持系列顺序（分项视图）。 */
+  ordered?: boolean
   series: SeriesSpec[]
   buckets: string[]
   height?: number
@@ -368,7 +380,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
             />
           ))}
           <HoverCard
-            hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} scale={svgScale} fmt={formatValue}
+            hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} scale={svgScale} fmt={formatValue} ordered={ordered}
           />
         </>
       )}
@@ -378,7 +390,9 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
 
 // ---- 堆叠柱图（圆角顶 + crosshair） ----
 
-export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns }: {
+export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns, ordered }: {
+  /** tooltip 行保持系列顺序（分项视图）。 */
+  ordered?: boolean
   series: SeriesSpec[]
   buckets: string[]
   height?: number
@@ -463,30 +477,48 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
       })}
       {hover && hover.index < n && (
         <HoverCard
-          hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} stackedTotal scale={svgScale} fmt={formatValue}
+          hover={hover} plot={plot} bucketLabels={buckets} series={series} height={height} margin={margin} yMax={yMax} stackedTotal scale={svgScale} fmt={formatValue} ordered={ordered}
         />
       )}
     </svg>
   )
 }
 
-// ---- 双组组合图:tokens in/out 双段堆叠柱 + credit 曲线叠加 ----
+// ---- 双组组合图:tokens 分项堆叠柱 + credit 曲线叠加 ----
 // 两套账本两个纵轴（左 = tokens,右 = credit）,共享横轴 = 天;积分曲线只画到
 // 导出覆盖的最后一天（数据缺口断线表达,不伪装成 0）。
+// 多个模型画在同一张图里:天粒度每日一组并排柱（每模型一根,柱内分项堆叠,取该模型色阶）,
+// 每模型一条 credit 曲线（模型本色）;小时粒度每日内 24 根细柱（只画第一个柱组）。
 
-export interface ComboSeries {
-  /** 输入 tokens（未命中近似口径;柱只分 in/out 两段,cache 不单列）。 */
-  input: number
-  output: number
-  /** 当日 credit;null = 积分账本未覆盖该日（断线,≠0）。 */
-  credit: number | null
-  /** 小时粒度:日内 24 小时 tokens 细柱（缺省 = 天粒度单柱）。 */
-  inputHours?: number[]
-  outputHours?: number[]
+export interface ComboPart {
+  key: string
+  label: string
 }
 
-export function ComboChart({ series, buckets, height = 230 }: {
-  series: ComboSeries[]
+/** 一个柱组（合计或一个模型）。values / hours 的分项维与 parts 同序,自下而上堆叠。 */
+export interface ComboGroup {
+  key: string
+  label: string
+  /** 与 parts 同序的分项色。 */
+  colors: string[]
+  /** [桶][分项] */
+  values: number[][]
+  /** 小时粒度:[桶][小时 0-23][分项]（缺省 = 天粒度单柱）。 */
+  hours?: number[][][]
+}
+
+/** 一条 credit 曲线;null = 积分账本未覆盖该日（断线,≠0）。 */
+export interface ComboCredit {
+  key: string
+  label: string
+  color: string
+  values: (number | null)[]
+}
+
+export function ComboChart({ parts, groups, credits, buckets, height = 230 }: {
+  parts: ComboPart[]
+  groups: ComboGroup[]
+  credits: ComboCredit[]
   buckets: string[]
   height?: number
 }) {
@@ -498,30 +530,64 @@ export function ComboChart({ series, buckets, height = 230 }: {
   const plot = { w: width - margin.left - margin.right, h: height - margin.top - margin.bottom }
   const n = buckets.length
   const slot = n > 0 ? plot.w / n : plot.w
-  // 小时档:每组内 24 根细柱并排;天档:单柱。
-  const hasHours = series.some((s) => (s.inputHours?.length ?? 0) > 0 || (s.outputHours?.length ?? 0) > 0)
+  const hasHours = groups.some((g) => (g.hours?.length ?? 0) > 0)
+  const G = Math.max(1, groups.length)
+  const gap = G > 1 ? 1 : 0
   const barW = hasHours
     ? Math.max(1.5, Math.min((slot * 0.9) / 24 - 0.6, 6))
-    : Math.max(2, Math.min(slot * 0.72, 26))
+    : Math.max(1.5, Math.min((slot * 0.8 - (G - 1) * gap) / G, 26))
 
-  const tokTotals = buckets.map((_, i) => (series[i]?.input ?? 0) + (series[i]?.output ?? 0))
-  const tokMax = niceMax(Math.max(1, ...tokTotals))
-  const creditVals = series.map((s) => s.credit).filter((c): c is number => c !== null && c > 0)
+  const sum = (v: number[] | undefined) => (v ?? []).reduce((a, b) => a + b, 0)
+  const groupTotal = (g: ComboGroup, i: number) => sum(g.values[i])
+  const barPeak = hasHours
+    ? Math.max(1, ...groups.flatMap((g) => (g.hours ?? []).flatMap((day) => day.map((h) => sum(h)))))
+    : Math.max(1, ...groups.flatMap((g) => buckets.map((_, i) => groupTotal(g, i))))
+  const tokMax = niceMax(barPeak)
+  const creditVals = credits.flatMap((c) => c.values).filter((c): c is number => c !== null && c > 0)
   // credit 恒 ≥ 0;轴上限给 10% 余量防贴顶
   const creditMax = niceMax(creditVals.length > 0 ? Math.max(...creditVals) * 1.1 : 1)
 
+  const base = margin.top + plot.h
   const xOf = (i: number) => margin.left + (i + 0.5) * slot
-  const yTok = (v: number) => margin.top + plot.h - (v / tokMax) * plot.h
-  const yCredit = (v: number) => margin.top + plot.h - (v / creditMax) * plot.h
+  const yTok = (v: number) => base - (v / tokMax) * plot.h
+  const yCredit = (v: number) => base - (v / creditMax) * plot.h
 
-  // credit 曲线路径:跳过 null（账本未覆盖日断线）;连续 <2 点不画曲线只画点。
-  // 平滑度与 tokens 合计曲线一致（同 smoothPath）。
-  const creditPts: [number, number][] = []
-  buckets.forEach((_, i) => {
-    const c = series[i]?.credit
-    if (c !== null && c !== undefined) creditPts.push([xOf(i), yCredit(c)])
+  // 一根分项堆叠柱:底 = 第 0 项（价格最高的 Output）;只有最上一段画顶部圆角
+  const stackBar = (key: string, x: number, w: number, vals: number[], colors: string[]) => {
+    if (sum(vals) <= 0) return null
+    let acc = 0
+    const rr = Math.min(3, w / 2)
+    return (
+      <g key={key}>
+        {vals.map((v, pi) => {
+          if (v <= 0) return null
+          const h = (v / tokMax) * plot.h
+          const y = base - acc - h
+          acc += h
+          const isTop = vals.slice(pi + 1).every((u) => u <= 0)
+          return (
+            <path
+              key={pi}
+              d={isTop && rr > 0 && h > rr
+                ? `M${x},${y + rr} Q${x},${y} ${x + rr},${y} L${x + w - rr},${y} Q${x + w},${y} ${x + w},${y + rr} L${x + w},${y + h} L${x},${y + h} Z`
+                : `M${x},${y} L${x + w},${y} L${x + w},${y + h} L${x},${y + h} Z`}
+              fill={colors[pi]}
+            />
+          )
+        })}
+      </g>
+    )
+  }
+
+  // credit 曲线:跳过 null（账本未覆盖日断线）;连续 <2 点不画曲线只画点。
+  const creditPaths = credits.map((c) => {
+    const pts: [number, number][] = []
+    buckets.forEach((_, i) => {
+      const v = c.values[i]
+      if (v !== null && v !== undefined) pts.push([xOf(i), yCredit(v)])
+    })
+    return { ...c, pts, line: smoothPath(pts) }
   })
-  const creditLine = smoothPath(creditPts)
 
   const onMove = (e: React.MouseEvent) => {
     const rect = svgRef.current?.getBoundingClientRect()
@@ -532,19 +598,35 @@ export function ComboChart({ series, buckets, height = 230 }: {
     setHover({ index: i, x: xOf(i), y: e.clientY - rect.top })
   }
 
-  // tooltip:柱两段 + credit（null 显示「未覆盖」）
-  const tooltipRows = hover
-    ? [
-        { label: 'Input', value: series[hover.index]?.input ?? 0, color: COMBO_IN },
-        { label: 'Output', value: series[hover.index]?.output ?? 0, color: COMBO_OUT },
-      ]
-        .filter((r) => r.value > 0)
-        .concat(
-          series[hover.index]?.credit !== null && series[hover.index]?.credit !== undefined
-            ? [{ label: 'credit', value: series[hover.index]!.credit!, color: COMBO_CREDIT }]
-            : [],
-        )
-    : []
+  // tooltip:单柱组 = 各分项（价格顺序）;多柱组 = 每模型总量;再列各 credit
+  type Row = { key: string; label: string; value: number; color: string; credit?: boolean }
+  const tooltipRows: Row[] = []
+  let dayTotal = 0
+  let uncovered = false
+  if (hover) {
+    const i = hover.index
+    dayTotal = groups.reduce((a, g) => a + groupTotal(g, i), 0)
+    if (groups.length === 1) {
+      parts.forEach((p, pi) => {
+        const v = groups[0].values[i]?.[pi] ?? 0
+        if (v > 0) tooltipRows.push({ key: p.key, label: p.label, value: v, color: groups[0].colors[pi] })
+      })
+    } else {
+      for (const g of groups) {
+        const v = groupTotal(g, i)
+        if (v > 0) tooltipRows.push({ key: `t:${g.key}`, label: g.label, value: v, color: g.colors[0] })
+      }
+    }
+    for (const c of credits) {
+      const v = c.values[i]
+      if (v !== null && v !== undefined) {
+        tooltipRows.push({ key: `c:${c.key}`, label: credits.length > 1 ? `${c.label} · credit` : 'credit', value: v, color: c.color, credit: true })
+      } else {
+        uncovered = true
+      }
+    }
+  }
+  const tipW = 220
 
   return (
     <svg
@@ -552,21 +634,21 @@ export function ComboChart({ series, buckets, height = 230 }: {
       onMouseMove={onMove} onMouseLeave={() => setHover(null)}
     >
       <defs>
-        {/* credit 曲线渐变面积（与 tokens 合计曲线同款曲线+渐变质感）*/}
+        {/* 单条 credit 曲线带渐变面积;多条（按模型）只画线,免得面积互相遮盖*/}
         <linearGradient id="combo-credit-grad" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={COMBO_CREDIT} stopOpacity={0.18} />
           <stop offset="100%" stopColor={COMBO_CREDIT} stopOpacity={0.02} />
         </linearGradient>
       </defs>
-      {/* 左轴网格（tokens）+ 右轴刻度（credit,共享横轴双纵轴）*/}
+      {/* 左轴网格（tokens）+ 右轴刻度（credit,共享网格线,按各自量程标值）*/}
       {yTicks(tokMax).map((t, i) => (
         <g key={i}>
           <line x1={margin.left} x2={margin.left + plot.w} y1={yTok(t)} y2={yTok(t)} stroke="var(--border)" strokeWidth={1} />
           <text x={margin.left - 6} y={yTok(t) + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
             {formatAxis(t)}
           </text>
-          <text x={margin.left + plot.w + 6} y={yCredit(t) + 3} textAnchor="start" fontSize={10} fill={COMBO_CREDIT} opacity={0.75}>
-            {formatAxis(t)}
+          <text x={margin.left + plot.w + 6} y={yTok(t) + 3} textAnchor="start" fontSize={10} fill={COMBO_CREDIT} opacity={0.75}>
+            {formatAxis((t / tokMax) * creditMax)}
           </text>
         </g>
       ))}
@@ -576,97 +658,45 @@ export function ComboChart({ series, buckets, height = 230 }: {
           <text key={b} x={xOf(i)} y={height - 6} textAnchor="middle" fontSize={10} fill="var(--text-faint)">{lbl}</text>
         ) : null
       })}
-      {/* tokens 柱:小时档 = 组内 24 根细柱（in 蓝组 + out 绿组并排）;
-          天档 = in（下,蓝）+ out（上,绿）双段单柱,总高 = 总 tokens*/}
+      {/* tokens 柱:小时档 = 组内 24 根细柱;天档 = 每模型一根并排,柱内分项堆叠,柱高 = 该模型总 tokens*/}
       {buckets.map((b, i) => {
-        const s = series[i]
-        if (!s || (s.input <= 0 && s.output <= 0)) return null
-        if (hasHours && (s.inputHours?.length ?? 0) > 0) {
-          // 组内小时并排:in 细柱组（蓝）+ out 细柱组（绿）,各自按小时值立高
-          const groupX = margin.left + i * slot
-          const inBars = (s.inputHours ?? []).map((v, h) => ({ v, h })).filter((x) => x.v > 0)
-          const outBars = (s.outputHours ?? []).map((v, h) => ({ v, h })).filter((x) => x.v > 0)
-          const inW = inBars.length * barW
-          const outW = outBars.length * barW
-          const groupGap = inW > 0 && outW > 0 ? 2 : 0
-          const totalW = inW + outW + groupGap
-          let x = groupX + (slot - totalW) / 2
-          const inRects = inBars.map(({ v, h }) => {
-            const bh = (v / tokMax) * plot.h
-            const rect = (
-              <path
-                key={`i${h}`}
-                d={`M${x},${margin.top + plot.h - bh} L${x + barW},${margin.top + plot.h - bh} L${x + barW},${margin.top + plot.h} L${x},${margin.top + plot.h} Z`}
-                fill={COMBO_IN}
-              />
-            )
-            x += barW
-            return rect
-          })
-          if (groupGap > 0) x += groupGap
-          const outRects = outBars.map(({ v, h }) => {
-            const bh = (v / tokMax) * plot.h
-            const rect = (
-              <path
-                key={`o${h}`}
-                d={`M${x},${margin.top + plot.h - bh} L${x + barW},${margin.top + plot.h - bh} L${x + barW},${margin.top + plot.h} L${x},${margin.top + plot.h} Z`}
-                fill={COMBO_OUT}
-              />
-            )
-            x += barW
-            return rect
-          })
-          return <g key={b}>{inRects}{outRects}</g>
+        if (hasHours) {
+          const g = groups[0]
+          const hours = g?.hours?.[i] ?? []
+          const x0 = margin.left + i * slot + (slot - 24 * barW) / 2
+          return <g key={b}>{hours.map((vals, h) => stackBar(`h${h}`, x0 + h * barW, Math.max(1, barW - 0.4), vals, g.colors))}</g>
         }
-        const x = margin.left + (i + 0.5) * slot - barW / 2
-        const vin = s.input
-        const vout = s.output
-        const hin = (vin / tokMax) * plot.h
-        const hout = (vout / tokMax) * plot.h
-        const yIn = margin.top + plot.h - hin
-        const yOut = yIn - hout
-        const isTop = vout > 0
-        const rr = Math.min(3, barW / 2)
-        return (
-          <g key={b}>
-            {hin > 0 && (
-              <path d={`M${x},${yIn} L${x + barW},${yIn} L${x + barW},${margin.top + plot.h} L${x},${margin.top + plot.h} Z`} fill={COMBO_IN} />
-            )}
-            {hout > 0 && (
-              <path
-                d={isTop && rr > 0
-                  ? `M${x},${yOut + rr} Q${x},${yOut} ${x + rr},${yOut} L${x + barW - rr},${yOut} Q${x + barW},${yOut} ${x + barW},${yOut + rr} L${x + barW},${yIn} L${x},${yIn} Z`
-                  : `M${x},${yOut} L${x + barW},${yOut} L${x + barW},${yIn} L${x},${yIn} Z`}
-                fill={COMBO_OUT}
-              />
-            )}
-          </g>
-        )
+        const x0 = xOf(i) - (G * barW + (G - 1) * gap) / 2
+        return <g key={b}>{groups.map((g, gi) => stackBar(g.key, x0 + gi * (barW + gap), barW, g.values[i] ?? [], g.colors))}</g>
       })}
-      {/* credit 曲线（右轴,玫红,平滑+渐变面积）+ 覆盖区内数据点*/}
-      {creditPts.length >= 2 && (
-        <>
-          <path
-            d={`${creditLine} L${creditPts[creditPts.length - 1][0]},${margin.top + plot.h} L${creditPts[0][0]},${margin.top + plot.h} Z`}
-            fill="url(#combo-credit-grad)"
-          />
-          <path d={creditLine} fill="none" stroke={COMBO_CREDIT} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
-        </>
-      )}
-      {creditPts.map(([px, py], i) => (
-        <circle key={i} cx={px} cy={py} r={2} fill={COMBO_CREDIT} />
+      {/* credit 曲线（右轴,平滑）+ 覆盖区内数据点*/}
+      {creditPaths.map((c) => (
+        <g key={c.key}>
+          {c.pts.length >= 2 && credits.length === 1 && (
+            <path
+              d={`${c.line} L${c.pts[c.pts.length - 1][0]},${base} L${c.pts[0][0]},${base} Z`}
+              fill="url(#combo-credit-grad)"
+            />
+          )}
+          {c.pts.length >= 2 && (
+            <path d={c.line} fill="none" stroke={c.color} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
+          )}
+          {c.pts.map(([px, py], i) => (
+            <circle key={i} cx={px} cy={py} r={2} fill={c.color} />
+          ))}
+        </g>
       ))}
       {hover && hover.index < n && (
         <g>
           <line
-            x1={hover.x} x2={hover.x} y1={margin.top} y2={margin.top + plot.h}
+            x1={hover.x} x2={hover.x} y1={margin.top} y2={base}
             stroke="var(--border-strong)" strokeDasharray="3 3" strokeWidth={1}
           />
           <foreignObject
-            x={hover.x > plot.w / 2 ? hover.x - 190 - 12 : hover.x + 12}
+            x={hover.x > plot.w / 2 ? hover.x - tipW - 12 : hover.x + 12}
             y={margin.top}
-            width={190}
-            height={30 + tooltipRows.length * 18}
+            width={tipW}
+            height={34 + tooltipRows.length * 18 + (uncovered ? 16 : 0)}
           >
             <div
               style={{
@@ -677,21 +707,17 @@ export function ComboChart({ series, buckets, height = 230 }: {
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontWeight: 700, marginBottom: 3 }}>
                 <span>{buckets[hover.index]}</span>
-                <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-                  {formatFull((series[hover.index]?.input ?? 0) + (series[hover.index]?.output ?? 0))}
-                </span>
+                <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatFull(dayTotal)}</span>
               </div>
               {tooltipRows.map((r) => (
-                <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 5, lineHeight: '18px' }}>
-                  <span style={{ width: 7, height: 7, borderRadius: 2, background: r.color, flexShrink: 0 }} />
-                  <span style={{ color: 'var(--text-muted)', flex: 1 }}>{r.label}</span>
-                  <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-                    {r.label === 'credit' ? r.value.toFixed(2) : formatFull(r.value)}
-                  </span>
+                <div key={r.key} style={{ display: 'flex', alignItems: 'center', gap: 5, lineHeight: '18px' }}>
+                  <span style={{ width: 7, height: 7, borderRadius: r.credit ? 4 : 2, background: r.color, flexShrink: 0 }} />
+                  <span style={{ color: 'var(--text-muted)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.label}</span>
+                  <span style={{ fontVariantNumeric: 'tabular-nums' }}>{r.credit ? r.value.toFixed(2) : formatFull(r.value)}</span>
                 </div>
               ))}
               {tooltipRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No data</div>}
-              {tooltipRows.length > 0 && series[hover.index]?.credit === null && (
+              {tooltipRows.length > 0 && uncovered && (
                 <div style={{ color: 'var(--text-faint)', lineHeight: '16px' }}>credit not covered</div>
               )}
             </div>

@@ -63,6 +63,7 @@ NSIS 出包会为更新包签名（`src-tauri/tauri.conf.json` 的 `plugins.upda
 
 ## 版本
 
+- **0.8.1** —— token 分项**配色按价格顺序**:Output 最深 → Input → Cache write → Cache read 最浅（最深 = 模型本色）;CodeBuddy 积分图改为四分项堆叠,**By model 时所有模型画在同一张图**(每模型并排柱 + 各自积分曲线)。只改界面,不动数据。
 - **0.7.9** —— **总 tokens 拆成 Input / Cache write / Cache read / Output 四个互斥分项**:矩阵与 Insights 新增 Cache W / Cache R 指标;Insights 筛到单个模型时按分项出图(按量从多到少,本色由深到浅,柱高 = 总量)。ZCode 的 Input 改为未命中缓存的输入(总量不变)。首次启动就地升级数据库(先自动备份,不清库)。
 - **0.7.8** —— 应用内更新改为**启动时自动检查 + 后台下载 + 系统通知,由你点 Install 才安装**（顶栏 Settings 出现提示点,直达 About）;修复更新时偶尔弹「Error opening file for writing」:程序内只跑一次下载、一个安装器,安装器也只允许单实例,并等程序文件真正可写再覆盖。不动数据。
 - **0.7.7** —— Insights → Pricing 的**官方价目表可按列排序**（默认按生效日期从新到旧,未公布的价格始终排在最后）,**价格有变动的格子标箭头**:涨价红色 ↑、降价绿色 ↓,点箭头看变动量;去掉几乎全是平线的「价格梯度」图。只改界面,不动数据。
