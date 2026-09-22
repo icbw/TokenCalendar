@@ -1,61 +1,57 @@
-//! Codex 侧的本地读数回溯（→ 实现;
-//! []）。
+//! Codex 侧的本地读数回溯。
 //!
 //! Codex CLI / Desktop 每收到一次模型响应就往 rollout 会话文件里写一条 `token_count`
 //! 事件,**服务端在那次响应里回的限流状态被原样记在同一条事件的 `payload.rate_limits`
-//! 上**。于是本机就有了一条与 Claude 桌面端 `plan-usage-history.json` 等价的额度读数
-//! 历史,而且**比那条更好**：
+//! 上**。于是本机有一条与 Claude 桌面端 `plan-usage-history.json` 等价的额度读数历史,
+//! 而且**比那条更好**：
 //!
 //! - **读数与代价写在同一行**。`payload.info.last_token_usage` 就是产生这次涨幅的那一笔
 //!   调用的 token 明细。Claude 那条路要去 `collector.db` 按轮的 `ended_at` 切区间、
 //!   还要把小时级缓存按轮体量摊回（见 bootstrap.rs）,两处近似在这里都不需要。
-//!   这不是"更好看",是**实质差别**：里两种取法各干跑一遍,用 `collector.db` 取代价
-//!   时拟合值随配对粒度在 1.73〜6.67 之间漂（3.9 倍),用同一行的 token 则稳定在
-//!   8.15〜8.66（±3%）。`turn_raw` 是按**对话轮**聚合的,一整轮几十次调用的 token 全挂在
-//!   `ended_at` 那一个时刻上,而这里的读数是**按调用**落的——错配随区间变短而放大。
-//! - **每条读数自带 `plan_type`**。Claude 那条路只能拿"当前快照的套餐"回标整段历史,
+//!   这是实质差别：`turn_raw` 按**对话轮**聚合,一整轮几十次调用的 token 全挂在 `ended_at`
+//!   那一个时刻上,而这里的读数是**按调用**落的;用 `collector.db` 取代价时拟合值随配对粒度
+//!   漂移数倍,用同一行的 token 则稳定在 ±3% 以内。
+//! - **每条读数自带 `plan_type`**。Claude 那条路只能拿「当前快照的套餐」回标整段历史,
 //!   期间升过档就会标错;这里逐条都是准的,跨套餐的区间可以直接不建样本。
 //! - **带 `resets_at`**,而 Codex 的快照本来就要显示窗尾。
 //!
 //! ## 它不只是冷启动：还是一条零请求的实时读数
 //!
 //! `rate_limits` 是 Codex 在**每次响应**里回的那个服务端数字,与 `wham/usage` 端点
-//! 同源、同精度。所以这条路除了回溯建样本,
-//! 还负责**把最新一条读数推进快照**（`update_snapshot`）——用贵模型时一个轮次就能吃掉
-//! 5h 窗的十几二十个百分点,而取数是按预计消耗触发的、还要等采集器先看见那些 token;
-//! 读数在文件里已经是真值了,没有理由让球上显示上一次取数的旧数。
+//! 同源、同精度（两边都是整数百分比）。所以这条路除了回溯建样本,还负责**把最新一条读数
+//! 推进快照**（`update_snapshot`）——用贵模型时一个轮次就能吃掉 5h 窗的十几二十个百分点,
+//! 而取数是按预计消耗触发的、还要等采集器先看见那些 token;读数在文件里已经是真值了,
+//! 没有理由让球上显示上一次取数的旧数。
 //!
 //! ## 配对方式：链式端点,一笔 token 都不丢
 //!
 //! 读数密到中位 8 秒一条,直接拿**相邻**两条配对的话,绝大多数区间会因为
 //! `dt < MIN_PAIR_SECS` 被判出界,那一段的代价就再也进不了任何样本——那是**丢样本**,
-//! 与既定原则相反（AGENTS.md / calib.rs：样本只增不删,不准靠丢样本降噪）。
+//! 与「样本只增不删,不靠丢样本降噪」的原则相反（见 calib.rs）。
 //!
 //! 所以这里按**链式端点**配对：端点之间至少相隔 `MIN_PAIR_SECS`,**跨过去的读数不是被
 //! 丢掉,而是成了区间内点**——它们对应的调用照常计入该区间的代价。每一笔 token 恰好落在
 //! 一个区间里,每一条读数要么是端点、要么是内点。
 //!
-//! 注意这**不是**"把区间拉长来降噪"：
-//! 下界仍是 `MIN_PAIR_SECS` 这个既有常量,一个新阈值都没引入;真正的问题从来不是区间太短,
-//! 是代价挂错了时刻,而这条路上它挂对了。
+//! 这**不是**「把区间拉长来降噪」：下界仍是 `MIN_PAIR_SECS`,没有引入新阈值;
+//! 问题从来不是区间太短,而是代价挂错了时刻,这条路上它挂对了。
 //!
 //! ## 区间口径：`（t0, t1]`,端点那一笔算在区间内
 //!
-//! 与 bootstrap.rs / `record_pair` 同口径（左开右闭）。这一条过：把端点那一笔改成
-//! 算进**下一个**区间（`[t0, t1)`）之后,拟合值在各配对粒度下的极差由 0.51 涨到 2.73
-//! ——含端点更自洽,因为这条读数正是那笔调用的响应带回来的。
+//! 与 bootstrap.rs / `record_pair` 同口径（左开右闭）。这条读数正是端点那笔调用的响应
+//! 带回来的,含端点更自洽;改成 `[t0, t1)` 时拟合值随配对粒度的极差明显变大。
 //!
 //! ## 增量与工作量
 //!
 //! 水位线 = `max（usage_pair 里 src='rollout' 的 MAX（t1), 上次扫到的文件 mtime, now - 回溯上限)`。
 //! **数据下界与文件下界取同一个值**（文件下界再退 `SCAN_LAG_SECS` 容错）——两者必须一致,
-//! 否则会拿"读数齐全但调用缺了一半"的区间去建样本,代价系统性偏低。
+//! 否则会拿「读数齐全但调用缺了一半」的区间去建样本,代价系统性偏低。
 //! 代价是每次扫描丢掉一个跨扫描边界的区间,按每次扫描进来几百条读数算可以忽略。
 //!
-//! **哪些文件要读,与水位线是两件事**：水位线管"要哪一段读数",要不要打开一个文件只看
+//! **哪些文件要读,与水位线是两件事**：水位线管「要哪一段读数」,要不要打开一个文件只看
 //! 它**有没有变长**（`META_FILE_SIZES`,跨重启持久）。文件下界那一路只在记录里没有
 //! 这个文件时兜底——rollout 的 mtime 在 Windows 上停在创建时刻,拿它判正在写的文件
-//! 会漏掉整个当前会话。
+//! 会漏掉整个当前会话（见 `rollout_files`）。
 //!
 //! 读数照常收割进 `desktop_sample` 永久留着（rollout 会被 Codex 归档 / 被用户清掉 /
 //! `CODEX_HOME` 改指向,源没了历史也不能跟着丢）。
@@ -76,14 +72,14 @@ pub const PAIR_SRC: &str = "rollout";
 
 /// 上次扫到的最新文件 mtime（`meta` 表的键）。
 ///
-/// 没有它,"本机有 rollout 但一条 5h 读数都没有"这种账号（老版 CLI 只回报周窗）
+/// 没有它,「本机有 rollout 但一条 5h 读数都没有」这种账号（老版 CLI 只回报周窗）
 /// 每次启动都会把整个回溯窗重扫一遍——水位线靠 `usage_pair` 推进,而它一条都建不出来。
 const META_SCANNED_MTIME: &str = "codex_rollout_scanned_mtime";
 
 /// 上次扫到每个 rollout 文件时它有多大（`meta` 表的键,JSON `{"路径": 字节数}`）。
 ///
 /// 持久化是必需的而不是优化：一个长会话的文件 mtime 停在它**开始**的时刻
-/// （见 `rollout_files`）,重启之后要是认不出"它比上次长了",那道 mtime 下界就会
+/// （见 `rollout_files`）,重启之后要是认不出「它比上次长了」,那道 mtime 下界就会
 /// 把整个文件跳过去,那段读数再也进不来。
 const META_FILE_SIZES: &str = "codex_rollout_file_sizes";
 
@@ -92,29 +88,27 @@ const META_RULE_VER: &str = "codex_rollout_pair_rule";
 
 /// 回溯上限（天）：**这是工作量上界,不是口径上界**。
 ///
-/// Claude 那边的 14 天来自"源文件只保 14 天"与"越久远越可能跨套餐";这里两条都不成立
-/// ——本机 rollout 留了 85 天,而套餐由每条读数自带、跨套餐的区间本来就会被跳过。
-/// 所以这个数唯一的作用是给**首次扫描**的 I/O 封顶：本机 30 天 = 125 个文件 / 490 MB,
-/// 90 天 = 293 个 / 884 MB,而两者拟合出来的系数只差 1%（8.28 vs 8.38）。
+/// Claude 那边的 14 天来自「源文件只保 14 天」与「越久远越可能跨套餐」;这里两条都不成立
+/// ——rollout 通常留得更久,而套餐由每条读数自带、跨套餐的区间本来就会被跳过。
+/// 所以这个数唯一的作用是给**首次扫描**的 I/O 封顶：30 天约 500 MB,放到 90 天 I/O 近乎
+/// 翻倍,拟合系数只差约 1%。
 const HORIZON_DAYS: i64 = 30;
 
 /// 文件下界相对数据下界再退这么多秒：mtime 的粒度、并发写入、时钟回拨都可能让
-/// "文件 mtime 比它里面最后一行还早一点"。退一小时是纯保险,重读几个文件而已。
+/// 「文件 mtime 比它里面最后一行还早一点」。退一小时是纯保险,重读几个文件而已。
 const SCAN_LAG_SECS: i64 = 3600;
 
 /// 5h / 7d 滚动窗在 `rate_limits` 里的窗长（分钟）。
 ///
 /// **必须按 `window_minutes` 认窗口,不能按 `primary` / `secondary` 的位置认**：
-/// 本机 2026-07/08 的老记录里 `primary` 装的是**周窗**、`secondary` 为 null
-/// （12,869 条,全是老版 CLI 的 plus 账号）。按位置取会把 7d 当成 5h。
+/// 老版 CLI 的记录里 `primary` 装的是**周窗**、`secondary` 为 null,按位置取会把 7d 当成 5h。
 const WINDOW_5H_MINUTES: i64 = 300;
 const WINDOW_7D_MINUTES: i64 = 10080;
 
-/// 5h 滚动窗口的长度（秒）——算「这段时间从窗尾老掉的代价」要用它回看。
+/// 5h 滚动窗口的长度（秒）——算「这段时间从窗尾老掉的代价」要用它回看;
+/// 扫描下界因此要比建样本的下界再往前一个窗长（见 `ingest`）。
 const WINDOW_SECS: i64 = 5 * 3_600;
 
-/// 扫描要比建样本的下界再往前 `WINDOW_SECS`：`（t0−5h, t1−5h]` 里的调用是算老化量的
-/// 原料,少扫这一段会把最早那批区间的老化量算成 0（偏保守但不对）。
 /// 拿不到模型名时的占位（匹配不上任何价目键 ⇒ 走回落价并标 unknown,与采集器同名）。
 const UNKNOWN_MODEL: &str = "unknown";
 
@@ -169,15 +163,13 @@ fn codex_home() -> Option<PathBuf> {
 
 /// 全部候选 rollout 文件及其**世代** `（mtime 秒, 字节数)`。
 ///
-/// **mtime 单独用不得**：Windows 上 Codex 追加写 rollout 时 mtime 不跟着动——本机
-///  的会话文件内容已写到 22:45,mtime 仍停在创建时刻 22:23:43;
-/// 会话结束、进程退出之后也不补（中午那个 12:04 的文件内容到 12:25,十小时后
-/// mtime 依然是 12:04:33）。只看 mtime 的闸门于是会在**正在用的那个会话**上彻底
-/// 瞎掉,而那正是最需要实时读数的时候（[]）。
+/// **mtime 单独用不得**：Windows 上 Codex 追加写 rollout 时 mtime 停在创建时刻,
+/// 会话结束、进程退出之后也不补。只看 mtime 的闸门会在**正在用的那个会话**上彻底
+/// 瞎掉,而那正是最需要实时读数的时候。
 ///
 /// 字节数是准的（同一次 `stat` 里就能拿到,不多一次系统调用）,而 rollout 是**追加
 /// 写**的 ⇒ **字节数变了就是有新行,没变就没有**。这与 `collector:jsonl:generation`
-/// 的 `（size, mtime)` 是同一套判据——采集那一路一直是对的,订阅这一路照抄。
+/// 的 `（size, mtime)` 是同一套判据。
 fn rollout_files() -> Vec<(PathBuf, i64, u64)> {
     let Some(home) = codex_home() else { return vec![] };
     let mut paths = vec![];
@@ -208,7 +200,7 @@ pub fn generation() -> Option<(i64, u64)> {
 }
 
 /// 候选文件里最新的 mtime（unix 秒;无文件 → None）——只给水位线
-/// （`META_SCANNED_MTIME`）用,**不再当闸门**。
+/// （`META_SCANNED_MTIME`）用,**不当闸门**。
 pub fn newest_mtime() -> Option<i64> {
     rollout_files().into_iter().map(|(_, m, _)| m).max()
 }
@@ -216,7 +208,7 @@ pub fn newest_mtime() -> Option<i64> {
 /// 扫描有新内容的文件,取出 `t >= since` 的读数与调用。
 ///
 /// `seen` = 上次扫到每个文件时它有多大（`ingest` 从 `meta` 取、扫完写回;
-/// 跨重启持久,所以一个长会话在重启之后照样认得出"它又长了"）。
+/// 跨重启持久,所以一个长会话在重启之后照样认得出「它又长了」）。
 /// **跳过一个文件的唯一理由是它没长**；`mtime_floor` 只在**记录里没有这个文件**
 /// （首扫 / 新装 / 换了 `CODEX_HOME`）时兜底,它的职责仅仅是给首扫的 I/O 封顶,
 /// 判不了一个正在被追加的文件（mtime 不动,见 `rollout_files`）。
@@ -260,12 +252,12 @@ fn needs_read(known: Option<u64>, size: u64, mtime: i64, mtime_floor: i64) -> bo
 /// 扫一个 rollout 文件（行式流读;先做子串预筛再解析 JSON）。
 ///
 /// 预筛不是微优化：rollout 的字节数绝大部分是 `session_meta` 的 base_instructions 与
-/// 消息正文,本机最大的单个文件 44 MB,逐行 serde 解析它们纯属浪费。
+/// 消息正文,单个文件可达几十 MB,逐行 serde 解析它们纯属浪费。
 fn scan_file(path: &Path, since: i64, out: &mut Scan) {
     let Ok(file) = std::fs::File::open(path) else { return };
     let mut reader = std::io::BufReader::new(file);
     // 模型在 `turn_context` 行的 `payload.model`（轮级设置,token_count 行不带)——
-    // 与 collector:codex 同一条。逐行推进,token_count 取当时最近的那个值。
+    // 与 collector:codex 同一判据。逐行推进,token_count 取当时最近的那个值。
     let mut model = String::new();
     let mut buf: Vec<u8> = vec![];
     loop {
@@ -275,8 +267,8 @@ fn scan_file(path: &Path, since: i64, out: &mut Scan) {
             Ok(_) => {}
         }
         // 按字节读 + lossy：`read_line` 遇到一个非法 UTF-8 字节就返回错误,那会让
-        // **整个文件的剩余部分**被静默丢掉（本机最大的 rollout 44 MB）。写到一半的
-        // 尾行同理——它解析不出 JSON 被跳过,mtime 还在动,下一轮自然重读。
+        // **整个文件的剩余部分**被静默丢掉。写到一半的尾行解析不出 JSON 被跳过,
+        // 文件字节数还在变,下一轮自然重读。
         let line = String::from_utf8_lossy(&buf);
         let is_ctx = line.contains("\"turn_context\"");
         let is_tok = line.contains("\"token_count\"");
@@ -345,7 +337,7 @@ fn parse_reading(payload: &Value, t: i64) -> Option<Reading> {
 ///
 /// 口径与 `collector:codex` 一致：`input_tokens` 是**含缓存**的原值,减掉缓存读得到
 /// 计费口径的输入;`output_tokens` 保持 provider 口径（含 reasoning）。
-/// 本机验过 `Σ last_token_usage.total` 与文件末条 `total_token_usage.total` 逐位相同
+/// `Σ last_token_usage.total` 与文件末条 `total_token_usage.total` 逐位相同
 /// ⇒ 它确实是**单次值**,不必差分。
 fn parse_call(payload: &Value, t: i64, model: &str) -> Option<Call> {
     let usage = payload.get("info")?.get("last_token_usage")?;
@@ -402,15 +394,14 @@ pub fn build_pairs(
             cur += 1;
         }
         // 跨套餐的区间不建样本：scale 是「这个套餐一个窗口有多大」,两端不是同一个
-        // 套餐时这条样本无从归属（本机历史里 plan_type 在 plus / edu 之间跳过 40 多次）。
+        // 套餐时这条样本无从归属（同一台机器上 plan_type 可能在多个账号间来回跳）。
         if a.plan != b.plan || breakdown.is_empty() {
             continue;
         }
         // **跨账号切换点的区间也不建样本**。每个账号有自己独立的额度窗口
         // ⇒ 跨在切换点上的 Δ 是拿两个账号的读数相减出来的,毫无意义。`plan_type` 挡不住
-        // 这件事:本机 2026-07 出现过**两个都是 plus** 的账号交替使用。边界只对
-        // 「从现在往后」有效（rollout 里一个账号字段都没有,历史补不回来）,更早的区间
-        // 仍靠套餐与窗尾判据兜着。
+        // 这件事:可能有两个同套餐的账号交替使用。边界只对「从现在往后」有效（rollout 里
+        // 一个账号字段都没有,历史补不回来）,更早的区间仍靠套餐与窗尾判据兜着。
         if account_since.is_some_and(|t| a.t < t && t <= b.t) {
             continue;
         }
@@ -437,7 +428,7 @@ pub fn build_pairs(
             used5_0: a.used5,
             used5_1: b.used5,
             // rollout 的每条读数都带窗尾 ⇒ 跨重置这件事可以**直接判**,不必靠
-            // 「读数变小了」推断（语义见 calib:Pair:window_reset）。
+            // 「读数变小了」推断（语义见 calib:Pair:window_changed）。
             resets5_0: a.resets5,
             resets5_1: b.resets5,
             cost: total,
@@ -445,7 +436,7 @@ pub fn build_pairs(
             aged_cost: aged,
         };
         if !pair.usable(calib::scale(Platform::Codex)) {
-            continue; // 跨重置 / 间隔越界 / 零代价 / 比值离谱,与另外两路同一套筛选
+            continue; // 跨重置 / 间隔越界 / 零代价 / 比值过高等,与另外两路同一套筛选
         }
         out.push((pair, (a.used7, b.used7), breakdown, b.plan.clone()));
     }
@@ -510,7 +501,17 @@ fn update_snapshot(store: &SubStore, readings: &[Reading], now: i64) -> bool {
     true
 }
 
-/// 收割 + 增量标定 + 快照推进（主轮询每轮调用一次;**零网络、零凭据**）。
+/// 扫描的比较基准 `seen` = 上一轮各文件的大小（坏 JSON / 没有这个键 ⇒ 空表,
+/// 退化成「按文件下界首扫一遍」）。判据升版时必须返回空表：重建要把回溯上限内的文件
+/// 全部重读,而那些文件多半一个字节都没长,按大小比较会全部跳过、重建一行都建不出来。
+fn scan_baseline(rule_stale: bool, stored: Option<String>) -> BTreeMap<String, u64> {
+    if rule_stale {
+        return BTreeMap::new();
+    }
+    stored.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()
+}
+
+/// 收割 + 增量标定 + 快照推进（主轮询在 rollout 世代变化时调用;**零网络、零凭据**）。
 /// 返回 `（本次新收割的读数条数, 本次新建的标定样本数, 快照是否变了)`。
 pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     let floor = now - HORIZON_DAYS * 86_400;
@@ -528,13 +529,9 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
             .max(store.meta_i64(META_SCANNED_MTIME).unwrap_or(0))
             .max(floor)
     };
-    // 数据下界再往前推一个窗长：老化量的原料在 `（t0−5h, …]`,少扫这一段会把最早那批
-    // 区间的老化量算成 0。读数仍按 `since` 切（下面 build_pairs 之前过滤）,只多要调用。
-    // 上一轮各文件的大小（坏 JSON / 没有这个键 ⇒ 空表,退化成"按文件下界首扫一遍"）。
-    let seen: BTreeMap<String, u64> = store
-        .meta_str(META_FILE_SIZES)
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    // 扫描下界再往前推一个窗长（见下方 `scan` 调用）：老化量的原料在 `（t0−5h, …]`,少扫
+    // 这一段会把最早那批区间的老化量算成 0。读数仍按 `since` 切（build_pairs 之前过滤）,只多要调用。
+    let seen = scan_baseline(rule_stale, store.meta_str(META_FILE_SIZES));
     let scan = scan(since - WINDOW_SECS, since - SCAN_LAG_SECS - WINDOW_SECS, &seen);
     if scan.files_read == 0 {
         return (0, 0, false);
@@ -547,7 +544,7 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     let samples: Vec<_> =
         scan.readings.iter().map(|r| (r.t, r.used5, r.used7, r.plan.clone())).collect();
     let harvested = store.insert_samples_of(Platform::Codex, &samples).unwrap_or(0);
-    // 同一批读数再落一遍**归一化序列**（-4;两层并存,见 store 建表注释）。
+    // 同一批读数再落一遍**归一化序列**（两层并存,见 store 建表注释）。
     // 这一路比桌面端全：rollout 的每条 rate_limits 都自带窗尾与套餐,两个窗口各一行。
     let quota_rows: Vec<_> = scan
         .readings
@@ -619,8 +616,7 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     if let Some(m) = newest_mtime() {
         let _ = store.set_meta_i64(META_SCANNED_MTIME, m);
     }
-    // 同理写在建样本之后。真变了才写——稳态下每 5 分钟一轮,没必要为一份没动的表
-    // 反复打 WAL。
+    // 同理写在建样本之后。真变了才写,没动的表不必反复打 WAL。
     if scan.seen != seen {
         if let Ok(json) = serde_json::to_string(&scan.seen) {
             let _ = store.set_meta_str(META_FILE_SIZES, &json);
@@ -658,8 +654,8 @@ fn log_scan(store: &SubStore, scan: &Scan, harvested: usize, pairs: usize) {
         store.quota_reading_count(Platform::Codex)
     );
     if scan.weekly_only > 0 {
-        // 老版 CLI（本机 2026-07/08 的 plus 记录）只回报周窗 ⇒ 这些读数进不了标定。
-        // 不当错误,但要让"它们存在且被跳过"这件事在日志里看得。
+        // 老版 CLI 只回报周窗 ⇒ 这些读数进不了标定。
+        // 不当错误,但要让「它们存在且被跳过」这件事在日志里看得。
         crate::dev_log!(
             "[subscription] codex rollout: {} reading(s) carried no 5h window (weekly-only, skipped)",
             scan.weekly_only
@@ -670,6 +666,18 @@ fn log_scan(store: &SubStore, scan: &Scan, harvested: usize, pairs: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 判据升版：回溯上限内没长过的文件也必须重读,否则重建一行样本都建不出来。
+    #[test]
+    fn stale_rule_rescans_unchanged_files() {
+        let stored = Some(r#"{"a.jsonl":4096}"#.to_string());
+        let fresh = scan_baseline(false, stored.clone());
+        assert!(!needs_read(fresh.get("a.jsonl").copied(), 4_096, 300, 200), "判据当前:没长就跳过");
+        let stale = scan_baseline(true, stored);
+        assert!(stale.is_empty());
+        assert!(needs_read(stale.get("a.jsonl").copied(), 4_096, 300, 200), "判据升版:下界内的文件照读");
+        assert!(scan_baseline(false, Some("not json".into())).is_empty(), "坏 JSON 退化成空表");
+    }
 
     /// 追加写的文件：字节数没变 = 没有新行,不必打开。
     #[test]
@@ -704,7 +712,7 @@ mod tests {
         Reading { t, used5, used7: 10.0, plan: plan.into(), resets5: None, resets7: None }
     }
 
-    /// 真实量级的一笔调用：每 1% 配额约合 $0.12 等价用量（本机实测 scale≈8 %/美元）,
+    /// 真实量级的一笔调用：Codex 每 1% 配额约合 $0.12 等价用量（scale≈8 %/美元）,
     /// 太小的 token 量会让隐含比值落到 calib 的可信带之外,样本会被当成账目错配丢掉。
     fn call(t: i64, model: &str, input: i64) -> Call {
         Call { t, model: model.into(), tokens: [input, 0, 0, 0] }
@@ -716,7 +724,7 @@ mod tests {
 
     #[test]
     fn window_is_picked_by_length_not_by_slot() {
-        // 老版 CLI 把**周窗**放在 primary、secondary 为 null（本机 12,869 条）
+        // 老版 CLI 把**周窗**放在 primary、secondary 为 null
         let weekly_only = line(
             r#"{"rate_limits":{"primary":{"used_percent":18.0,"window_minutes":10080},
                  "secondary":null,"plan_type":"plus"}}"#,
@@ -910,27 +918,7 @@ mod tests {
         assert_eq!(out[0].3, "edu");
     }
 
-    #[test]
-    fn window_reset_is_judged_by_the_window_tail() {
-        let calls = vec![call(1_030, "gpt-5.6-sol", 60_000)];
-        // 掉了 = 窗口重置（没有窗尾时的兜底判据）
-        let reset = vec![reading(1_000, 30.0, "edu"), reading(1_060, 2.0, "edu")];
-        assert!(build_pairs(&reset, &calls, None).is_empty());
-        // **窗尾前移 = 重置的直接证据**,哪怕读数看着还在涨（2026-09-19）
-        let crossed = vec![
-            Reading { resets5: Some(1_050), ..reading(1_000, 5.0, "edu") },
-            Reading { resets5: Some(19_050), ..reading(1_060, 8.0, "edu") },
-        ];
-        assert!(build_pairs(&crossed, &calls, None).is_empty());
-        // 同一个窗口内（窗尾没动）照常建样本
-        let same = vec![
-            Reading { resets5: Some(19_050), ..reading(1_000, 5.0, "edu") },
-            Reading { resets5: Some(19_050), ..reading(1_060, 8.0, "edu") },
-        ];
-        assert_eq!(build_pairs(&same, &calls, None).len(), 1);
-    }
-
-    /// **跨账号切换点的区间不建样本**（2026-09-19）：每个账号有自己独立的额度窗口,
+    /// **跨账号切换点的区间不建样本**：每个账号有自己独立的额度窗口,
     /// 跨在切换点上的 Δ 是拿两个账号的读数相减出来的。边界之外的区间照常建。
     #[test]
     fn intervals_straddling_an_account_switch_are_dropped() {
@@ -949,7 +937,7 @@ mod tests {
         assert_eq!(build_pairs(&readings, &calls, Some(9_999)).len(), 2);
     }
 
-    /// 没涨的读数**收**,只要这段消耗本来就不该动一格（PHASE15 §9-8 定案）。
+    /// 没涨的读数**收**,只要这段消耗本来就不该动一格。
     #[test]
     fn a_flat_reading_below_one_step_still_makes_a_sample() {
         let flat = vec![reading(1_000, 5.0, "edu"), reading(1_060, 5.0, "edu")];

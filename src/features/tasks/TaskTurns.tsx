@@ -1,6 +1,6 @@
 // 逐轮条形（Tasks 行展开）:每轮一条,长度 = wall_ms（按本任务最长轮归一）,
 // 内部分段 model / tool（两者之和超过 wall 时按比例压回——JSONL 族为估算值）,
-// 右侧标 steps 与 tool 数;中止轮（aborted,S4-R 起与错误分列）以错误色描边标记,
+// 右侧标 steps 与 tool 数;中止轮（aborted,与错误分列）以错误色描边标记,
 // 带 API / 工具错误的轮在右侧计数后追加错误数。
 // 只读 get_task_turns 的数值列,不含任何内容列。
 import type { TaskTurn } from '../../services'

@@ -1,27 +1,23 @@
 //! ZCode 适配器：`~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表（rowid 增量）。
 //!
-//! 口径（跟随旧项目）：total = `provider_total_tokens`，为 0/NULL 时兜底
-//! `computed_total_tokens`；input/output 取原始列（cache 分项独立列,不并入）；
-//! 仅 `status='completed'` 计入；时间优先 `started_at`（Unix 毫秒）→ 本地日。
+//! 口径：total = `provider_total_tokens`，为 0/NULL 时兜底 `computed_total_tokens`；input/output 取原始列
+//! （cache 分项独立列,不并入）；仅 `status='completed'` 计入；时间取 `started_at`（Unix 毫秒）→ 本地日。
 //! 数据库被 ZCode 进程实时写入（WAL）：只读打开 + busy_timeout,BUSY 视为可重试降级。
 //!
-//! 请求数（S4-R 正,待观察 C）：行级增量**不再**按行写 request_count 粗值——旧做法「每行 +1、
-//! 10 分钟节流后 distinct turn 重算覆盖」在活跃长轮里会把当天一格虚高,
-//! 且节流窗口内最后一批之后若再无新行,虚高值一直留着。现在每次有新行都对涉及的日期范围
-//! （非整月）即时重算 distinct turn（同一只读连接,无节流）;重算失败的日期挂起到下次采集重试。
+//! 请求数：行级增量不写 request_count 粗值（一轮含多次模型调用,按行 +1 会虚高）。每次有新行都对
+//! 涉及的日期范围即时重算 distinct turn（同一只读连接）;重算失败的日期挂起到下次采集重试。
 //!
-//! 轮与时间（精确值,不走累加器）：按会话重算覆盖——turn_usage（每轮一行:
-//! started / completed / duration_ms = wall、time_to_first_token_ms = ttft、model_retry_count、
-//! tool_call_count;`cancelled_by_user = 1` 或 `error_type = turn_cancelled` 记**中止**（S4-R,不计错）,
-//! 其余 error_type 非空计错）+ model_usage（completed 行 = 模型调用与 token,
-//! Σ duration_ms = model_ms;turn_usage 缺行的 turn_id 由 model_usage 补轮）+ tool_usage
-//! （Σ duration_ms = tool_ms）+ session（parent_id 子会话 / directory 项目 / title 内容列）。
-//! turn_mark 镜像 `apply_recalc` 的 COUNT（DISTINCT turn_id) GROUP BY （日, 模型),与 request_count 守恒。
+//! 轮与时间（精确值,不走累加器）：按会话重算覆盖——turn_usage（每轮一行:started / completed /
+//! duration_ms = wall、time_to_first_token_ms = ttft、model_retry_count、tool_call_count;
+//! `cancelled_by_user = 1` 或 `error_type = turn_cancelled` 记中止,不计错,其余 error_type 非空计错）
+//! + model_usage（completed 行 = 模型调用与 token,Σ duration_ms = model_ms;turn_usage 缺行的 turn_id
+//! 由 model_usage 补轮）+ tool_usage（Σ duration_ms = tool_ms）+ session（parent_id 子会话 / directory
+//! 项目 / title 内容列）。turn_mark 镜像 `apply_recalc` 的 COUNT（DISTINCT turn_id) GROUP BY （日, 模型),
+//! 与 request_count 守恒。
 //!
-//! 子会话不计轮：`session.parent_id` 非空的会话,其轮不进
-//! request_count / turn_mark,token 照常计入。session 表缺 parent_id 列（schema 漂移）时退回全计。
-//!
-//! 子会话项目：继承根会话的 `directory`（子代理可在子目录运行,自身目录不代表项目）。
+//! 子会话不计轮（与 Codex 子代理规则对齐）：`session.parent_id` 非空的会话,其轮不进 request_count /
+//! turn_mark,token 照常计入。session 表缺 parent_id 列（schema 漂移）时退回全计。
+//! 子会话的项目继承根会话的 `directory`（子代理可在子目录运行,自身目录不代表项目）。
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -89,7 +85,7 @@ impl ZcodeAdapter {
             })
     }
 
-    /// schema 校验：必需列齐全才算 ready,否则 unsupported_schema。
+    /// 必需列齐全才算 ready,否则 unsupported_schema。
     fn check_schema(conn: &Connection) -> Result<String, AdapterError> {
         let mut stmt = conn
             .prepare("PRAGMA table_info(model_usage)")
@@ -137,7 +133,7 @@ impl Adapter for ZcodeAdapter {
 
     fn collect(&self, store: &mut Store) -> CollectResult {
         let conn = self.open_ro()?;
-        let fingerprint = Self::check_schema(&conn)?; // 采集前再校验一次 schema（可能漂移）
+        let fingerprint = Self::check_schema(&conn)?; // schema 可能漂移,采集前再校验
         // cache 分项为可选列:缺失时按 0 采,不升格为 unsupported_schema。
         let optional_col = |c: &str| {
             let present = fingerprint.split_once(':').map_or(false, |(_, cols)| cols.split(',').any(|x| x == c));
@@ -192,7 +188,7 @@ impl Adapter for ZcodeAdapter {
                 fetched += 1;
                 last_in_batch = last_in_batch.max(rowid);
 
-                // 行级过滤（与旧项目一致）：非 completed 不计,但游标照常推进
+                // 非 completed 不计,但游标照常推进
                 if status.as_deref() != Some("completed") {
                     continue;
                 }
@@ -222,10 +218,10 @@ impl Adapter for ZcodeAdapter {
             }
         }
 
-        // request_count 权威化：涉及日期即时按 distinct turn 重算。
+        // request_count 权威值:涉及日期即时按 distinct turn 重算。
         self.recalc_turn_counts(&conn, store, days);
 
-        // 任务层:失败只记日志,不影响已提交的 token 聚合（单源内再隔离）。
+        // 任务层失败只记日志,不影响已提交的 token 聚合。
         if let Err(e) = self.sync_tasks(&conn, store) {
             crate::dev_log!("[collector] zcode task sync failed: {} {}", e.code, e.message);
         }
@@ -282,7 +278,6 @@ impl ZcodeAdapter {
         }) else {
             return false;
         };
-        // 按 day 聚合后覆盖
         let mut per_day: HashMap<String, Vec<(String, i64)>> = HashMap::new();
         for row in rows.flatten() {
             let (d, model, turns) = row;
@@ -322,8 +317,8 @@ fn row_tokens(input: Option<i64>, output: Option<i64>, provider_total: Option<i6
     }
 }
 
-/// 路径类 TEXT 列按字节读:UTF-8 优先,非法段按系统 ANSI 代码页回退（S4-R 缺陷 A;
-/// rusqlite 的 String 读取遇非法 UTF-8 直接报错,会让整行元数据丢失 → 项目落 unknown）。
+/// 路径类 TEXT 列按字节读:UTF-8 优先,非法段按系统 ANSI 代码页回退。
+/// rusqlite 的 String 读取遇非法 UTF-8 直接报错,会让整行元数据丢失 → 项目落 unknown。
 fn text_col(r: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
     use rusqlite::types::ValueRef;
     Ok(match r.get_ref(idx)? {
@@ -333,8 +328,7 @@ fn text_col(r: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String
 }
 
 /// 子会话的项目目录 = 根会话目录（沿 parent_id 上溯取最上层非空 directory;深度上限防环）。
-/// 子代理常在子目录运行,按自身目录
-/// 会拆出一个没有根会话轮次的伪项目,Scratch 规则按 0 会话 0 轮把它整个折进 Scratch。
+/// 子代理常在子目录运行,按自身目录会拆出一个没有根会话轮次的伪项目,被 Scratch 规则按 0 会话 0 轮整个吞掉。
 fn root_directory(conn: &Connection, parent: &str) -> Option<String> {
     let mut cur = parent.to_string();
     let mut dir = None;
@@ -371,7 +365,6 @@ struct TaskCursor {
     turn_ts: i64,
 }
 
-/// 一轮的同步构建态。
 #[derive(Default)]
 struct TurnBuild {
     started_at: Option<i64>,
@@ -381,13 +374,13 @@ struct TurnBuild {
     retry_count: i64,
     tool_call_count: Option<i64>,
     error: bool,
-    /// 用户中止（cancelled_by_user = 1 / error_type = turn_cancelled;S4-R 与 error 分列）。
+    /// 用户中止（cancelled_by_user = 1 / error_type = turn_cancelled）,与 error 分列。
     aborted: bool,
     model_ms: i64,
     model_calls: i64,
     min_model_at: Option<i64>,
     max_model_end: Option<i64>,
-    /// （millis, day, model) of 首条完成的响应
+    /// 首条完成响应的 （millis, day, model)。
     first: Option<(i64, String, String)>,
     parts: Vec<TurnPart>,
     tool_count: i64,
@@ -518,7 +511,7 @@ impl ZcodeAdapter {
                 b.ttft_ms = ttft;
                 b.retry_count = retry.unwrap_or(0);
                 b.tool_call_count = tool_calls;
-                // 本机:status=cancelled ⇔ cancelled_by_user=1 ⇔ error_type=turn_cancelled（75 轮）;
+                //  status=cancelled ⇔ cancelled_by_user=1 ⇔ error_type=turn_cancelled;
                 // 旧库缺 cancelled_by_user 列时靠 error_type 判别。
                 b.aborted = cancelled.unwrap_or(0) != 0 || error_type.as_deref() == Some("turn_cancelled");
                 b.error = error_type.is_some() && !b.aborted;
@@ -620,7 +613,7 @@ impl ZcodeAdapter {
         batch.replace_session(META.id, sid);
         let mut prev_end: Option<i64> = None;
         let mut span: (Option<i64>, Option<i64>) = (None, None);
-        // 末轮现状——turn_usage 已写 completed_at = 答完在等用户（用户中止除外）;
+        // 末轮现状:turn_usage 已写 completed_at = 答完在等用户（用户中止除外）;
         // 缺 turn_usage 行 / 未完成 = 模型在处理（工具明细不分,tool_pending 不适用）。
         let mut live_phase = LivePhase::Idle;
         let mut live_last = 0;
@@ -741,8 +734,7 @@ mod tests {
         // 内存库模拟 model_usage,验证行级过滤与 total 兜底口径
         let conn = Connection::open_in_memory().unwrap();
         setup_table(&conn);
-        // 2026-09-05 12:00 本地 → 用固定毫秒;本地日断言经由 millis_to_local_day
-        let millis = 1_757_000_000_000i64; // 2025-09-05T12:26:40Z 附近,仅验证非空日产出
+        let millis = 1_757_000_000_000i64; // 2025-09-04 附近的固定时刻,只验证产出合法本地日
         insert(&conn, "glm-5.3", millis, "completed", 10, 5, Some(20), 22);
         insert(&conn, "glm-5.3", millis, "error", 99, 99, Some(99), 99); // 非 completed 跳过
         insert(&conn, "gpt-5", millis, "completed", 1, 1, Some(0), 7); // provider=0 → computed 兜底
@@ -785,7 +777,7 @@ mod tests {
         let _ = days_in_month(2026, 9);
     }
 
-    /// PHASE12 S2:真实列结构的临时 ZCode 库走完整 collect——轮 / 会话精确同步、子会话并入、守恒。
+    /// 真实列结构的临时 ZCode 库走完整 collect——轮 / 会话精确同步、子会话并入、守恒。
     #[test]
     fn s2_task_sync_from_zcode_tables() {
         let dir = std::env::temp_dir().join(format!("tc_zcode_s2_{}", std::process::id()));
@@ -858,7 +850,7 @@ mod tests {
         assert_eq!((p.title.as_deref(), p.subagent_count, p.subagent_calls), (Some("<title>"), 1, 1));
         let c = sessions.iter().find(|s| s.session_id == "ses_c").unwrap();
         assert_eq!(c.parent_id.as_deref(), Some("ses_p"));
-        // v13:子代理在子目录运行 → 继承根会话目录（否则子目录伪项目 0 会话 0 轮,被 Scratch 整个吞掉）
+        // 子代理在子目录运行 → 继承根会话目录（否则子目录伪项目 0 会话 0 轮,被 Scratch 整个吞掉）
         assert_eq!(c.project_key, "e:/Work/Demo");
         let keys: Vec<String> = {
             let mut stmt = store.conn().prepare("SELECT DISTINCT project_key FROM daily_project").unwrap();
@@ -867,15 +859,14 @@ mod tests {
         assert_eq!(keys, vec!["e:/Work/Demo".to_string()], "子会话 token 不落子目录键");
         assert_eq!(store.test_task_sessions(META.id), vec!["ses_p".to_string()]);
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
-        // S3 定案:子会话轮不计 request_count,token 照常计入
+        // 子会话轮不计 request_count,token 照常计入
         let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
         assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 1, "只计父会话 t1;子会话 c1 与取消轮 t2 不计");
         assert_eq!(rows[0].month_total, 110 + 220 + 55);
     }
 
-    /// S4-R 待观察 C:活跃会话的一轮跨多次采集持续追加 model_usage 行——旧实现每行 +1 且 10 分钟节流
-    /// 重算,当天一格会虚高（本机实证 1 轮记成 3〜8）。现应每次采集后都等于 distinct turn,并与
-    /// daily_project.turns 逐格守恒;model_error 轮计错、不算中止。
+    /// 活跃会话的一轮跨多次采集持续追加 model_usage 行:每次采集后 request_count 都应等于
+    /// distinct turn（按行计会虚高）,并与 daily_project.turns 逐格守恒;model_error 轮计错、不算中止。
     #[test]
     fn active_turn_across_collects_keeps_request_count_exact() {
         let dir = std::env::temp_dir().join(format!("tc_zcode_active_{}", std::process::id()));
@@ -938,7 +929,7 @@ mod tests {
         assert_eq!(turns[0].project_key, "d:/OneDrive/文档/knowledge", "中文目录原样归一");
     }
 
-    /// S3 定案:apply_recalc 排除 parent_id 非空的会话;session 表缺列时退回全计。
+    /// apply_recalc 排除 parent_id 非空的会话;session 表缺列时退回全计。
     #[test]
     fn turn_recalc_excludes_child_sessions() {
         let today = chrono::Local::now().date_naive();
@@ -978,7 +969,7 @@ mod tests {
 
     #[test]
     fn turn_recalc_counts_distinct_turns_per_day_and_model() {
-        // 本地日边界:取今天 0 点(本地),三行同日、两行昨日
+        // 本地日边界:取今天 0 点(本地),今日与昨日各有若干行
         let today = chrono::Local::now().date_naive();
         let day_start = chrono::Local
             .from_local_datetime(&today.and_hms_opt(0, 0, 0).unwrap())
@@ -1000,7 +991,7 @@ mod tests {
         insert(&conn, "A", day_start + 4_000, "error", 9, 9, Some(9), 9);
 
         let mut store = crate::collector::store::Store::open_in_memory().unwrap();
-        // 模拟 collect 的行级粗值:今日按「行数」计(2+1+1=4,含 1 行 error 不入库);
+        // 模拟 collect 的行级粗值:今日按「行数」计 3（error 行不入库）;
         // 粗值用真实日期落库,供重算覆盖
         let today_ymd = today.format("%Y-%m-%d").to_string();
         let yesterday_ymd = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();

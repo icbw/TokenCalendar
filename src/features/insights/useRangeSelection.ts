@@ -1,4 +1,4 @@
-// 范围选择状态（-R）:Tasks 与 Insights 各自持有一份,规则共用。
+// 范围选择状态:Tasks 与 Insights 各自持有一份,规则共用。
 // - 数据跨度（All 起点）与选定项目的生命周期经 get_project_span 取,随 usage:changed 刷新;
 // - 选定单个项目且自动开关开（designPrefs.projectAutoRange,缺省开）→ 范围切到项目生命周期;
 // - 在项目生命周期模式下手改范围 → 关自动（写 designPrefs,两视图共用）;「Project span」按钮套用并重开;

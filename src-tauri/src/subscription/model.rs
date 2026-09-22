@@ -109,17 +109,16 @@ impl FetchStatus {
     }
 }
 
-/// 读数来源：
-/// - `api` = 平台 usage 端点读数,`fetched_at` = 请求时刻,与本地代价的累计区间对得上
-///   （差不到一秒）;
+/// 读数来源（标定筛选与诊断用）：
+/// - `api` = 平台 usage 端点读数,`fetched_at` = 请求时刻,与本地代价的累计区间对得上;
 /// - `desktop` = Claude 桌面端 `plan-usage-history.json` 采样,`fetched_at` = 样本时刻
 ///与「这段时间花了多少」对应的不是同一段时间;
 /// - `rollout` = Codex 会话 rollout 里 `token_count` 事件带的 `rate_limits`,
-///   `fetched_at` = 那次 API 调用的时刻。**它和 `api` 是同一个服务端数字**——
-///   Codex 在每次响应里回的限流状态,只是走本地文件到手,不花一个请求。
+///   `fetched_at` = 那次 API 调用的时刻。**它和 `api` 是同一个服务端数字**,
+///   只是走本地文件到手,不花一个请求。
 ///
-/// 三者的百分比精度其实相同,分开标不是为了
-/// 精度,是为了**时刻语义**：`api` 的时刻就是「现在」,另外两个是「那一刻」。
+/// 三者的百分比精度相同（两个平台给的都是整数）,分开标是为了**时刻语义**：
+/// `api` 的时刻就是「现在」,另外两个是「那一刻」。
 ///
 /// **在线标定样本只认两端都是 `api` 的读数对**（`record_pair`）:另外两路各自按**读数
 /// 自己的时刻**精确切割（[`super:bootstrap`] / [`super:codex_rollout`]）——两个窗口
@@ -160,14 +159,13 @@ pub struct SubscriptionSnapshot {
     pub windows: Vec<QuotaWindow>,
     /// 最近一次成功获取。
     pub fetched_at: Option<i64>,
-    /// 状态。
     pub status: FetchStatus,
     /// 读数来源（语义见 [`SnapshotSource`];失败轮沿用库内上一条的来源）。
     #[serde(default)]
     pub source: SnapshotSource,
 }
 
-/// 归一化读数序列的一行（-4;落库形状见 `store` 的 `quota_reading` 建表注释）。
+/// 归一化读数序列的一行（落库形状见 `store` 的 `quota_reading` 建表注释）。
 ///
 /// 一行 = **一个窗口在某一时刻的一次读数**。与 `SubscriptionSnapshot` 的区别是维度：
 /// 快照是「此刻两个窗口各是多少」,这里是「某个窗口一路走来是多少」——前者每平台
@@ -186,12 +184,11 @@ pub struct QuotaReading {
     pub source: SnapshotSource,
 }
 
-/// 日级汇总的一行（-4;**纯派生**,可从 `quota_reading` 完全重建）。
+/// 日级汇总的一行（**纯派生**,可从 `quota_reading` 完全重建）。
 ///
 /// 日界按**本地日期**切,与热力图 / collector 的 `YYYY-MM-DD` 同口径。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaDay {
-    /// 本地日期 `YYYY-MM-DD`。
     pub day: String,
     pub kind: String,
     /// 当日读数条数（**按时刻去重之后**）。
@@ -222,7 +219,6 @@ pub struct QuotaDay {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialInfo {
     pub platform: Platform,
-    /// 凭据文件是否存在。
     pub present: bool,
     /// 结构是否可解析（present 且 parseable 才可绑定）。
     pub parseable: bool,

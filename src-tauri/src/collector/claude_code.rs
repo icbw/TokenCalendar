@@ -1,32 +1,29 @@
 //! Claude Code 适配器：`~/.claude/projects/**/*.jsonl` 递归（CLAUDE_CONFIG_DIR 可覆盖）。
 //!
-//! 口径（起）：仅 `type=="assistant"` 且 `message.usage` 存在的行；
+//! 口径：仅 `type=="assistant"` 且 `message.usage` 存在的行；
 //! input/output 取 `message.usage.input_tokens / output_tokens` 原始值；
 //! **total = input + output + cache_read + cache_write**。
 //! Anthropic 的 usage 没有 total 字段,而 `input_tokens` 是 **cache-exclusive** 的——开了
 //! prompt caching 之后真实输入几乎全落在 `cache_read_input_tokens` /
-//! `cache_creation_input_tokens` 里,`input_tokens` 只剩个位数（本机一行:
-//! in=2 / cache_write=2623 / cache_read=99404 / out=459）。旧口径 total = input + output
-//! 因此退化成「约等于 output」,把 Claude 的用量低估约 100〜220 倍（
-//! _claude-total-excludes-cache）。四项和正是守则给出的自洽关系
-//! `total = input_excl + cache + output`。
+//! `cache_creation_input_tokens` 里,`input_tokens` 只剩个位数（典型一行:
+//! in=2 / cache_write=2623 / cache_read=99404 / out=459）。只取 input + output 会退化成
+//! 「约等于 output」,把用量低估两个数量级。四项和即自洽关系 `total = input_excl + cache + output`。
 //! 时间取顶层 `timestamp`（RFC3339）→ 本地日。模型缺失填 "unknown"。
 //!
-//! **v8 token 去重**：一次 API 响应被流式拆成多条 assistant 行（thinking / text / tool_use
-//! 各一行）,每行都带同一份 `message.usage`（本机：10075 行 / 4660 个
-//! `message.id`,重复行 5288 条 usage 完全相同、134 条 output 递增）。按 `message.id`
-//! 只入账增量——旧口径逐行相加,Claude token 约重计 1 倍。
+//! **token 去重**：一次 API 响应被流式拆成多条 assistant 行（thinking / text / tool_use
+//! 各一行）,每行都带同一份 `message.usage`（绝大多数完全相同,少数 output 递增）。按 `message.id`
+//! 只入账增量,逐行相加会让 token 约重计 1 倍。
 //!
 //! 对话轮计数：「真实用户输入行」置 pending 标志——type=="user" 且无 toolUseResult、
 //! 无 tool_result 块、非 sidechain / meta / compact summary,且 `origin.kind` 缺省或为
 //! `human`（`task-notification` 等是系统注入,不是用户发起）;下一条 assistant usage 行
 //! 按其模型计 1 turn 并清位,pending 持久化进游标。
 //!
-//! 零调用输入：本文件出现过 `origin` 字段的前提下,缺 `origin` 的用户行（本机:
-//! 本地斜杠命令 `<command-name>`、命令输出 `<local-command-stdout>`、`[Request interrupted…]`
-//! 标记,64/64 均不带 origin;386 条真实输入全带 `origin.kind=human`）记为**待定输入**:拿到响应
-//! 照常成轮计 request_count,零调用则不成轮（不写 turn_raw、不计中止错误）。全文件无 origin 的
-//! 旧 CLI 文件维持原判（缺 origin 即真实输入,零调用按中止轮）。
+//! 零调用输入：本文件出现过 `origin` 字段的前提下,缺 `origin` 的用户行（本地斜杠命令
+//! `<command-name>`、命令输出 `<local-command-stdout>`、`[Request interrupted…]` 标记都不带 origin,
+//! 真实输入全带 `origin.kind=human`）记为**待定输入**:拿到响应照常成轮计 request_count,
+//! 零调用则不成轮（不写 turn_raw、不计中止错误）。全文件无 origin 的旧 CLI 文件维持原判
+//! （缺 origin 即真实输入,零调用按中止轮）。
 //!
 //! 轮与时间：真实输入开轮;assistant 行 = 模型调用（按 message.id 去重）,
 //! `tool_use` 块 id → `tool_result.tool_use_id` 配对算 tool_ms;`isApiErrorMessage` 计错,
@@ -37,14 +34,14 @@
 //! 项目：= 文件所在文件夹 `projects/<编码启动目录>/`（源自己的分组,`project_dir`）;行内 `cwd` 只用来
 //! 还原可读路径——它是 Bash 当前目录,随 `cd` 漂进子目录,不能当身份。
 //!
-//! **v12 会话族折叠**：
+//! **会话族折叠**：
 //! 桌面应用「续聊 / fork」把整份历史复制进新会话文件——复制行的 `uuid` / `message.id` / 时间戳与原文件
 //! 逐行一致;新版改写 `sessionId`（及用户行 `promptId`）,旧版（2.1.260）连 `sessionId` 都沿用根会话,
 //! 所以判族只看行 uuid;根文件在 fork 之后不再追加带时间戳的行。
 //! 口径：文件内**首个带 uuid 的主会话行**若已被计过 → 整个文件是该根会话的续篇:
 //! session_id 归根（`TurnState:fold_into`）、文件名主干作副本 id 记入 `session_alias`（子会话 parent 归根）、
 //! 只计未见过的 uuid（复制的历史行跳过:不开轮、不入账、不配对）、标题按最新文件覆盖。已计行持久化在
-//! `seen_line`（派生数据,随清库重扫）。文件按 （首个 uuid 行时间, 尾部时间) 升序处理,根文件先占 uuid
+//! `seen_line`（派生数据）。文件按 （首个 uuid 行时间, 尾部时间) 升序处理,根文件先占 uuid
 //! （mtime 不可靠:根文件事后会被追加无时间戳的元数据行）。`/compact` 在同一文件内追加,不受影响。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -71,7 +68,6 @@ static META: AdapterMeta = AdapterMeta {
     kind: "jsonl",
 };
 
-/// 用户行的分类。
 #[derive(Debug, PartialEq)]
 enum UserKind {
     /// 真实用户输入（开轮 + 置 pending）。
@@ -198,9 +194,9 @@ impl ClaudeCodeAdapter {
         if let Some(t) = ts {
             cursor.last_ts = cursor.last_ts.max(t);
         }
-        // v12 会话族判定:首个带 uuid 的行。主会话行已被计过（不论行内 sessionId 是否改写:前的
-        // 副本沿用根会话的 sessionId,之后的改写成新 id）→ 本文件是该根会话的续篇;截断重读的文件由 collect
-        // 预先置已判定（自身重读不是副本）。子会话文件只置已判定。
+        // 会话族判定:首个带 uuid 的行。主会话行已被计过（不论行内 sessionId 是否改写:旧版副本沿用根会话的
+        // sessionId,新版改写成新 id）→ 本文件是该根会话的续篇;截断重读的文件由 collect
+        // 预先置已判定（自身重读不是副本）。子会话文件（全是 sidechain 行,不会被复制）只置已判定。
         if let (Some(u), false) = (uuid, cursor.family_resolved) {
             cursor.family_resolved = true;
             let root = if sidechain { None } else { fam.seen_session(store, u) };
@@ -226,8 +222,8 @@ impl ClaudeCodeAdapter {
                 None => st.set_session(sid),
             }
         }
-        // 行内 cwd 不再参与项目归属（它是 Bash 当前目录,`cd` 后漂进子目录）;项目由文件所在文件夹决定,collect 里设定。
-        // 宿主线索,供聚焦选目标进程。
+        // 行内 cwd 不参与项目归属（它是 Bash 当前目录,`cd` 后漂进子目录）;项目由文件所在文件夹决定,collect 里设定。
+        // 宿主线索（claude-desktop / claude-vscode）,供聚焦选目标进程。
         if let Some(ep) = v.get("entrypoint").and_then(|x| x.as_str()) {
             st.set_host(ep);
         }
@@ -343,7 +339,7 @@ impl Adapter for ClaudeCodeAdapter {
         let mut files = Vec::new();
         super::jsonl::discover(&self.projects_dir, true, &mut files);
         // 按 （首个 uuid 行时间, 尾部时间, 路径) 升序——根文件先于其续聊 / fork 副本占 uuid。
-        // 排序键随游标持久化;只对未扫过且有新内容的文件读头尾（迁移清库后的首轮全量扫一次）。
+        // 排序键随游标持久化;只对未扫过且有新内容的文件读头尾。
         let mut entries: Vec<(PathBuf, String, FileCursor)> = files
             .into_iter()
             .map(|path| {
@@ -408,7 +404,7 @@ impl Adapter for ClaudeCodeAdapter {
 mod tests {
     use super::*;
 
-    // ---------- 冻结样本行（2026-09-15 本机真实结构,正文 / 标题 / 路径已脱敏,键集保持） ----------
+    // ---------- 冻结样本行（本机真实结构,正文 / 标题 / 路径已脱敏,键集保持） ----------
 
     const S: &str = "0a1b2c3d-0000-4000-8000-000000000001";
     fn human(ts: &str, origin: Option<&str>) -> String {
@@ -433,7 +429,7 @@ mod tests {
         format!(r#"{{"parentUuid":null,"isSidechain":true,"agentId":"a1b2c3d4e5","userType":"external","cwd":"E:\\Work\\Demo","sessionId":"{S}","version":"2.1.0",{body},"uuid":"x-{ts}","timestamp":"{ts}"}}"#)
     }
 
-    /// 缺 origin 的本地命令 / 命令输出 / 中断标记行（2026-09-15 本机真实键集,正文脱敏为结构标记）。
+    /// 缺 origin 的本地命令 / 命令输出 / 中断标记行（真实键集,正文脱敏为结构标记）。
     fn no_origin(ts: &str, content: &str) -> String {
         format!(r#"{{"parentUuid":"p","isSidechain":false,"promptId":"pr-{ts}","type":"user","message":{{"role":"user","content":{content}}},"uuid":"n-{ts}","timestamp":"{ts}","userType":"external","entrypoint":"claude-desktop","cwd":"E:\\Work\\Demo","sessionId":"{S}","version":"2.1.0","gitBranch":"main"}}"#)
     }
@@ -463,8 +459,8 @@ mod tests {
         store
     }
 
-    /// v13:行内 cwd 是 Bash 当前目录——`cd` 进子目录后工具结果、助手行乃至下一条真实提问都带子目录
-    /// （2026-09-16 本机实证）。项目恒为文件首个 cwd:轮、会话行、daily_project 都不出现子目录键。
+    /// 行内 cwd 是 Bash 当前目录——`cd` 进子目录后工具结果、助手行乃至下一条真实提问都带子目录。
+    /// 项目恒为启动目录:轮、会话行、daily_project 都不出现子目录键。
     #[test]
     fn project_stays_at_launch_dir_after_cd() {
         let cd = |line: String| line.replace(r"E:\\Work\\Demo", r"E:\\Work\\Demo\\src-tauri\\src");
@@ -499,7 +495,7 @@ mod tests {
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
 
-    /// v13:身份 = 文件夹。同一文件夹下另一个文件每一行都已漂进子目录（首个 cwd 也是子目录）,仍归该文件夹的项目;
+    /// 身份 = 文件夹。同一文件夹下另一个文件每一行都已漂进子目录（首个 cwd 也是子目录）,仍归该文件夹的项目;
     /// 可读路径来自同批已解析的兄弟文件,并持久化为 `folder:` 映射供下次采集复用。
     #[test]
     fn folder_decides_project_even_if_every_line_drifted() {
@@ -525,7 +521,7 @@ mod tests {
         assert_eq!(store.get_cursor(META.id, "folder:E--Work-Demo").as_deref(), Some("e:/Work/Demo"), "映射持久化");
     }
 
-    /// PHASE14 S3:stop_reason 驱动注意力观测——tool_use 未回 = 工具中;非 tool_use = 答完等用户;
+    /// stop_reason 驱动注意力观测——tool_use 未回 = 工具中;非 tool_use = 答完等用户;
     /// 答完后的中断标记（待定零调用轮）= 无状态。
     #[test]
     fn stop_reason_drives_live_phase() {
@@ -554,7 +550,7 @@ mod tests {
         assert_eq!(phase("live_interrupt", done), Some(LivePhase::Idle));
     }
 
-    /// S3 定案:同文件出现过 origin → 缺 origin 的零调用行不成轮;拿到响应的照常成轮;跨批次正确。
+    /// 同文件出现过 origin → 缺 origin 的零调用行不成轮;拿到响应的照常成轮;跨批次正确。
     #[test]
     fn zero_call_lines_without_origin_are_not_turns() {
         let text = r#"{"type":"text","text":"x"}"#;
@@ -593,7 +589,7 @@ mod tests {
         assert!(store.test_project_conservation().is_empty());
     }
 
-    /// 旧版全文件无 origin:缺 origin 仍是真实输入,零调用按中止轮（维持 S2 口径）。
+    /// 旧版全文件无 origin:缺 origin 仍是真实输入,零调用按中止轮。
     #[test]
     fn legacy_files_without_origin_keep_aborted_turns() {
         let text = r#"{"type":"text","text":"x"}"#;
@@ -623,7 +619,7 @@ mod tests {
             UserKind::Injected
         );
         assert_eq!(user_kind(&v(&tool_result("2026-09-05T10:00:00Z", "toolu_1"))), UserKind::ToolResults(vec!["toolu_1".into()]));
-        // 无 toolUseResult 但带 tool_result 块（实证 232 行）→ 仍是工具结果
+        // 无 toolUseResult 但带 tool_result 块 → 仍是工具结果
         assert_eq!(
             user_kind(&v(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_9"}]}}"#)),
             UserKind::ToolResults(vec!["toolu_9".into()])
@@ -645,7 +641,7 @@ mod tests {
         assert!(assistant_usage(&no_ts).is_none());
     }
 
-    // ---------- v12 续聊 / fork 副本（2026-09-16 本机 11 个会话族实证:复制行只改 sessionId / promptId） ----------
+    // ---------- 续聊 / fork 副本（复制行只改 sessionId / promptId） ----------
 
     const S2: &str = "0a1b2c3d-0000-4000-8000-000000000002";
     /// 副本文件的行 = 原行改写 sessionId（uuid / message.id / timestamp 逐字不变）。
@@ -656,7 +652,7 @@ mod tests {
     /// 冻结样本每条 assistant 行带的 cache 两项（同一 message.id 只入账一次）。
     const CPM: i64 = 4800 + 120;
 
-    /// 根文件:两轮 + 末尾一条未得响应的输入（实证:根文件末尾的 stop_hook / 中断行不被复制）。
+    /// 根文件:两轮 + 末尾一条未得响应的输入（根文件末尾的 stop_hook / 中断行不被复制）。
     fn root_lines() -> Vec<String> {
         vec![
             TITLE_CUSTOM.to_string(),
@@ -718,7 +714,7 @@ mod tests {
         )
     }
 
-    /// 全量重扫:根 + fork 副本 + fork 目录下的子代理同批出现,根文件 mtime 反而更新（实证:根文件事后被
+    /// 全量重扫:根 + fork 副本 + fork 目录下的子代理同批出现,根文件 mtime 反而更新（根文件事后被
     /// 追加元数据行）→ 仍按首个 uuid 行时间先处理根;副本折进根会话,轮 / token 只计一份,子会话 parent 归根。
     #[test]
     fn fork_copies_fold_into_root_session() {
@@ -812,7 +808,7 @@ mod tests {
         assert_eq!(family_summary(&c), (1, 6, 5, 110 + 220 + 330 + 440 + 550 + 5 * CPM, 1, 11));
     }
 
-    /// 旧版副本（2026-09-09 前的桌面版,实证 2c0e1ae7 / 7494e2a8 族）:复制行连 `sessionId` 都沿用根会话,
+    /// 旧版副本（早期桌面版）:复制行连 `sessionId` 都沿用根会话,
     /// 只有文件名是新 id → 仍按已计行折叠,别名取文件名。
     #[test]
     fn fork_copies_keeping_root_session_id_fold_too() {

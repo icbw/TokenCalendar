@@ -1,18 +1,10 @@
-// 月矩阵色阶：P99 截断 + log1p 归一化，支持 global / perRow
-// 与 react-grid-heatmap 的线性 min-max 不同；拉满让高值与中值不挤（视觉）
+// 月矩阵色阶：分位截断 + log1p 归一化，支持 global / perRow。
+// 与线性 min-max 不同：log1p 压缩让高值与中值不挤在一起。
 
 export type ScaleMode = 'global' | 'perRow'
 export type CellStatus = 'future' | 'zero' | 'normal' | 'estimated' | 'error' | 'today' | 'selected'
 
-/** 非零值的 P99 作为色阶上限，避免单日极端峰值压扁其余数据 */
-export function p99Cap(values: number[]): number {
-  const nz = values.filter((v) => v > 0).sort((a, b) => a - b)
-  if (nz.length === 0) return 0
-  const idx = Math.min(nz.length - 1, Math.floor(nz.length * 0.99))
-  return nz[idx]
-}
-
-/** P95 截断（保留为兼容性；新代码用 p99Cap） */
+/** 非零值的 P95 作为色阶上限，避免单日极端峰值压扁其余数据 */
 export function p95Cap(values: number[]): number {
   const nz = values.filter((v) => v > 0).sort((a, b) => a - b)
   if (nz.length === 0) return 0
@@ -26,9 +18,8 @@ export function intensity(value: number, cap: number): number {
   return Math.min(1, Math.log1p(value) / Math.log1p(cap))
 }
 
-/** 分档色带（视觉：4 桶 + 峰值档），让 log1p 压缩后的中低值仍有清晰色差。
- * 反馈：整体色系太深、饱和度拉满不好看 → 整条下移：
- * 桶 0~3 用 blue-100~400（浅到中浅），仅峰值用 blue-500，饱和度适中。 */
+/** 分档色带（4 桶 + 峰值档），让 log1p 压缩后的中低值仍有清晰色差。
+ * 整条偏浅：桶 0~3 用 blue-100~400（浅到中浅），仅峰值用 blue-500，避免整体过深过饱和。 */
 const PALETTE_NORMAL = [
   '#dbeafe', // blue-100  浅    t<0.35
   '#bfdbfe', // blue-200  中浅  0.35~0.7
@@ -54,7 +45,7 @@ function bucketIndex(t: number): number {
   return 0
 }
 
-/** 非零单元格背景色（蓝阶分档）：P95 截断 + log1p，
+/** 非零单元格背景色（蓝阶分档）：分位截断 + log1p，
  * 4 桶 + 峰值档让中低值有清晰色差。 */
 export function normalCellBackground(value: number, cap: number): string {
   const t = intensity(value, cap)
@@ -94,7 +85,7 @@ export function cellVisual(
   return { background: normalCellBackground(value, cap), status: 'normal' }
 }
 
-/** 千分位格式化（tooltip 用完整格式，v0.3） */
+/** 千分位格式化（tooltip 用完整格式） */
 export function formatFull(n: number): string {
   return n.toLocaleString('en-US')
 }

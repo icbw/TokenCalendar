@@ -1,9 +1,8 @@
 // Widget design preferences shared across components （settings drawer writes,
 // YearMatrix reads). Module-level store: tiny, no provider needed.
-// 发布数据架构：持久化单一源 = 数据根 prefs.json（Rust
-// 命令 get_prefs_raw/set_prefs_raw 原子读写）;localStorage 仅作旧数据一次性
-// 迁移来源（首启检测 prefs.json 缺失而 localStorage 有 → 迁入后清除旧键）,
-// 跨窗口实时互通仍走 'storage' 事件桥（写入方同时写 localStorage 中转键）。
+// 持久化单一源 = 数据根 prefs.json（Rust 命令 get_prefs_raw/set_prefs_raw 原子读写）;
+// localStorage 仅作旧数据一次性迁移来源（首启检测 prefs.json 缺失而 localStorage 有 → 迁入后清除旧键）,
+// 跨窗口实时互通走 'storage' 事件桥（写入方同时写 localStorage 中转键）。
 
 /** 尺寸预设三档。窗口尺寸单一源：SIZE_PRESETS（YearMatrix.tsx），
  * designPrefs 只存档位名；档位切换即 set_widget_size，几何落盘兜底。 */
@@ -13,11 +12,11 @@ import type { SubscriptionPlatform } from '../../services/subscriptionService'
 import { setFetchPolicy } from '../../services/subscriptionService'
 
 /** 「按预计消耗取数」阈值的合法域（与 Rust clamp 同源：0.5〜10.0，步进 0.5；
- * 默认 2 = 距上次读数预计消耗 2% 就取一次）。设置页的 min/max/step 取这里。 */
-// 默认由 2 改为 5（DEFAULT_THRESHOLD_PCT 同源）：
-// 阈值的单位是「5h 窗口的百分点」，而两个平台的窗口值钱程度差一个数量级
-//2% 对 Codex
-// 相当于两三毛钱的活就要打一次请求。Codex 的读数新鲜度不靠它——rollout 会零请求推进快照。
+ * default = 距上次读数预计消耗这么多百分点就取一次）。设置页的 min/max/step 取这里。 */
+// 默认 5 与 Rust 侧 demand:DEFAULT_THRESHOLD_PCT 同源。
+// 阈值的单位是「5h 窗口的百分点」，而两个平台满窗的 API 等价用量差约一个数量级
+// （Claude Max ≈ $110、Codex ≈ $11〜14），阈值过低会让 Codex 很少的用量就触发一次请求。
+// Codex 的读数新鲜度不靠它——rollout 会零请求推进快照。
 export const SUBSCRIPTION_FETCH_PCT = { min: 0.5, max: 10, step: 0.5, default: 5 } as const
 
 /** 毛玻璃材质档（undefined = 关闭）。两窗口各自独立一个键。
@@ -25,7 +24,7 @@ export const SUBSCRIPTION_FETCH_PCT = { min: 0.5, max: 10, step: 0.5, default: 5
  * Win10 1809+（Win11 ≥22523 走 host backdrop，染色参数被忽略）。 */
 export type MaterialEffect = 'mica' | 'acrylic'
 
-/** 圆角方案三档（全局圆角统一为主题参数）。
+/** 圆角方案三档：全局圆角统一为主题参数。
  * 每档拆分主面板 panel 与挂件 widget 两个值（当前同档对齐相等，结构
  * 拆分留独立演化空间）。**材质态窗口圆角由 DWM 裁切（系统 ~8px），不
  * 受本方案控制**——需要与材质态一致请选 small。undefined = large。 */
@@ -45,8 +44,7 @@ export type WeekStart = 'sunday' | 'monday'
 /** 三档窗口尺寸（单一源，YearMatrix 与 SettingsPage 共用）。
  * 数值由格位精确反推：53 列 × cell（15/12/6) + 52×gap4 网格 + 卡片
  * padding 8×2 + border 2（横向 +38）；纵向 = 7×cell + 6×gap4 + 26
- * （padding 12×2 + border 2；月标签浮层化不再占布局位，
- * 上下边距严格对称，格子尺寸不变）。
+ * （padding 12×2 + border 2；月标签是浮层不占布局位，上下边距严格对称）。
  * chrome（header/标签）为 hover 浮层不占常驻空间，三档热力图面积占比
  * ≈81% / 78% / 71%，满足设计约束 ≥ 2/3。 */
 export const SIZE_PRESETS: Record<SizePreset, { w: number; h: number; labels: boolean }> = {
@@ -90,39 +88,36 @@ export interface DesignPrefs {
   lockAspectRatio: boolean
   /** Locked widget: the card content ignores the mouse （read-only minimal
    * form); hovering calls the chrome back and the unlock button stays
-   * clickable. Replaces the old always-on-top pin — the widget is a
-   * glanceable desktop calendar. */
+   * clickable. The widget is a glanceable desktop calendar, not always-on-top. */
   locked: boolean
   /** Widget window size preset （large/medium/small); switching applies the
    * preset's window size immediately via set_widget_size. */
   sizePreset: SizePreset
-  /** v3.1:CodeBuddy 积分卡显隐。默认关——没用过 CodeBuddy 的用户
+  /** CodeBuddy 积分卡显隐。默认关——没用过 CodeBuddy 的用户
    * 不应看到常驻空引导卡;开启后 chart 视图尾部渲染该卡。 */
   insightsCredit: boolean
-  /** v3.2:主窗口矩阵最大行数（同时限制 agent/model 视图行数,
+  /** 主窗口矩阵最大行数（同时限制 agent/model 视图行数,
    * 超出截断为「+N more」摘要行）。默认 15;0 = 不限。热力图是主体,行数
    * 上限保证小窗下热力图完整可见、不被图表面板挤压。 */
   matrixMaxRows: number
-  /** ：订阅**兜底取数间隔**（秒）。默认 600（10 分钟）;设置页下拉 5/10/15/30 分钟。
+  /** 订阅**兜底取数间隔**（秒）。undefined = 1800（30 分钟,默认值见 SettingsPage 的 POLL_DEFAULT_SECS）;设置页下拉 5/10/15/30 分钟。
    * 读数主路径是本地 token 探针（采集器一发现本机新 token 就立即取数）,本键只管
    * 「本地留不下痕迹」那部分用量（网页 / 在线会话）的兜底节奏。持久化在此键,
    * 运行时值经 set_subscription_poll_secs 下发（窗口装载时恢复）。 */
   subscriptionPollSecs?: number
-  /** 取数阈值（百分点;undefined = 2）：本地 token 按模型加权折算成「距上次读数大约
+  /** 取数阈值（百分点;undefined = SUBSCRIPTION_FETCH_PCT.default）：本地 token 按模型加权折算成「距上次读数大约
    * 消耗了百分之几」,达到本值就取一次读数——这是取数主路径,subscriptionPollSecs
    * 只剩兜底。合法域见 SUBSCRIPTION_FETCH_PCT（0.5〜10,0.5 的整数倍;Rust 侧同域 clamp）。
    * 运行时值经 set_subscription_fetch_policy 下发（与 subscriptionTightenLow 合成一次调用）。 */
   subscriptionFetchPct?: number
-  /** 低余量收紧（undefined = 开）：5h 窗口剩余 ≤ 20% 时把上面的阈值减半（默认 2% → 1%）,
+  /** 低余量收紧（undefined = 开）：5h 窗口剩余 ≤ 20% 时把上面的阈值减半,
    * 额度见底那段时间读数更密。与 subscriptionFetchPct 同一条下发命令。 */
   subscriptionTightenLow?: boolean
-  /** 待机监控：兜底取数自适应退档（Rust subscription/idle.rs）。
-   * 读数无变化逐档放慢（封顶 30 分钟）,任何变化立即回设置档;待机中悬浮球整体
-   * 减淡 50%。**默认开**（undefined = 开）——退档是收敛行为,不需要显式授权。
-   * 运行时经 set_subscription_idle_enabled 下发,orb 窗口装载时恢复;档位状态本身
-   * 不持久化（重启回基础档重评）。 */
+  /** 待机（Rust subscription/idle.rs）：本地 agent 静默满「离开」时长即进入待机,悬浮球整体减淡;
+   * 新 token / 用户注意（手动刷新等）立即退出。只影响视觉,不改变取数频次。
+   * **默认开**（undefined = 开）。运行时经 set_subscription_idle_enabled 下发,orb 窗口装载时恢复。 */
   orbIdleEnabled?: boolean
-  /** 悬浮球上次显示的订阅平台（启动恢复上次的平台,而非固定第一个）。
+  /** 悬浮球上次显示的订阅平台：启动恢复上次的平台,而非固定第一个。
    * 按平台 id 记（绑定集合变化时下标会错位）;该平台未绑定 → 回落第一个已绑定平台,
    * 键保持不动直到用户再切换。undefined = 第一个。 */
   orbPlatform?: SubscriptionPlatform
@@ -133,7 +128,7 @@ export interface DesignPrefs {
   autoUpdate: boolean
   /** 离开阈值（分钟,1〜1440;undefined = 30）:轮间空档 ≤ 阈值才计入「人工时间」。
    * **写入方是 Rust `set_idle_threshold`**（合并写 prefs.json 并同步重算 daily_project）;
-   * 前端改阈值时须同时 setDesignPrefs 本键,否则 persist 的旧快照会把它覆盖回去（S4 接线）。 */
+   * 前端改阈值时须同时 setDesignPrefs 本键,否则 persist 的旧快照会把它覆盖回去。 */
   idleThresholdMin?: number
   /** 采集频率（秒,30 / 60 / 120 / 180 / 300;undefined = 30）。**写入方是 Rust `set_collect_interval`**
    * （合并写 prefs.json 并下发运行时值）;前端改档时须同时 setDesignPrefs 本键,否则 persist 的旧快照会覆盖回去。 */
@@ -141,7 +136,7 @@ export interface DesignPrefs {
   /** Tasks 列表标签:time（开始时间,默认）⇄ title（会话标题,空时回退 time）。
    * undefined = time。title 是内容列,只在 Tasks 列表渲染。 */
   taskLabelMode?: 'time' | 'title'
-  /** -R 选定单个项目时,Tasks / Insights 的范围自动切到该项目生命周期（undefined = 开）。
+  /** 选定单个项目时,Tasks / Insights 的范围自动切到该项目生命周期（undefined = 开）。
    * 用户在项目生命周期模式下手改范围即写 false;范围控件的「Project span」按钮写回 true。 */
   projectAutoRange?: boolean
   /** 项目自动折叠规则（设置·Projects）:根会话数 < scratchMinSessions 且总轮数 < scratchMinTurns 的
@@ -152,15 +147,14 @@ export interface DesignPrefs {
   scratchMinSessions?: number
   scratchMinTurns?: number
   scratchUnknown?: boolean
-  /** 时间轴监测项目组:**原始目录键**列表（读时经 list_project_meta 的 effective_key 解析,
+  /** 时间轴监测项目组（时间轴只显示这些项目,顺序即列序;设置·Projects 管理）:**原始目录键**列表（读时经 list_project_meta 的 effective_key 解析,
    * merge 后不孤儿;匹配不到的键静默忽略不删除）。undefined = 无置顶。主窗口 ProjectManager 与
    * timeline 窗口共享本键,经 storage 桥跨窗口即时同步。 */
   timelinePinnedKeys?: string[]
-  /** ：
-   * 过去 / 未来天数（0〜30;undefined = 7 / 7）。设置·General Timeline 段。 */
+  /** 时间轴过去 / 未来天数（0〜30;undefined = 7 / 7）。设置·General Timeline 段。 */
   timelinePastDays?: number
   timelineFutureDays?: number
-  /** ：过去的日期每天只显示 timelinePastSessions 条会话（1〜10,undefined = 1）,
+  /** 过去的日期每天只显示 timelinePastSessions 条会话（1〜10,undefined = 1）,
    * 今天显示 timelineTodaySessions 条（1〜20,undefined = 5）;选哪几条按 timelinePick：latest = 最新的代表
    * 一天（默认）/ earliest = 最早的几条代表一天 / longest = tokens 最多的代表一天。
    * 格内与日期一律按时间从旧到新自上而下;timelineReverse = true 整体反转（最新在上）。 */
@@ -168,9 +162,9 @@ export interface DesignPrefs {
   timelineTodaySessions?: number
   timelinePick?: 'latest' | 'earliest' | 'longest'
   timelineReverse?: boolean
-  /** ：看板失焦 N 秒后自动折成条态（0〜3600;undefined / 0 = 关）。第二屏挂着不获焦就不触发。 */
+  /** 看板失焦 N 秒后自动折成条态（0〜3600;undefined / 0 = 关）。第二屏挂着不获焦就不触发。 */
   timelineAutoStripSecs?: number
-  /** 时间轴外观：面板背景 alpha（0〜1,undefined = 0.55）、
+  /** 时间轴外观（设置·Appearance Timeline 组）：面板背景 alpha（0〜1,undefined = 0.55）、
    * 顶栏 alpha（0.2〜1,undefined = 0.85）、会话格 alpha（0.2〜1,undefined = 0.8）。都是背景色 alpha,
    * 不是元素 opacity——文字与按钮始终全不透明。与挂件 bgOpacity / 主界面 titlebarAlpha 零关联。 */
   timelineBgAlpha?: number
@@ -202,7 +196,7 @@ const DEFAULTS: DesignPrefs = {
 }
 
 // 载入清洗：未知键（如已退役字段）不落 prefs；非法色值/越界 alpha 视为未自定义
-// （P1 主界面三色 + 顶栏 alpha 与 P0 卡片色同口径）。
+// （主界面三色 + 顶栏 alpha 与卡片色同口径）。
 function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   const hexKeys = ['widgetCardBg', 'titlebarBg', 'panelBg', 'borderColor', 'timelineAccent'] as const
   for (const k of hexKeys) {
@@ -228,14 +222,12 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
     delete p.matrixMaxRows
   }
   // 兜底取数间隔只认设置页四个档（秒;Rust 侧受理域仍是 60〜1800,
-  // 前端收窄到下拉可选值,越界或旧档视为未设置 → 回默认 600）。
-  // （悬浮球总开关的 `orbEnabled` 键已退役：可见性单一源在 Rust visibility.rs,
-  //   持久化在 window-state.json 的 orb_visible;设置页直接消费该源,见㉚。）
+  // 前端收窄到下拉可选值,越界或旧档视为未设置 → 回默认）。
   if (p.subscriptionPollSecs !== undefined && ![300, 600, 900, 1800].includes(p.subscriptionPollSecs as number)) {
     delete p.subscriptionPollSecs
   }
   // 取数阈值：只认 0.5〜10 且是 0.5 的整数倍（与 Rust clamp / 步进同域;
-  // 0.5 的倍数在二进制里精确可表示,×2 取整判断无误差）。越界 / 非法步进视为未设置 → 回默认 2。
+  // 0.5 的倍数在二进制里精确可表示,除以步进取整判断无误差）。越界 / 非法步进视为未设置 → 回默认值。
   if (
     p.subscriptionFetchPct !== undefined &&
     !(
@@ -255,8 +247,8 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.orbPlatform !== undefined && p.orbPlatform !== 'codex' && p.orbPlatform !== 'claude') {
     delete p.orbPlatform
   }
-  // 退役键清理（取数改由本地 token 探针驱动,提频档位整组退役;
-  // `orbEnabled` 更早退役,可见性单一源在 Rust visibility.rs）。旧 prefs.json 里的
+  // 退役键清理：提频档位 orbBoost* 与悬浮球总开关 orbEnabled 已不再使用（可见性单一源在
+  // Rust visibility.rs,持久化在 window-state.json 的 orb_visible）。旧 prefs.json 里的
   // 残值静默清掉——不读、不回写、不报错。**只认这两条前缀**：命名空间通配会把
   // 将来新增的 orb 前缀键一并吞掉。
   for (const k of Object.keys(p)) {
@@ -286,7 +278,7 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.scratchMinTurns !== undefined && !(typeof p.scratchMinTurns === 'number' && Number.isInteger(p.scratchMinTurns) && p.scratchMinTurns >= 1 && p.scratchMinTurns <= 500)) {
     delete p.scratchMinTurns
   }
-  // 时间轴:置顶键 = 非空字符串数组（去重,单键 ≤ 1024 字符,最多 200 项）;方向只认两值。
+  // 时间轴置顶键 = 非空字符串数组（去重,单键 ≤ 1024 字符,最多 200 项）。
   if (p.timelinePinnedKeys !== undefined) {
     if (Array.isArray(p.timelinePinnedKeys)) {
       const seen = new Set<string>()
@@ -298,13 +290,13 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
       delete p.timelinePinnedKeys
     }
   }
-  // 看板方向键 timelineOrientation 已退役:旧 prefs 残值清掉
+  // 退役键 timelineOrientation（看板只有纵向项目视图）:旧 prefs 残值清掉
   delete (p as Record<string, unknown>).timelineOrientation
   if (p.timelineHeat !== undefined && typeof p.timelineHeat !== 'boolean') delete p.timelineHeat
   if (p.timelineWindowStyle !== undefined && p.timelineWindowStyle !== 'shadow' && p.timelineWindowStyle !== 'flat') {
     delete p.timelineWindowStyle
   }
-  // 最多显示项目数 timelineMaxProjects 已退役:清残值
+  // 退役键 timelineMaxProjects（时间轴改为固定监测项目组,见 timelinePinnedKeys）:清残值
   delete (p as Record<string, unknown>).timelineMaxProjects
   for (const k of ['timelinePastDays', 'timelineFutureDays'] as const) {
     if (p[k] !== undefined && !(typeof p[k] === 'number' && Number.isInteger(p[k]) && p[k] >= 0 && p[k] <= 30)) delete p[k]
@@ -328,7 +320,7 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.timelineAutoStripSecs !== undefined && !(typeof p.timelineAutoStripSecs === 'number' && Number.isInteger(p.timelineAutoStripSecs) && p.timelineAutoStripSecs >= 0 && p.timelineAutoStripSecs <= 3600)) {
     delete p.timelineAutoStripSecs
   }
-  // 应用更新开关：非布尔值视为未设置（回落默认开）。
+  // 应用更新开关：非布尔值视为未设置（回落默认关）。
   if (p.autoUpdate !== undefined && typeof p.autoUpdate !== 'boolean') {
     delete p.autoUpdate
   }
@@ -436,13 +428,12 @@ export function subscribeDesignPrefs(fn: (p: DesignPrefs) => void): () => void {
   return () => listeners.delete(fn)
 }
 
-/** designPrefs → 待机开关（undefined = 开;与 Rust ENABLED 初值对齐——
- * 退档是收敛行为,无需显式授权）。 */
+/** designPrefs → 待机开关（undefined = 开;与 Rust ENABLED 初值对齐）。 */
 export function orbIdleEnabled(p: DesignPrefs): boolean {
   return p.orbIdleEnabled ?? true
 }
 
-/** designPrefs → 取数阈值（百分点;undefined = 2）。 */
+/** designPrefs → 取数阈值（百分点;undefined = SUBSCRIPTION_FETCH_PCT.default）。 */
 export function subscriptionFetchPct(p: DesignPrefs): number {
   return p.subscriptionFetchPct ?? SUBSCRIPTION_FETCH_PCT.default
 }
@@ -454,15 +445,15 @@ export function subscriptionTightenLow(p: DesignPrefs): boolean {
 
 /** 恢复 / 下发取数策略运行时值：两键合成一次 set_subscription_fetch_policy
  * （与 applyPollSecs 同款——持久化在本模块,运行时值归 Rust;非 Tauri 环境与
- * 旧版 Rust 缺命令时静默跳过,不打断调用方）。 */
+ * Rust 缺命令时静默跳过,不打断调用方）。 */
 export async function applySubscriptionFetchPolicy(p: DesignPrefs): Promise<void> {
   await setFetchPolicy(subscriptionFetchPct(p), subscriptionTightenLow(p)).catch(() => {})
 }
 
-// 跨窗口实时互通：widget / main 两个窗口共享同源 localStorage。
+// 跨窗口实时互通：各窗口共享同源 localStorage。
 // 'storage' 事件只在「其他」窗口触发（写入方收不到），收到后重读并通知
-// 本窗口订阅者——主窗口抽屉拖滑条，挂件即时生效；反之亦然（验收项）。
-// 桥键与旧键都监听（迁移期旧版本多窗口共存兼容）。
+// 本窗口订阅者——主窗口抽屉拖滑条，挂件即时生效；反之亦然。
+// 桥键与旧键都监听（兼容仍写旧键的旧版本窗口共存）。
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.key !== BRIDGE_KEY && e.key !== KEY && e.key !== null) return

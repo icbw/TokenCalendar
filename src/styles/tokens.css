@@ -1,7 +1,6 @@
-/* 前代项目设计令牌 v2（主窗口现代化：与挂件卡片同源）。
-   v1 色板经 /02 验证保留；v2 补齐间距/圆角/阴影/动效体系。 */
+/* 设计令牌：色板 + 间距/圆角/阴影/动效体系，主窗口与挂件卡片同源。 */
 :root {
-  /* ---- 布局尺寸（保留） ---- */
+  /* ---- 布局尺寸 ---- */
   --label-width: 140px;
   --total-width: 92px;
   --cell-size: 15px;
@@ -10,7 +9,7 @@
   --font-size-sm: 12px;
   --font-size-md: 13px;
 
-  /* ---- v2 间距体系（4px 基线） ---- */
+  /* ---- 间距体系（4px 基线） ---- */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -18,28 +17,28 @@
   --space-5: 20px;
   --space-6: 24px;
 
-  /* ---- v2 圆角体系（挂件卡片 16px 为最大锚点） ---- */
+  /* ---- 圆角体系（挂件卡片 16px 为最大锚点） ---- */
   --radius-sm: 4px;
   --radius: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
   --radius-card: 16px; /* 主窗口圆角方案档（radiusTheme 覆写）；挂件体系用 --widget-card-radius，同档对齐 */
 
-  /* ---- v2 阴影体系（系统 DWM 阴影观感校准；widget 卡片不用 CSS 阴影，
+  /* ---- 阴影体系（按系统 DWM 阴影观感校准；widget 卡片不用 CSS 阴影，
          见 yearMatrix.css 阴影策略注释） ---- */
   --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.08);
   --shadow-2: 0 4px 14px rgba(15, 23, 42, 0.14);
   --shadow-3: 0 8px 28px rgba(15, 23, 42, 0.18);
 
-  /* ---- v2 动效体系（统一曲线与时长） ---- */
+  /* ---- 动效体系（统一曲线与时长） ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-fast: 0.12s;
   --dur-normal: 0.18s;
 
-  /* ---- v2 标题栏（frameless 主窗口自绘） ---- */
+  /* ---- 标题栏（frameless 主窗口自绘） ---- */
   --titlebar-h: 40px;
 
-  /* ---- 浅色主题（保留） ---- */
+  /* ---- 浅色主题 ---- */
   --bg: #f8fafc;
   --panel: #ffffff;
   --border: #e2e8f0;
@@ -59,7 +58,7 @@
   --estimated-dash: #b45309;
   --error-bg: repeating-linear-gradient(45deg, #fecaca 0 2px, #fee2e2 2px 4px);
 
-  /* widget 卡片（tokscale 参考：近白卡片，GitHub 式对比建立在白底上）
+  /* widget 卡片（近白卡片，GitHub 式对比建立在白底上）
      card-bg 用 RGB 三元组，yearMatrix.css 里配 --widget-card-alpha 合成 rgba。
      border/zero/text/text-muted 为「可派生变量」——默认值跟随 scheme；
      用户自定义卡片色时由 widgetTheme.ts 按底色亮度整体覆写（对比度守卫）。
@@ -91,13 +90,13 @@
     --accent-weak: rgba(59, 130, 246, 0.16);
     --danger: #ef4444;
     --warn: #f59e0b;
---zero-bg: #334155; /* slate-700 中性灰：深色主题下不偏蓝*/
+--zero-bg: #334155; /* slate-700 中性灰：深色主题下无用量格不偏蓝 */
   --future-bg: transparent;
     --selected-ring: #a78bfa;
     --estimated-dash: #fbbf24;
     --error-bg: repeating-linear-gradient(45deg, #7f1d1d 0 2px, #991b1b 2px 4px);
 
-    /* v2 阴影（深色下加重） */
+    /* 阴影（深色下加重） */
     --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.45);
     --shadow-3: 0 8px 28px rgba(0, 0, 0, 0.5);

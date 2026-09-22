@@ -1,9 +1,9 @@
 //! JSONL 公共设施：发现（mtime 升序）、generation（size-mtime）、增量 Tail。
 //!
-//! 增量语义（与旧项目 genericjsonl 同族,自维护重写）：
+//! 增量语义：
 //! - offset 永远停在「完整行边界」；半行留待下次（写到 EOF 才是行尾才算消费）。
 //! - 文件变小（size < offset）= 截断/重写 → `Truncated`，调用方以 offset 0 重读
-//!。
+//!   （已聚合数据不回滚,属已知限制）。
 //! - generation = （size, mtime_millis)：未变化直接跳过读取。
 
 use std::fs;
@@ -57,14 +57,14 @@ pub fn discover_named(dir: &Path, recursive: bool, name: &str, out: &mut Vec<Pat
     }
 }
 
-/// 按 mtime 升序排序（旧文件先消费,与旧项目一致,让新数据后到、事件时间更接近提交时刻）。
+/// 按 mtime 升序排序（旧文件先消费,让新数据后到、事件时间更接近提交时刻）。
 pub fn sort_by_mtime(files: &mut [PathBuf]) {
     files.sort_by_key(|p| generation(p).map(|(_, m)| m).unwrap_or(0));
 }
 
-/// v12（Claude 会话族排序）：（首个带 `uuid` 行的顶层 `timestamp`, 尾部最后一条带顶层 `timestamp` 行的时间),
-/// 毫秒;找不到 → 0。只读头 1MB / 尾 256KB（本机 58 个文件:首个 uuid 行偏移最大 57KB,
-/// 头部是 custom-title / mode / file-history-snapshot 等无 uuid 的元数据行）。
+/// Claude 会话族排序键：（首个带 `uuid` 行的顶层 `timestamp`, 尾部最后一条带顶层 `timestamp` 行的时间),
+/// 毫秒;找不到 → 0。只读头 1MB / 尾 256KB：头部是 custom-title / mode / file-history-snapshot 等
+/// 无 uuid 的元数据行,首个 uuid 行偏移在几十 KB 以内。
 pub fn head_tail_stamp(path: &Path) -> (i64, i64) {
     const HEAD: u64 = 1024 * 1024;
     const TAIL: u64 = 256 * 1024;
@@ -129,8 +129,8 @@ pub fn tail(path: &Path, start_offset: u64, max_bytes: u64) -> std::io::Result<T
         None => 0,
     };
     let new_offset = start_offset + complete_end as u64;
-    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（S4-R 缺陷 A,见 collector/text.rs）。
-    // 与 str:lines 同语义:完整行以 '\n' 结尾,split 末尾多出的空段丢弃,中间空行保留。
+    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（见 collector/text.rs）。
+    // 与 str:lines 同语义:完整行以换行结尾,split 末尾多出的空段丢弃,中间空行保留。
     let mut lines: Vec<String> = buf[..complete_end]
         .split(|&b| b == b'\n')
         .map(|l| super::text::decode_bytes(l).trim_end_matches('\r').to_string())

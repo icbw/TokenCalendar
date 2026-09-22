@@ -5,13 +5,12 @@
 //! 移植自 DSH 的 `session-persistence-jsonl/zstd.ts`；DSH 以 MIT 许可发布
 //! （Copyright （c) 2026 DeepSeek），详见仓库根 THIRD-PARTY-NOTICES.md。
 //!
-//! 口径（本机活跃+闭合双会话逐行核对 + 官方 projcache
-//! tokenUsage totals 数字对账）：
+//! 口径（与官方 projcache tokenUsage totals 数字一致）：
 //!
 //! - **usage 行** = `assistant/message` 的 `data.usage`：`inputTokens`（已排
 //!   cache）/`outputTokens`/`totalTokens`/`cacheReadTokens`,守恒
 //!   `total = input + output + cacheRead` 逐条成立 → input **无需 cache 减法**,
-//!   total 取 provider total（缺失回退 input+output,守则通用规则）。
+//!   total 取 provider total（缺失回退 input+output）。
 //! - **对话轮** = `user/message` 且 `data.source.kind=="user"`（真实用户输入,
 //!   带 rpcId）。注入伪行 kind ∈ {agent-instructions, plugin, skill-catalog}
 //!   不置位（AGENTS.md/运行时上下文/skill 目录以 role=user 注入,一字段判别,
@@ -28,13 +27,15 @@
 //!   事件 seq 水位去重（seq 跨代际稳定,迁移重编码不变）。
 //! - **种子会话**（分叉,isSeeded）：头部 `inheritedEventCount` = 复制父会话的
 //!   前缀事件数,`seq < inheritedEventCount` 跳过。
-//! - request/header、request/context、turn/start、session/title* 等一律忽略
+//! - request/header、request/context、turn/start、session/title-llm-* 等一律忽略
 //!   （title 生成无 usage;request/header 每会话仅一条,不可作请求计数）。
+//! - **标题** = `session/title` 的 `data.title`：先落首条输入截断的占位标题（source.kind=fallback）,
+//!   随后生成标题覆盖;fallback 不能盖掉生成标题。
 //! - **轮与时间**：真实用户输入开轮（与 pending 同一判据,splice 进活跃 turn 的
 //!   追加输入同样开新轮,保证轮数 == request_count）;带 usage 的 assistant/message = 模型调用
 //!   （model_ms 按相邻事件估算）;`tool/call` 的 seq 与 `tool/result.sourceEventSeqs` 配对算
-//!   tool_ms;`turn/end` 闭轮;`data.interrupted` 记中止（S4-R,用户中断不计错）。会话 = 会话目录名,项目 = 头行 `cwd`;
-//!   事件级 seq 水位（`event_seq`）防代际重读重复累计。DSH 无子代理与标题落库。
+//!   tool_ms;`turn/end` 闭轮;`data.interrupted` 记中止（用户中断不计错）。会话 = 会话目录名,项目 = 头行 `cwd`;
+//!   事件级 seq 水位（`event_seq`）防代际重读重复累计。DSH 无子代理。
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -103,6 +104,9 @@ struct DshCursor {
     /// 轮累加器。
     #[serde(default)]
     turn: TurnState,
+    /// 已从文件头补扫过 `session/title`（旧游标 false:已读过的前缀里的标题事件当时被忽略,补扫一次）。
+    #[serde(default)]
+    title_scanned: bool,
 }
 
 fn default_last_seq() -> i64 {
@@ -121,6 +125,7 @@ impl DshCursor {
             pending_turn: false,
             event_seq: -1,
             turn: TurnState::default(),
+            title_scanned: false,
         }
     }
     fn to_json(&self) -> String {
@@ -180,7 +185,7 @@ fn select_generation(dir: &Path) -> Option<PathBuf> {
 }
 
 /// 发现全部会话：sessions/<project>/<session-uuid>/ → （会话目录, 选中文件)。
-/// 单目录不可读静默跳过（容错铁律）。
+/// 单目录不可读静默跳过。
 fn discover_session_files(root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     let Ok(projects) = std::fs::read_dir(root) else {
@@ -316,7 +321,7 @@ fn decompress_frames(buf: &[u8], frames: &[(usize, usize)]) -> (Vec<u8>, usize) 
 }
 
 fn split_lines(text: &[u8]) -> Vec<String> {
-    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（S4-R,头行 cwd;见 collector/text.rs）
+    // 逐行解码:UTF-8 优先,非法段按系统 ANSI 代码页回退（影响头行 cwd;见 collector/text.rs）
     text.split(|&b| b == b'\n')
         .map(|l| super::text::decode_bytes(l).trim_end_matches('\r').to_string())
         .filter(|l| !l.is_empty())
@@ -371,8 +376,7 @@ fn read_from(path: &Path, zstd: bool, start: u64, reset: bool) -> Option<DshCons
 // ---------- 口径解析 ----------
 
 /// 模型名归一化：arkcli 写入的火山 API 模型 id → 其他采集器通行的模型名
-/// （collector.db ：codebuddy/workbuddy/zcode 记 glm-5.3-flash 与
-/// deepseek-v4-flash）。未映射 id 原样通过。
+/// （codebuddy/workbuddy/zcode 记 glm-5.3-flash 与 deepseek-v4-flash）。未映射 id 原样通过。
 fn normalize_model(model: &str) -> String {
     match model {
         "glm-5-3-flash" => "glm-5.3-flash",
@@ -388,7 +392,7 @@ enum DshLine {
     Header { inherited: i64, cwd: Option<String> },
     /// 真实用户输入（kind=="user"）。
     UserInput { seq: i64, time: Option<i64> },
-    /// 无 usage 的 assistant/message（interrupted 计错）。
+    /// 无 usage 的 assistant/message（interrupted 记中止）。
     Assistant { seq: i64, time: i64, interrupted: bool },
     /// 工具调用（tool/call）:以自身 seq 为配对键。
     ToolCall { seq: i64, time: i64 },
@@ -396,6 +400,8 @@ enum DshLine {
     ToolResult { seq: i64, time: i64, calls: Vec<i64> },
     /// 轮结束（turn/end）。
     TurnEnd { seq: i64, time: i64 },
+    /// 会话标题（session/title）:source.kind=="fallback" = 首条输入截断的占位标题,低于生成 / 改名标题。
+    Title { title: String, rank: u8 },
     /// usage 行（assistant/message + data.usage）。
     Usage {
         seq: i64,
@@ -471,6 +477,13 @@ fn parse_line(line: &str) -> DshLine {
             let id = v.pointer("/data/message/id").and_then(|x| x.as_str()).map(str::to_string);
             DshLine::Usage { seq, time, id, interrupted, day, hour, model, input, output, total, cache_read, cache_write }
         }
+        Some("session/title") => match v.pointer("/data/title").and_then(|t| t.as_str()) {
+            Some(title) => {
+                let fallback = v.pointer("/data/source/kind").and_then(|k| k.as_str()) == Some("fallback");
+                DshLine::Title { title: title.to_string(), rank: if fallback { 1 } else { 2 } }
+            }
+            None => DshLine::None,
+        },
         Some(ty @ ("tool/call" | "tool/result" | "turn/end")) => {
             let (Some(seq), Some(time)) = (v.get("seq").and_then(|x| x.as_i64()), v.get("time").and_then(|x| x.as_i64())) else {
                 return DshLine::None;
@@ -521,6 +534,7 @@ impl Adapter for DshAdapter {
 
         let mut batch = Batch::default();
         let mut months: BTreeSet<String> = BTreeSet::new();
+        let mut titles: Vec<(String, String)> = Vec::new();
 
         for (dir, file) in files {
             let scope = dir.display().to_string();
@@ -538,7 +552,27 @@ impl Adapter for DshAdapter {
                 cursor.mtime = 0;
             }
             let zstd = fname.ends_with(".zstd");
+            let session_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            // 旧游标补标题：标题事件在会话头部（seq ~15）,只读首个读块;只写标题,不建新会话行
+            let backfill = !cursor.title_scanned && cursor.offset > 0;
+            if backfill {
+                if let Some(head) = read_from(&file, zstd, 0, false) {
+                    for line in &head.lines {
+                        if let DshLine::Title { title, rank } = parse_line(line) {
+                            cursor.turn.set_title(&title, rank);
+                        }
+                    }
+                }
+                cursor.title_scanned = true;
+                cursor.turn.set_session(&session_name);
+            }
             let Some(consume) = advance_dsh_file(&file, zstd, &cursor) else {
+                if backfill {
+                    if let Some(title) = cursor.turn.title.clone() {
+                        titles.push((cursor.turn.session_id.clone(), title));
+                    }
+                    batch.cursors.push((scope, cursor.to_json()));
+                }
                 continue;
             };
             if consume.reset {
@@ -546,9 +580,8 @@ impl Adapter for DshAdapter {
             }
 
             let mut next = cursor;
-            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-                next.turn.set_session(name);
-            }
+            next.title_scanned = true;
+            next.turn.set_session(&session_name);
             for line in &consume.lines {
                 let parsed = parse_line(line);
                 // 轮事件水位 + 种子前缀守卫（usage 另有 last_seq 水位,见下）
@@ -620,6 +653,7 @@ impl Adapter for DshAdapter {
                             next.turn.close(&mut batch, META.id);
                         }
                     }
+                    DshLine::Title { title, rank } => next.turn.set_title(&title, rank),
                     DshLine::None => {}
                 }
             }
@@ -634,6 +668,13 @@ impl Adapter for DshAdapter {
         }
 
         store.commit(META.id, &batch).map_err(|e| AdapterError::new("error", e))?;
+        if !titles.is_empty() {
+            let pairs: Vec<(&str, &str)> = titles.iter().map(|(id, t)| (id.as_str(), t.as_str())).collect();
+            match store.sync_session_titles(META.id, &pairs) {
+                Ok(n) => crate::dev_log!("[collector] dsh session titles backfilled: {n}"),
+                Err(e) => crate::dev_log!("[collector] dsh title backfill failed: {e}"),
+            }
+        }
         Ok(CollectOutcome { events: batch.events, months })
     }
 }
@@ -642,7 +683,7 @@ impl Adapter for DshAdapter {
 mod tests {
     use super::*;
 
-    // ---------- 冻结样本行（2026-09-09 真实会话,口径基准） ----------
+    // ---------- 冻结样本行（真实会话,口径基准） ----------
 
     const REAL_USER: &str = r#"{"type":"user/message","seq":8,"time":1788901883263,"data":{"content":[{"type":"text","text":"这是一个作为历史会话的测试流"}],"source":{"kind":"user","rpcId":"736c66f5-8423-49a8-b115-1bd09c42d305","clientTimeZone":"Europe/Rome"},"role":"user","id":"34b8c73a"},"surfaceOp":"append"}"#;
     const INJECTED_INSTRUCTIONS: &str = r#"{"type":"user/message","seq":9,"time":1788901883264,"data":{"content":[{"type":"text","text":"<system-reminder> AGENTS.md"}],"source":{"kind":"agent-instructions","form":"instructions","baseline":true},"role":"user","id":"375609f8"}}"#;
@@ -715,6 +756,56 @@ mod tests {
             }
         }
         assert_eq!(turns, vec![1, 0]);
+    }
+
+    /// session/title:fallback 占位标题 rank 1,生成标题 rank 2（后者不被前者盖掉）;缺 title → 忽略。
+    #[test]
+    fn session_title_lines() {
+        let fb = r#"{"type":"session/title","seq":14,"time":1,"data":{"title":"分析目前执行到哪","messageSeqs":[8],"source":{"kind":"fallback"}}}"#;
+        let gen = r#"{"type":"session/title","seq":15,"time":2,"data":{"title":"启动更新QGIS程序","source":{"kind":"provider"}}}"#;
+        assert!(matches!(parse_line(fb), DshLine::Title { rank: 1, .. }));
+        assert!(matches!(parse_line(gen), DshLine::Title { rank: 2, .. }));
+        assert!(matches!(parse_line(r#"{"type":"session/title-llm-request","seq":15,"data":{}}"#), DshLine::None));
+        let mut t = TurnState::default();
+        for l in [fb, gen, fb] {
+            if let DshLine::Title { title, rank } = parse_line(l) {
+                t.set_title(&title, rank);
+            }
+        }
+        assert_eq!(t.title.as_deref(), Some("启动更新QGIS程序"));
+    }
+
+    /// 旧游标（无 title_scanned、标题事件早已读过）:文件无新内容也补扫头部标题,只改标题不动用量。
+    #[test]
+    fn title_backfill_for_already_consumed_sessions() {
+        let root = std::env::temp_dir().join(format!("tc_dsh_title_{}", std::process::id()));
+        let sess = root.join("sessions").join("--E-Projects-Demo--").join("session-title-fixture");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::copy(fixture_path(), sess.join("session.v3.jsonl.zstd")).unwrap();
+        let adapter = DshAdapter { sessions_dir: root.join("sessions") };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let title = |store: &Store| store.test_sessions(META.id)[0].title.clone();
+        assert_eq!(title(&store).as_deref(), Some("这是一个作为历史会话的测试"), "首读即落标题");
+
+        let scope = sess.display().to_string();
+        let mut c: DshCursor = serde_json::from_str(&store.get_cursor(META.id, &scope).unwrap()).unwrap();
+        c.title_scanned = false;
+        c.turn.title = None;
+        c.turn.title_rank = 0;
+        let mut b = Batch::default();
+        b.cursors.push((scope.clone(), c.to_json()));
+        store.commit(META.id, &b).unwrap();
+        store.conn().execute("UPDATE session SET title = NULL", []).unwrap();
+        let ok2 = adapter.collect(&mut store).is_ok();
+        let ok3 = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ok && ok2 && ok3);
+        assert_eq!(title(&store).as_deref(), Some("这是一个作为历史会话的测试"), "补扫写回旧会话行");
+        let c: DshCursor = serde_json::from_str(&store.get_cursor(META.id, &scope).unwrap()).unwrap();
+        assert!(c.title_scanned);
+        let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
+        assert_eq!(rows[0].month_total, 29478, "补扫不重计用量");
     }
 
     #[test]
@@ -906,7 +997,7 @@ mod tests {
         assert_eq!(batch.hourly.len(), batch.entries.len());
     }
 
-    /// PHASE12 S2:冻结真实闭合会话走完整 collect——轮表 / 会话 / 项目维守恒 + 二次采集幂等。
+    /// 冻结真实闭合会话走完整 collect——轮表 / 会话 / 项目维守恒 + 二次采集幂等。
     #[test]
     fn s2_fixture_session_turns_via_collect() {
         let root = std::env::temp_dir().join(format!("tc_dsh_s2_{}", std::process::id()));

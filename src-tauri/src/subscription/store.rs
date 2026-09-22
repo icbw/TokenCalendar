@@ -1,6 +1,6 @@
 //! 订阅快照库：`<数据根>/subscriptions.db`。
 //!
-//! 设计红线（/）：**凭据永不落库**——表里只有「绑定了哪些平台」
+//! **凭据永不落库**——表里只有「绑定了哪些平台」
 //! 的开关事实与归一化快照;token 每次轮询现读凭据原文件,内存短存。
 //! 独立于 collector.db（在线账户额度 ≠ 本机用量聚合）。
 
@@ -14,6 +14,32 @@ pub struct SubStore {
     conn: Connection,
 }
 
+/// 开库时发现的结构缺口;任一为真 ⇒ 这是存量库的结构升级,动库之前先落备份。
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SchemaGaps {
+    pub price_table_added: bool,
+    pub reading_table_added: bool,
+    pub need_pair_src: bool,
+    pub need_snapshot_source: bool,
+    pub need_pair_epoch: bool,
+    pub need_sample_plan: bool,
+    pub need_pair_resets: bool,
+    pub need_pair_aged: bool,
+}
+
+impl SchemaGaps {
+    pub fn any(&self) -> bool {
+        self.price_table_added
+            || self.reading_table_added
+            || self.need_pair_src
+            || self.need_snapshot_source
+            || self.need_pair_epoch
+            || self.need_sample_plan
+            || self.need_pair_resets
+            || self.need_pair_aged
+    }
+}
+
 impl SubStore {
     /// 只读取 `conn` 供同模块树的真库 smoke 复核（`#[cfg（test)]`,不进发布构建）。
     #[cfg(test)]
@@ -25,15 +51,8 @@ impl SubStore {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
-        // 建表之前先探：price_model 缺、而 usage_pair 已在 ⇒ 这是**存量库的一次结构
-        // 升级**,要在动它之前落一份备份（红线：迁移前备份,见 AGENTS.md 第 3 节）。
-        // 全新库（两张都没有）不算升级,不必备份空文件。
-        let price_table_added =
-            !Self::has_table(&conn, "price_model") && Self::has_table(&conn, "usage_pair");
-        // 同理：`quota_reading` 缺、而 `desktop_sample` 已在 ⇒ 这一开是存量库的结构
-        // 升级,动它之前要落备份。**回填本身不看这个标记**（见 `backfill_readings`）。
-        let reading_table_added =
-            !Self::has_table(&conn, "quota_reading") && Self::has_table(&conn, "desktop_sample");
+        // 建表之前先探结构缺口：建表之后缺表就看不出来了。
+        let gaps = Self::schema_gaps(&conn);
         // `quota_daily` 是**纯派生层**：形状变了直接丢掉重建,不必 ALTER 回填。
         // 这条与「读数层只增不删」并不矛盾——分界线就是「丢了还能不能长回来」。
         Self::drop_stale_quota_daily(&conn);
@@ -53,9 +72,9 @@ impl SubStore {
                  -- 都是 api 的读数对,桌面端那一路由 bootstrap.rs 按样本时刻切。
                  source     TEXT NOT NULL DEFAULT 'api'
              );
-             -- 标定样本（2026-09-18）：相邻两次成功读数之间的「本地代价 vs 实测涨幅」。
+             -- 标定样本：相邻两次成功读数之间的「本地代价 vs 实测涨幅」。
              -- 纯派生数据,只为算取数时机的换算系数;超出保留条数即按时间裁剪（见 prune_pairs）。
-             -- breakdown 存分模型 token 明细,留作将来回过头拟合逐模型权重。
+             -- breakdown 存分模型 token 明细,供拟合逐模型权重。
              CREATE TABLE IF NOT EXISTS usage_pair (
                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
                  platform     TEXT NOT NULL,
@@ -75,27 +94,27 @@ impl SubStore {
                  --                       观测（codex_rollout.rs;读数与代价同一行）。
                  -- 增量续算的水位线各取自己那一路的 MAX(t1),几路互不干扰。
                  src          TEXT NOT NULL DEFAULT 'online',
-                 -- 世代标记（2026-09-18）：cost 是派生值,这两列记住它是按哪把尺子量的。
+                 -- 世代标记：cost 是派生值,这两列记住它是按哪把尺子量的。
                  -- weight_ver = 算 cost 时的权重表版本（cost::WEIGHT_VERSION）;价格一变
                  --   就升版,存量行按 breakdown 里的原始 token 就地重算,0 = 重算不了、存疑;
                  -- plan_type  = 该区间的套餐;套餐变了 scale 就变了,旧样本留着当档案
                  --   但不参与当前拟合（'' = 存量未知）。
                  weight_ver   INTEGER NOT NULL DEFAULT 1,
                  plan_type    TEXT NOT NULL DEFAULT '',
-                 -- 5h 窗口在两端各自申报的重置时刻（2026-09-19;NULL = 该来源不提供,
+                 -- 5h 窗口在两端各自申报的重置时刻（NULL = 该来源不提供,
                  -- 或是升级之前的存量行）。跨重置的区间两端读数不在同一个窗口里,Δ 不是
-                 -- 这段消耗涨出来的 ⇒ 不参与拟合（判据见 calib::Pair::window_reset）。
+                 -- 这段消耗涨出来的 ⇒ 不参与拟合（判据见 calib::Pair::window_changed）。
                  -- **存原值而不是存「重置过没有」**：判据将来要改,这两个数还能重新判一遍。
                  resets5_0    INTEGER,
                  resets5_1    INTEGER,
-                 -- 这段时间从 5h 窗尾**老掉**的代价（2026-09-19;发生在 (t0−5h, t1−5h]
+                 -- 这段时间从 5h 窗尾**老掉**的代价（发生在 (t0−5h, t1−5h]
                  -- 的那些调用）。5h 是滚动窗口 ⇒ 计数器的变化是「新花的 − 老掉的」,
                  -- 而不是 cost 本身。**存原始观测不存差值**：判据要改时两个数都还在。
                  -- 0 = 该来源给不出（在线路没有历史窗口）或是升级前的存量行 ⇒ 不做修正。
                  aged_cost    REAL NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS usage_pair_by_platform ON usage_pair (platform, t1);
-             -- **本地读数收割表**（2026-09-18 用户定案;2026-09-19 起两个平台都用）：
+             -- **本地读数收割表**（两个平台共用）：
              -- 平台自己留的本地读数历史都是会滚掉的（Claude 桌面端的
              -- plan-usage-history.json 只保约 14 天;Codex 的 rollout 会话文件会被归档 /
              -- 被用户清掉 / CODEX_HOME 会改指向）,这里把见过的读数**永久留下**
@@ -103,7 +122,7 @@ impl SubStore {
              -- 一行 5 个数,主键 (platform, t) ⇒ 重复收割天然幂等。
              --
              -- 表名沿用 desktop_sample 不改：改名要重建表 + 搬数据,而这张表装的正是
-             -- 「丢了就再也回不来」的历史,为了名字好听去动它不划算（红线见 AGENTS.md §3）。
+             -- 「丢了就再也回不来」的历史,不为改名冒搬迁风险。
              CREATE TABLE IF NOT EXISTS desktop_sample (
                  platform TEXT NOT NULL,
                  t        INTEGER NOT NULL,
@@ -119,7 +138,7 @@ impl SubStore {
                  k TEXT PRIMARY KEY,
                  v TEXT NOT NULL
              );
-             -- 官方价目快照对照表（PHASE15 S1）：**一个模型的一段生效期 = 一行**。
+             -- 官方价目快照对照表：**一个模型的一段生效期 = 一行**。
              -- 绝大多数模型终其生命周期只有一行;只有真的被官方降价过的模型才会有第二行
              -- ——版本化的粒度跟着真正会变的东西走,某模型降价不该把别的模型一起换代。
              --
@@ -129,7 +148,7 @@ impl SubStore {
              -- 嵌入,启动时按主键幂等 upsert;**不做运行时取价**（重算必须可复现）。
              --
              -- 只 upsert、不删行：更早版本留下的历史生效段必须留着,否则用户跳过若干
-             -- 版本再更新时,中间那些价格段就断了（设计 4.1）。
+             -- 版本再更新时,中间那些价格段就断了。
              CREATE TABLE IF NOT EXISTS price_model (
                  platform        TEXT    NOT NULL,
                  -- 小写子串模式（opus / gpt-5-6-sol 之类）,匹配时**最长键优先**
@@ -144,16 +163,16 @@ impl SubStore {
                  -- **出处 + 上游核对信息**:这张表是可审计的官方价格快照,任何时候要能
                  -- 回答「这个数从哪儿来」。「什么时候核对的」由 price_seed.json 的 git
                  -- 历史回答——定时重跑生成器 + 只在数据真动时提交,其 commit history
-                 -- 恰好就是价格时间线（设计 7.4 末段）。
+                 -- 恰好就是价格时间线。
                  source_note     TEXT    NOT NULL DEFAULT '',
                  PRIMARY KEY (platform, match_key, effective_from)
              );
-             -- **归一化读数时间序列**（PHASE15 §9-4）：与 `desktop_sample` **两层并存**。
+             -- **归一化读数时间序列**：与 `desktop_sample` **两层并存**。
              -- `desktop_sample` 是「源的忠实副本」——它照抄本地文件里写着的那几个数;
              -- 这张表是**归一化序列**：三路来源（api / desktop / rollout）都按同一形状
              -- 落进来,一行 = **一个窗口在某一时刻的一次读数**,带窗尾与套餐。
              --
-             -- 为什么不合并进 `desktop_sample`（2026-09-18 定案）:两者的精度语义不同
+             -- 不合并进 `desktop_sample`:两者的精度语义不同
              -- ——`desktop_sample` 只有 5h/7d 两列、没有窗尾、没有 `7d_opus`,而 API 读数
              -- 带窗尾且窗口种类是开放集合。合并会丢掉「这个数原本是什么精度、从哪来」。
              --
@@ -162,7 +181,7 @@ impl SubStore {
              -- （优先级见 `SRC_RANK`）。
              --
              -- **只增不删**,与 `desktop_sample` 同一条红线：读数历史是丢了就再也回不来的
-             -- 长期档案（AGENTS.md §3）。
+             -- 长期档案。
              CREATE TABLE IF NOT EXISTS quota_reading (
                  platform     TEXT    NOT NULL,
                  -- 窗口种类,原样透传适配器给的 kind：5h / 7d / 7d_opus
@@ -179,7 +198,7 @@ impl SubStore {
                  plan_type    TEXT    NOT NULL DEFAULT '',
                  PRIMARY KEY (platform, kind, t, src)
              );
-             -- **日级汇总**（PHASE15 §9-4）：年度曲线与统计指标读这一层。
+             -- **日级汇总**：年度曲线与统计指标读这一层。
              -- **纯派生**——可从 `quota_reading` 完全重建（`rebuild_quota_daily`），
              -- 所以它可以随口径升版整表重算,不属于「丢了就回不来」的那一类。
              -- 日界按**本地日期**切（与热力图 / collector 的 `YYYY-MM-DD` 同口径）。
@@ -215,7 +234,7 @@ impl SubStore {
              );",
         )
         .map_err(|e| e.to_string())?;
-        Self::upgrade_schema(&conn, path, price_table_added, reading_table_added)?;
+        Self::upgrade_schema(&conn, path, &gaps)?;
         let store = Self { conn };
         // 出厂种子按主键幂等 upsert（每次开库都跑一遍：新装填满、升级补齐、
         // 已是最新则原样写回）。必须在 recompute_stale_costs 之前——重算要按库里的价目。
@@ -240,7 +259,7 @@ impl SubStore {
         .is_ok()
     }
 
-    // ---------- 就地列升级（**只 ALTER + 回填,永不清表**,红线见 AGENTS.md） ----------
+    // ---------- 就地列升级（**只 ALTER + 回填,永不清表**:库是历史唯一副本） ----------
 
     /// `quota_daily` 的形状与当前代码对不上（缺列）就整表丢掉,让下面的
     /// `CREATE TABLE IF NOT EXISTS` 按新形状重建、`ensure_quota_daily` 按
@@ -248,7 +267,7 @@ impl SubStore {
     ///
     /// **只有这一张表可以这么处理**：它的每一个数都能从读数层重新算出来。读数层
     /// （`quota_reading` / `desktop_sample`）与样本层的原始观测一律走就地 ALTER
-    /// ——丢了就再也回不来（AGENTS.md）。
+    /// ——丢了就再也回不来。
     fn drop_stale_quota_daily(conn: &Connection) {
         if !Self::has_table(conn, "quota_daily") {
             return;
@@ -269,6 +288,27 @@ impl SubStore {
         );
     }
 
+    /// 存量库这一开要补的结构（开库建表之前探）。缺表只在「同批的老表已在」时才算升级:
+    /// 全新库什么都没有,不必备份空文件;缺列只对已存在的表算,不存在的表会整张新建、列齐全。
+    pub(super) fn schema_gaps(conn: &Connection) -> SchemaGaps {
+        let col = |table: &str, column: &str| {
+            Self::has_table(conn, table) && !Self::has_column(conn, table, column)
+        };
+        SchemaGaps {
+            price_table_added: !Self::has_table(conn, "price_model")
+                && Self::has_table(conn, "usage_pair"),
+            // 回填本身不看这个标记（见 `backfill_readings`）,它只决定要不要先落备份。
+            reading_table_added: !Self::has_table(conn, "quota_reading")
+                && Self::has_table(conn, "desktop_sample"),
+            need_pair_src: col("usage_pair", "src"),
+            need_snapshot_source: col("snapshot", "source"),
+            need_pair_epoch: col("usage_pair", "weight_ver"),
+            need_sample_plan: col("desktop_sample", "plan_type"),
+            need_pair_resets: col("usage_pair", "resets5_0"),
+            need_pair_aged: col("usage_pair", "aged_cost"),
+        }
+    }
+
     /// 该表是否已有此列（`PRAGMA table_info`;表不存在按「没有」处理）。
     fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
         let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
@@ -281,33 +321,24 @@ impl SubStore {
         names.iter().any(|name| name == column)
     }
 
-    /// 补齐新列。存量库走 ALTER + 默认值,
+    /// 补齐新列（读数来源 / 样本来源等）。存量库走 ALTER + 默认值,
     /// **不重建表、不清空样本**——subscriptions.db 里的标定样本与桌面端采样是跨版本
     /// 累积的历史（桌面端自己只保 14 天,丢了就再也回不来）。
-    fn upgrade_schema(
-        conn: &Connection,
-        path: &Path,
-        price_table_added: bool,
-        reading_table_added: bool,
-    ) -> Result<(), String> {
-        let need_pair_src = !Self::has_column(conn, "usage_pair", "src");
-        let need_snapshot_source = !Self::has_column(conn, "snapshot", "source");
-        let need_pair_epoch = !Self::has_column(conn, "usage_pair", "weight_ver");
-        let need_sample_plan = !Self::has_column(conn, "desktop_sample", "plan_type");
-        let need_pair_resets = !Self::has_column(conn, "usage_pair", "resets5_0");
-        let need_pair_aged = !Self::has_column(conn, "usage_pair", "aged_cost");
-        if !need_pair_src
-            && !need_snapshot_source
-            && !need_pair_epoch
-            && !need_sample_plan
-            && !need_pair_resets
-            && !need_pair_aged
-            && !price_table_added
-            && !reading_table_added
-        {
+    fn upgrade_schema(conn: &Connection, path: &Path, gaps: &SchemaGaps) -> Result<(), String> {
+        if !gaps.any() {
             return Ok(());
         }
         Self::backup_before_upgrade(conn, path);
+        let SchemaGaps {
+            price_table_added,
+            reading_table_added,
+            need_pair_src,
+            need_snapshot_source,
+            need_pair_epoch,
+            need_sample_plan,
+            need_pair_resets,
+            need_pair_aged,
+        } = *gaps;
         if need_pair_src {
             conn.execute_batch("ALTER TABLE usage_pair ADD COLUMN src TEXT NOT NULL DEFAULT 'online';")
                 .map_err(|e| e.to_string())?;
@@ -353,7 +384,7 @@ impl SubStore {
         }
         if need_pair_resets {
             // 存量行留 NULL = **未知**,不是「没重置过」：那时根本没记这两个数。
-            // calib 侧对 NULL 的处理就是退回旧判据（读数变小了才算重置）,与升级前
+            // calib 侧对 NULL 的处理就是退回「读数变小了才算重置」判据,与升级前
             // 的行为逐位相同 ⇒ **一行都不动、一行都不删**,老样本照常参与拟合。
             conn.execute_batch(
                 "ALTER TABLE usage_pair ADD COLUMN resets5_0 INTEGER;
@@ -388,8 +419,7 @@ impl SubStore {
         Ok(())
     }
 
-    /// 把 `desktop_sample` 里的读数历史**就地回填**进 `quota_reading`
-    /// （-4 的迁移那一步）。
+    /// 把 `desktop_sample` 里的读数历史**就地回填**进 `quota_reading`。
     ///
     /// `desktop_sample` 里已经躺着两个平台全部收割过的读数——那是丢了就再也回不来的
     /// 历史,新表必须从它长出来,而**不是**重新去扫一遍源文件（源本身会滚掉:桌面端
@@ -455,8 +485,8 @@ impl SubStore {
 
     /// 把出厂种子写进库（幂等,按 `（platform, match_key, effective_from)`）。
     ///
-    /// 冲突时**覆盖价目与出处**：同一段生效期的数值若有正（比如发现 `-pro`
-    /// 一族官方根本没有缓存读单价）,库里要跟着更正。而**不在种子里的行原样留着**
+    /// 冲突时**覆盖价目与出处**：同一段生效期的数值若有正（如 `-pro` 一族官方没有
+    /// 缓存读单价）,库里要跟着更正。而**不在种子里的行原样留着**
     /// ——那是更早版本下发的历史生效段,删了就断了价格时间线。
     pub fn upsert_price_seed(&self, rows: &[super::price::PriceRow]) -> Result<usize, String> {
         if rows.is_empty() {
@@ -493,7 +523,7 @@ impl SubStore {
         Ok(rows.len())
     }
 
-    /// 全部价目行（启动装载进程内索引 / S2 查询面;**唯一查询源**）。
+    /// 全部价目行（启动装载进程内索引 / 查询面;**唯一查询源**）。
     pub fn price_rows(&self) -> Vec<super::price::PriceRow> {
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT platform, match_key, effective_from, display_name,
@@ -553,7 +583,7 @@ impl SubStore {
     }
 
     /// 升级前备份（`VACUUM INTO`,含 WAL 里未落盘的内容;与 collector.db 同口径）。
-    /// 失败只记日志不拦升级——这里全是派生数据,备份是保险不是前置条件。
+    /// 失败只记日志不拦升级——升级本身只 ALTER / 补表,不删读数层与样本层的行。
     fn backup_before_upgrade(conn: &Connection, path: &Path) {
         let Some(dir) = path.parent().map(|d| d.join("backups")) else { return };
         if dir.as_os_str().is_empty() || std::fs::create_dir_all(&dir).is_err() {
@@ -624,7 +654,7 @@ impl SubStore {
     pub fn save_snapshot(&self, snap: &SubscriptionSnapshot) -> Result<(), String> {
         // 失败轮（无窗口 + 无 fetched_at,且不是解绑的 idle）**只推进 status**：
         // 上一轮成功的窗口/时间戳必须留着——UI 的「showing last known data」
-        // 全指望这条（旧版会把 windows 覆盖成空,读数直接变 —）。
+        // 全指望这条（覆盖成空窗口会让读数直接变 —）。
         let is_failure = snap.windows.is_empty()
             && snap.fetched_at.is_none()
             && snap.status != FetchStatus::Idle;
@@ -731,11 +761,10 @@ impl SubStore {
         })
     }
 
-    /// 命令面出口:两平台快照 + 绑定态合并（未绑定平台给 idle 占位,前端形状稳定）。
     // ---------- usage_pair（标定样本;纯派生数据,见 calib.rs） ----------
 
     /// 保留条数（够拟合又不无限长;超出按 t1 最旧裁剪）。桌面端那一路按 15 分钟
-    /// 一条的节律建样本,500 条只够十来天——提到 5000（约两个月满密度）,
+    /// 一条的节律建样本,5000 条约两个月满密度;
     /// 真被裁掉的也能从 desktop_sample 重建,原始观测在那张表里永久留着。
     const PAIR_KEEP: i64 = 5000;
 
@@ -872,18 +901,17 @@ impl SubStore {
     /// **按倍率类而不是按套餐名筛**。`scale` 是
     /// 「这个套餐一个窗口有多大」,所以分代要分的是**窗口大小**,而套餐名只是它的代号
     /// ——出厂倍率表里同一类的两个档（Codex 的 `plus` 与 `edu`）我们自己就认为窗口一样
-    /// 大,它们的样本本来就可比。本机：一台机器登录两个 Codex 账号（edu / plus）
-    /// 轮换使用，按名字筛会让生效系数跟着「上次用的是哪个账号」在 **8.89 ↔ 7.63**
-    /// 之间跳（16%），而直接测量说两个账号的满窗只差 2%（$13.70 / $13.96）——
-    /// 那个跳幅是把数据劈成两半之后各自的抽样噪声,不是真实差异。合并之后是 8.13。
+    /// 大,它们的样本本来就可比。一台机器登录多个同类账号轮换使用时,按名字筛会让生效系数
+    /// 跟着「上次用的是哪个账号」跳动（把数据劈成几份后各自的抽样噪声,不是真实差异）,
+    /// 而两个账号的满窗直接测量只差约 2%。
     ///
     /// 倍率类的判据见 [`super:cost:same_plan_class`]：**两边都得在倍率表里查得到**
     /// 才算同类,否则退回按名字精确比——表外的档拿到的是「回落基准档」那个占位值,
     /// 拿它当依据会把一堆互不相干的档归成一类。
     ///
-    /// **不再按 `weight_ver` 等于当前订号筛**。原因：价格
-    /// 世代按模型走之后,每个模型按自己的时间线取价,各订号下算出来的 `cost` 都是
-    /// 「该区间按**当时**官方价目的美元当量」,**量纲一致、可比**。反过来那道筛是有害的
+    /// **不按 `weight_ver` 等于当前订号筛**：价格
+    /// 世代按模型走,每个模型按自己的时间线取价,各订号下算出来的 `cost` 都是
+    /// 「该区间按**当时**官方价目的美元当量」,**量纲一致、可比**。那道筛反而有害
     /// ——官方一调价就会把整段历史一次性排除掉,而正常路径下 `recompute_stale_costs`
     /// 已经把存量行按各自时刻的价目重算过了。
     ///
@@ -955,15 +983,15 @@ impl SubStore {
             .unwrap_or_default()
     }
 
-    /// 价格数据集升订号后的**就地重算**。
+    /// 价格数据集升订号后的**就地重算**（价格变更的落点）。
     ///
     /// 遍历 `weight_ver < 当前订号` 的行,按 `breakdown` 里的原始 token 重新折算
     /// `cost`/`unknown_cost` 并写回,`weight_ver` 置为当前订号。**全部是按 id 的 UPDATE**,
     /// 不删行、不产生新行、可重复执行。
     ///
-    /// **每个模型按它在该区间 `t1` 时刻生效的价目**重算。
-    /// 这是本阶段的那个错误：此前一律用**最新**价目,于是"上游 X 日调价、我们 X+14
-    /// 发版"这种正常节奏下,**X 之前本来正确的样本会被算错**。按时刻取价之后：
+    /// **每个模型按它在该区间 `t1` 时刻生效的价目**重算,而不是一律用最新价目——
+    /// 否则「上游 X 日调价、我们 X+14 发版」这种正常节奏下,X 之前本来正确的样本会被算错。
+    /// 按时刻取价之后：
     /// - 只有一个模型变价时,不含该模型的行重算出来的值与原值相同（幂等,无副作用）,
     ///   所以**不必挑行,全量重算最简单**（`PAIR_KEEP = 5000` 封顶,开销可忽略）;
     /// - 一个区间里的不同模型各取各的时间线,不存在"这个区间属于哪一代"。
@@ -974,7 +1002,7 @@ impl SubStore {
     ///
     /// 恢复不了的行（`breakdown` 缺失 / 解析不出任何模型——极早期的行或写坏的行）
     /// **不删**,置 `weight_ver = 0` 表示存疑：它们仍可被查询、仍是档案的一部分,
-    /// 只是不再参与推断（`pairs_for_fit` 按等于当前版本筛）。
+    /// 只是不再参与推断（`pairs_for_fit` 排除 `weight_ver = 0`）。
     ///
     /// 返回 `（重算成功条数, 标为存疑条数)`。当前版本与库内一致时是一次索引查询,零开销。
     pub fn recompute_stale_costs(&self, platform: Platform) -> Result<(usize, usize), String> {
@@ -1077,10 +1105,10 @@ impl SubStore {
     ///
     /// 这条边界是给 `codex_rollout` 用的：一台机器可以登录多个账号来回切,而每个账号
     /// 有**自己独立的额度窗口** ⇒ 跨在切换点上的区间,它的 Δ 是拿两个账号的读数相减
-    /// 出来的,毫无意义,必须整条丢掉。`plan_type` 挡不住这件事——本机 2026-07 就出现过
-    /// **两个都是 plus** 的账号交替使用。
+    /// 出来的,毫无意义,必须整条丢掉。`plan_type` 挡不住这件事——同一套餐的两个账号
+    /// 也会交替使用。
     ///
-    /// 历史补不回来,所以这条边界只对
+    /// 历史补不回来（rollout 里没有账号字段）,所以这条边界只对
     /// **从现在往后**有效;边界之前仍靠 `plan_type` 与窗尾判据兜着。
     pub fn account_since(&self, platform: Platform) -> Option<i64> {
         self.meta_i64(&format!("account_since_{}", platform.as_str()))
@@ -1193,9 +1221,8 @@ impl SubStore {
     /// 相邻样本间隔的**中位数**。
     ///
     /// 必须取中位数而不是 `（最新 − 最早) / （条数 − 1)`：桌面端只在自己运行时采样,
-    /// 关机 / 休眠会在序列里留下十几小时的空档,
-    /// 均值被这种空档拉到 1864 秒,读日志的人会以为采样器半小时才写一条——而真实节律
-    /// 是 900 秒整。
+    /// 关机 / 休眠会在序列里留下十几小时的空档,均值会被拉到真实节律（900 秒）的
+    /// 两倍以上,读日志的人会误判采样密度。
     pub fn median_sample_gap(&self, platform: Platform) -> Option<i64> {
         self.conn
             .query_row(
@@ -1223,7 +1250,7 @@ impl SubStore {
             .and_then(|(a, b)| Some((a?, b?)))
     }
 
-    // ---------- quota_reading / quota_daily（读数时间序列两层;-4） ----------
+    // ---------- quota_reading / quota_daily（读数时间序列两层） ----------
 
     /// 日级汇总的**口径订号**。改了 `gain_pct` / `drop_pct` / `resets` 任何一条的
     /// 算法,或者改了日界口径,就 +1 ——开库时发现库里记的版本对不上,整表按
@@ -1236,8 +1263,8 @@ impl SubStore {
         format!("quota_daily_rule_{}", platform.as_str())
     }
 
-    /// 同一时刻同一窗口撞上多条来源时的取舍（小者优先;「查询时按
-    /// 优先级取一条,不在写入时合并」）。
+    /// 同一时刻同一窗口撞上多条来源时的取舍（小者优先;查询时按
+    /// 优先级取一条,不在写入时合并）。
     ///
     /// `api` 最先：它的时刻就是请求时刻,语义最直接。`rollout` 次之——它和 `api`
     /// 是同一个服务端数字,只是走本地文件到手。`desktop` 最后：整数百分比、采样时刻。
@@ -1497,8 +1524,7 @@ impl SubStore {
     ///
     /// 光看「窗尾前移了」会把**空窗漂移**整片误判成重置：窗口空着的时候服务端报的是
     /// `now + 窗长`,它跟着 now 一起往前走 ⇒ 每两条读数之间窗尾都在前移,且前移量
-    /// **恰好等于两条读数的间隔**。本机 :Codex 的 5h 空窗时连续 8 条
-    /// 读数给出 7 次「前移」,没有一次是真重置。
+    /// **恰好等于两条读数的间隔**。
     ///
     /// 所以判据是**前移得比时间本身还快**——真重置会把窗尾整段推到下一个窗口
     /// （最多一个窗长）,而漂移永远追不上时间。容差沿用
@@ -1585,7 +1611,7 @@ impl SubStore {
     }
 
     /// 某窗口在区间内的读数（`[from, to]` 闭区间,**按时刻去重后**升序）。
-    /// S2 查询面与统计层的唯一读口（命令面 `get_quota_readings`）。
+    /// 查询面与统计层的唯一读口（命令面 `get_quota_readings`）。
     pub fn quota_readings(
         &self,
         platform: Platform,
@@ -1778,7 +1804,7 @@ mod tests {
         assert_eq!(loaded.status, FetchStatus::Ok);
     }
 
-    /// 套餐边界（设计 §9-10 ②）：套餐名变了（含从无到有）才推进,失败轮的 "unknown"
+    /// 套餐边界：套餐名变了（含从无到有）才推进,失败轮的 "unknown"
     /// 与重复的同名成功轮都不推进。
     #[test]
     fn plan_boundary_moves_only_when_the_plan_name_really_changes() {
@@ -1930,7 +1956,7 @@ mod tests {
         samples.push((1_000 + 4 * 900 + 79_339, 11.0, 4.0));
         s.insert_samples(p, &samples).unwrap();
         assert_eq!(s.median_sample_gap(p), Some(900), "中位数不被空档带偏");
-        // 均值会被拉到 16000 秒以上——这正是旧写法的问题
+        // 均值会被拉到 16000 秒以上
         let (first, last) = s.sample_span(p).unwrap();
         let mean = (last - first) / (s.sample_count(p) - 1);
         assert!(mean > 15_000, "均值确实被空档拉走:{mean}");
@@ -2015,7 +2041,7 @@ mod tests {
         assert_eq!(s.latest_pair_t1(p, "desktop"), Some(2_800), "水位线随新样本前移");
     }
 
-    /// 存量库升级：**只 ALTER + 回填,样本一条不能少**（红线见 AGENTS.md §3）。
+    /// 存量库升级：**只 ALTER + 回填,样本一条不能少**。
     #[test]
     fn legacy_schema_upgrades_in_place() {
         let dir = std::env::temp_dir().join(format!("tc_sub_upgrade_{}", std::process::id()));
@@ -2065,9 +2091,9 @@ mod tests {
         // 就地升级只负责补列（存量 cost 是按修订号 1 的尺子量的 ⇒ 回填 1）;把它们的
         // cost 换算到当前修订号的是启动时的重算,顺序与 mod.rs 一致。
         //
-        // 注意与升级前的差别：`pairs_for_fit` 不再按修订号筛,所以这两行**升级当刻就
-        // 已经可用**（PHASE15 S1,设计 §4.5——那道筛会在官方调价时把整段历史一次性
-        // 排除掉）。重算改的是 cost 的**数值**,不是它能不能参与拟合。
+        // `pairs_for_fit` 不按修订号筛,所以这两行**升级当刻就已经可用**
+        // （那道筛会在官方调价时把整段历史一次性排除掉）。重算改的是 cost 的**数值**,
+        // 不是它能不能参与拟合。
         let before: Vec<f64> =
             s.pairs_for_fit(Platform::Claude, "max").iter().map(|p| p.cost).collect();
         assert_eq!(before.len(), 2, "修订号旧但样本照常可用");
@@ -2093,7 +2119,7 @@ mod tests {
         };
         assert_eq!(shapes[0], r#"{"claude-sonnet-5":[1000,10,0,0]}"#, "包装层抹平");
         assert_eq!(shapes[1], r#"{"claude-opus-5":[500,0,0,0]}"#, "已规范的原样不动");
-        // 升级前先备份（VACUUM INTO,红线要求）
+        // 升级前先备份（VACUUM INTO）
         let backups: Vec<_> = std::fs::read_dir(dir.join("backups")).unwrap().flatten().collect();
         assert_eq!(backups.len(), 1, "升级前落一份备份");
         // 幂等：再开一次不重复升级、不再备份
@@ -2107,7 +2133,7 @@ mod tests {
     }
 
     /// 拟合筛选：套餐对不上的、存疑的排除,但**行还在库里**;
-    /// **不按价格修订号筛**（S1 去掉了那道筛,理由见 `pairs_for_fit` 注释）。
+    /// **不按价格修订号筛**（理由见 `pairs_for_fit` 注释）。
     #[test]
     fn pairs_for_fit_filters_by_plan_and_doubt_only() {
         let s = mem_store();
@@ -2136,8 +2162,8 @@ mod tests {
         assert_eq!(kept, 3, "被筛掉的行仍留在库里当档案");
     }
 
-    /// 按**倍率类**筛而不是按套餐名（2026-09-19 用户定案）：出厂倍率表认为窗口一样大的
-    /// 两个档（Codex 的 plus / edu / business）样本可比,合成一代;倍率不同的仍分代。
+    /// 按**倍率类**筛而不是按套餐名：出厂倍率表认为窗口一样大的
+    /// 几个档（Codex 的 plus / edu / business）样本可比,合成一代;倍率不同的仍分代。
     #[test]
     fn pairs_for_fit_pools_plans_of_the_same_multiplier_class() {
         let s = mem_store();
@@ -2212,7 +2238,7 @@ mod tests {
         assert_eq!(again, cost, "重复重算是空操作,不改数值");
     }
 
-    /// **S1 验收的核心用例**：某模型在 T 降价,重算后
+    /// **核心用例**：某模型在 T 降价,重算后
     /// T 之前的样本按旧价、T 之后按新价,而**不含该模型的样本 `cost` 一字不变**。
     #[test]
     fn a_price_cut_only_rescales_rows_containing_that_model() {
@@ -2420,7 +2446,7 @@ mod tests {
         assert_eq!(loaded.fetched_at, None);
     }
 
-    // ---------- quota_reading / quota_daily（PHASE15 §9-4） ----------
+    // ---------- quota_reading / quota_daily ----------
 
     fn reading(t: i64, kind: &str, used: f64, src: SnapshotSource) -> super::super::model::QuotaReading {
         super::super::model::QuotaReading {
@@ -2467,7 +2493,7 @@ mod tests {
     }
 
     /// 同一时刻同一窗口的两条来源:**两条都留在库里**,查询时按优先级取一条
-    /// （2026-09-18 定案:不在写入时合并）。
+    /// （不在写入时合并）。
     #[test]
     fn both_sources_are_kept_and_the_query_picks_by_priority() {
         let s = mem_store();
@@ -2593,7 +2619,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 窗尾前移才算一次重置（读数没变小也算——那正是「读数变小了」这条旧判据
+    /// 窗尾前移才算一次重置（读数没变小也算——那正是「读数变小了」这条判据
     /// 抓不到的那一类）。
     #[test]
     fn window_tail_moves_are_counted_as_resets() {
@@ -2610,9 +2636,8 @@ mod tests {
         assert_eq!(day.resets, 1, "窗尾前移一次;读数一路在涨,旧判据一次都抓不到");
     }
 
-    /// **空窗漂移不是重置**（2026-09-19 真机实测改的判据）：窗口空着时服务端报
-    /// `now + 窗长`,窗尾每条读数都在前移,前移量恰好等于读数间隔。真库里 Codex 的
-    /// 5h 空窗连续 8 条读数给出 7 次「前移」,一次真重置都没有。
+    /// **空窗漂移不是重置**：窗口空着时服务端报
+    /// `now + 窗长`,窗尾每条读数都在前移,前移量恰好等于读数间隔。
     #[test]
     fn an_empty_window_drifting_forward_is_not_a_reset() {
         let s = mem_store();

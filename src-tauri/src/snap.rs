@@ -1,7 +1,5 @@
-//! 挂件网格吸附——检测 Rust：拖动走
-//! data-tauri-drag-region 的系统模态移动循环，前端无法在拖动中插手，吸附时机
-//! 只能从窗口消息拿（设计文档选型 B；tauri:Monitor 无工作区，
-//! 格网铺在 rcWork 内，Win32 取）。
+//! 挂件网格吸附。拖动走 data-tauri-drag-region 的系统模态移动循环，前端无法在拖动中插手，
+//! 吸附时机只能从窗口消息拿，故检测在 Rust；tauri:Monitor 无工作区，格网铺在 rcWork 内，由 Win32 取。
 //!
 //! 机制：comctl32 子类化 widget 窗口，拦 WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE /
 //! WM_MOVING（子类化 proc 先于 tao wndproc 执行，末尾无条件 DefSubclassProc
@@ -9,20 +7,17 @@
 //! - ENTER 快照几何；EXIT 无条件量化：**窗口右上角吸附到工作区格网最近顶点**
 //!   （pitch 10 逻辑像素 × scale_factor；原点 = 工作区右上角向左/下延展；
 //!   移动过程零迟滞——WM_MOVING 只读，动作仅 EXIT 后一次 set_position）；
-//! - **贴边语义已删除（-3）**：边缘即顶点子集，不再重复定义；移动/拉伸/
-//!   混合变化统一右上角网格对齐；比例锁程序化回写不产生 ENTER/EXIT
-//!   （WM_MOVING 仅模态拖动发送），无自触发回路；
-//! - `widget_snap_enabled`（serde default **false**，-4）P3 设置页接线前
-//!   的开启杠杆：手改 window-state.json `"widget_snap_enabled": true`；
+//! - 无单独的贴边语义：边缘即顶点子集；移动/拉伸/混合变化统一右上角网格对齐；
+//!   比例锁程序化回写不产生 ENTER/EXIT（WM_MOVING 仅模态拖动发送），无自触发回路；
+//! - 开关 `widget_snap_enabled`（默认开，设置页可关，落盘于 window-state.json）；
 //! - 状态单侧写：子类化线程是唯一写者（AppState Mutex 单一源），不另设锁。
-//! WM_* 不可达的回退（Moved 去抖）见设计文档 /
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-// ---------- SnapState（window-state.json 字段类型，跨平台编译；P2 顶点锚点消费） ----------
+// ---------- SnapState（window-state.json 字段类型，跨平台编译） ----------
 
-/// 格网顶点索引：相对工作区右上角原点的偏移格数（向左/向下为正；P1-R，-2）。
+/// 格网顶点索引：相对工作区右上角原点的偏移格数（向左/向下为正）。
 /// 绝对坐标不落盘——由 SnapState + 当前工作区矩形 + pitch 重算，显示器拔插/
 /// DPI 变化时按当前工作区重对齐即自然适配。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +26,7 @@ pub struct SnapVertex {
     pub row: u32,
 }
 
-/// 吸附状态（`widget_snap` 字段，纯顶点模型——edge/corner 随 P1-R 删除）。
+/// 吸附状态（`widget_snap` 字段，纯顶点模型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapState {
     /// 停靠顶点（窗口右上角所在格网位置）。
@@ -75,13 +70,13 @@ mod win {
     /// 子类化槽位 id（同窗口多子类化按 id 区分，本应用仅此一处，取任意非零值）。
     const SUBCLASS_ID: usize = 0x7048_5350;
 
-    // WM_* 本地常量（不为此引 Win32_UI_WindowsAndMessaging，见设计文档）：
+    // WM_* 消息常量：
     // 进入/退出系统移动尺寸模态循环（拖动与拉伸共用同一循环）、移动中的位置通知。
     const WM_ENTERSIZEMOVE: u32 = 0x0231;
     const WM_EXITSIZEMOVE: u32 = 0x0232;
     const WM_MOVING: u32 = 0x0216;
 
-    /// 格网间距。
+    /// 格网间距（逻辑像素，暂定值）。
     const PITCH_LOGICAL: f64 = 10.0;
 
     /// 子类化回调上下文（install 时填充一次；回调与 tao wndproc 同为主线程）。
@@ -137,14 +132,14 @@ mod win {
             WM_ENTERSIZEMOVE => on_enter(),
             WM_MOVING => {
                 if !LOGGED_MOVING.swap(true, Ordering::Relaxed) {
-                    // S1 spike 结论通道：本行出现在 dev 控制台 = WM_MOVING 可达
+                    // 诊断通道：本行出现在 dev 日志 = WM_MOVING 可达
                     crate::dev_log!("[snap] MOVING reachable (lparam={lparam:#x})");
                 }
             }
             WM_EXITSIZEMOVE => on_exit(hwnd),
             _ => {}
         }
-        // 无条件转发子类化链（最终到 tao 的 wndproc）——零迟滞约束（-1）：
+        // 无条件转发子类化链（最终到 tao 的 wndproc）；零迟滞：
         // 拖动过程零干预，量化动作只在 EXIT 后一次 set_position
         DefSubclassProc(hwnd, msg, wparam, lparam)
     }
@@ -158,7 +153,7 @@ mod win {
         crate::dev_log!("[snap] ENTER sizemove");
     }
 
-    /// 拖动/拉伸结束：**无条件网格量化**（-3 贴边语义已删除，移动/拉伸同路径）。
+    /// 拖动/拉伸结束：**无条件网格量化**（移动/拉伸同路径）。
     fn on_exit(hwnd: HWND) {
         crate::dev_log!("[snap] EXIT sizemove");
         let Some(ctx) = CTX.get() else { return };
@@ -186,7 +181,7 @@ mod win {
                 outer.1, vertex.col, vertex.row, target.0, target.1
             );
             let _ = ctx.window.set_position(PhysicalPosition::new(target.0, target.1));
-            // P3 落定动效事件：仅位置真变时发（量化未位移不发,避免每次松手都闪）
+            // 落定动效事件：仅位置真变时发（量化未位移不发,避免每次松手都闪）
             use tauri::Emitter;
             let _ = app.emit("widget-snap-landed", vertex);
         }

@@ -1,11 +1,10 @@
 // 应用更新（设置·About）：检查更新 / 下载安装 / 公开仓入口。
 // 更新源 = 公开仓 Release 的 latest.json（tauri.conf.json 的 plugins.updater）；
-// 安装包签名校验由 updater 插件内置执行（按配置里的 pubkey 验签）——校验不
-// 通过的包不会进入安装步骤。非 Tauri 环境（浏览器布局调试）一律降级为
-// unavailable，不抛错、不改变既有降级路径。
+// 安装包签名校验由 updater 插件按配置里的 pubkey 执行——校验不通过的包不会进入安装步骤。
+// 非 Tauri 环境（浏览器布局调试）一律降级为 unavailable，不抛错。
 //
 // dev 构建不提供安装：dev 与安装版 identifier 不同（tw 窗口类/数据根都隔离），
-// dev 里执行安装会把正式版装进系统，与「开发中」语境不符——只允许检查。
+// dev 里执行安装会把正式版装进系统——只允许检查。
 
 import { inTauri, tryInvoke } from './tauri'
 
@@ -49,9 +48,8 @@ function errText(e: unknown): string {
   if (/network|dns|connect|timed? ?out/i.test(s)) {
     return 'Network error while checking for updates.'
   }
-  // 安装包验签失败（公钥与签名不配套等）：自动安装没有出路，直接指向手动下载。
-  // 事故背景：tauri.conf.json 的 pubkey 曾与私钥不配套，下载到 100% 后
-  // 在此处抛错——此前原文文案不指向任何动作，用户只看到「没有开始安装」。
+  // 安装包验签失败（如 tauri.conf.json 的 pubkey 与签名私钥不配套，下载到 100% 后在此抛错）：
+  // 自动安装没有出路，文案直接指向手动下载。
   if (/signature|minisign|verification failed/i.test(s)) {
     return 'The downloaded package failed signature verification. Download the installer from the releases page instead.'
   }

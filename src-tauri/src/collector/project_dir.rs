@@ -3,8 +3,7 @@
 //! Claude Code（`~/.claude/projects/<编码目录>/`）与 WorkBuddy（`~/.workbuddy/projects/<编码目录>/`）
 //! 都把会话文件归档在「启动目录编码后的文件夹」下——续聊 / fork 副本、子代理目录都在同一文件夹里,
 //! 源自己的会话列表也按这个文件夹分组。**项目身份 = 文件夹**;行内 `cwd` 只用来还原可读路径
-//! （Claude 的 `cwd` 是 Bash 当前目录,`cd` 之后会漂进子目录,不能当身份用,
-//! _project-key-drift）。
+//! （Claude 的 `cwd` 是 Bash 当前目录,`cd` 之后会漂进子目录,不能当身份用）。
 //!
 //! 可读路径的解析顺序：本次采集已解析 → 库内持久化映射（`source_cursor` scope `folder:<文件夹>`）→
 //! 文件里首个 `cwd` 且编码后与文件夹一致 → 旧游标里的目录且编码一致 → 文件夹名本身（无 cwd 行时的兜底,
@@ -72,7 +71,7 @@ impl FolderProjects {
         if let Some(k) = self.resolved.get(folder) {
             return k.clone();
         }
-        // 库内映射与旧游标提示都只在「像路径」时采纳:兜底写回的文件夹名不能自我印证（迁移会正旧值）。
+        // 库内映射与旧游标提示都只在「像路径」时采纳:兜底写回的文件夹名不能自我印证（迁移正库内旧值）。
         if let Some(k) = store.get_cursor(self.agent, &format!("{SCOPE_PREFIX}{folder}")).filter(|k| looks_like_path(k)) {
             self.resolved.insert(folder.to_string(), k.clone());
             return k;
@@ -122,7 +121,7 @@ mod tests {
         let mut batch = Batch::default();
         fp.persist(&mut batch);
         assert!(batch.cursors.is_empty(), "文件夹名不得持久化为映射");
-        // 库里已被写坏的映射（v13 漏洞遗留）视为不存在,由真实 cwd 覆盖
+        // 库里已被写坏的映射（兜底文件夹名）视为不存在,由真实 cwd 覆盖
         let mut b2 = Batch::default();
         b2.cursors.push(("folder:E--W-Demo".to_string(), "E--W-Demo".to_string()));
         store.commit("claude-code", &b2).unwrap();

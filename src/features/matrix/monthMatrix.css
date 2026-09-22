@@ -1,11 +1,9 @@
-/* 月矩阵布局：固定行头 + 31 列 + 行总量
-   格子尺寸 CSS 单源封顶,只随窗口缩小不放大。
-   格子尺寸改 JS 双轴等比（UsageMatrixView ResizeObserver
-   量测宽高,cell = min（17, 宽预算/31, 高预算/行数),gap = cell/5 与原版 15:3
-   同比例——行距恒 = 列距）;结果写进 --cell-px/--cell-gap-px/--cells-w 三个
-   共享变量。格子区宽度恒 = --cells-w（不再 minmax 拉伸）,整个
-   「标签|格子|Total」块作为一个整体在中列内居中——两侧文字间距封顶,放大
-   窗口不再把文字推离格子。工具栏/图表面板消费同一组变量对齐格子两缘。 */
+/* 月矩阵布局：固定行头 + 31 列 + 行总量（CSS Grid）。
+   格子尺寸由 JS 双轴等比计算（UsageMatrixView ResizeObserver 量测宽高,
+   cell = min（17, 宽预算/31, 高预算/行数),gap = cell/5——行距恒 = 列距）,
+   结果写进 --cell-px/--cell-gap-px/--cells-w 三个共享变量。格子区宽度恒 = --cells-w
+   （不做 minmax 拉伸）,整个「标签|格子|Total」块作为一个整体在中列内居中——
+   两侧文字间距封顶,放大窗口不会把文字推离格子。工具栏/图表面板消费同一组变量对齐格子两缘。 */
 
 .month-matrix {
   --label-width: 150px;
@@ -111,7 +109,7 @@
   gap: var(--cell-gap-px, 3px);
 }
 
-/* 单元格（bugfix:宽高都显式取 --cell-px——删 aspect-ratio 后 height
+/* 单元格（宽高都显式取 --cell-px:无 aspect-ratio 时 height
    会塌成文字行高,格子变横线;JS 等比缩放保证两轴同尺寸） */
 .day-cell {
   width: var(--cell-px, 17px);
@@ -192,4 +190,4 @@
   padding: 0 2px;
 }
 
-/* Tooltip 样式已抽至 matrixTooltip.css（挂件与主窗口共用同组件同格式） */
+/* Tooltip 样式在 matrixTooltip.css（挂件与主窗口共用同组件同格式） */

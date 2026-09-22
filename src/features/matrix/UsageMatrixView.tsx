@@ -1,7 +1,6 @@
-// 视图状态与数据装配（自前代项目移植）：usageService 加载真实数据；mock 仅降级。
-// 窗口改造：31 列恒定、最右列 = 今天（与挂件「最右列 = 当前周」同语义的
-// 天粒度版）——窗口跨月时按需拉多个月份矩阵在前端拼接；hover 显示年月日 +
-// tokens·对话数（message_counts 契约扩展）。
+// 视图状态与数据装配：usageService 加载真实数据；mock 仅降级。
+// 窗口 31 列恒定、最右列 = 今天（与挂件「最右列 = 当前周」同语义的天粒度版）——
+// 窗口跨月时按需拉多个月份矩阵在前端拼接；hover 显示年月日 + tokens·对话数（message_counts）。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import UsageMatrix, { MatrixRow } from './UsageMatrix'
 import RowBreakdown from '../breakdown/RowBreakdown'
@@ -13,14 +12,13 @@ import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip } from '../insights/analytics'
 import './matrixView.css'
 
-/** :project 维走 get_project_month_rows / get_project_breakdown;agent / model 维命令不变。 */
+/** project 维走 get_project_month_rows / get_project_breakdown;agent / model 维走月矩阵命令。 */
 export type GroupBy = 'agent' | 'model' | 'project'
 type Bucket = 'day' | 'week' | 'cumulative'
 /** wait / human = 时间成本（毫秒,并列不相加）,仅 project 维可选（其余维度无时间数据）。 */
 type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
 /** 排序策略按视图分账：各视图各自记忆互不串扰。
- * 工具栏减宽:下拉框改右缘图标开关——byTotal（激活 = 按总量,未激活 = 按名称）;
- * family（家族聚合,仅 model 视图生效）叠加在 byTotal 之上,排序逻辑本身不变。 */
+ * byTotal（激活 = 按总量,未激活 = 按名称）;family（家族聚合,仅 model 视图生效）叠加在 byTotal 之上。 */
 type ViewSort = Record<GroupBy, { byTotal: boolean; family: boolean }>
 
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -106,7 +104,7 @@ function simplifyLabel(key: string, groupBy: GroupBy): string {
   return key
 }
 
-/** 模型家族键：key 首段即家族——
+/** 模型家族键（综合排序用）：key 首段即家族——
  * deepseek-v4-flash/pro → deepseek、gpt-5.6-sol/luna/terra → gpt、
  * claude-opus-5/sonnet-5 → claude;agent 视图与无分段 key 原样成组。 */
 function familyOf(key: string, groupBy: GroupBy): string {
@@ -115,12 +113,12 @@ function familyOf(key: string, groupBy: GroupBy): string {
 }
 
 export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow, onRowSelect }: {
-  /** 9.1 联动：groupBy 由 FullWindow 持有（model 视图下方全系列曲线跟随切换）。
+  /** groupBy 由 FullWindow 持有（model 视图下方全系列曲线跟随切换）。
    * 不传时内部自持（保持独立可用）。 */
   groupBy?: GroupBy
   onGroupByChange?: (g: GroupBy) => void
-  /** v3.1 行联动:面板选中行由 FullWindow 持有（受控高亮）;不传时内部自持
-   * （独立使用 = 旧行为内联展开）。 */
+  /** 行联动:面板选中行由 FullWindow 持有（受控高亮）;不传时内部自持
+   * （独立使用 = 内联展开）。 */
   selectedRow?: string | null
   /** 点行名上抛（null = 取消/恢复预设）。不传时内部内联展开。 */
   onRowSelect?: (rowKey: string | null) => void
@@ -150,13 +148,12 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
   const [loading, setLoading] = useState(false)
   const [useMock, setUseMock] = useState(false)
   const [refreshTick, setRefreshTick] = useState(0)
-  // 矩阵最大行数（设置页 General → Matrix max rows,默认 15）——限制
-  // 显示的 agent/model 行数上限,超出部分并入「+N more」摘要行,保证热力图
-  // 主体在小窗也完整可见（不出现内部滚动）。
+  // 矩阵最大行数（设置页 General → Matrix max rows,默认 15;0 = 不限）——排序后
+  // 只保留 top N 行,超出行静默隐藏,保证热力图主体在小窗也完整可见（不出现内部滚动）。
   const [maxRows, setMaxRows] = useState(() => getDesignPrefs().matrixMaxRows)
   useEffect(() => subscribeDesignPrefs((p) => setMaxRows(p.matrixMaxRows)), [])
 
-  // 格子等比缩放（双轴）——见 visibleRows 之后的 effect（依赖行数）。
+  // 格子等比缩放（双轴）见 visibleRows 之后的 effect（依赖行数）。
   const matrixRef = useRef<HTMLDivElement>(null)
   const [cellPx, setCellPx] = useState(17)
 
@@ -206,8 +203,8 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       >()
       // 行的键集 = 窗口内任一月份有记录的 key;键集内的格子全部走灰底语义:
       // 后端行只覆盖「该月有记录」的月份,跨月拼接时缺月份的格子若留 null
-      // 会渲染成透明空白——窗口最右列 = 今天,窗口内
-      // 不存在未来日,缺月份 = 该月无记录 = 真实零,补 0 而非 null。
+      // 会渲染成透明空白——窗口最右列 = 今天,窗口内不存在未来日,
+      // 缺月份 = 该月无记录 = 真实零,补 0 而非 null。
       const allKeys = new Map<string, string>()
       for (const monthRows of byMonth.values()) {
         for (const r of monthRows.values()) allKeys.set(r.key, r.label)
@@ -270,8 +267,8 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     )
   }, [])
 
-  // 行名点击:v3.1 受控模式（onRowSelect）→ 上抛 FullWindow（面板联动,不再内联
-  // 展开）;独立模式 → 旧行为内联展开钻取（GetBreakdown 跨月拼 31 天）。
+  // 行名点击:受控模式（onRowSelect）→ 上抛 FullWindow（面板联动,不内联展开）;
+  // 独立模式 → 内联展开钻取（GetBreakdown 跨月拼 31 天）。
   const toggleExpand = useCallback(
     async (rowKey: string) => {
       if (onRowSelect) {
@@ -357,10 +354,10 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     [matrixRows, maxRows],
   )
 
-  // 格子等比缩放（双轴）。此前 CSS minmax 只按宽度收缩、高度不跟,缩窗后
-  // 行距 > 列距失衡。ResizeObserver 量测矩阵区可用宽高:cell = min（17,
-  // 宽预算/31, 高预算/行数)——宽高同一尺寸;gap 与 cell 同步等比（cell:gap =
-  // 5:1,与原版 15:3 一致）,行距恒 = 列距。结果写进本区 style 的 CSS 变量,
+  // 格子等比缩放（双轴）:CSS minmax 只按宽度收缩、高度不跟,缩窗后行距 > 列距失衡,
+  // 所以由 JS 计算。ResizeObserver 量测矩阵区可用宽高:cell = min（17,
+  // 宽预算/31, 高预算/行数)（下限 8）——宽高同一尺寸;gap 与 cell 同步等比
+  // （cell:gap = 5:1）,行距恒 = 列距。结果写进 CSS 变量,
   // 格子网格与图表面板列模板同源消费（图表两缘 = 格子两缘,随缩放同步）。
   useEffect(() => {
     const el = matrixRef.current
@@ -388,10 +385,10 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
     return () => ro.disconnect()
   }, [visibleRows.length])
 
-  // v3.7 共享列模板变量:工具栏 / 矩阵行 / 图表面板三方同源。变量挂在
+  // 共享列模板变量:工具栏 / 矩阵行 / 图表面板三方同源。变量挂在
   // .matrix-stage（本视图与图表面板的共同父级）上——面板是 stage 的直接子元素、
-  // 不在 .matrix-view 内,挂 view 上会断链（面板拿到 fallback 值,
-  // 图表 517px ≠ 格子区 629px 错位）。cellPx 变化时同步写 stage.style。
+  // 不在 .matrix-view 内,挂 view 上会断链（面板拿到 fallback 值,图表与格子区错位）。
+  // cellPx 变化时同步写 stage.style。
   const cellGap = Math.max(2, cellPx / 5)
   const cellsW = WINDOW_DAYS * cellPx + (WINDOW_DAYS - 1) * cellGap
   useEffect(() => {
@@ -465,9 +462,8 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       </div>
 
       <div className="matrix-body">
-        {/* （工具栏过宽）:色阶与排序移出工具栏 → 矩阵区右缘竖排
-            图标开关,与图表面板图标列同风格同右缘。单钮双态,默认态不高亮
-            （高亮碍眼）:色阶默认 = Global / 高亮 = Per row;
+        {/* 色阶与排序放在矩阵区右缘竖排图标开关（不占工具栏宽度）,与图表面板图标列
+            同风格同右缘。单钮双态,默认态不高亮:色阶默认 = Global / 高亮 = Per row;
             排序默认 = 按 tokens / 高亮 = 按名称;Family 仅 model 视图提供
             （家族聚合对 agent/project 无意义）,叠加在排序之上,默认开启即高亮
             （表示子排序激活）。*/}

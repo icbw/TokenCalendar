@@ -3,16 +3,14 @@
 //! - 数据源：各 agent CLI 的**本机凭据文件**（只读）+ 平台 usage 端点（逆向）;
 //!   Claude 另有桌面端本地采样回落（claude_desktop.rs,零凭据）;
 //! - 存储：`<数据根>/subscriptions.db`（快照 + 绑定开关;凭据永不落库）;
-//! - 取数节奏：
-//!   **按预计消耗取数**——采集线程报来的分模型 token 经 cost.rs 折成加权代价、
-//!   经 calib.rs 的标定系数换成「大约消耗了百分之几」,达到阈值（默认 5%,可调）
-//!   就取一轮（最快 60 秒,demand.rs）;本地无 token 则不取;固定间隔降为**兜底**（默认 30 分钟）,
-//!   只为覆盖不产生本地 token 的在线 / 网页用量,Claude 侧兜底先用桌面端采样
-//!   零请求探测有没有涨（claude_desktop:probe_growth）——**没涨也会把样本里的下降
-//!   正进快照**（5h 是滚动窗口,空闲期余量会自己恢复,见 `apply_flat_sample`）;
-//!   本地 token 静默 10 分钟即待机
-//!   （idle.rs,全局视觉态,只翻转悬浮球减淡,不改取数频次）;绑定前零网络,凭据判死后零网络
-//!   （mtime 探针复活）;**没取到更新读数的轮按 demand.rs 的退避推后重试**
+//! - 取数节奏：**按预计消耗取数**——采集线程报来的分模型 token 经 cost.rs 折成代价、
+//!   经 calib.rs 的标定系数换成「大约消耗了百分之几」,达到阈值就取一轮（demand.rs）;
+//!   本地无 token 则不取。固定间隔只是**兜底**,覆盖不产生本地 token 的在线 / 网页用量;
+//!   Claude 侧兜底先用桌面端采样零请求探测有没有涨（claude_desktop:probe_growth）——
+//!   **没涨也会把样本里的下降正进快照**（滚动窗口空闲期余量会自己恢复,
+//!   `apply_flat_sample`）。本地 token 静默即待机（idle.rs,只翻转悬浮球减淡,不改取数
+//!   频次）;绑定前零网络,凭据判死后零网络（mtime 探针复活）;**没取到更新读数的轮按
+//!   demand.rs 的退避推后重试**,故障期间不按采集频率空转;
 //! - 红线：凭据文件只读不写,刷新 token 只存内存;单平台失败不拖垮整体。
 
 pub mod bootstrap;
@@ -40,46 +38,43 @@ use tauri::{AppHandle, Manager};
 use model::{CredentialInfo, FetchStatus, Platform, SnapshotSource, SubscriptionSnapshot};
 use store::SubStore;
 
-/// 默认**兜底**取数间隔（30 分钟;设置页 5/10/15/30 分钟可调）。
+/// 默认**兜底**取数间隔（设置页 5/10/15/30 分钟可调）。
 /// 兜底没有任何动态检测能力,只是「本地 token 看不见的用量」的最后一道保底,
 /// 故取封顶档;真正的取数时机由本地 token 驱动（demand.rs）。
 const DEFAULT_POLL_SECS: u64 = 1800;
 const MIN_POLL_SECS: u64 = 60;
 const MAX_POLL_SECS: u64 = 1800;
 
-/// 桌面端采样的**收割节律**。
-/// 与取数无关——收割只读本机文件、零网络,所以它可以比兜底档密得多：桌面端 15 分钟
-/// 写一条,5 分钟扫一次即可做到「样本一落地就进库」,也让兜底轮的读数正
-/// （`apply_flat_sample`）最多滞后这么久,而不是等到下一个兜底轮（默认 30 分钟）。
-/// mtime 没变时这一轮只花一次 stat。
+/// 桌面端采样的**收割节律**（秒）。与取数无关——收割只读本机文件、零网络,所以可以比
+/// 兜底档密得多：桌面端 15 分钟写一条,5 分钟扫一次即可「样本一落地就进库」,也让兜底轮
+/// 的读数正（`apply_flat_sample`）最多滞后这么久。mtime 没变时这一轮只花一次 stat。
 const HARVEST_SECS: u64 = 300;
 
-/// 手动刷新的最小间隔。手动刷新走 `wake` 推进代际,
-/// 一轮进行期间的连点会被代际吸收成一轮,但「一轮结束后再点」是不受任何约束的
-/// ——Claude 的 usage 端点按 User-Agent 分限流桶,连打最容易把自己打进 429 冷却。
-/// 被挡下的那次仍然退待机 + 广播,前端刷新动画照常落地,用户感觉不到差别。
+/// 手动刷新的最小间隔（秒）。手动刷新走 `wake` 推进代际,一轮进行期间的连点会被代际
+/// 吸收成一轮,但「一轮结束后再点」不受约束——Claude 的 usage 端点按 User-Agent 分限流桶,
+/// 连打最容易把自己打进 429 冷却。被挡下的那次仍然退待机 + 广播,前端刷新动画照常落地。
 const MANUAL_REFRESH_MIN_GAP_SECS: i64 = 15;
 
 /// 上次放行的手动刷新时刻（unix 秒;0 = 从未）。
 static LAST_MANUAL_REFRESH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// 轮询间隔（prefs 前的运行时默认;S4 设置页接线后经 AppState 存储）。
+/// 兜底取数间隔（秒;运行时值,由 `set_poll_secs` 下发,持久化在前端）。
 static POLL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(DEFAULT_POLL_SECS);
 
 /// 唤醒（立即刷新一次;bind/手动 refresh 用）。
 static WAKE: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
 
 pub fn wake() {
-    // poison 容忍（审计 P3-）：持锁线程 panic 后唤醒通道仍须可用,
+    // poison 容忍：持锁线程 panic 后唤醒通道仍须可用,
     // 否则主轮询的刷新/bind/间隔变更全部连锁失效。
     let mut gen = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
     *gen += 1;
     WAKE.1.notify_all();
 }
 
-/// 重算睡眠（不推进代际 = 不触发全量轮）：待机应检时刻被提前后,让主轮询醒来
+/// 重算睡眠（不推进代际 = 不触发全量轮）：应检时刻被提前后,让主轮询醒来
 /// 按 `idle:due` 只检到期平台。持 WAKE.0 再 notify——主线程读代际→算时长→
-/// 进等待全程持锁,通知不会落进解锁间隙（同审计 P1-）。
+/// 进等待全程持锁,通知不会落进解锁间隙。
 pub fn reschedule() {
     let _g = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
     WAKE.1.notify_all();
@@ -140,7 +135,7 @@ pub fn poll_secs() -> u64 {
     POLL_SECS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 调整轮询间隔（S4 设置页接线;调用方按 clamp 规则传值）。
+/// 调整兜底取数间隔（调用方按 clamp 规则传值）。
 pub fn set_poll_secs(v: u64) {
     POLL_SECS.store(
         v.clamp(MIN_POLL_SECS, MAX_POLL_SECS),
@@ -148,13 +143,13 @@ pub fn set_poll_secs(v: u64) {
     );
 }
 
-/// 共享适配器（内存 token 缓存生命周期 = 线程;命令侧经 Arc 仅做 invalidate,S4 接线）。
+/// 共享适配器（内存 token 缓存生命周期 = 线程;命令侧经 Arc 共享）。
 pub struct Adapters {
     codex: codex::CodexAdapter,
     claude: claude::ClaudeAdapter,
     /// 取数互斥（每平台一枚,下标 = `fetch_lock_index`）：命令面的立即刷新与
     /// 轮询线程可能同时进入取数,无互斥时两者会在冷却检查与 429 冷却写入之间
-    /// 各发一请求（限流桶风险,审计 P3-）。
+    /// 各发一请求（限流桶风险）。
     fetch_locks: [Mutex<()>; 2],
 }
 
@@ -179,10 +174,6 @@ impl Adapters {
 /// 共享读取连接（命令线程查快照;WAL 一写多读,写连接归轮询线程）。
 pub struct SubscriptionReader(pub Arc<Mutex<SubStore>>);
 
-/// 共享适配器句柄（S4 设置页 bind 后 invalidate 内存缓存用;本阶段管理进 AppState 保生命周期）。
-#[allow(dead_code)]
-pub struct SubscriptionAdapters(pub Arc<Adapters>);
-
 pub fn http_agent() -> Option<ureq::Agent> {
     Some(ureq::AgentBuilder::new().build())
 }
@@ -193,7 +184,7 @@ pub fn http_agent() -> Option<ureq::Agent> {
 pub struct RateGate(std::sync::Mutex<Option<i64>>);
 
 impl RateGate {
-    /// 取闸位（poison 容忍,审计 P3-：单次 panic 不应让整个订阅链路失去限流保护）。
+    /// 取闸位（poison 容忍：单次 panic 不应让整个订阅链路失去限流保护）。
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<i64>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -316,10 +307,9 @@ fn with_desktop_fallback(primary: SubscriptionSnapshot, note: &mut &'static str)
 /// 返回 Some = 零网络。token 驱动轮与唤醒轮不短路——用户要的就是那一刻
 /// 的即时读数。
 ///
-/// 「没涨」**不等于**「没变」：5h / 7d 都是滚动窗口,空闲期间
-/// 旧用量不断过期,余量会自己涨回来。旧版把这条已经握在手里的更新样本整个丢掉、快照
-/// 原样保留,于是球上的数停在偏低的旧值,要等复工那一笔 token 或手动刷新才纠正。
-/// 现在把样本里的**下降**正进快照（仍然零网络,细则见 `apply_flat_sample`）。
+/// 「没涨」**不等于**「没变」：5h / 7d 都是滚动窗口,空闲期间旧用量不断过期,余量会自己
+/// 涨回来。所以把样本里的**下降**正进快照（仍然零网络,细则见 `apply_flat_sample`）,
+/// 否则球上的数会停在偏低的旧值,直到复工或手动刷新。
 fn skip_by_desktop_probe(
     via: &str,
     platform: Platform,
@@ -339,10 +329,10 @@ fn skip_by_desktop_probe(
 /// 成功取到新读数后落一条标定样本,并重算系数。
 /// 上一读数不是成功态 / 本地零代价（纯在线用量）→ 不落样本,但账目照常清零。
 ///
-/// **只认两端都是 API 读数的读数对**：桌面端来源的读数是整数
-/// 百分比,`fetched_at` 又是样本时刻（可能比轮时刻早十几分钟）,而代价是按 token 到达
-/// 时刻累加的——两个时间窗对不齐,单条样本的错配可达区间的一半。桌面端那一路改由
-/// `bootstrap:ingest` 按**样本时刻**精确切,密度还更高（15 分钟一条）。
+/// **只认两端都是 API 读数的读数对**：桌面端来源的读数是整数百分比,`fetched_at` 又是
+/// 样本时刻（可能比轮时刻早十几分钟）,而代价是按 token 到达时刻累加的——两个时间窗对
+/// 不齐,单条样本的错配可达区间的一半。桌面端那一路由 `bootstrap:ingest` 按**样本时刻**
+/// 精确切,密度还更高（15 分钟一条）。
 fn record_pair(
     store: &SubStore,
     platform: Platform,
@@ -377,8 +367,8 @@ fn record_pair(
         resets5_1: resets(snap),
         cost: acc.cost,
         // 在线路**给不出老化量**：`demand` 的账目只从上一次成功轮累加,没有「5 小时前
-        // 那一段」的历史。填 0 = 不做正,与加这一列之前逐位相同（两条回溯路有历史,
-        // 它们会填真值）。本机这一路统共只有几十行,影响可忽略。
+        // 那一段」的历史。填 0 = 不做正（两条回溯路有历史,会填真值）;这一路样本很少,
+        // 影响可忽略。
         aged_cost: 0.0,
         unknown_cost: acc.unknown_cost,
     };
@@ -484,17 +474,15 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         // 而收割本身只是本机文件读 + 幂等写。
         if let Some(db) = collector_db.as_ref() {
             let mtime = claude_desktop::history_mtime();
-            // **冷启动次序**：这一路要两份数据
-            // ——桌面端的读数历史**和** collector.db 里的本地轮——而闸门只看前者的
-            // mtime,两者的到位时刻毫不相关。全新安装的第一轮里 collector 首扫还没写盘,
-            // 读数收割进去了却一条样本都建不出来,mtime 却已经锁存 ⇒ 要等桌面应用再写
-            // 一次采样（约 15 分钟,且它得在运行）或下次启动应用才补得上。
+            // **冷启动次序**：这一路要两份数据——桌面端的读数历史**和** collector.db 里的本地轮
+            // ——而闸门只看前者的 mtime,两者的到位时刻毫不相关。全新安装的第一轮里 collector
+            // 首扫还没写盘,读数收割进去了却建不出样本,mtime 却已经锁存 ⇒ 要等桌面应用再写一次
+            // 采样（约 15 分钟,且它得在运行）或下次启动才补得上。
             //
-            // 所以在「这一路还没建出过任何样本」期间,把 collector.db 的 mtime 一并计入
-            // 闸门：首扫一写盘就立刻重试。建出第一条样本之后第二格恒为 None,闸门退回
-            // 只看历史文件,稳态下不多一次 stat 也不多一次解析。
-            // （本机从不用 Claude Code 的人会一直停在冷启动态、跟着 collector 写盘重试
-            // ——那正是要一直等的情形,而每次重试也只是一次本地文件解析。）
+            // 所以在「这一路还没建出过任何样本」期间,把 collector.db 的 mtime 一并计入闸门：
+            // 首扫一写盘就立刻重试。建出第一条样本之后第二格恒为 None,闸门退回只看历史文件。
+            // （从不用 Claude Code 的机器会一直停在冷启动态、跟着 collector 写盘重试——那正是
+            // 要一直等的情形,每次重试也只是一次本地文件解析。）
             let cold = write_store.latest_pair_t1(Platform::Claude, bootstrap::PAIR_SRC).is_none();
             let gate = (mtime, if cold { file_mtime(db) } else { None });
             if mtime.is_some() && gate != last_harvest_mtime {
@@ -503,7 +491,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
             }
         }
         // Codex 那一路（同样不看绑定,理由同上;它连 collector.db 都不需要——读数与
-        // 代价都在 rollout 的同一行上）。闸门同样是 mtime：只 stat 不读内容。
+        // 代价都在 rollout 的同一行上）。闸门只 stat 不读内容。
         //
         // 它还会**零请求地推进 Codex 快照**：rollout 里的 rate_limits 与 usage 端点
         // 同源同精度,只是走本地文件到手。真改了就立刻广播,不等下面的取数轮
@@ -511,8 +499,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         //
         // 闸门是 `（mtime, 总字节数)` 而**不是 mtime**：Windows 上正在被追加的 rollout
         // 文件 mtime 不动（见 `codex_rollout:rollout_files`）,只看 mtime 会让这条路在
-        // 当前会话上一直不触发—— 22:30 之后整段爆发全靠 60 秒一次的
-        // API 轮询顶着,显示落后到 8 个百分点,而磁盘上躺着 49 条没人读的读数。
+        // 当前会话上一直不触发,显示只能靠 API 轮询顶着、落后数个百分点。
         {
             let gen = codex_rollout::generation();
             if gen.is_some() && gen != last_rollout_gen {
@@ -576,7 +563,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                 last_mtime.insert(*platform, mtime);
 
                 // 判死态:仅当文件刚变化（用户重新登录/CLI 续期）才复活重试,
-                // 否则**零网络**（预案）。但快照仍要落成 auth_failed
+                // 否则**零网络**。但快照仍要落成 auth_failed
                 // ——判死是「不试」,不是「UI 停在旧结论」。
                 let dead = match platform {
                     Platform::Codex =>
@@ -584,8 +571,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     Platform::Claude => adapters.claude.is_dead(*platform),
                 };
                 let prev = write_store.load_snapshot(*platform);
-                // 快照（落库与日志在各分支内完成;待机判据已改为本地 token 静默,
-                // 不再消费读数内容,故此处只留绑定供将来扩展)
+                // 快照
                 let snap = if dead && !changed {
                     // 判死零网络,但桌面端采样是本地文件,照读（Claude 专属回落）
                     let mut note = "";
@@ -608,7 +594,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     let _ = write_store.save_snapshot(&quiet);
                     quiet
                 } else {
-                    // 取数互斥（审计 P3-）：与命令面的立即刷新共用同一把平台锁,
+                    // 取数互斥：与命令面的立即刷新共用同一把平台锁,
                     // 防两处同时进入 fetch_one（冷却检查与 429 冷却写入之间无
                     // 原子性,各发一请求会加速触限）。
                     let _lease = adapters.lock_fetch(*platform);
@@ -652,20 +638,20 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         }
 
         let now = chrono::Utc::now().timestamp();
-        // 待机判据 = 安静起点距今满 10 分钟（idle.rs）:每次醒来重算一次,翻转即广播
+        // 待机判据 = 安静起点距今满 STANDBY_QUIET_SECS（idle.rs）:每次醒来重算一次,翻转即广播
         if idle::evaluate(now) {
             idle::emit_idle(&app);
             crate::dev_log!("[subscription] standby toggled");
         }
 
         // 可中断睡眠（wake 提前返回）：睡到最近的应检时刻与最近的待机判定时刻里
-        // 较早的那个（兜底档最长 30 分钟）;无绑定时仍按基础档空转睡眠（零网络）。
-        // ⚠ 代际读取与 wait 必须**同一把锁贯穿**（审计 P1-）：分两次 lock 会在
-        // 解锁间隙丢 wake 通知（notify 无等待者即失效,待机深档时唤醒最长被吞
-        // 30 分钟）——读代际、算时长、进等待三步之间不得释放 WAKE.0。
+        // 较早的那个;无绑定时仍按基础档空转睡眠（零网络）。
+        // ⚠ 代际读取与 wait 必须**同一把锁贯穿**：分两次 lock 会在解锁间隙丢 wake 通知
+        // （notify 无等待者即失效,唤醒最长被吞一个兜底档）——读代际、算时长、进等待三步
+        // 之间不得释放 WAKE.0。
         let guard = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
         let gen_before = *guard;
-        // 收割节律参与封顶（零网络,见 HARVEST_SECS）：兜底档 30 分钟时也不至于让
+        // 收割节律参与封顶（零网络,见 HARVEST_SECS）：兜底档再长也不至于让
         // 桌面端样本在库外压半小时。无绑定时同样照睡 HARVEST_SECS——收割不看绑定。
         let wait = idle::next_wait_secs(now, poll_secs()).min(HARVEST_SECS);
         let (guard, _) = WAKE
@@ -682,7 +668,7 @@ fn emit_changed(app: &AppHandle) {
 }
 
 /// setup 调用:开库（写连接归线程;读连接进 AppState）+ spawn daemon。
-/// 绑定前线程空转睡眠,**零网络**（S2 行为保证）。
+/// 绑定前线程空转睡眠,**零网络**。
 pub fn spawn(app: AppHandle) -> Result<(), String> {
     let root = crate::data_root::current(&app)?;
     std::fs::create_dir_all(&root.root).map_err(|e| e.to_string())?;
@@ -715,7 +701,6 @@ pub fn spawn(app: AppHandle) -> Result<(), String> {
     }
 
     app.manage(SubscriptionReader(reader));
-    app.manage(SubscriptionAdapters(adapters.clone()));
 
     std::thread::Builder::new()
         .name("subscription".into())
@@ -724,7 +709,7 @@ pub fn spawn(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// ---------- 命令面（snake_case,契约风格） ----------
+// ---------- 命令面 ----------
 
 /// 两平台归一化快照（前端唯一读口;未绑定平台 = idle 占位）。
 #[tauri::command]
@@ -822,13 +807,12 @@ pub fn unbind_subscription(
     Ok(())
 }
 
-/// 手动立即刷新（右键菜单/设置页按钮）。手动刷新 = 用户注意到额度 → 先退出待机
-///再全量取数;注意在前,唤醒轮的无变化只计第 1 轮安静。
+/// 手动立即刷新（右键菜单/设置页按钮）。手动刷新 = 用户注意到额度 → 先退出待机,
+/// 再全量取数;注意在前,唤醒轮的无变化只计第 1 轮安静。
 ///
-/// **最小间隔 `MANUAL_REFRESH_MIN_GAP_SECS`**：被挡下的
-/// 那次不推进代际（= 不触发全量轮,两个平台各省一次请求）,但退待机与广播照发,前端的
-/// 刷新三态动画正常落地。只挡手动这一路——bind / unbind / 改档的 `wake` 不是连点面,
-/// 不受此限。
+/// **最小间隔 `MANUAL_REFRESH_MIN_GAP_SECS`**：被挡下的那次不推进代际（= 不触发全量轮,
+/// 两个平台各省一次请求）,但退待机与广播照发,前端的刷新三态动画正常落地。只挡手动
+/// 这一路——bind / unbind / 改档的 `wake` 不是连点面,不受此限。
 #[tauri::command]
 pub fn refresh_subscriptions_now(app: AppHandle) -> Result<(), String> {
     use std::sync::atomic::Ordering;
@@ -850,11 +834,11 @@ pub fn refresh_subscriptions_now(app: AppHandle) -> Result<(), String> {
 }
 
 /// 取数策略（设置页 Subscriptions tab）：预计消耗达到 `threshold_pct` 就取一次读数;
-/// `tighten_when_low` = 5h 剩余 ≤ 20% 时阈值减半。持久化在前端 designPrefs,
-/// 本命令只改运行时值（窗口装载时恢复,与 set_subscription_poll_secs 同款）。
+/// `tighten_when_low` = 5h 剩余 ≤ `demand:LOW_REMAINING_PCT` 时阈值减半。持久化在前端
+/// designPrefs,本命令只改运行时值（窗口装载时恢复,与 set_subscription_poll_secs 同款）。
 #[tauri::command]
 pub fn set_subscription_fetch_policy(threshold_pct: f64, tighten_when_low: bool) -> Result<(), String> {
-    // 幂等早退（审计 P2-）：装载恢复 + 设置页直调会重复下发同一值
+    // 幂等早退：装载恢复 + 设置页直调会重复下发同一值
     if (demand::threshold_pct() - threshold_pct).abs() < 1e-9
         && demand::tighten_when_low() == tighten_when_low
     {
@@ -877,7 +861,7 @@ pub struct EstimatorState {
     pub est_pct_since_fetch: f64,
     /// 当前归一化系数（**百分点 / 美元当量**）：1 美元的官方 API 当量吃掉多少配额。
     /// 取倒数就是「1% 配额 ≈ 多少美元」——Insights 价格面板用它把「相当于多少钱」
-    /// 与「还剩多少额度」接上（-bis）。未装载过样本时 = 出厂预设。
+    /// 与「还剩多少额度」接上。未装载过样本时 = 出厂预设。
     pub scale: f64,
     /// 已收割留存的桌面端采样条数（仅 Claude 有源;0 = 本机没有桌面端采样文件）。
     /// 桌面端自己只保约 14 天,这个数会越过那条线继续涨——它就是「样本密度」。
@@ -915,7 +899,7 @@ pub fn get_subscription_estimator(
 /// 此处只改运行时值——重启后前端初查时再调用本命令恢复。
 #[tauri::command]
 pub fn set_subscription_poll_secs(secs: u64) -> Result<(), String> {
-    // 幂等早退（审计 P2-）：设置页直调 + 装载恢复 effect 会重复下发同一值,
+    // 幂等早退：设置页直调 + 装载恢复 effect 会重复下发同一值,
     // 不早退则每次多唤醒主轮询一整轮（两平台各多发一次请求）。
     let next = secs.clamp(MIN_POLL_SECS, MAX_POLL_SECS);
     if poll_secs() == next {

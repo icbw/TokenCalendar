@@ -10,7 +10,7 @@
 //!   model / tool 由相邻事件时间戳推算,是**估算值**;ttft 一律 NULL（仅 ZCode 有真值）。
 //! - **中止轮**：用户输入后没拿到任何响应就被下一次输入顶掉 → model_calls = 0、aborted = 1;
 //!   适配器见到源的显式中止事件（Codex turn_aborted、DSH interrupted）调 `abort`。
-//!   **S4-R :中止（用户主动）与错误（API / 工具失败,`error`）分列,中止不计 error_count。**
+//!   **中止（用户主动）与错误（API / 工具失败,`error`）分列,中止不计 error_count。**
 //! - **待定输入**：适配器可把一次输入标为「待定」（Claude:同文件已出现过 `origin`
 //!   字段而本行缺 `origin`——本地斜杠命令 / 命令输出 / 中断标记）。待定轮拿到响应即转为普通轮;
 //!   零调用就被顶掉则**丢弃**（不写 turn_raw、不计中止错误、轮号复用、gap 基准不前移）。
@@ -43,7 +43,7 @@ pub fn normalize_project(dir: &str) -> String {
     if s.len() == 3 && s.ends_with(":/") {
         s.pop();
     }
-    // Git Bash 工具把 cwd 写成 `/e/Work/X`（同一会话里与 `E:\Work\X` 混用）,
+    // Git Bash 工具把 cwd 写成 `/e/Work/X`（同一会话里可与 `E:\Work\X` 混用）,
     // 折成盘符形式,否则同一项目会裂出第三个键。只在 Windows 上做:类 Unix 系统 `/e/...` 是真实路径。
     if cfg!(windows) {
         let b = s.as_bytes();
@@ -102,7 +102,7 @@ pub struct TurnAcc {
     pub error_count: i64,
     #[serde(default)]
     pub retry_count: i64,
-    /// 用户中止（S4-R,与 error_count 分列）。
+    /// 用户中止（与 error_count 分列）。
     #[serde(default)]
     pub aborted: bool,
     /// 模型已答完、在等用户（0 = 否;1 = 启发式,源无显式信号;2 = 源显式信号,
@@ -579,7 +579,7 @@ mod tests {
     use super::*;
 
     /// 游标里嵌着 `TurnAcc.parts`:给 `TurnPart` 加字段时若忘了 `serde(default)`,旧游标整条反序列化
-    /// 失败 → 该源从零重扫 → 历史整份重复入账（2026-09-19 实测 workbuddy 全表翻倍）。
+    /// 失败 → 该源从零重扫 → 历史整份重复入账。
     #[test]
     fn legacy_cursor_without_new_turn_part_fields_still_loads() {
         let legacy = r#"{"session_id":"S","open":{"seq":1,"started_at":1,"start_day":"2026-09-05",
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!((parts[0].total, parts[0].cache_read, parts[0].cache_write), (3, 0, 0), "缺的 cache 两项按 0 补");
     }
 
-    const T0: i64 = 1_788_602_400_000; // 2026-09-05 本地日内
+    const T0: i64 = 1_788_602_400_000; // 本地 2026-09-05 日内
 
     fn tok(i: i64, o: i64) -> Tokens {
         Tokens { input: i, output: o, total: i + o, cache_read: 0, cache_write: 0 }
@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(st.prev_end, Some(T0 + 60_000), "gap 基准取最后事件");
     }
 
-    /// S4-R:显式中止与错误分列——同一轮可以既被中止又带 API 错误,两列各记各的。
+    /// 显式中止与错误分列——同一轮可以既被中止又带 API 错误,两列各记各的。
     #[test]
     fn explicit_abort_does_not_count_as_error() {
         let mut b = Batch::default();
@@ -706,7 +706,7 @@ mod tests {
         assert!(!old.aborted);
     }
 
-    /// PHASE14 S3:显式闭轮 = 答完等用户;中止闭轮 = 无状态;有未配对工具时 mark_done 不生效;
+    /// 显式闭轮 = 答完等用户;中止闭轮 = 无状态;有未配对工具时 mark_done 不生效;
     /// flush 以最后一次为准。
     #[test]
     fn observe_live_phase() {

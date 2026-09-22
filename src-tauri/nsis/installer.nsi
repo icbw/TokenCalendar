@@ -426,7 +426,7 @@ Var DeleteAppDataCheckbox
 Var DeleteAppDataCheckboxState
 !define /ifndef WS_EX_LAYOUTRTL         0x00400000
 !define MUI_PAGE_CUSTOMFUNCTION_SHOW un.ConfirmShow
-Function un.ConfirmShow ; Add add a `Delete app data` check box
+Function un.ConfirmShow ; Add a `Delete app data` check box
   ; $1 inner dialog HWND
   ; $2 window DPI
   ; $3 style
@@ -474,16 +474,15 @@ FunctionEnd
   !include "{{this}}"
 {{/each}}
 
-; TokenCalendar 默认安装目录（用户定案 2026-09-07）：
+; TokenCalendar 默认安装目录：
 ; D:\Program 可创建且可写 → INSTDIR = D:\Program\${PRODUCTNAME}
 ; 否则（D 盘不存在/只读/ACL 拒绝）→ INSTDIR = $LOCALAPPDATA\${PRODUCTNAME}
 ; （仅首次安装的默认值;覆盖安装被 RestorePreviousInstallLocation 的注册表
 ;  记忆覆盖,永远落回用户上次选择的目录。）
 ; 实现注记：**不可用 ${FileExists} "D:\" 预判盘存在**——NSIS file_exists()
-; 底层 FindFirstFile 不接受尾反斜杠路径,盘根判定恒假（2026-09-07 实测翻车,
-; GPT 咨询证实）。CreateDirectory 已存在目录时幂等静默;失败置 error flag,
-; 用 ClearErrors+IfErrors 一次覆盖「盘存在 + 目录可建」两条件;真正可写性
-; 由 probe 临时目录验证。
+; 底层 FindFirstFile 不接受尾反斜杠路径,盘根判定恒假。CreateDirectory 已存在目录时
+; 幂等静默;失败置 error flag,用 ClearErrors+IfErrors 一次覆盖「盘存在 + 目录可建」
+; 两条件;真正可写性由 probe 临时目录验证。
 Function TcalSetDefaultInstDir
   StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
   ClearErrors
@@ -534,9 +533,8 @@ Function .onInit
         StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
       ${EndIf}
     !else if "${INSTALLMODE}" == "currentUser"
-      ; TokenCalendar 默认安装规则（用户定案 2026-09-07）：永不 Program Files,
-      ; 默认 D:\Program\<产品名>;D 盘缺失或根目录创建失败 → 回退用户目录。
-      ; 覆盖安装不受影响:下方 RestorePreviousInstallLocation 用注册表记忆覆盖。
+      ; TokenCalendar：永不 Program Files,默认目录规则见 TcalSetDefaultInstDir;
+      ; 覆盖安装由下方 RestorePreviousInstallLocation 用注册表记忆覆盖。
       Call TcalSetDefaultInstDir
     !endif
 
@@ -808,7 +806,7 @@ Section Uninstall
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; Delete the app directory and its content from disk
-  ; Copy main executable
+  ; Delete main executable
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources

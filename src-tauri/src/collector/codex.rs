@@ -1,32 +1,33 @@
 //! Codex 适配器：`~/.codex/sessions/**/*.jsonl` 递归 + `~/.codex/archived_sessions/*.jsonl`
 //! （CODEX_HOME 可覆盖）。
 //!
-//! 本机格式（2026-09，cli 0.145+）：
+//! 格式（cli 0.145+）：
 //! - 模型在 `turn_context` 行的 `payload.model`（turn 级设置，token_count 行不带）；
 //! - 用量在 token_count 行 `payload.info`：`last_token_usage` = **单次调用值**（优先，
 //!   无需差分）；`total_token_usage` = 会话内累积快照（备用）。
-//! - 旧格式兼容：顶层 `info.total_token_usage`（旧 Go 适配器的路径）→ 走差分 +
-//!   游标持久化基线（旧 Go「续读基线归零重计」缺陷以持久化基线复）。
+//! - 旧格式兼容：顶层 `info.total_token_usage` → 走差分 + 游标持久化基线
+//!   （基线持久化,续读时不会归零重计）。
 //!
 //! 对话轮计数：`event_msg/task_started`（带 `turn_id`,每轮一条）置 pending 标志,
 //! 下一条 token_count 行按其模型计 1 turn 并清位;pending 持久化进游标。
 //! `token_count` 是 API 回合级（一轮工具循环多条）,不能当对话数。
-//! - 为什么不再用 `event_msg/user_message`（信号）：cli 0.145+ 历史 rollout 经
-//!   Codex 自行迁移重写后,该事件全机仅剩 2 条,task_started 有 3728 条（
-//!   摸底）。user_message 仅在文件从未出现 task_started 时兼容置位,防同轮双计。
+//! - 不用 `event_msg/user_message` 作主信号：cli 0.145+ 历史 rollout 经 Codex 自行迁移重写后,
+//!   该事件几乎消失,task_started 完整保留。user_message 仅在文件从未出现 task_started 时兼容置位,
+//!   防同轮双计。
 //! - **子代理会话不计轮**：`session_meta.parent_thread_id` 非空（guardian 审批 /
-//!   thread_spawn 子代理）的 task_started 是代理派发的,不是用户输入——本机 78% 的
-//!   task_started 在子代理会话里,计入会把轮次放大约 4 倍。其 token 照常计入。
+//!   thread_spawn 子代理）的 task_started 是代理派发的,不是用户输入——子代理会话里的
+//!   task_started 占多数,计入会把轮次放大数倍。其 token 照常计入。
 //!
 //! 轮与时间：task_started 开轮、task_complete / turn_aborted 闭轮（wall 优先取其
 //! `duration_ms`,缺失退时间戳差）;token_count = 模型调用（model_ms 按相邻事件估算）;
 //! `function_call` / `custom_tool_call` / `tool_search_call` 的 `call_id` 与对应 `*_output`
-//! 配对算 tool_ms;`turn_aborted`记**中止**（S4-R,不计错）,
+//! 配对算 tool_ms;`turn_aborted`（reason 实际均为 interrupted）记**中止**（不计错）,
 //! `task_complete.error` 非空计错。会话 = `session_meta.id`,
 //! 子代理会话 parent = `parent_thread_id`（token / 调用并入父会话对应轮）;项目 =
-//! `turn_context.cwd` 逐轮,`session_meta.cwd` 兜底。Codex rollout 无标题,不落 title。
+//! `turn_context.cwd` 逐轮,`session_meta.cwd` 兜底。rollout 无标题;标题取线程库 `threads.name`（侧栏名）,
+//! 无名退首条用户消息首行,每轮就地同步到已有会话行。
 //!
-//! 口径（本机：total=19914 = input 19139（含 cached 11008) + output 775（含
+//! 口径（样例：total=19914 = input 19139（含 cached 11008) + output 775（含
 //! reasoning 397)）：input = raw.input - cached（cache-exclusive）；output 保持
 //! provider 口径（含 reasoning）；total = raw.total_tokens（回退 input+output）。
 
@@ -83,9 +84,9 @@ enum Parsed {
     ModelOnly,
     /// turn_context：逐轮工作目录（模型已按行更新）。
     TurnContext { cwd: Option<String> },
-    /// 轮开始事件（event_msg/task_started,v7 主信号）。
+    /// 轮开始事件（event_msg/task_started,主信号）。
     TaskStarted { ts: Option<i64> },
-    /// 旧用户输入事件（event_msg/user_message,v5 信号,兼容）。
+    /// 旧用户输入事件（event_msg/user_message,兼容）。
     UserMessage { ts: Option<i64> },
     /// 会话头（session_meta）:parent_thread_id 非空 = 子代理会话。
     SessionMeta { subagent: bool, id: Option<String>, parent: Option<String>, cwd: Option<String> },
@@ -99,7 +100,7 @@ enum Parsed {
     TurnAborted { ts: Option<i64>, duration: Option<i64> },
 }
 
-/// `~/.codex/state_<N>.sqlite` 取 N 最大者（Codex 随 schema 版本换文件名;本机 2026-09 为 state_5）。
+/// `~/.codex/state_<N>.sqlite` 取 N 最大者（Codex 随 schema 版本换文件名）。
 fn latest_state_db(base: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(base).ok()?;
     entries
@@ -111,6 +112,22 @@ fn latest_state_db(base: &Path) -> Option<PathBuf> {
         })
         .max_by_key(|(n, _)| *n)
         .map(|(_, p)| p)
+}
+
+/// Codex 线程库一行：会话当前工作区 + 标题。
+struct ThreadRecord {
+    cwd: Option<String>,
+    title: Option<String>,
+}
+
+/// 线程标题：侧栏名优先;无名 → 首条用户消息的首个非空行（截 80 字符）。
+fn thread_title(name: Option<String>, first_message: Option<String>) -> Option<String> {
+    if let Some(n) = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+        return Some(n);
+    }
+    let first = first_message?;
+    let line = first.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(80).collect())
 }
 
 impl CodexAdapter {
@@ -126,22 +143,33 @@ impl CodexAdapter {
         }
     }
 
-    /// 线程 id → `threads.cwd`（只读打开;库缺失 / 忙 / 列缺失 → 空表,会话行退回首轮目录）。
-    fn thread_cwds(&self) -> HashMap<String, String> {
+    /// 线程 id → Codex 线程记录（只读打开;库缺失 / 忙 / 列缺失 → 空表,会话行退回首轮目录、无标题）。
+    fn thread_records(&self) -> HashMap<String, ThreadRecord> {
         let Some(db) = self.state_db.as_ref().filter(|p| p.is_file()) else { return HashMap::new() };
         let opened = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .and_then(|c| c.busy_timeout(std::time::Duration::from_secs(2)).map(|_| c));
         let Ok(conn) = opened else { return HashMap::new() };
-        let Ok(mut stmt) = conn.prepare("SELECT id, cwd FROM threads WHERE cwd IS NOT NULL AND cwd <> ''") else {
+        // `name` = 侧栏线程名（应用生成或用户改名,较新 schema 才有）;`title` = 首条用户消息
+        let has_name = conn
+            .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'name'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+        let sql = if has_name { "SELECT id, cwd, title, name FROM threads" } else { "SELECT id, cwd, title, NULL FROM threads" };
+        let Ok(mut stmt) = conn.prepare(sql) else {
             crate::dev_log!("[collector] codex threads table unreadable, session project falls back to first turn");
             return HashMap::new();
         };
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+        let rows = stmt.query_map([], |r| {
+            let cwd: Option<String> = r.get(1)?;
+            let first: Option<String> = r.get(2)?;
+            let name: Option<String> = r.get(3)?;
+            Ok((r.get::<_, String>(0)?, ThreadRecord { cwd: cwd.filter(|c| !c.is_empty()), title: thread_title(name, first) }))
+        });
         rows.map(|it| it.flatten().collect()).unwrap_or_default()
     }
 
     /// 从一行提取模型更新与用量。info 路径双兼容：`payload.info`（新）/
-    /// 顶层 `info`（旧 Go 格式）。
+    /// 顶层 `info`（旧格式）。
     fn parse_line(line: &str, file_model: &mut String) -> Option<Parsed> {
         let v = serde_json::from_str::<Value>(line).ok()?;
         let payload = v.get("payload");
@@ -240,7 +268,7 @@ impl Adapter for CodexAdapter {
 
         let mut batch = Batch::default();
         let mut months = BTreeSet::new();
-        let thread_cwds = self.thread_cwds();
+        let threads = self.thread_records();
 
         for path in files {
             let scope = path.display().to_string();
@@ -389,8 +417,13 @@ impl Adapter for CodexAdapter {
                 }
             }
             // 会话行的项目以 Codex 自己的线程记录为准（用户在应用里切换工作区后 threads.cwd 跟着变;轮仍逐轮归属）
-            if let Some(cwd) = thread_cwds.get(&cursor.turn.session_id) {
-                cursor.turn.set_session_project(cwd);
+            if let Some(rec) = threads.get(&cursor.turn.session_id) {
+                if let Some(cwd) = rec.cwd.as_deref() {
+                    cursor.turn.set_session_project(cwd);
+                }
+                if let Some(t) = rec.title.as_deref() {
+                    cursor.turn.set_title(t, 1);
+                }
             }
             cursor.turn.flush(&mut batch, META.id);
             cursor.offset = consume.new_offset;
@@ -398,6 +431,15 @@ impl Adapter for CodexAdapter {
         }
 
         store.commit(META.id, &batch).map_err(|e| AdapterError::new("error", e))?;
+        // 标题只在线程库里、且会在 rollout 不增长时变化（应用稍后生成线程名 / 用户改名）:
+        // 每轮就地同步到已有会话行,历史会话无需重读 rollout。
+        let titles: Vec<(&str, &str)> =
+            threads.iter().filter_map(|(id, r)| r.title.as_deref().map(|t| (id.as_str(), t))).collect();
+        match store.sync_session_titles(META.id, &titles) {
+            Ok(n) if n > 0 => crate::dev_log!("[collector] codex session titles synced: {n}"),
+            Ok(_) => {}
+            Err(e) => crate::dev_log!("[collector] codex title sync failed: {e}"),
+        }
         Ok(CollectOutcome { events: batch.events, months })
     }
 }
@@ -545,7 +587,7 @@ mod tests {
 
     #[test]
     fn task_started_counts_main_session_turns() {
-        // 主会话两轮,每轮两次模型回合;第一轮 task_started 后紧跟 user_message（实证顺序）
+        // 主会话两轮,每轮两次模型回合;第一轮 task_started 后紧跟 user_message（真实顺序）
         let lines = vec![
             meta(None), turn_context_line("gpt-5.6"),
             task_started(), user_message(), tc(10), tc(10),
@@ -566,7 +608,7 @@ mod tests {
         assert_eq!(run_lines("legacy", &lines), (33, 2), "无 task_started 的旧文件走 user_message 兼容");
     }
 
-    // ---------- PHASE12 S2:冻结样本行（2026-09-15 本机 rollout 真实结构,键集保持,正文脱敏） ----------
+    // ---------- 冻结样本行（本机 rollout 真实结构,键集保持,正文脱敏） ----------
 
     fn ev(ts: &str, ty: &str, payload: &str) -> String {
         format!(r#"{{"timestamp":"{ts}","type":"{ty}","payload":{payload}}}"#)
@@ -632,7 +674,7 @@ mod tests {
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
     }
 
-    /// v13:会话行的项目 = Codex `threads.cwd`（用户在应用里把线程切到别的工作区）;轮仍按各自 turn_context 归属;
+    /// 会话行的项目 = Codex `threads.cwd`（用户在应用里把线程切到别的工作区）;轮仍按各自 turn_context 归属;
     /// 线程库缺该线程 → 退回首轮目录。
     #[test]
     fn session_project_follows_codex_thread_record() {
@@ -658,7 +700,7 @@ mod tests {
         {
             let c = rusqlite::Connection::open(&state).unwrap();
             c.execute_batch(r"CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT);
-                              INSERT INTO threads (id, cwd) VALUES ('th_a', 'E:\Work\Spring');").unwrap();
+                              INSERT INTO threads (id, cwd, title) VALUES ('th_a', 'E:\Work\Spring', char(10) || '  修复时间线' || char(13, 10) || '细节');").unwrap();
         }
         assert_eq!(latest_state_db(&dir).as_deref(), Some(state.as_path()));
         let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived"), state_db: Some(state) };
@@ -672,9 +714,21 @@ mod tests {
         assert_eq!(get("th_b"), "e:/Work/Chat/bang", "线程库无记录 → 首轮目录");
         let keys: Vec<String> = store.test_turns(META.id).iter().filter(|t| t.session_id == "th_a").map(|t| t.project_key.clone()).collect();
         assert_eq!(keys, vec!["e:/Work/Chat/bang".to_string(), "e:/Work/Spring".to_string()], "轮仍逐轮归属");
+        let title = |id: &str| sessions.iter().find(|s| s.session_id == id).unwrap().title.clone();
+        assert_eq!(title("th_a").as_deref(), Some("修复时间线"), "旧 schema 无 name 列 → 首条消息首行");
+        assert_eq!(title("th_b"), None);
     }
 
-    /// S4-R 缺陷 A 冻结样本:同一中文目录分别以 UTF-8 与 GBK 字节写进 session_meta / turn_context 的 cwd,
+    /// 线程标题：侧栏名优先;空名退首条消息首个非空行,截 80 字符。
+    #[test]
+    fn thread_title_prefers_sidebar_name() {
+        assert_eq!(thread_title(Some(" 排查连接 ".into()), Some("原话".into())).as_deref(), Some("排查连接"));
+        assert_eq!(thread_title(Some("".into()), Some("\r\n继续下一步\n细节".into())).as_deref(), Some("继续下一步"));
+        assert_eq!(thread_title(None, Some("x".repeat(200))).map(|t| t.chars().count()), Some(80));
+        assert_eq!(thread_title(None, Some("  \n ".into())), None);
+    }
+
+    /// 非 UTF-8 路径:同一中文目录分别以 UTF-8 与 GBK 字节写进 session_meta / turn_context 的 cwd,
     /// 走真实 collect 后 project_key 一致（GBK 样本按系统 ANSI 代码页回退;本机 CP936 时断言中文原文）。
     #[test]
     fn chinese_cwd_utf8_and_gbk_bytes() {

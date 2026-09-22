@@ -12,7 +12,7 @@
 //! 4. **显示名**:`coalesce（alias, 末段)`;`__scratch` → alias 或 "Scratch";`unknown` → "Unknown project"。
 //!
 //! 规则参数（开关 / 两个阈值 / Unknown 开关）是 Rust 校验过的整数,以字面量拼进 CTE（无字符串拼接面）。
-//! 运行时值 = designPrefs `scratch*` 四键（启动载入、`set_scratch_rule` 下发）,同离开阈值模式;
+//! 运行时值 = designPrefs `scratch*` 四键（启动载入、`set_scratch_rule` 下发）;
 //! 规则只作用于查询时的解析,改规则不重算任何表。
 //!
 //! 行存在性语义（显式管理）:
@@ -70,7 +70,7 @@ pub struct ScratchRule {
 
 impl ScratchRule {
     pub const DEFAULT: ScratchRule = ScratchRule { enabled: true, min_sessions: 2, min_turns: 5, unknown_as_scratch: true };
-    /// 规则全关（解析层只剩 alias / hidden / merge;测试与「规则关」等价）。
+    /// 规则全关（解析层只剩 alias / hidden / merge）。
     pub const OFF: ScratchRule = ScratchRule { enabled: false, min_sessions: 2, min_turns: 5, unknown_as_scratch: false };
 
     /// 阈值越界 → Err（命令层入口校验;prefs 载入走 `from_prefs` 的逐键回落）。
@@ -118,7 +118,6 @@ impl ScratchRule {
 
 static RULE: Mutex<ScratchRule> = Mutex::new(ScratchRule::DEFAULT);
 
-/// 当前运行时规则。
 pub fn scratch_rule() -> ScratchRule {
     RULE.lock().map(|r| *r).unwrap_or(ScratchRule::DEFAULT)
 }
@@ -420,9 +419,8 @@ impl Store {
 
     /// 把 `keys` 合并进 `into`（一层）。拒绝:并入自身（环）、目标本身已合并、源是他人的合并目标、Scratch 伪项目作源。
     /// 目标补建空 meta 行（显式项目,不受自动规则影响）。返回合并的键数。
-    /// **手动归入 Scratch**（管理列表点状态徽章在 Active / Scratch 间切换）= 以 `SCRATCH_KEY` 为目标
-    /// 合并;解析层不需改动（pm_res 取 Scratch 自身归属 = `__scratch`,Scratch 隐藏时连带不可）,列表状态报 `scratch`。
-    /// 只新增一种 merged_into 取值,无 schema 变化、不动既有行。
+    /// **手动归入 Scratch** = 以 `SCRATCH_KEY` 为目标合并;解析层不需改动（pm_res 取 Scratch 自身归属 = `__scratch`,
+    /// Scratch 隐藏时连带不可）,列表状态报 `scratch`。无 schema 变化。
     pub fn merge_projects(&mut self, keys: &[String], into: &str) -> Result<usize, String> {
         let into = clean_key(into)?;
         let keys = clean_keys(keys)?;
@@ -498,7 +496,7 @@ mod tests {
     use crate::collector::task_query::{TaskFilters, TaskPageReq, TaskSort};
     use chrono::NaiveDate;
 
-    const T: i64 = 1_788_602_400_000; // 2026-09-05 本地日内
+    const T: i64 = 1_788_602_400_000; // 本地 2026-09-05 日内
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()

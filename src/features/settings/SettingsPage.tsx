@@ -1,9 +1,9 @@
-// SettingsPage：设置页（自右缘窄面板改为内容区全幅独立视图）。
+// SettingsPage：设置页（内容区全幅独立视图）。
 // 子 tab：General（行为）/ Appearance（美化）/ Projects（项目管理）/ Data（导出）/
 // Subscriptions（订阅额度）/ About（版本与更新）。
 // 外观 tab 的挂件美化组：预定义色板 + react-colorful 取色弹层 + hex 输入 +
 // 恢复默认；色与透明度分离（调色盘只改色相，alpha 仍走 bgOpacity 滑条）。
-// 浮层铁律：取色弹层 DOM 常驻不卸载——隐藏=移出视口+visibility，
+// 浮层约束：取色弹层 DOM 常驻不卸载——隐藏=移出视口+visibility，
 // 禁止条件渲染（透明 WebView2 条件卸载留脏像素残影）。
 import { useEffect, useRef, useState } from 'react'
 // react-colorful 自注入样式（运行时 <style> 注入，无独立 CSS 文件可 import）。
@@ -28,7 +28,7 @@ const TABS: { id: SettingsTab; label: string; hint: string }[] = [
   { id: 'about', label: 'About', hint: 'Version and updates' },
 ]
 
-/** 策展预定义色板（8 色，点击即用；首项=跟随 scheme 默认）。 */
+/** 策展预定义色板：8 色，点击即用；首项=跟随 scheme 默认。 */
 const WIDGET_SWATCHES: { label: string; hex: string | null }[] = [
   { label: 'Default', hex: null },
   { label: 'Snow', hex: '#f8f9fb' },
@@ -128,7 +128,7 @@ export default function SettingsPage({ onBack, initialTab }: { onBack(): void; i
   )
 }
 
-/* ---------------- General：行为类设置（自右缘面板平移） ---------------- */
+/* ---------------- General：行为类设置 ---------------- */
 
 /** 采集频率五档（与 Rust collector:POLL_INTERVAL_CHOICES_SECS 同域）。 */
 const COLLECT_INTERVAL_CHOICES = [
@@ -236,10 +236,9 @@ function GeneralTab() {
       .catch(console.error)
   }
 
-  // 设置页改版：分组参照 Appearance 用 setting-block 卡片化；
-  // 布尔项复选框全部退役改 ToggleRow（Off/On 分段开关）；解释性长文转为
-  // 行 label / 按钮 title hover，仅动态结果与危险警示保留常驻 note。
-  // Week starts on 自 Widget 组迁入 Matrix 组（它决定矩阵行列排布口径）。
+  // 分组用 setting-block 卡片化（与 Appearance 一致）；布尔项用 ToggleRow（Off/On 分段开关）；
+  // 解释性长文放在行 label / 按钮 title hover，仅动态结果与危险警示保留常驻 note。
+  // Week starts on 放在 Matrix 组（它决定矩阵行列排布口径）。
   return (
     <>
       <div className="setting-section">Startup</div>
@@ -323,7 +322,7 @@ function GeneralTab() {
         </div>
       </div>
 
-      {/* 时间轴窗口设置,prefs 经 storage 桥即时同步到 timeline 窗口*/}
+      {/* 时间轴窗口设置（显隐 / 前后天数;项目集在 Projects tab 的 Timeline projects 组）,prefs 经 storage 桥即时同步到 timeline 窗口*/}
       <div className="setting-section">Timeline</div>
       <div className="setting-block">
         <ToggleRow
@@ -487,15 +486,15 @@ function GeneralTab() {
 
 /* ---------------- Appearance：挂件美化组 + 主界面美化组 ---------------- */
 
-/** 取色槽位：挂件卡片 / 主界面顶栏 / 主界面主体 / 主界面边框。 */
+/** 取色槽位：挂件卡片 / 主界面顶栏 / 主界面主体 / 主界面边框 / 时间轴主题色。 */
 type ColorSlot = 'card' | 'titlebar' | 'panel' | 'border' | 'timeline'
 
 function AppearanceTab() {
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   useEffect(() => subscribeDesignPrefs(setDesign), [])
 
-  // 取色弹层开合（单一弹层服务四个槽位）。浮层 DOM 常驻：open 只驱动
-  // 类名/aria，绝不条件渲染卸载（铁律）。
+  // 取色弹层开合（单一弹层服务所有槽位）。浮层 DOM 常驻：open 只驱动
+  // 类名/aria，绝不条件渲染卸载。
   const [pickerFor, setPickerFor] = useState<ColorSlot | null>(null)
   const colorRowRefs = {
     card: useRef<HTMLDivElement>(null),
@@ -514,7 +513,7 @@ function AppearanceTab() {
 
   // 点击弹层外关闭。内点 = 色板行 + 取色弹层两者：二者是平级节点，只认色板行
   // 的话，弹层内拖取色盘/点输入框会被误判外点而闪关（react-colorful 不拦
-  // mousedown 冒泡，必现）。
+  // mousedown 冒泡）。
   useEffect(() => {
     if (!pickerFor) return
     const onDown = (e: MouseEvent) => {
@@ -551,7 +550,7 @@ function AppearanceTab() {
   }
 
   /** 色板行（PRESETS + 自定义钮）+ 取色弹层，包在槽位容器内：弹层 absolute
-   * 锚定本行正下方（四个槽位互不串位）。浮层 DOM 常驻不卸载（铁律），
+   * 锚定本行正下方（各槽位互不串位）。浮层 DOM 常驻不卸载，
    * closed = visibility + pointer-events，open 才恢复交互。 */
   const renderColorField = (slot: ColorSlot, presets: { label: string; hex: string | null }[]) => {
     const s = slots[slot]
@@ -828,7 +827,7 @@ const TIMELINE_ALPHA_ROWS: { key: 'timelineBgAlpha' | 'timelineBarAlpha' | 'time
   { key: 'timelineCellAlpha', label: 'Session cell opacity', hint: 'Session cell backgrounds; text stays fully opaque', min: 0.2, def: TIMELINE_CELL_ALPHA },
 ]
 
-/* ---------------- 材质三档（spike，两窗口共用行控件） ---------------- */
+/* ---------------- 材质三档（两窗口共用行控件） ---------------- */
 
 const MATERIAL_OPTIONS: { label: string; value: 'mica' | 'acrylic' | null; hint: string }[] = [
   { label: 'Off', value: null, hint: 'No glass effect' },
@@ -865,8 +864,8 @@ function MaterialRow({
 }
 
 /* ---------------- 布尔开关行：Off/On 两段
- * 分段控件，与档位切换同语言。说明文案走 label 的 title hover，
- * 不再常驻 note；disabled 段保持可 hover（title 仍可读）。 ---------------- */
+ * 分段控件，与档位切换同语言。说明文案走 label 的 title hover；
+ * disabled 段保持可 hover（title 仍可读）。 ---------------- */
 
 function ToggleRow({
   label,
@@ -876,7 +875,7 @@ function ToggleRow({
   onChange,
 }: {
   label: string
-  /** 行说明（hover 提示，替代原常驻 note）。 */
+  /** 行说明（hover 提示）。 */
   title?: string
   checked: boolean
   disabled?: boolean
@@ -911,13 +910,13 @@ function ToggleRow({
   )
 }
 
-/* ---------------- Data：月度导出（自右缘面板平移） ---------------- */
+/* ---------------- Data：月度导出 ---------------- */
 
 function DataTab() {
   const [exporting, setExporting] = useState(false)
   const [exportResult, setExportResult] = useState<string | null>(null)
   const month = currentMonth()
-  // 数据管理（发布数据架构）：信息 + 迁移 + 备份/恢复 + 打开目录。
+  // 数据管理：信息 + 迁移 + 备份/恢复 + 打开目录。
   // 目录输入用手输路径（写路径场景）;目录/文件选择走 dialog 插件。
   const [info, setInfo] = useState<DataInfo | null>(null)
   const [migTarget, setMigTarget] = useState('')
@@ -925,7 +924,7 @@ function DataTab() {
   const [resTarget, setResTarget] = useState('')
   const [busy, setBusy] = useState<'migrate' | 'backup' | 'restore' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  // credit 卡开关（insightsCredit）随区块一并移入本 tab。
+  // credit 卡开关（insightsCredit）归在本 tab。
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   useEffect(() => subscribeDesignPrefs(setDesign), [])
 
@@ -1108,7 +1107,7 @@ function DataTab() {
 /* ---------------- Subscriptions：悬浮球总开关 + 平台绑定卡 ---------------- */
 
 const POLL_OPTIONS = [300, 600, 900, 1800] // 秒 → 5/10/15/30 分钟（兜底取数间隔）
-const POLL_DEFAULT_SECS = 1800 // 默认 30 分钟（2026-09-18：兜底无动态检测能力，取封顶档；时机由本地 token 驱动）
+const POLL_DEFAULT_SECS = 1800 // 默认 30 分钟：兜底无动态检测能力，取封顶档；取数时机由本地 token 驱动
 
 function SubscriptionsTab() {
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
@@ -1125,7 +1124,7 @@ function SubscriptionsTab() {
     const loadEstimator = () =>
       subscriptionService
         .getEstimator()
-        // null = 非 Tauri 环境或旧版 Rust 还没这条命令 → 保持空,校准状态行整行不显示
+        // null = 非 Tauri 环境或 Rust 缺这条命令 → 保持空,校准状态行整行不显示
         .then((e) => e && setEstimator(e))
         .catch(() => {})
     subscriptionService.scanCredentials().then((s) => s && setScan(s)).catch(console.error)
@@ -1173,14 +1172,11 @@ function SubscriptionsTab() {
     subscriptionService.setFetchPolicy(n, tightenLow).catch(console.error)
   }
 
-  // 悬浮球总开关（㉚,「顶栏 Orbit 钮 / 表盘右键关闭后设置页
-  // 复选框不跟随,反过来也不 check」）：状态**直接取可见性单一源**——Rust
-  // visibility.rs 的 orb_visible,get_visibility 初查 + orb-visibility-changed
-  // 广播跟随;顶栏 Orbit 钮、托盘勾选、orb 自身右键「Hide orb」三条路径都汇入
-  // 那里（与顶栏按钮完全同款消费方式）。
-  // 旧版读 designPrefs.orbEnabled（只在勾选时写）⇒ 别处改了这里看不,是单向的;
-  // 该键随之退役——可见性的持久化在 window-state.json 的 orb_visible（Rust 唯一源）,
-  // 前端不需要第二份镜像。
+  // 悬浮球总开关：状态**直接取可见性单一源**——Rust visibility.rs 的 orb_visible,
+  // get_visibility 初查 + orb-visibility-changed 广播跟随;顶栏 Orbit 钮、托盘勾选、
+  // orb 自身右键「Hide orb」三条路径都汇入那里（与顶栏按钮完全同款消费方式）,
+  // 因此任一路径改动这里都能跟随。可见性的持久化在 window-state.json 的 orb_visible
+  // （Rust 唯一源）,前端不存第二份镜像。
   const [orbVisible, setOrbVisible] = useState(false)
   useEffect(() => {
     void windowService
@@ -1198,8 +1194,8 @@ function SubscriptionsTab() {
     }
   }, [])
   const toggleOrb = (next: boolean) => {
-    // 开 = showOrb;关 = hideOrb（停取数与绑定数据不在此处——绑定管理独立于呈现,
-    // 兜底取数始终低频,实施口径:总开关只控呈现,凭据绑定在平台卡卸载）
+    // 开 = showOrb;关 = hideOrb。总开关只控呈现:不停取数、不动绑定数据
+    // （凭据绑定在平台卡卸载,兜底取数始终低频）。
     windowService[next ? 'showOrb' : 'hideOrb']().catch(console.error)
   }
 
@@ -1249,7 +1245,7 @@ function SubscriptionsTab() {
           checked={orbVisible}
           onChange={toggleOrb}
         />
-        {/* 按预计消耗取数：本地 token 按模型加权折算出代价,
+        {/* 按预计消耗取数（取数主路径）：本地 token 按模型加权折算出代价,
             乘以自动校准的系数 → 「距上次读数大约消耗了百分之几」,达到阈值就取一次读数。*/}
         <div className="setting-row">
           <span title="Pull a reading when the estimated use since the last one reaches this. Estimated from local tokens, weighted per model.">
@@ -1329,9 +1325,9 @@ function SubscriptionsTab() {
             ))}
           </div>
         </div>
-        {/* Standby monitoring：待机看的是**本地 agent 十分钟
-            没有新 token**（不再是「读数连续无变化」）→ 悬浮球减淡;新 token / 手动刷新·展开·
-            切换平台立即退出。取数频次不受待机影响（兜底本身已是封顶档）。默认开。*/}
+        {/* Standby monitoring：待机看的是**本地 agent 十分钟没有新 token**
+            → 悬浮球减淡;新 token / 手动刷新·展开·切换平台立即退出。
+            取数频次不受待机影响（兜底本身已是封顶档）。默认开。*/}
         <ToggleRow
           label="Standby monitoring"
           title="Dims the orb after 10 minutes with no new tokens from local agents"

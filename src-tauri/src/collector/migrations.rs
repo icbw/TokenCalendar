@@ -1,7 +1,7 @@
 //! 就地迁移（起）：口径变更**只升级库内已有行**,不清库、不依赖源日志仍在。
 //!
-//! 原则：collector.db 是用量历史唯一的持久副本——源日志会轮换 / 被删
-//! （Claude Code 默认清理旧转录、用户删目录）,「清库重扫」会把源里已经没有的历史一起丢掉。
+//! 原则：collector.db 是用量历史唯一的持久副本——源日志会轮换 / 被删（Claude Code 默认清理旧转录、
+//! 用户删目录）,「清库重扫」会把源里已经没有的历史一起丢掉。
 //! 每次口径迭代: 迁移前 `VACUUM INTO` 一份备份（`Store:open`）; 结构变更走 `CREATE IF NOT EXISTS` /
 //! `ALTER`; 口径变更用库内原始层（`turn_raw` / `turn_part` / `session` / `source_cursor`）就地重算;
 //!  只有采集器**下次读到**的会话才按新口径由源覆盖,读不到的行原样保留。
@@ -14,17 +14,17 @@
 //! - Codex:会话行项目 = 最后一轮的项目（近似 Codex `threads.cwd` = 当前工作区;采集器下次读到该线程时以库内值覆盖）。
 //! - 然后 `daily_project` 全表重算（只读原始层）。
 //!
-//! v14 = 正 v13 解析器漏洞留下的「文件夹名当项目键」（looks_like_path`）:
+//! v14 = 正 v13 解析留下的「文件夹名当项目键」（见 `project_dir:looks_like_path`）:
 //! - 凡 Claude Code / WorkBuddy 会话的键不像路径（无盘符、无分隔符）,且库内存在编码后与之一致的真实路径键 →
 //!   会话 / 轮 / 原始轮 / 文件游标提示 / `project_meta` 一并改到真实键;`folder:` 映射写成真实键。
-//! - 顺带按文件游标为每个文件夹补种 `folder:` 映射,后续采集不再从零解析（从零解析正是踩坑的入口）。
+//! - 顺带按文件游标为每个文件夹补种 `folder:` 映射,后续采集不必从零解析（从零解析正是产生坏键的入口）。
 //! - 找不到真实键的（源里从未出现过 cwd 行）原样保留。
 //!
 //! v15 = Claude Code 的 total 口径:
-//! Anthropic 的 `usage.input_tokens` 是 cache-exclusive 且 JSONL 没有 provider total,旧口径
-//! `total = input + output` 退化成「约等于 output」,把 Claude 低估约 100〜220 倍。新口径 = 四项和。
-//! - `daily_usage` / `hourly_usage` 早就存着 cache 两列 → **精确就地重算**,源日志在不在都无损。
-//! - 原始层 `turn_raw` / `turn_part` 此前没有 cache 列 → 先 `ALTER` 补列（此后采集器写真值,
+//! Anthropic 的 `usage.input_tokens` 是 cache-exclusive 且 JSONL 没有 provider total,
+//! `total = input + output` 退化成「约等于 output」,把 Claude 低估两个数量级。改为四项和。
+//! - `daily_usage` / `hourly_usage` 本就存着 cache 两列 → **精确就地重算**,源日志在不在都无损。
+//! - 原始层 `turn_raw` / `turn_part` 原本没有 cache 列 → 先 `ALTER` 补列（此后采集器写真值,
 //!   口径再变可以只读原始层重算）,存量按**日格 cache 总量 ∝ 各 turn_part 的 output** 分摊回填:
 //!   日粒度与 `daily_usage` 逐格精确（末位行吃取整余数）,轮粒度是近似。被采集器再次读到的会话
 //!   会用源值整行覆盖近似值;源已消失的会话保留近似值,不丢行。
@@ -507,7 +507,7 @@ pub fn upgrade_v15(conn: &Connection) -> Res<V15Report> {
 
     // b 跨迁移仍开着的轮:累加器整份存在游标里,下一批 flush 会用它**整行覆盖** turn_part。
     // 若不同步,那一轮迁移前的部分会带着旧口径的 total（且 cache 两项按 serde default 为 0）被写回去,
-    // daily_usage（只累加）与 turn_part / daily_project 就此失衡（当日 opus 差 2098 万）。
+    // daily_usage（只累加）与 turn_part / daily_project 就此失衡。
     report.cursors_synced = sync_open_turn_cursors(conn, AGENT)?;
 
     //  turn_raw 的 token 三列 = 其 turn_part 行之和（原始层内部自洽）。

@@ -1,5 +1,5 @@
-// mock 数据（S1 用）：10 agents × 2026-08（31 天），含模型构成、估算、未来日、真实零
-// 起由 Go UsageService 返回真实数据替换
+// mock 数据：10 agents × 2026-08（31 天），含模型构成、估算、未来日、真实零。
+// 仅在真实取数失败时作降级（UsageMatrixView）。
 
 export interface MockModelSlice {
   modelKey: string

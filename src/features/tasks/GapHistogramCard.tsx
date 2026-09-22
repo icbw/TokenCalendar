@@ -3,7 +3,7 @@
 // 两侧计数 / 时长与合计取后端 within / beyond（与 daily_project.idle_ms 同判据）。
 // 改阈值的唯一路径:set_idle_threshold（Rust 合并写 prefs.json + 同步重算 + emit usage:changed）,
 // 成功后再 setDesignPrefs（{ idleThresholdMin })——designPrefs 持久化的是整份内存快照,
-// 不同步内存值,下一次任意偏好保存会把旧阈值写回 prefs.json（S3 双写问题）。
+// 不同步内存值,下一次任意偏好保存会把旧阈值写回 prefs.json。
 import { useEffect, useState } from 'react'
 import { taskService } from '../../services'
 import type { DayRange, GapHistogram } from '../../services'

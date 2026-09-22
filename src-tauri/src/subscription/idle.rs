@@ -1,27 +1,21 @@
 //! 待机（悬浮球减淡）与兜底取数的应检时刻。
 //!
-//! 本模块装着**两件互不相干的事**,审计后彻底拆开——此前它们混在同一张
-//! 每平台轨道表里,结果一个纯视觉开关能改网络行为（关掉减淡 ⇒ `prune` 清表 ⇒ `due`
-//! 的「无轨道即应检」让每次醒来两个平台都取一轮）：
+//! 本模块装着**两件互不相干的事**,状态分开存：若混在同一张每平台表里,纯视觉开关会改
+//! 网络行为（关掉减淡 ⇒ 清表 ⇒ `due` 的「无记录即应检」让每次醒来两个平台都取一轮）。
 //!
-//! - **待机（视觉）**：一个全局态。定位：
-//!   用户离开 agent 开发工作时尽量降低常驻贴边条的视觉干扰;回到工作或注意到它立刻退出。
-//!   判据 = **安静起点距今 ≥ `STANDBY_QUIET_SECS`**（10 分钟,与 demand 的「复工即取」
-//!   共用同一个常量——「用户离开了」本来就是同一件事）。
-//!   安静起点 = 最近一次「用户注意 / 本地 agent 活动」,**全局一个数**：待机是全局视觉态,
-//!   任何 agent 在用 = 用户在工作（`note_attention` 的定位,`note_local_tokens` 对所有
-//!   采集源都调它,包括不对应订阅的源）。初值取进程启动时刻,免得刚打开就减淡。
-//!   > 旧版还按平台取 `demand:last_token_at` 的较晚者,那是从「按平台判待机」的更早
-//!   > 设计下来的死项：本地 token 一定先经 `nudge_standby` 把安静起点推到同一时刻,
-//!   > per-platform 的那一项永远不会胜出。
+//! - **待机（视觉）**：一个全局态。用户离开 agent 开发工作时降低常驻贴边条的视觉干扰;
+//!   回到工作或注意到它立刻退出。
+//!   判据 = **安静起点距今 ≥ `STANDBY_QUIET_SECS`**（与 demand 的「复工即取」共用常量）。
+//!   安静起点 = 最近一次「用户注意 / 本地 agent 活动」,**全局一个数**：任何 agent 在用
+//!   = 用户在工作（`note_local_tokens` 对所有采集源都调 `note_attention`,包括不对应订阅
+//!   的源）。初值取进程启动时刻,免得刚打开就减淡。
 //!   退出只翻转视觉态,**不排取数**——取数时机单一源在 demand.rs（复工那一笔 token 会
 //!   照常排一轮;手动刷新走 `refresh_subscriptions_now` 的全量轮）。
-//!   只看本地痕迹意味着**纯在线 / 网页用量期间悬浮球会减淡**——本地确实没有痕迹可依
-//!   （兜底取数照常跑,读数不会停）。
+//!   只看本地痕迹意味着**纯在线 / 网页用量期间悬浮球会减淡**（兜底取数照常跑,读数不会停）。
 //!
-//! - **兜底调度（网络）**：每平台一个应检时刻 = 上一轮取数时刻 + 设置的兜底间隔
-//!   （默认 30 分钟）。待机**不改变取数频次**（兜底本身已是封顶档）,两者唯一的交集是
-//!   主线程睡眠时长要同时照顾「下一次应检」与「下一次待机判定」。
+//! - **兜底调度（网络）**：每平台一个应检时刻 = 上一轮取数时刻 + 设置的兜底间隔。
+//!   待机**不改变取数频次**,两者唯一的交集是主线程睡眠时长要同时照顾「下一次应检」
+//!   与「下一次待机判定」。
 //!
 //! 开关持久化在 designPrefs（orbIdleEnabled,默认开），只影响待机,不影响调度。
 
@@ -42,7 +36,6 @@ pub use super::demand::QUIET_SECS as STANDBY_QUIET_SECS;
 struct Standby {
     /// 开关（designPrefs.orbIdleEnabled 的运行时镜像）。
     enabled: bool,
-    /// 当前是否减淡。
     on: bool,
     /// 安静起点（最近一次用户注意 / 本地 agent 活动;初值 = 进程启动时刻）。
     attended_at: i64,
@@ -91,7 +84,7 @@ static STANDBY: LazyLock<Mutex<Standby>> = LazyLock::new(|| {
     })
 });
 
-/// 取待机状态机（poison 容忍,审计 P3-）。
+/// 取待机状态机（poison 容忍）。
 fn standby() -> std::sync::MutexGuard<'static, Standby> {
     STANDBY.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -114,7 +107,7 @@ pub fn evaluate(now: i64) -> bool {
 static DUES: LazyLock<Mutex<HashMap<Platform, i64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 取应检时刻表（poison 容忍,审计 P3-）。
+/// 取应检时刻表（poison 容忍）。
 fn dues() -> std::sync::MutexGuard<'static, HashMap<Platform, i64>> {
     DUES.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -168,7 +161,7 @@ pub fn emit_idle(app: &tauri::AppHandle) {
     let _ = app.emit("subscription:idle", true);
 }
 
-// ---------- 命令面（snake_case,契约风格） ----------
+// ---------- 命令面 ----------
 
 /// 单平台待机态（前端 orb 窗口消费）。待机是全局视觉态,两条记录的 `idle` 恒相同
 /// ——形状按平台给是为了前端「全部已绑定平台都待机才减淡」的判据不必特判。
@@ -189,12 +182,11 @@ pub fn get_subscription_idle() -> Result<Vec<PlatformIdleState>, String> {
 }
 
 /// 下发待机开关（持久化由前端 designPrefs 承担,orb 窗口装载时再调本命令恢复）。
-/// 关闭即清待机态。**不 wake**：待机是视觉态,早已不改变取数频次,
-/// wake 会推进代际 = 两个平台各多发一次请求;只用 `reschedule` 让主轮询重算睡眠
-/// （下一次待机判定时刻变了）。
+/// 关闭即清待机态。**不 wake**：待机是视觉态,不改变取数频次,wake 会推进代际 =
+/// 两个平台各多发一次请求;只用 `reschedule` 让主轮询重算睡眠（下一次待机判定时刻变了）。
 #[tauri::command]
 pub fn set_subscription_idle_enabled(enabled: bool) -> Result<(), String> {
-    // 幂等早退（审计 P2-）：设置页直调 + orb 桥接跟随会重复下发同一值。
+    // 幂等早退：设置页直调 + orb 桥接跟随会重复下发同一值。
     if !standby().set_enabled(enabled) {
         return Ok(());
     }
@@ -299,8 +291,8 @@ mod tests {
         prune(&[]);
     }
 
-    /// 待机开关是**视觉**开关：关掉它不许动兜底调度表（旧版 `prune` 在关掉时清表,
-    /// 于是每次醒来两个平台都被判成应检,一个纯视觉开关改了网络行为）。
+    /// 待机开关是**视觉**开关：关掉它不许动兜底调度表,否则每次醒来两个平台都被判成
+    /// 应检,纯视觉开关改了网络行为。
     #[test]
     fn the_standby_switch_leaves_the_fallback_schedule_alone() {
         let p = Platform::Codex;

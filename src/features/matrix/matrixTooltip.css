@@ -1,5 +1,5 @@
-/* 共享悬浮提示（主窗口月矩阵 + 挂件年度热力图，统一为同组件同格式）。
-   自 monthMatrix.css 拆出，避免挂件窗口加载整份月矩阵样式。 */
+/* 共享悬浮提示（主窗口月矩阵 + 挂件年度热力图，同组件同格式）。
+   独立于 monthMatrix.css，避免挂件窗口加载整份月矩阵样式。 */
 .matrix-tooltip {
   position: fixed;
   transform: translate(-50%, -100%);
@@ -19,9 +19,8 @@
   transform: translate(-50%, 0);
 }
 
-/* 紧凑单行变体：高度 ≈ 一行格子（23px），上下浮动只压住
-   相邻一行，hover 的那一行永远可见（原两行 52px 在矮窗里压住 2〜3 行，往下滑
-   看不到自己 hover 的行）。 */
+/* 紧凑单行变体（挂件）：高度 ≈ 一行格子（23px），上下浮动只压住相邻一行，
+   hover 的那一行永远可见（两行 52px 在矮窗里会压住 2〜3 行）。 */
 .matrix-tooltip.is-compact {
   padding: 4px 8px;
   min-width: 0;

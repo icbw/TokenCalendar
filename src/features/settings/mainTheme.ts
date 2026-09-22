@@ -1,11 +1,11 @@
-// mainTheme: 主界面美化（顶栏色/顶栏 alpha/主体色/边框色）。
+// mainTheme: 主界面外观（顶栏色/顶栏 alpha/主体色/边框色）。
 // 与 widgetTheme 同机制：hex → CSS 变量覆写，undefined = 清除覆写回 scheme。
 // **仅主窗口入口（FullWindow）挂载**——--shell-bg/--panel/--border 是主窗口
 // 体系变量；挂件窗口不读这三个变量（.shell.is-widget 全透明全出血），
-// 天然满足「改主界面取色，挂件外围零变化」的独立性验收（教训）。
+// 因此改主界面取色时挂件外围零变化。
 //
-// 顶栏 alpha 独立于挂件 bgOpacity：shell.css 从固定 0.8 改读
-// --shell-bg-alpha（默认 0.8）；最大化态转实底（alpha 不参与，见 shell.css）。
+// 顶栏 alpha 独立于挂件 bgOpacity：shell.css 读 --shell-bg-alpha（默认 0.8）；
+// 最大化态转实底（alpha 不参与，见 shell.css）。
 import { getDesignPrefs, subscribeDesignPrefs, type DesignPrefs } from './designPrefs'
 import { hexToRgbTriple } from './widgetTheme'
 

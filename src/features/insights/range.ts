@@ -1,4 +1,4 @@
-// 时间范围模型（-R）:Tasks 与 Insights 共用。
+// 时间范围模型:Tasks 与 Insights 共用。
 // 选择 = 三档预设 / All（全部数据首日 → 今天）/ Custom（起止日）/ 项目生命周期（选定单个项目时自动或按钮套用）。
 // 解析结果统一为本地日闭区间 DayRange,直接喂 get_task_list / get_effort_series / get_gap_histogram / get_range_series。
 import type { DayRange, DaySpan } from '../../services'

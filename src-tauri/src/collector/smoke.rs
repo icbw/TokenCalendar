@@ -2,7 +2,7 @@
 //!
 //! 只读扫描本机全部源 → 内存库聚合 → 断言产出与守恒。不触碰真实 collector.db
 //! （内存库游标与聚合都随进程消失）,不写任何用户目录。
-//! S4-R:设环境变量 `TC_SMOKE_DB=<文件路径>` 时改写入该文件（先删旧文件）,供事后只读 SQL 复核;
+//! 设环境变量 `TC_SMOKE_DB=<文件路径>` 时改写入该文件（先删旧文件）,供事后只读 SQL 复核;
 //! 路径由调用方指定（放临时目录）,同样不触碰真实 collector.db。
 
 use chrono::Datelike;
@@ -11,9 +11,9 @@ use super::store::Store;
 use super::{default_adapters, Adapter};
 
 
-/// Codex 两种轮信号同日数量级对比。只读逐行扫
-/// `~/.codex` 的事件类型与 session_meta.parent_thread_id,不读正文;再跑一遍真实
-/// 适配器,核对 v7 入库轮次 == 主会话 task_started（按 token_count 消费,允许无回合轮差异）。
+/// Codex 两种轮信号同日数量级对比。只读逐行扫 `~/.codex` 的事件类型与
+/// session_meta.parent_thread_id,不读正文;再跑一遍真实适配器,核对入库轮次 == 主会话
+/// task_started（按 token_count 消费,允许无回合轮差异）。
 #[test]
 #[ignore]
 fn codex_turn_signal_compare() {
@@ -52,7 +52,7 @@ fn codex_turn_signal_compare() {
     let adapter = super::codex::CodexAdapter::new();
     let _ = adapter.collect(&mut store);
 
-    let mut out = format!("=== Codex 轮信号对比（{} 个 rollout）===\nday         user_message  task_started(main)  task_started(sub)  v7_turns\n", files.len());
+    let mut out = format!("=== Codex 轮信号对比（{} 个 rollout）===\nday         user_message  task_started(main)  task_started(sub)  stored_turns\n", files.len());
     let today = chrono::Local::now().date_naive();
     let mut totals = [0i64; 4];
     let mut month_turns: BTreeMap<String, Vec<i64>> = BTreeMap::new();
@@ -68,16 +68,16 @@ fn codex_turn_signal_compare() {
                 .unwrap_or_default()
         });
         let d: usize = day[8..].parse().unwrap_or(1);
-        let v7 = counts.get(d - 1).copied().unwrap_or(0);
-        out.push_str(&format!("{day}  {:>12}  {:>18}  {:>17}  {:>8}\n", c[0], c[1], c[2], v7));
+        let stored = counts.get(d - 1).copied().unwrap_or(0);
+        out.push_str(&format!("{day}  {:>12}  {:>18}  {:>17}  {:>12}\n", c[0], c[1], c[2], stored));
         for i in 0..3 {
             totals[i] += c[i];
         }
-        totals[3] += v7;
+        totals[3] += stored;
     }
-    out.push_str(&format!("合计        {:>12}  {:>18}  {:>17}  {:>8}\n", totals[0], totals[1], totals[2], totals[3]));
+    out.push_str(&format!("合计        {:>12}  {:>18}  {:>17}  {:>12}\n", totals[0], totals[1], totals[2], totals[3]));
     println!("{out}");
-    assert!(totals[1] >= totals[3], "v7 轮次不应超过主会话 task_started");
+    assert!(totals[1] >= totals[3], "入库轮次不应超过主会话 task_started");
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn real_sources_smoke() {
             r.key, r.month_total, today_v, msgs
         ));
     }
-    // v7 cache 两列 + 小时表守恒（hourly 日合计 == daily,六源全部走 hour 路径）
+    // cache 两列 + 小时表守恒（hourly 日合计 == daily,六源全部走 hour 路径）
     for (agent, cr, cw, hourly, daily) in store.cache_totals(&month) {
         summary.push_str(&format!(
             "  cache {:<12} read={:>12} write={:>10} | hourly Σ={} daily Σ={} 守恒={}\n",
@@ -177,7 +177,7 @@ fn real_sources_smoke() {
         assert_eq!(negative, 0, "{id} 时间段不得为负");
         assert_eq!(store.test_child_sessions_in_tasks(id), 0, "{id} 子会话不得单独出现在任务列表");
     }
-    // 对比:当月与全量的 request_count / 物化轮 / 零调用轮 / Σerror
+    // 当月与全量的 request_count / 物化轮 / 零调用轮 / Σerror 对比
     for id in ["claude-code", "zcode"] {
         let (rc, rows, zero, errors) = store.test_month_turn_stats(id, &month);
         let (rc_all, rows_all, zero_all, errors_all) = store.test_month_turn_stats(id, "");
@@ -261,6 +261,58 @@ fn attention_live_smoke() {
     for it in table.items(now, idle) {
         let tail = it.project_key.rsplit('/').next().unwrap_or("");
         out.push_str(&format!("{:<12} {:<12} {:>5}m  {}\n", it.agent, it.state, (now - it.since) / 60_000, tail));
+    }
+    println!("{out}");
+}
+
+/// 标题就地升级:对安装版 collector.db 的**副本**（TC_TITLE_DB）跑真实 Codex / DSH 源,
+/// 打印两源已有会话的标题覆盖率前后对比 + 近 7 天会话样本。
+#[test]
+#[ignore]
+fn title_upgrade_on_db_copy() {
+    let path = std::env::var_os("TC_TITLE_DB").expect("TC_TITLE_DB = collector.db 副本路径");
+    let mut store = Store::open(std::path::Path::new(&path)).expect("open copy");
+    let coverage = |store: &Store| -> Vec<(String, i64, i64)> {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT agent_key, COUNT(*), COUNT(title) FROM session WHERE agent_key IN ('codex','dsh') AND parent_id IS NULL GROUP BY 1")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+    };
+    let before = coverage(&store);
+    let mut out = format!("before (agent, root sessions, titled) = {before:?}\n");
+    for adapter in default_adapters().into_iter().filter(|a| matches!(a.meta().id, "codex" | "dsh")) {
+        let r = adapter.collect(&mut store);
+        out.push_str(&format!("[{}] collect ok={}\n", adapter.meta().id, r.is_ok()));
+    }
+    out.push_str(&format!("after  (agent, root sessions, titled) = {:?}\n", coverage(&store)));
+    let since = chrono::Local::now().timestamp_millis() - 7 * 86_400_000;
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT agent_key, project_key, datetime(started_at/1000,'unixepoch','localtime'), COALESCE(title,'<NULL>')
+             FROM session WHERE agent_key IN ('codex','dsh') AND parent_id IS NULL AND ended_at >= ?1 ORDER BY started_at",
+        )
+        .unwrap();
+    for row in stmt
+        .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))
+        .unwrap()
+        .flatten()
+    {
+        let tail = row.1.rsplit('/').next().unwrap_or_default().to_string();
+        out.push_str(&format!("  {:<5} {:<14} {} {}\n", row.0, tail, row.2, row.3));
+    }
+    // 看板实际拿到的格子（与 get_project_timeline 同一查询）
+    let today = chrono::Local::now().date_naive();
+    let from = (today - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+    let to = today.format("%Y-%m-%d").to_string();
+    let tl = store.project_timeline(&from, &to, today, &super::project_meta::ScratchRule::DEFAULT).expect("timeline");
+    for p in &tl.projects {
+        for c in &p.cells {
+            for it in c.items.iter().filter(|it| matches!(it.agent_key.as_str(), "codex" | "dsh")) {
+                out.push_str(&format!("  cell {:<14} {} {:<5} {}\n", p.label, c.day, it.agent_key, it.title.as_deref().unwrap_or("<NULL → HH:mm>")));
+            }
+        }
     }
     println!("{out}");
 }

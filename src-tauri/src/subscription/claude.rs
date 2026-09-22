@@ -1,19 +1,18 @@
 //! Claude（Pro/Max 订阅）额度适配器。
 //!
-//! 端点：GET api.anthropic.com/api/oauth/usage,
+//! 端点（逆向,未公开）：GET api.anthropic.com/api/oauth/usage,
 //! Headers 四件套（Authorization/Accept/Content-Type/anthropic-beta:
-//! oauth-——曾从可选转必填,必须带上）。
+//! oauth-——必填,必须带上）。
 //!
-//! **User-Agent 决定限流桶**：
-//! 同一枚 token,带 `claude-code/<version>` 能穿到鉴权层（正规 401/200）,
-//! 不带（ureq/curl 默认 UA）持续 429 rate_limit_error——**必须显式带上**,
-//! 否则无论怎么重试都是「Network error」（真实症状：读数全 —）。
+//! **User-Agent 决定限流桶**：同一枚 token,带 `claude-code/<version>` 能穿到鉴权层
+//! （正规 401/200）,不带（ureq/curl 默认 UA）持续 429 rate_limit_error——**必须显式带上**,
+//! 否则无论怎么重试都是「Network error」（症状：读数全 —）。
 //!
 //! 凭据 = ~/.claude/.credentials.json claudeAiOauth.*,**只读、不刷新**：
 //! Claude 的 refresh token **一次性**（用过即轮换）,刷新了不写回会把 Claude
 //! Code 自己的登录态用废（它下次刷新 invalid_grant 被迫重登）;而写回又违反
 //! 「凭据文件只读」红线。故 token 过期即记 auth_failed,待用户跑一次 CLI
-//! 重写文件（mtime 自愈）——自助刷新/自持登录态另立项。
+//! 重写文件（mtime 自愈）。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -22,8 +21,7 @@ use super::credentials::{self, MemoryToken, RawCredential};
 use super::model::{FetchStatus, Platform, QuotaWindow, SnapshotSource, SubscriptionSnapshot};
 use super::RateGate;
 
-/// 上报的 CLI 版本：UA 只要求形态正确 + 版本够新。
-/// 取值参照本机装着的扩展 `anthropic.claude-code-2.1.267` / npm latest 2.1.269。
+/// 上报的 CLI 版本：UA 只要求形态正确 + 版本够新（2.1.72 起即可通过）。
 const CLAUDE_CODE_VERSION: &str = "2.1.269";
 
 /// usage 端点 UA（命中宽松限流桶）。
@@ -63,7 +61,7 @@ impl ClaudeAdapter {
         self.gate.remaining(chrono::Utc::now().timestamp())
     }
 
-    /// 取内存 token 缓存（poison 容忍,审计 P3-：持锁线程 panic 后缓存仍可用,
+    /// 取内存 token 缓存（poison 容忍：持锁线程 panic 后缓存仍可用,
     /// 不让轮询线程与命令面连锁停摆）。
     fn tokens_slot(&self) -> std::sync::MutexGuard<'_, HashMap<Platform, MemoryToken>> {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
@@ -153,7 +151,7 @@ pub fn fetch(adapter: &ClaudeAdapter, cred: RawCredential) -> SubscriptionSnapsh
             error_snapshot(FetchStatus::RateLimited)
         }
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
-            // 401/403 两可:token 失效或 订阅撤销（预案）——**不刷新**
+            // 401/403 两可:token 失效或 订阅撤销——**不刷新**
             // （一次性 refresh token,见模块头）:判死,待 CLI 重写凭据文件复活。
             adapter.note_dead(Platform::Claude);
             error_snapshot(FetchStatus::AuthFailed)
@@ -193,7 +191,7 @@ pub fn parse_usage(cred: &super::credentials::RawCredential, body: &str, now: i6
     }
 
     if windows.is_empty() {
-        // token 有效但零窗口:企业 spend 形状（首期不支持）或权益缺失
+        // token 有效但零窗口:企业 spend 形状（不支持）或权益缺失
         return error_snapshot(FetchStatus::PlanInactive);
     }
 

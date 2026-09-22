@@ -1,4 +1,4 @@
-// 导出契约封装（对齐旧 ExportService）。
+// 导出命令封装。
 
 import type { ExportResultContract } from './contract'
 import type { ExportResult } from './types'

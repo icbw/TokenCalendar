@@ -1,16 +1,13 @@
-// 手写 SVG 图表库：零依赖,延续项目「不引图表库」
-// （前代项目设计稿曾推荐 visx,落地时否决走手写;竞品
-//   zcode-usage-panel 同为 SVG 路线）。
-// 提供:平滑曲线（Catmull-Rom → bezier）、堆叠柱、环形占比,统一 crosshair
-// tooltip / 轴刻度 / 稳定配色（家族编码 + 金角色相）。
+// 手写 SVG 图表库：零依赖,项目不引图表库。
+// 提供:平滑曲线（Catmull-Rom → bezier）、堆叠柱、环形占比、双组组合图、阶梯图,
+// 统一 crosshair tooltip / 轴刻度 / 稳定配色（家族编码）。
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
 
 // ---- 配色 ----
-// 家族绑定 + 精选色板（v3 金角随机色相的亮绿/黄绿不可接受,整块不
-// 协调;改回 v2 时代的紫/蓝/青/粉协调色系,保留「同族同色、族间异色」绑定思路）。
-// 色板 = 手工挑选的 12 色环（紫→蓝→青→品红域,避开黄绿/草绿）;家族按注册序
-// 依次绑定,族内成员同色相明度分层。模块级注册表:同 key 永远同色（跨图表一致）。
+// 家族绑定 + 精选色板:手工挑选的 12 色环（紫→蓝→青→品红域,避开与整体不协调的
+// 黄绿/草绿）;家族按注册序依次绑定,族内成员同色相明度分层。
+// 模块级注册表:同 key 永远同色（跨图表一致）。
 
 /** HSL → CSS color string（h 度,s/l 0-1） */
 export function hsl(h: number, s: number, l: number): string {
@@ -60,9 +57,8 @@ export function colorFor(key: string): string {
   return hsl(entry.hue, sat, light)
 }
 
-// 双组图固定语义色（定稿）:in=蓝 out=绿 credit=玫红——玫红与 tokens
-// 合计曲线（红/粉族）同视觉家族（「参照 tokens 合计曲线」,弃琥珀,
-// 琥珀与紫蓝系整体不协调）;平滑度已与主图曲线一致（同 smoothPath）。
+// 双组图固定语义色:in=蓝 out=绿 credit=玫红——玫红与 tokens 合计曲线（红/粉族）
+// 同视觉家族,琥珀等暖黄与紫蓝系不协调;credit 曲线与主图同用 smoothPath。
 export const COMBO_IN = hsl(217, 0.72, 0.53) // blue-500 族
 export const COMBO_OUT = hsl(152, 0.66, 0.44) // green-600 族
 export const COMBO_CREDIT = hsl(348, 0.78, 0.58) // 玫红（tokens 合计曲线同族）
@@ -75,7 +71,7 @@ export interface SeriesSpec {
   values: number[]
 }
 
-/** :数值格式化钩子（缺省 = token 口径:hover 千分位、轴 / 环紧凑）。
+/** 数值格式化钩子（缺省 = token 口径:hover 千分位、轴 / 环紧凑）。
  * 时间成本指标（毫秒）传入 formatDuration,hover / 轴 / 环同一格式。 */
 export type ValueFormat = (v: number) => string
 
@@ -86,10 +82,8 @@ interface Margin {
   left: number
 }
 
-// top margin 12 → 20——最高档 Y 轴刻度文本（10px,基线在
-// 刻度线 +3）此前顶部被裁。
-// （顶部刻度 1000.0M 左侧被裁）:left 44 → 52,刻度文本改
-// formatAxis（去尾 .0、≥1000M 进位 B）,7 字符的 1000.0M 收成 1B。
+// top 20:最高档 Y 轴刻度文本（10px,基线在刻度线 +3）需要顶部余量,否则被裁。
+// left 52 配合 formatAxis（去尾 .0、≥1000M 进位 B）,最宽刻度文本不被左缘裁切。
 const MARGIN: Margin = { top: 20, right: 16, bottom: 22, left: 52 }
 
 /** 坐标轴刻度专用紧凑格式:1B / 750M / 187.5M / 12.5K——去掉无意义的 .0。 */
@@ -141,16 +135,26 @@ function xTickLabel(bucket: string, total: number, i: number): string {
   return bucket.slice(5).replace(/^0/, '')
 }
 
-/** v3.7.2:紧凑模式（无 Y 轴）margin——绘图区两缘 = 格子两缘、第 i 个 slot
- * 中心 = 第 i 格中心。解 slot = plot.w/n 且 margin = slot/2:
- * plot.w = width·n/（n+1),margin = width/（2（n+1))——SVG 宽 = --cells-w 时
- * 曲线与格子列完全对齐（点/柱都落在格子正中）。 */
-function compactMargin(n: number, showXAxis: boolean): Margin {
-  const m = n > 0 ? 760 / (2 * (n + 1)) : 12
+/** 热力图格子列几何（CSS 像素）：图表叠在格子区下方时用它把点 / 柱对到格子中心。 */
+export interface CellColumns {
+  cell: number
+  gap: number
+}
+
+/** 紧凑模式（无 Y 轴）margin,SVG 宽 = 格子区宽 W = n·cell + （n−1)·gap。
+ * 第 i 格中心 = cell/2 + i·（cell+gap),对 i 线性,两种图各自解出 margin:
+ * - `edge`（折线,点从绘图区左缘等距排到右缘）：margin = cell/2;
+ * - `slot`（柱,点在 slot 中心、slot = cell+gap）：margin = −gap/2,slot 两端各伸出半个间距。
+ * 换成 viewBox 单位乘 760/W。没有列几何时退回 slot = 宽/（n+1) 的近似。 */
+function compactMargin(n: number, showXAxis: boolean, cols: CellColumns | undefined, anchor: 'edge' | 'slot'): Margin {
+  const colsW = cols && n > 0 ? n * cols.cell + (n - 1) * cols.gap : 0
+  const m = colsW > 0
+    ? (760 * (anchor === 'edge' ? cols!.cell / 2 : -cols!.gap / 2)) / colsW
+    : n > 0 ? 760 / (2 * (n + 1)) : 12
   return { top: MARGIN.top, right: m, bottom: showXAxis ? MARGIN.bottom : 6, left: m }
 }
 
-/** v3.7.2:SVG 实际渲染宽 / viewBox 宽 —— tooltip 反缩放系数。图表随格子
+/** SVG 实际渲染宽 / viewBox 宽 —— tooltip 反缩放系数。图表随格子
  * 缩放时 viewBox 内的 foreignObject 会跟着缩小/放大,tooltip 必须以真实
  * CSS 像素显示（否则小窗下小到不可读）。 */
 function useSvgScale(ref: React.RefObject<SVGSVGElement | null>): number {
@@ -184,16 +188,16 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   margin: Margin
   yMax: number
   stackedTotal?: boolean
-  /** v3.7.2:SVG 渲染缩放系数——foreignObject 内容按 1/scale 放大,图表随
+  /** SVG 渲染缩放系数——foreignObject 内容按 1/scale 放大,图表随
    * 格子缩小时 tooltip 保持真实 CSS 像素尺寸可读。 */
   scale?: number
   fmt?: ValueFormat
 }) {
   const i = hover.index
   const total = series.reduce((s, sr) => s + (sr.values[i] ?? 0), 0)
-  // 行数动态上限:图表高度放得下几行就列几行,余量并作「+N more」摘要行
-  // ——卡体永不超出图表高度。原 8 行硬上限 + 卡内滚动已废弃:卡片 pointerEvents
-  // none,滚动条永远无法交互（鼠标移近即触发 crosshair 重渲染）。
+  // 行数动态上限:图表高度放得下几行就列几行,余量并作「+N more」摘要行,
+  // 卡体永不超出图表高度。不用卡内滚动:卡片 pointerEvents none,滚动条无法交互
+  // （鼠标移近即触发 crosshair 重渲染）。
   const ROW_H = 18
   const MORE_H = 16
   const HEAD_H = 32 // 卡片 padding+border+标题行固定开销
@@ -212,7 +216,7 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   const rowsH = HEAD_H + rows.length * ROW_H + (restCount > 0 ? MORE_H : 0)
   const cardH = rowsH * inv
   const flip = hover.x > plot.w / 2
-  // 水平钳制——窄面板下按中点 flip 后 left 仍可能越左缘。
+  // 水平钳制:窄面板下按中点 flip 后 left 仍可能越左缘。
   const totalW = margin.left + plot.w + margin.right
   const left = Math.max(2, Math.min(flip ? hover.x - cardW - 12 : hover.x + 12, totalW - cardW - 2))
   const top = Math.max(2, Math.min(margin.top, height - cardH - margin.bottom))
@@ -259,13 +263,12 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
 }
 
 // ---- 曲线图（多系列平滑 + 渐变填充） ----
-// showYAxis=false 时去左轴刻度文本,showGrid=false 去横向网格线
-// （Matrix 面板浮层用——叠在热力图上,轴/网格纯添乱）。
-// showXAxis=false 再去底部日期刻度（面板与矩阵格子共用列模板、横轴
-// 完全对齐格子,日期由表头行表达）;浮层模式四边贴边（left/right 2px 描边半宽,
-// bottom 6px）——绘图区两缘 = 格子两缘,宽度随 --cells-w 等比缩放。
+// showYAxis=false 去左轴刻度文本,showGrid=false 去横向网格线（Matrix 面板浮层用:
+// 叠在热力图上,轴/网格纯添乱）。
+// showXAxis=false 再去底部日期刻度（面板与矩阵格子共用列模板,日期由表头行表达）;
+// 无 Y 轴时 margin 走 compactMargin,绘图区与格子列对齐,宽度随 --cells-w 等比缩放。
 
-export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue }: {
+export function LineChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns }: {
   series: SeriesSpec[]
   buckets: string[]
   height?: number
@@ -273,6 +276,8 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
   showGrid?: boolean
   showXAxis?: boolean
   formatValue?: ValueFormat
+  /** 紧凑模式下对齐的热力图格子列几何（见 compactMargin）。 */
+  columns?: CellColumns
 }) {
   const width = 760
   const n = buckets.length
@@ -281,7 +286,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
   const svgScale = useSvgScale(svgRef)
   const margin: Margin = showYAxis
     ? MARGIN
-    : compactMargin(n, showXAxis)
+    : compactMargin(n, showXAxis, columns, 'edge')
   const plot = { w: width - margin.left - margin.right, h: height - margin.top - margin.bottom }
   const yMax = useMemo(() => niceMax(Math.max(1, ...series.flatMap((s) => s.values))), [series])
   const xOf = (i: number) => margin.left + (n <= 1 ? plot.w / 2 : (i / (n - 1)) * plot.w)
@@ -301,7 +306,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
       onMouseMove={onMove} onMouseLeave={() => setHover(null)}
     >
       <defs>
-        {/* id 带系列序号——项目路径含非 ASCII 字符时清洗后会撞名（渐变串色）*/}
+        {/* id 带系列序号:项目路径含非 ASCII 字符时清洗后会撞名（渐变串色）*/}
         {series.map((s, si) => (
           <linearGradient key={s.key} id={`grad-${si}-${s.key.replace(/[^a-zA-Z0-9]/g, '_')}`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={colorFor(s.key)} stopOpacity={0.22} />
@@ -353,7 +358,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
 
 // ---- 堆叠柱图（圆角顶 + crosshair） ----
 
-export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue }: {
+export function StackedBarChart({ series, buckets, height = 220, showYAxis = true, showGrid = true, showXAxis = true, formatValue, columns }: {
   series: SeriesSpec[]
   buckets: string[]
   height?: number
@@ -361,6 +366,8 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
   showGrid?: boolean
   showXAxis?: boolean
   formatValue?: ValueFormat
+  /** 紧凑模式下对齐的热力图格子列几何（见 compactMargin）。 */
+  columns?: CellColumns
 }) {
   const width = 760
   const [hover, setHover] = useState<HoverState | null>(null)
@@ -368,7 +375,7 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
   const svgScale = useSvgScale(svgRef)
   const margin: Margin = showYAxis
     ? MARGIN
-    : compactMargin(buckets.length, showXAxis)
+    : compactMargin(buckets.length, showXAxis, columns, 'slot')
   const plot = { w: width - margin.left - margin.right, h: height - margin.top - margin.bottom }
   const totals = buckets.map((_, i) => series.reduce((s, sr) => s + (sr.values[i] ?? 0), 0))
   const yMax = useMemo(() => niceMax(Math.max(1, ...totals)), [totals])
@@ -445,10 +452,10 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
 
 // ---- 双组组合图:tokens in/out 双段堆叠柱 + credit 曲线叠加 ----
 // 两套账本两个纵轴（左 = tokens,右 = credit）,共享横轴 = 天;积分曲线只画到
-// 导出覆盖的最后一天（数据缺口断线表达,不伪装成 0——缺口红线）。
+// 导出覆盖的最后一天（数据缺口断线表达,不伪装成 0）。
 
 export interface ComboSeries {
-  /** 输入 tokens（未命中近似口径,cache 三段依赖 v7 迁移,暂两段）。 */
+  /** 输入 tokens（未命中近似口径;柱只分 in/out 两段,cache 不单列）。 */
   input: number
   output: number
   /** 当日 credit;null = 积分账本未覆盖该日（断线,≠0）。 */
@@ -466,7 +473,7 @@ export function ComboChart({ series, buckets, height = 230 }: {
   const width = 760
   const [hover, setHover] = useState<HoverState | null>(null)
   const svgRef = useRef<SVGSVGElement>(null)
-  // 双纵轴需要更宽的右缘——右轴刻度文本（如 200.0M）此前被右边缘裁切。
+  // 双纵轴需要更宽的右缘,否则右轴刻度文本（如 200.0M）被右边缘裁切。
   const margin = { ...MARGIN, right: 52 }
   const plot = { w: width - margin.left - margin.right, h: height - margin.top - margin.bottom }
   const n = buckets.length
@@ -488,7 +495,7 @@ export function ComboChart({ series, buckets, height = 230 }: {
   const yCredit = (v: number) => margin.top + plot.h - (v / creditMax) * plot.h
 
   // credit 曲线路径:跳过 null（账本未覆盖日断线）;连续 <2 点不画曲线只画点。
-  // 平滑度与 tokens 合计曲线一致（同 smoothPath Catmull-Rom）。
+  // 平滑度与 tokens 合计曲线一致（同 smoothPath）。
   const creditPts: [number, number][] = []
   buckets.forEach((_, i) => {
     const c = series[i]?.credit
@@ -525,7 +532,7 @@ export function ComboChart({ series, buckets, height = 230 }: {
       onMouseMove={onMove} onMouseLeave={() => setHover(null)}
     >
       <defs>
-        {/* credit 曲线渐变面积（参照 tokens 合计曲线的曲线+渐变质感）*/}
+        {/* credit 曲线渐变面积（与 tokens 合计曲线同款曲线+渐变质感）*/}
         <linearGradient id="combo-credit-grad" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={COMBO_CREDIT} stopOpacity={0.18} />
           <stop offset="100%" stopColor={COMBO_CREDIT} stopOpacity={0.02} />
@@ -616,8 +623,7 @@ export function ComboChart({ series, buckets, height = 230 }: {
           </g>
         )
       })}
-      {/* credit 曲线（右轴,玫红,平滑+渐变面积——参照 tokens 合计曲线质感）
-          + 覆盖区内数据点*/}
+      {/* credit 曲线（右轴,玫红,平滑+渐变面积）+ 覆盖区内数据点*/}
       {creditPts.length >= 2 && (
         <>
           <path
@@ -676,8 +682,8 @@ export function ComboChart({ series, buckets, height = 230 }: {
   )
 }
 
-// ---- 环形占比图（布局:圆环居中,图例分列环体左右,压缩高度） ----
-// 每条目 = 色点 + 名称 | tokens 值 + 百分比;
+// ---- 环形占比图（圆环居中,图例分列环体左右,压缩高度） ----
+// 每条目 = 色点 + 名称 | tokens 值 + 百分比（值/百分比放条目行两端）;
 // 超过每侧 6 项截断,余量并入「+N more」行（title 提示完整清单,不做 tooltip 卡）。
 
 export function DonutChart({ items, centerLabel, unitLabel, height = 190, formatValue = formatCompact, titleFor }: {
@@ -765,7 +771,7 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190, format
   )
 }
 
-// ---- 阶梯图（S3「价格梯度」） ----
+// ---- 阶梯图（价格梯度） ----
 // 与上面几个图的根本差别:横轴是**真实时刻**而不是等距桶。价目行本来就是稀疏的
 // （一个模型一段生效期一行,相邻两行可能隔半年）,摊成等距桶会把「什么时候变的」
 // 这件唯一要看的事抹掉。每条线从该模型第一段生效期起画,变价处走直角台阶,

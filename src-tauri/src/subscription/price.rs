@@ -1,15 +1,12 @@
-//! 官方价目快照对照表：价格从**编译进二进制的常量**升为**按模型带生效
-//! 时间、可查询可展示的一等数据**。
+//! 官方价目快照对照表：价格是按模型带生效时间、可查询可展示的数据。
 //!
 //! 库里存的是**官方公布的绝对价目（USD / Mtok）**四项——输入 / 输出 / 缓存写 / 缓存命中
-//! ——按模型名精确对准,不做归一化。理由：相对权重是派生值
-//! （`usd_x ÷ 基准模型 usd_input`）,而"永远不要只存派生值"是本项目的既定原则;
-//! 存绝对价目还顺带消掉了「基准模型」这个本身要跟着世代走的概念,
+//! ——按模型名精确对准,不做归一化。相对权重（`usd_x ÷ 基准模型 usd_input`）是派生值,
+//! 只存派生值会丢失原始输入;存绝对价目也免去了要跟着世代走的「基准模型」概念,
 //! 以及 Fable 5.1 缓存读那种"通行比例 + 例外"的双层规则。
 //!
-//! **一个模型的一段生效期 = 一行**。绝大多数模型终其生命周期只有一行;只有真的被官方
-//! 降价过的模型才会有第二行。所以某模型降价只给它加一行,其余模型的历史继续有效
-//! ——**版本化的粒度跟着真正会变的东西走**。
+//! **一个模型的一段生效期 = 一行**。只有被官方降价过的模型才有第二行,
+//! 某模型降价只给它加一行,其余模型的历史继续有效（版本化粒度跟着真正会变的东西走）。
 //!
 //! 取价链路：
 //! ```text
@@ -19,8 +16,8 @@
 //! subscriptions.db 的 price_model ──load_from──▶ 进程内索引（取数路径零 IO）
 //! ```
 //! 出厂种子由 `scripts/price-seed-gen.mjs` 从 models.dev 第一方目录产出并提交进仓,
-//! **不做运行时取价**（重算存量样本必须可复现——同一个 `WEIGHT_VERSION`
-//! 在任何机器任何时刻都要得出同一个数;联网取价会让它取决于"那台机器那一刻的目录版本"）。
+//! **不做运行时取价**：重算存量样本必须可复现,同一个 `WEIGHT_VERSION` 在任何机器任何时刻
+//! 都要得出同一个数;联网取价会让它取决于"那台机器那一刻的目录版本"。
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
@@ -39,15 +36,13 @@ pub struct PriceRow {
     pub match_key: String,
     /// unix 秒;该价目开始生效（模型首次出现时 = 其上线时刻）。
     pub effective_from: i64,
-    /// 面板展示名。
     pub display_name: String,
     pub usd_input: f64,
     pub usd_output: f64,
     pub usd_cache_read: f64,
     pub usd_cache_write: f64,
-    /// **出处 + 上游核对信息**：这张表是可审计的官方价格快照,任何时候要能回答
-    /// 「这个数从哪儿来」。"什么时候核对的"由
-    /// `price_seed.json` 自己的 git 历史回答（末段）。
+    /// **出处 + 上游核对信息**：这张表是可审计的官方价格快照,要能回答「这个数从哪儿来」。
+    /// "什么时候核对的"由 `price_seed.json` 自己的 git 历史回答。
     #[serde(default)]
     pub source_note: String,
 }
@@ -148,9 +143,9 @@ fn pick<'a>(groups: &'a [KeyGroup], k: &str, at: i64) -> Option<&'a PriceRow> {
 
 /// 从库装载索引（启动时调一次,**必须排在重算之前**）。
 ///
-/// 库是唯一查询源（计算与展示都读它）,但单测与"库开不了"的退路仍走编译期种子
-/// ——种子就是刚 upsert 进去的那份,两者一致;库里另外还可能有**更早版本留下的历史
-/// 生效段**,那正是要留的（用户跳过若干版本再更新,中间的价格段一条不丢）。
+/// 库是唯一查询源（计算与展示都读它）,单测与"库开不了"的退路走编译期种子
+/// ——种子就是刚 upsert 进去的那份,两者一致;库里还可能有更早版本留下的历史生效段,
+/// 必须保留：用户跳过若干版本再更新时,中间的价格段一条不丢。
 pub fn load_from(store: &super::store::SubStore) {
     let rows = store.price_rows();
     if rows.is_empty() {
@@ -192,10 +187,7 @@ pub fn price_at(platform: Platform, model_key: &str, at: i64) -> Option<PriceRow
     pick(idx.by_platform.get(&platform)?, &k, at).cloned()
 }
 
-/// 某平台的全部价目行（按 match_key 与生效期排序）。
-///
-/// 这是「让价格成为可查询、可展示的数据」的读口,S2 的
-/// `get_price_models` 直接出它。
+/// 某平台的全部价目行（按 match_key 与生效期排序）,`get_price_models` 直接出它。
 pub fn rows_for(platform: Platform) -> Vec<PriceRow> {
     #[cfg(test)]
     if let Some(out) = OVERRIDE.with(|o| {
@@ -222,7 +214,7 @@ fn collect_rows(idx: &Index, platform: Platform) -> Vec<PriceRow> {
 /// 某平台**在 `at` 时刻生效**的价目：每个 `match_key` 至多一行（按 match_key 排序）。
 ///
 /// 与 [`rows_for`] 的区别是维度：那个是「这个模型一路走来有过哪些价」,这个是
-/// 「那一刻全线是什么价」。S2 的 `get_price_at` 出它,S3 的价目对照表按它画。
+/// 「那一刻全线是什么价」。`get_price_at` 出它,价目对照表按它画。
 ///
 /// 取段规则与 [`price_at`] 完全一致（含「`at` 早于首段则取首段」那条），
 /// 所以对照表里的数与代价计算用的数必然是同一个。
@@ -339,7 +331,7 @@ mod tests {
         assert_eq!(row.usd_input, first.usd_input);
     }
 
-    /// 按时刻取价：同一个键的两段,分界前后各取各的（**S1 验收的核心夹具**）。
+    /// 按时刻取价：同一个键的两段,分界前后各取各的。
     #[test]
     fn segments_are_picked_by_time() {
         const T: i64 = 1_800_000_000; // 降价生效时刻

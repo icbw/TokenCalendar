@@ -2,14 +2,14 @@
 // 结构:工具栏（固定,洞察页同款 .insight-toolbar + Seg）/ 滚动区 = 离开阈值 + 空档直方图卡、任务列表卡。
 // 数据:get_task_list（分页 50、表头排序、范围 / Agent / 项目过滤全在 SQL）;行展开 get_task_turns;
 // 筛选候选取 get_effort_series（turns) 的系列键:Agent = 当前范围内有轮的;项目 = 全部数据跨度内有轮的
-// （S4-R:选项目即切到其生命周期,候选不能被当前范围截掉）。
-// 范围（S4-R）:7d/30d/90d/All/Custom + 选定项目时默认切到项目生命周期,见 insights/useRangeSelection。
-// Errors 列 = API / 工具错误（S4-R 起不含用户中止）;中止轮数在 Turns 格 hover 与逐轮条形里表达。
-// 离群标记:对当前页 steps/turn 与 wall/turn 做 z-score（异常日同款阈值 |z| ≥ 2、样本 ≥ 7）,
+// （选项目即切到其生命周期,候选不能被当前范围截掉）。
+// 范围:7d/30d/90d/All/Custom + 选定项目时默认切到项目生命周期,见 insights/useRangeSelection。
+// Errors 列 = API / 工具错误（不含用户中止）;中止轮数在 Turns 格 hover 与逐轮条形里表达。
+// 离群标记:对当前页 steps/turn 与 wall/turn 做 z-score（与异常日同款阈值 |z| ≥ 2、样本 ≥ 7）,
 // 只标偏高一侧（偏低不是异常任务）。
 // 项目:列表 / 筛选 / 下拉候选全部是解析层的有效项目键（合并目标 / Scratch;隐藏项目不出现）;
 // 下拉末尾「Manage projects…」打开主窗口内的项目管理弹出层,不改变当前筛选。
-// 内容列红线:TaskRow.title 只在本文件的列表单元格渲染（标签开关 = title 时）,不进入展开、导出或其它视图。
+// 内容列约束:TaskRow.title 只在本文件的列表单元格渲染（标签开关 = title 时）,不进入展开、导出或其它视图。
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import { events, taskService, usageService } from '../../services'
 import type { TaskPage, TaskRow, TaskSort, TaskSortField, TaskTurn } from '../../services'

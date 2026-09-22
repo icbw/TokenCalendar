@@ -1,25 +1,21 @@
-//! 按官方价目折算的「代价」（取数时机估算的第一步;
-//! 把价目本体搬进 [`super:price`],本模块只负责折算与世代）。
+//! 按官方价目折算的「代价」：取数时机估算的第一步。价目本体在 [`super:price`],
+//! 本模块只负责折算与价格数据集订号。
 //!
-//! 为什么要折算：限流窗口的消耗大致按**价值**计,不按 token 条数计——最贵的模型
-//! 30 秒里产出的 token 不多,但可能已经吃掉可观的额度。所以先把各模型、各种类的
-//! token 折成同一把尺子上的「代价」,再由 calib.rs 的标定系数换成百分点。
+//! 限流窗口的消耗大致按**价值**计,不按 token 条数计——最贵的模型 30 秒里产出的 token
+//! 不多,但可能已经吃掉可观的额度。所以先把各模型、各种类的 token 折成同一把尺子上的
+//! 「代价」,再由 calib.rs 的标定系数换成百分点。
 //!
-//! **代价的单位是美元当量**：
-//! `cost` = 这笔 token 按**官方 API 定价**算出来的美元数。于是
-//! - 不再需要「基准模型」这个本身要跟着世代走的概念（旧口径是「千个基准模型输入
-//!   token 当量」,基准模型某代可能就不存在了）;
-//! - `scale` 的含义变成「每 1 美元当量吃掉配额的百分之几」,面板可以直接说
-//!   「这段时间你消耗了**相当于** $X 的 API 用量」。
+//! **代价的单位是美元当量**：`cost` = 这笔 token 按**官方 API 定价**算出来的美元数。
+//! `scale` 的含义是「每 1 美元当量吃掉配额的百分之几」,面板可以直接说「这段时间你消耗了
+//! **相当于** $X 的 API 用量」;也不需要一个会随模型世代消失的「基准模型」。
 //!
-//! > **语义红线（-bis,必须写进任何面板文案）**：它**不是账单**。用户付的是
-//! > 固定订阅月费,不是按 token 计费。只能说「**相当于** $X 的 API 用量」「等价价值」,
-//! > **不能说「你花了 $X」**。它衡量的是等价价值 / 机会成本。
+//! > **语义红线（任何面板文案都要遵守）**：它**不是账单**。用户付的是固定订阅月费,
+//! > 只能说「**相当于** $X 的 API 用量」「等价价值」,**不能说「你花了 $X」**。
 //! > 另：缓存写在部分平台按保留时长（TTL）分档,而采集层只有**一个** `cache_write`
 //! > 桶,无法区分 ⇒ 按常用档估算,面板需注明。
 //!
-//! 未知模型（新代号模型随时会出现）落回落价目,并标记 `unknown`——这种样本照常参与
-//! **触发估算**（有总比没有强）,但不参与**标定**（价目不可信的样本会污染系数）。
+//! 未知模型（新代号模型随时会出现）落回回落价目,并标记 `unknown`——这种样本照常参与
+//! **触发估算**,但不参与**标定**（价目不可信的样本会污染系数）。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, Mutex};
@@ -27,35 +23,20 @@ use std::sync::{LazyLock, Mutex};
 use super::model::Platform;
 use super::price;
 
-/// **出厂价格数据集的订号**（此前叫「权重表世代」）。
-///
-/// 它只回答一个问题：「库里这行的 `cost` 是不是按**当前这份**价格数据算出来的」。
+/// **出厂价格数据集的订号**：库里这行的 `cost` 是不是按**当前这份**价格数据算出来的。
 /// `price_seed.json` 每次真的变动（新模型 / 官方调价 / 正）就 +1。
 ///
-/// 为什么需要它：库里 `usage_pair.cost` 是**派生值**——按当时的价目把分模型 token
-/// 折出来的。价目一变,旧行的 `cost` 就是按旧尺子量的,和新样本一起做和之比拟合会把
-/// 系数拖偏。但原始 token 一直存在 `usage_pair.breakdown` 里,所以订号一升,存量行
-/// **就地重算**即可（`store:recompute_stale_costs`,**每个模型按它在该区间 `t1`
-/// 时刻生效的价目**）——不是丢数据,是换把尺子重新量一遍。
+/// `usage_pair.cost` 是**派生值**,价目一变,旧行按旧尺子量的 `cost` 与新样本一起拟合会把
+/// 系数拖偏。原始 token 一直存在 `usage_pair.breakdown` 里,所以订号一升,存量行
+/// **就地重算**（`store:recompute_stale_costs`,**每个模型按它在该区间 `t1` 时刻生效的价目**）。
 ///
 /// 与**套餐变更**是两回事：套餐变了 `cost` 没错、是 `scale`（%/美元）变了,那条靠
 /// `usage_pair.plan_type` 分代,旧样本留着但不参与当前拟合。
 ///
-/// **改 [`prior_scale`] 不在此列,别顺手升版**：它不参与 `cost` 的计算（只当拟合的先验
-/// 与样本准入带的基准）,存量行一个数都不会变。改了它只是让下一次 refit 用新的先验重算
-/// ——**自动生效,零迁移**。
-///
-/// 订史：
-/// - **1** 初版,硬编码 `match` 链的相对权重。
-/// - **2**对表 models.dev 第一方目录重出厂价目。世代 1 把 `gpt-5.6`
-///   一族（sol / terra / luna）用一条 `contains（"gpt-5")` 折成同一个权重,而它们的真实
-///   输入价是 4 / 2 / 0.2 USD/Mtok——**相差 20 倍**;`codex-auto-review` 被当成 gpt-5
-///   计价,高估约 6.4 倍。
-/// - **3**价目搬进 `price_model` 表、按模型带生效时间、单位改美元当量;
-///   顺带正 `-pro` 一族的缓存读（官方目录里根本没有这一项,世代 2 误套了通行比例 0.1）。
+/// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
+/// 基准）,存量行不变,下一次 refit 自动用新先验。
 pub const WEIGHT_VERSION: u32 = 3;
 
-/// 一笔 token 明细（采集批次里的四个口径）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
     pub input: i64,
@@ -76,11 +57,11 @@ const PER_MTOK: f64 = 1_000_000.0;
 /// 匹配不上时的回落价目（USD / Mtok,取该平台的**基准模型**：Claude = Sonnet 5、
 /// Codex = gpt-5）。
 ///
-/// 新代号模型随时会出现。回落**取基准而不是取当代旗舰**是有意的：估高会让取数更频繁
-/// （对限流不利）,估低只是让首次取数偏晚。这类样本照常参与触发估算,但标记 `unknown`。
+/// 回落**取基准而不是取当代旗舰**是有意的：估高会让取数更频繁（对限流不利）,估低只是
+/// 让首次取数偏晚。这类样本照常参与触发估算,但标记 `unknown`。
 ///
-/// 这里仍是硬编码常量而不是读库：它是"库里查不到"时的退路,拿库来兜库查不到的情形
-/// 说不通。数值与 `price_seed.json` 里这两个键的首段一致（单测 `fallback_matches_seed` 钉住）。
+/// 硬编码而不读库：它是「库里查不到」时的退路。数值与 `price_seed.json` 里这两个键的
+/// 首段一致（单测 `fallback_matches_seed` 钉住）。
 #[derive(Clone, Copy)]
 struct Fallback {
     input: f64,
@@ -96,20 +77,17 @@ const CODEX_FALLBACK: Fallback =
 /// Codex 把自动 review 记成 `codex-auto-review`——这**不是模型名而是路由标签**,
 /// 真正跑的模型由上游决定,官方没有公布对照表。
 ///
-/// 这里按目前已知的路由（起为 gpt-5.6-luna,依据 ccusage 维护的
-/// `codex-auto-review-fallbacks.json`,其自述为 best-effort）折价,但**照样标记为
-/// 不可信**：路由随时会改且我们无从校验,靠它主导的样本不该拿去标定系数。
-/// 相比世代 1 按 gpt-5 计价（高估约 6.4 倍）已经是大幅改善,但精度到此为止。
-///
-/// （折价但不可信。）
+/// 这里按已知路由（gpt-5.6-luna,依据 ccusage 维护的 `codex-auto-review-fallbacks.json`,
+/// 其自述为 best-effort）折价,但**照样标记为不可信**：路由随时会改且无从校验,
+/// 靠它主导的样本不该拿去标定系数。
 const AUTO_REVIEW: &str = "codex-auto-review";
 const AUTO_REVIEW_ROUTES_TO: &str = "gpt-5-6-luna";
 
 /// 一笔 token 明细的**美元当量**。返回 （代价, 该模型的价目是否可信)。
 ///
 /// `at` = 这笔 token 所属区间的时刻（在线路用 `now`,重算与冷启动用样本区间的 `t1`）。
-/// 每个模型按它**在该时刻生效**的价目取价——一个区间里的不同模型各取各的时间线,
-/// 所以「区间跨世代」这个问题不存在。
+/// 每个模型按它**在该时刻生效**的价目取价,一个区间里的不同模型各取各的时间线,
+/// 不存在「区间跨价目段」的问题。
 pub fn cost_of(platform: Platform, model_key: &str, t: &Tokens, at: i64) -> (f64, bool) {
     let p = priced_at(platform, model_key, at);
     (p.usd_of(t), p.known)
@@ -117,11 +95,8 @@ pub fn cost_of(platform: Platform, model_key: &str, t: &Tokens, at: i64) -> (f64
 
 /// 某个模型在某个时刻实际用来计价的那一组单价（含**回落**与**路由折价**之后的结果）。
 ///
-/// 这是 [`cost_of`] 心里那把尺子的外露形态。S2 的查询面要回答「这段用量是按哪条
-/// 价目算出来的」,而答案不能是"再查一次 price 表"——回落模型与 `codex-auto-review`
-/// 的折价都发生在 [`cost_of`] 里,查 price 表看不,两条路就会给出不同的数。
-/// 所以取价只有这一个入口,代价计算与展示共用它（S2「一个阶段数据集对应
-/// 一个价格指标」）。
+/// 回落与 `codex-auto-review` 的折价都发生在这里,直接查 price 表看不;所以取价只有
+/// 这一个入口,[`cost_of`] 与「这段用量按哪条价目算」的查询展示共用它,两条路才给出同一个数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Priced {
     /// 命中的价目段起点（`None` = 没命中任何键,四项单价来自回落常量）。
@@ -140,7 +115,6 @@ pub struct Priced {
 }
 
 impl Priced {
-    /// 一笔 token 明细按这组单价折成的**美元当量**。
     pub fn usd_of(&self, t: &Tokens) -> f64 {
         (self.usd_input * t.input as f64
             + self.usd_output * t.output as f64
@@ -185,7 +159,7 @@ pub fn priced_at(platform: Platform, model_key: &str, at: i64) -> Priced {
 }
 
 /// 把一份分模型明细折成 `（代价, 其中未知模型的代价)`,每个模型按 `at` 时刻的价目。
-/// 与 demand.rs 的逐笔累加等价——重算存量样本走这条,保证两条路算出来的是同一个数。
+/// 与 demand.rs 的逐笔累加等价——重算存量样本走这条,两条路必须算出同一个数。
 pub fn cost_of_breakdown(
     platform: Platform,
     models: &BTreeMap<String, [i64; 4]>,
@@ -209,10 +183,9 @@ pub fn cost_of_breakdown(
 
 /// 解析 `usage_pair.breakdown`。
 ///
-/// **规范形状 = 裸 map** `{"model":[输入,输出,缓存读,缓存写]}`（demand.rs 一直这么写）。
-/// 历史上 bootstrap.rs 另写过一层包装 `{"src":…,"models":{…}}`——`src` 现已是独立列,
-/// 包装纯属冗余,存量行由 store 的就地迁移统一。这里**两种都认**：重算是"派生值可恢复"
-/// 的唯一依靠,不能因为一半行形状不同就恢复不了。
+/// **规范形状 = 裸 map** `{"model":[输入,输出,缓存读,缓存写]}`（demand.rs 这么写）。
+/// 另一种包装形状 `{"src":…,"models":{…}}` 由 store 的就地迁移统一;这里**两种都认**：
+/// 重算是派生值可恢复的唯一依靠,不能因为部分行形状不同就恢复不了。
 pub fn parse_breakdown(json: &str) -> BTreeMap<String, [i64; 4]> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return BTreeMap::new();
@@ -221,66 +194,45 @@ pub fn parse_breakdown(json: &str) -> BTreeMap<String, [i64; 4]> {
     serde_json::from_value(inner.clone()).unwrap_or_default()
 }
 
-/// 出厂预设标定系数（**百分点 / 美元当量**）。
-///
-/// 取值来自的**离线**：拿本机桌面端 `plan-usage-history.json` 的两周
-/// 历史配 collector.db 的同期轮记录,219 条可用样本拟合出 ≈ 0.002 %/旧代价单位。
-/// 把代价单位从「千个 Sonnet 5 输入 token 当量」换成美元当量,这是一次
-/// **纯量纲换算**：旧单位 1 = 1000 × 2 USD/Mtok ÷ 1e6 = $0.002,故
-/// `0.002 %/旧单位 ÷ 0.002 $/旧单位` = **1.0 %/美元**,估算值逐位不变（单测钉住）。
+/// 出厂预设标定系数（**百分点 / 美元当量**）,取值来自本机两周历史的离线拟合。
 ///
 /// 好记的量级：**1% 的 Claude Max 5h 额度 ≈ 1 美元 API 当量**,即一个完整 5h 窗口
 /// ≈ $100 的 API 等价用量。
 ///
-/// 注意这是 **Max 档**账户的量级;Pro 档窗口更小,同样的 token 吃掉的百分比更大,真实
-/// 系数约为其数倍——预设偏小意味着首次取数**偏晚而非偏频**（对限流更安全）,几条
-/// 样本后就由 calib.rs 的混合公式接管。两个平台各有一条本地历史冷启动路
-/// （Claude 走 bootstrap.rs,Codex 走 codex_rollout.rs）,首次启动就能把预设换成。
+/// 两平台按美元当量同义,但数值相差近 10 倍（Claude Max ≈ 0.89、Codex plus/edu ≈ 8.9）
+/// 是**对的**：它就是「这个套餐一个窗口有多大」,两边月费本来就差一个数量级。
+/// 不要统一成一个数,那会让 Codex 低估约 9 倍。
 ///
-/// **起按平台分开,数值由填**（此前两个平台共用 `1.0`）。
-///
-/// 换成美元当量之后两边才第一次同义（旧口径里它是「每千个**该平台基准模型**输入 token
-/// 当量」,基准模型不同 ⇒ 同一个数在两边其实是两个量）。但**同义不等于数值接近**：
-/// 本机 Claude Max ≈ **0.89**、Codex edu/plus ≈ **8.88 %/美元**,相差近 10 倍
-/// ——而这是**对的**,它就是「这个套餐一个窗口有多大」,月费量级本来就差一个数量级。
-/// 共用 `1.0` 对 Codex 是低估约 9 倍;在 codex_rollout.rs 落地之前那就是 Codex 的
-/// **全部**（样本恒为 0）。
-///
-/// 这**不是**把刚删掉的「基准模型」概念请回来：那个是把平台差异藏在一个常量的**含义**
-/// 里（同一个数在两边指不同的东西）,这里是量纲统一之后**如实写出两个测出来的数**。
-///
-/// 只保留两位有效数字。再多就是假精度——同一平台换个套餐（Max / Pro、plus / pro）
-/// 真实系数本就差几倍,而这个数只是「还没有任何本机样本时的起点」：两条回溯路
-/// （Claude 走 bootstrap.rs,Codex 走 codex_rollout.rs）首次启动就会把它换成,
-/// 之后它只剩 `fit` 里那 5 个样本当量的权重。预设偏小意味着首次取数**偏晚而非偏频**。
+/// 只保留两位有效数字：同一平台换档真实系数差几倍,这个数只是「还没有任何本机样本时的
+/// 起点」。两条回溯路（Claude 走 bootstrap.rs,Codex 走 codex_rollout.rs）首次启动就会
+/// 把它换成,之后它只剩 `calib:PRIOR_WEIGHT` 个样本当量的权重。预设偏小意味着
+/// 首次取数**偏晚而非偏频**（对限流更安全）。
 ///
 /// 改这两个数**不需要**升 [`WEIGHT_VERSION`]（不参与 `cost` 的计算）,也不需要升
-/// `calib:ADMISSION_RULE_VERSION`（真库：换成先验之后,两个平台参与拟合的
-/// 样本集一条不变,只是混合公式不再把值往 `1.0` 拽）。
+/// `calib:ADMISSION_RULE_VERSION`（参与拟合的样本集不变,只是混合公式的先验变了）。
 ///
 /// **这两个数各自属于一档套餐**（[`BASE_PLAN_CLAUDE`] / [`BASE_PLAN_CODEX`]）,
-/// 别的档由 [`plan_multiplier`] 的倍率表折算。
+/// 别的档由 [`plan_table`] 的倍率表折算。
 const PRIOR_CLAUDE: f64 = 0.89;
 const PRIOR_CODEX: f64 = 8.9;
 
 /// 出厂预设所在的那一档（倍率 1.0 的基准）。
 ///
-/// - Claude = **Max 5x**;
-/// - Codex = **Plus / Edu**（官方对照表里 Standard Business 与 Plus 同额;本机那台
-///   的 `plan_type` 在 plus / edu 之间跳,两档同量级,同归这一档）。
+/// - Claude = **Max 5x**（`rateLimitTier = default_claude_max_5x`）;
+/// - Codex = **Plus / Edu**（官方对照表里 Standard Business 与 Plus 同额;账户的
+///   `plan_type` 在 plus / edu 之间跳,两档同量级,同归这一档）。
 const BASE_PLAN_CLAUDE: &str = "max_5x";
 const BASE_PLAN_CODEX: &str = "plus";
 
 /// 套餐 → 倍率对照表。
 ///
-/// 倍率是**推出来的,不是测出来的**：由官方公布的限额比直接取倒数——配额大 N 倍的档,
-/// 同样 1 美元当量只吃掉 1/N 的百分点 ⇒ `scale` 就是基准档的 1/N。这比「拿基准档的
-/// 数当所有档用」强,但仍是估计;真实数由两条回溯路的样本在首次启动后接管
-/// （预设在混合公式里只值 `calib:PRIOR_WEIGHT` 个样本当量）。
+/// 倍率是**推出来的,不是测出来的**：由官方公布的限额比取倒数——配额大 N 倍的档,
+/// 同样 1 美元当量只吃掉 1/N 的百分点 ⇒ `scale` 就是基准档的 1/N。仍是估计;真实数
+/// 由回溯路的样本在首次启动后接管（预设只值 `calib:PRIOR_WEIGHT` 个样本当量）。
 ///
-/// 要防的是**低估**方向：配额更小的档（Claude Pro）真实系数更大,预设偏小 ⇒ 取数偏晚
-/// ⇒ 「界面上还有余量、其实已经用完」。反过来高估只会让取数偏频、显示更新更勤。
-/// 所以**同名档拿不准时一律取较小的那一档**（Pro 5x 而不是 Pro 20x）。
+/// 要防的是**低估**方向：配额更小的档真实系数更大,预设偏小 ⇒ 取数偏晚 ⇒ 「界面上还有
+/// 余量、其实已经用完」。高估只会让取数偏频。所以**同名档拿不准时一律取较小的那一档**
+/// （Pro 5x 而不是 Pro 20x）。
 ///
 /// > ⚠️ **同一个词在两个平台意思相反**：Claude 的 Pro 是**小**档（Max 之下）,
 /// > ChatGPT 的 Pro 是**大**档（Plus 之上）。两张表因此方向相反,别互相抄。
@@ -288,7 +240,7 @@ const BASE_PLAN_CODEX: &str = "plus";
 /// 匹配按**子串、从特殊到一般**——同一个函数既吃 `plan_type`（"max" / "plus"）
 /// 也吃 Claude 凭据里的 `rateLimitTier`（"default_claude_max_5x"）。表里没有的档
 /// （Claude Team / Enterprise、ChatGPT Free / Go / Enterprise：官方没给可比的限额）
-/// 回落 1.0 = 按基准档算,与加这张表之前的行为一致。
+/// 回落 1.0 = 按基准档算。
 fn plan_table(platform: Platform) -> &'static [(&'static str, f64)] {
     match platform {
         // 官方：Max 5x = 5 × Pro,Max 20x = 20 × Pro（同一句话里给出）⇒ 以 Max 5x 为
@@ -309,7 +261,7 @@ fn plan_table(platform: Platform) -> &'static [(&'static str, f64)] {
             ("pro", 0.2), // API 的 `plan_type` 只说 "pro" → 按 5x 算（取较小档,偏高估）
             ("plus", 1.0),
             ("business", 1.0),
-            ("edu", 1.0), // 官方表里没有,但本机实测就在这一档
+            ("edu", 1.0), // 官方表里没有,但出厂预设的实测账户就在这一档
         ],
     }
 }
@@ -369,13 +321,11 @@ pub fn set_plan_tier(platform: Platform, tier: &str) {
     }
 }
 
-/// 两个套餐名是不是同一**倍率类**——我们自己的模型认为它们的窗口一样大,
-/// 那它们的标定样本就可比,该放进同一代。
+/// 两个套餐名是不是同一**倍率类**——窗口一样大,标定样本就可比,该放进同一代。
 ///
-/// **两边都得在表里查得到才算数**。查不到的档走的是「回落基准档」那条路,
-/// 那是一个占位值而不是判断——拿它当依据会把一堆互不相干的档（Claude Team、
-/// ChatGPT Go…）通通归成基准档那一类。所以只要有一边查不到,就退回按名字精确比,
-/// 与加这条之前的行为相同。
+/// **两边都得在表里查得到才算数**。查不到的档走「回落基准档」,那是占位值而不是判断,
+/// 拿它当依据会把互不相干的档（Claude Team、ChatGPT Go…）通通归成基准档那一类。
+/// 所以只要有一边查不到,就退回按名字精确比。
 pub fn same_plan_class(platform: Platform, a: &str, b: &str) -> bool {
     match (plan_lookup(platform, a), plan_lookup(platform, b)) {
         // 两边都是表里的字面常量,相等就是逐位相等
@@ -390,11 +340,10 @@ fn resolve_multiplier(platform: Platform, tier: &str, plan: &str) -> f64 {
     plan_lookup(platform, tier)
         .or_else(|| plan_lookup(platform, plan))
         // 两格都认不出（"unknown" / 官方改了命名 / 表里没收的档）→ 按基准档算,
-        // 也就是原样用 PRIOR_* 那个值,与加这张表之前逐位相同。
+        // 即原样用 PRIOR_* 那个值。
         .unwrap_or_else(|| plan_lookup(platform, base_plan(platform)).unwrap_or(1.0))
 }
 
-/// 当前套餐相对基准档的倍率。
 fn current_multiplier(platform: Platform) -> f64 {
     let hint = plan_slot().get(&platform).cloned().unwrap_or_default();
     resolve_multiplier(platform, &hint.tier, &hint.plan)
@@ -415,7 +364,7 @@ mod tests {
     use super::*;
 
     /// 足够晚的时刻:出厂种子里所有模型都已生效。
-    const NOW: i64 = 1_790_000_000; // 2026-09-21
+    const NOW: i64 = 1_790_000_000;
 
     #[test]
     fn breakdown_parses_both_historical_shapes() {
@@ -429,7 +378,7 @@ mod tests {
 
     #[test]
     fn recomputed_cost_matches_incremental_accumulation() {
-        // 重算路径与 demand.rs 的逐笔累加必须等价,否则换世代会凭空改变样本
+        // 重算路径与 demand.rs 的逐笔累加必须等价,否则升修订号会凭空改变样本
         let models = BTreeMap::from([
             ("claude-opus-5".to_string(), [100_000i64, 2_000, 50_000, 1_000]),
             ("sol-preview".to_string(), [10_000i64, 0, 0, 0]),
@@ -450,7 +399,7 @@ mod tests {
         assert!(unknown > 0.0, "未知代号模型照常标记");
     }
 
-    /// 代价就是官方价目下的美元数——这是 S1 换单位之后最该直接钉住的一条。
+    /// 代价就是官方价目下的美元数。
     #[test]
     fn cost_is_the_official_dollar_equivalent() {
         // 100 万个 Sonnet 5 输入 token,官方 2 USD/Mtok ⇒ 正好 $2
@@ -496,7 +445,7 @@ mod tests {
 
     #[test]
     fn codex_5_6_family_is_priced_apart() {
-        // 世代 1 的 bug：sol / terra / luna 共用一条 contains("gpt-5") ⇒ 权重全是 1.0。
+        // sol / terra / luna 输入价各不相同,不能共用一条 contains("gpt-5")。
         // 官方输入价 4 / 2 / 0.2 USD,基准 gpt-5 = 1.25 ⇒ 3.2 / 1.6 / 0.16。
         for (model, want) in [("gpt-5.6-sol", 3.2), ("gpt-5.6-terra", 1.6), ("gpt-5.6-luna", 0.16)] {
             let (w, known) = input_weight(Platform::Codex, model, 1.25);
@@ -537,8 +486,8 @@ mod tests {
         assert!(cost_of(Platform::Claude, "claude-sonnet-5", &w, NOW).0 > 0.0);
     }
 
-    /// `-pro` 一族的缓存读:官方目录里**没有这一项**（世代 2 误套了通行比例 0.1）。
-    /// 由生成器的 `--crosscheck` 发现,已在 `price-keys.json` 声明为已知偏差。
+    /// `-pro` 一族的缓存读:官方目录里**没有这一项**,不能套通行比例 0.1。
+    /// 已在 `scripts/price-keys.json` 声明为已知偏差。
     #[test]
     fn pro_models_have_no_cache_read_price() {
         let r = Tokens { cache_read: 1_000_000, ..Default::default() };
@@ -617,28 +566,8 @@ mod tests {
         assert!((rc / ic - 0.1).abs() < 1e-9, "Sonnet 5 缓存读 0.2 vs 输入 2.0");
     }
 
-    /// 换单位是**纯量纲换算**：1 个旧单位恰好是 $0.002,`cost` 逐位等值。
-    ///
-    /// 这条钉的是 `cost` 的量纲,不是先验的数值——先验 2026-09-19 已按实测改成
-    /// per-platform,拿它来钉换算关系会把两件不相干的事混成一笔。
-    #[test]
-    fn cost_survives_the_unit_change() {
-        // 旧口径:cost_旧 = Σ(相对权重 × token) / 1000（Claude 以 Sonnet 5 为基准）
-        // 新口径:cost_新 = cost_旧 × 0.002 美元/旧单位
-        const OLD_UNIT_USD: f64 = 0.002; // 1 旧单位 = 1000 × 2 USD/Mtok ÷ 1e6
-
-        // 100 万个 Sonnet 输入 token = 旧口径的 1000 个单位 ⇒ $2.00
-        let t = Tokens { input: 1_000_000, ..Default::default() };
-        let (c, _) = cost_of(Platform::Claude, "claude-sonnet-5", &t, NOW);
-        assert!((c - 1000.0 * OLD_UNIT_USD).abs() < 1e-12);
-        // 折成 Opus:同样的美元当量只需 40 万输入 token（价目 2.5 倍）
-        let opus = Tokens { input: 400_000, ..Default::default() };
-        let (co, _) = cost_of(Platform::Claude, "claude-opus-5", &opus, NOW);
-        assert!((co - c).abs() < 1e-12);
-    }
-
     /// 两个平台的先验相差近 10 倍是**如实记录**,不是笔误——一并钉住量级,
-    /// 免得将来有人"顺手统一"回一个数（见 `PRIOR_CLAUDE` 的注释）。
+    /// 免得有人「顺手统一」回一个数（见 `PRIOR_CLAUDE` 的注释）。
     #[test]
     fn priors_are_per_platform_and_an_order_of_magnitude_apart() {
         let (claude, codex) = (prior_scale(Platform::Claude), prior_scale(Platform::Codex));
@@ -649,7 +578,7 @@ mod tests {
     }
 
     /// 按时刻取价的**端到端**验收：某模型在 T 降价,T 前按旧价、T 后按新价,
-    /// 而**不含该模型的明细一字不变**（设计 §5 S1 验收条款）。
+    /// 而**不含该模型的明细一字不变**。
     #[test]
     fn a_price_cut_only_moves_rows_containing_that_model() {
         const T: i64 = 1_800_000_000;
@@ -727,7 +656,7 @@ mod tests {
         assert!(!same_plan_class(Platform::Claude, "max", "pro"));
     }
 
-    /// 表里没有的档 / 空串 → 1.0（= 按基准档算,与加这张表之前同）。
+    /// 表里没有的档 / 空串 → 1.0（= 按基准档算）。
     #[test]
     fn unknown_plans_fall_back_to_the_base_plan() {
         for p in ["", "unknown", "team", "enterprise", "go", "free"] {
@@ -756,7 +685,7 @@ mod tests {
         let codex_pro = PRIOR_CODEX * resolve_multiplier(Platform::Codex, "", "pro");
         assert!((claude_pro - 4.45).abs() < 1e-12, "Claude Pro 窗口只有 Max 5x 的 1/5");
         assert!((codex_pro - 1.78).abs() < 1e-12, "ChatGPT Pro 窗口是 Plus 的 5 倍");
-        // 没设过任何套餐（单测里的常态）→ 基准档,与加这张表之前逐位相同
+        // 没设过任何套餐（单测里的常态）→ 基准档,即原样的 PRIOR_CLAUDE
         assert_eq!(prior_scale(Platform::Claude), PRIOR_CLAUDE);
         assert_eq!(prior_scale(Platform::Codex), PRIOR_CODEX);
     }

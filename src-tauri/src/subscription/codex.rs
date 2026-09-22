@@ -1,6 +1,6 @@
 //! Codex（ChatGPT 订阅）额度适配器。
 //!
-//! 端点：GET chatgpt.com/backend-api/wham/usage,
+//! 端点（逆向,未公开）：GET chatgpt.com/backend-api/wham/usage,
 //! Bearer = ~/.codex/auth.json tokens.access_token,可选 ChatGPT-Account-Id。
 //! 刷新走 credentials:refresh_access（内存化,不回写文件）。
 
@@ -14,7 +14,7 @@ use super::model::{FetchStatus, Platform, QuotaWindow, SnapshotSource, Subscript
 use super::RateGate;
 
 pub struct CodexAdapter {
-    /// 内存 token 缓存（key = 平台;轮询线程单写单读,Mutex 仅为编译器安心）。
+    /// 内存 token 缓存（key = 平台;轮询线程与命令面等多个取数方共享）。
     tokens: Mutex<HashMap<Platform, MemoryToken>>,
     /// 429 冷却闸（`Retry-After` 期内不打网络）。
     gate: RateGate,
@@ -30,15 +30,14 @@ impl CodexAdapter {
         self.gate.remaining(chrono::Utc::now().timestamp())
     }
 
-    /// 取内存 token 缓存（poison 容忍,审计 P3-：持锁线程 panic 后缓存仍可用,
+    /// 取内存 token 缓存（poison 容忍：持锁线程 panic 后缓存仍可用,
     /// 不让轮询线程与命令面连锁停摆）。
     fn tokens_slot(&self) -> std::sync::MutexGuard<'_, HashMap<Platform, MemoryToken>> {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// 取当前可用 token（缓存有效则用缓存;否则现读文件;文件 token 过期且可刷新
-/// 则静默刷新一轮）。返回 None = 无可用凭据（文件缺失/解析失败/已判死）。
+/// 取凭据结果（见 `CodexAdapter:obtain_access`）。
 pub enum Access {
     Ok(RawCredential),
     /// 凭据判死（refresh 永久失败）——本周期跳过网络。
@@ -50,10 +49,10 @@ pub enum Access {
 }
 
 impl CodexAdapter {
-    /// 统一准入：从内存缓存或凭据文件取得可用 access token。
+    /// 统一准入：从内存缓存或凭据文件取得可用 access token;文件 token 过期且可刷新则静默刷新一轮。
     /// 死态复活条件 = 凭据文件 mtime 变化（mod.rs 轮询里清缓存）。
-    /// 锁只覆盖内存缓存读写——**网络刷新在锁外做**（审计 P2-：持锁刷新会把
-    /// 共享同一 Adapters 的其他取数方阻塞最长 15s）。
+    /// 锁只覆盖内存缓存读写——**网络刷新在锁外做**：持锁刷新会把共享同一 Adapters 的
+    /// 其他取数方阻塞最长 15s。
     pub fn obtain_access(&self, platform: Platform) -> Access {
         {
             let cache = self.tokens_slot();
@@ -242,7 +241,7 @@ fn account_id_from_jwt(access_token: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// **响应里看到的账号指纹**。
+/// **响应里看到的账号指纹**（`wham/usage` 顶层的 `account_id`）。
 ///
 /// 这是最权威的一路——它就是**服务端把这次用量记在谁头上**,与读数在同一个响应里,
 /// 零额外请求。但 `parse_usage` 是纯解析、拿不到 store,所以先放在这个格子里,
@@ -302,7 +301,7 @@ pub fn parse_usage(
         }
     }
 
-    // 多信号收敛判 plan_inactive（预案）:
+    // 多信号收敛判 plan_inactive:
     //  plan_type 报 free/unknown 且没有任何窗口 → 大概率无付费权益
     //  完全没有 rate_limit 结构 → 权益缺失
     let plan_inactive = matches!(plan_type.as_str(), "free" | "unknown") && windows.is_empty();
@@ -320,7 +319,7 @@ pub fn parse_usage(
     }
 }
 
-/// 被动刷新结果。
+/// 被动刷新结果。刷新成功也归 `Transient`：新 token 已进内存缓存,不重试。
 pub enum PassiveResult {
     Dead,
     Transient,

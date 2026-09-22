@@ -1,4 +1,4 @@
-//! 桌面端采样收割 + 标定。
+//! 桌面端采样收割 + 标定（常驻增量,随主轮询每轮运行）。
 //!
 //! 两份数据都在本机、都不花任何 API 请求：
 //! - Claude 桌面端 `plan-usage-history.json`：约 15 分钟一条的用量百分比历史（服务端口径,
@@ -17,8 +17,7 @@
 //! - **密度更高**。桌面端 15 分钟一条,比兜底轮（默认 30 分钟）密一倍;而且区间越短,
 //!   5h 滚动窗口里「过期掉的旧用量」吃掉新增的比例越小,系统性低估也越轻（calib.rs）。
 //! - **样本只增不减**。桌面端自己的历史文件只滚动保留约 14 天,收割进
-//!   `desktop_sample` 后**永久留着**（store.rs）——观测密度随时间累积,源文件裁剪掉的
-//!   也不会跟着丢。
+//!   `desktop_sample` 后**永久留着**（store.rs）——源文件裁剪掉的也不会跟着丢。
 //!
 //! 因此在线路径只保留**两端都是 API 读数**的样本（`mod.rs` 的 `record_pair`）,
 //! 桌面端那一路一律由本模块按样本时刻建。
@@ -60,7 +59,7 @@ pub const PAIR_SRC: &str = "desktop";
 /// 这一路上次是按哪一版准入判据建的样本（见 `calib:ADMISSION_RULE_VERSION`）。
 const META_RULE_VER: &str = "claude_desktop_pair_rule";
 
-/// 「本机解释不了的消耗」的统计窗口。
+/// 「本机解释不了的消耗」的统计窗口（小时）。
 const FOREIGN_WINDOW_HOURS: i64 = 24;
 
 /// 采集滞后余量（秒）：区间太新时本地轮可能还没被扫到,算成「本机零痕迹」是误判。
@@ -74,13 +73,12 @@ const COLLECT_LAG_MARGIN_SECS: i64 = 600;
 ///
 /// **它说明不了是谁在用**,只说明不是本机的 agent。可能的来源至少四种：
 ///  同一账号在另一台电脑上跑 agent; 网页版; **本机 Claude 桌面端自己的对话**
-/// （桌面端的聊天不走 collector 的 `claude-code` 源,却吃同一份配额——本机这一项
-/// 很可能占大头）; 手机 App。所以文案一律说「本地 token 解释不了」,
-/// **不要说成「别的设备」**。
+/// （桌面端的聊天不走 collector 的 `claude-code` 源,却吃同一份配额,很可能占大头）;
+///  手机 App。所以文案一律说「本地 token 解释不了」,**不要说成「别的设备」**。
 ///
-/// 它**不正**任何东西,只是把盲区量出来摆上台面（P0 的全部职责）：链路的取数与读数
-/// 本来就走服务端真值,不会错;真正被这类消耗污染的是**标定**——样本的涨幅含别处的量、
-/// 代价只有本机的,持续下去会把 `scale` 系统性拉大、取数偏频（见 HANDOFF）。
+/// 它**不正**任何东西,只是把盲区量出来：链路的取数与读数本来就走服务端真值,不会错;
+/// 真正被这类消耗污染的是**标定**——样本的涨幅含别处的量、代价只有本机的,
+/// 持续下去会把 `scale` 系统性拉大、取数偏频。
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct ForeignEvidence {
     /// 统计窗口内**可判定**的相邻样本区间数（太新的不算,见 `COLLECT_LAG_MARGIN_SECS`）。
@@ -217,11 +215,10 @@ pub fn build_pairs(
         // at = t1：该区间右端点,与 store:recompute_stale_costs 同口径
         let (c_total, c_unknown) = price(&breakdown, t1);
         // **老掉的**：发生在 （t0−5h, t1−5h] 的那些轮——5h 是滚动窗口,计数器的变化是
-        // 「新花的 − 老掉的」。轮记录读得不够早时这里自然
-        // 算成 0 = 不做正,不会算错方向。
+        // 「新花的 − 老掉的」。轮记录读得不够早时这里自然算成 0 = 不做正,不会算错方向。
         let aged = price(&slice(t0 - WINDOW_SECS, t1 - WINDOW_SECS), t1).0;
         // 桌面端那份采样历史只有两个百分比,没有窗口重置时刻 ⇒ 两端都是 None,
-        // 重置只能退回「读数变小了」去判（语义见 calib:Pair:window_reset）。
+        // 重置只能退回「读数变小了」去判（语义见 calib:Pair:window_changed）。
         let pair = Pair {
             t0,
             t1,
@@ -314,12 +311,11 @@ fn day_of(ts: i64) -> String {
 /// 返回 `（本次新收割的样本数, 本次新建的标定样本数)`。
 ///
 /// 三步都幂等：收割按主键忽略重复,建样本按水位线只处理新区间,没有新东西就是几条
-/// 索引查询的开销。首次运行（空库 / 刚升级）等价于原来的冷启动——水位线落在
-/// `now - HORIZON_DAYS`,一次把近两周补齐。
+/// 索引查询的开销。首次运行（空库）水位线落在 `now - HORIZON_DAYS`,一次把近两周补齐。
 pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, usize) {
     let desktop_samples = super::claude_desktop::all_samples();
     let harvested = sub_store.insert_samples(Platform::Claude, &desktop_samples).unwrap_or(0);
-    // 同一批读数再落一遍**归一化序列**（-4;两层并存,见 store 建表注释）。
+    // 同一批读数再落一遍**归一化序列**（两层并存,见 store 建表注释）。
     // 桌面端不提供窗尾也不提供套餐 ⇒ `resets_at` / `plan_type` 留空,那是「源给不出」
     // 而不是「没有」。写入按主键幂等,所以这里照旧可以每轮无脑全量喂。
     let readings: Vec<_> = desktop_samples
@@ -339,7 +335,7 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
         crate::dev_log!("[subscription] claude quota_reading insert failed: {e}");
     }
 
-    // 水位线 = 桌面端那一路已经建到哪儿;没有则从回溯上限起（= 原冷启动行为）。
+    // 水位线 = 桌面端那一路已经建到哪儿;没有则从回溯上限起。
     let floor = now - HORIZON_DAYS * 86_400;
     // 判据升版 ⇒ 这一路把「读数还在的那一段」按新判据重建一次:水位线整体退回下界,
     // 旧行等新样本建出来之后再按它们的首尾删（见 calib:ADMISSION_RULE_VERSION）。
@@ -361,10 +357,9 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
     let mut n = 0;
     if samples.len() >= 2 {
         let hour_cache = read_hour_cache(collector_db, &day_of(since - WINDOW_SECS));
-        // 首轮（空库 / 刚升级）一次能建上千条 ⇒ 一次事务写完,不逐条提交
-        // breakdown 写**规范的裸 map**（与在线路同形状）——旧版在这里包了一层
-        // `{"src":…,"models":{…}}`,而 src 现已是独立列。形状统一,将来按新权重
-        // 重算存量样本时才不会只能恢复一半（见 cost:parse_breakdown）。
+        // 首轮（空库）一次能建上千条 ⇒ 一次事务写完,不逐条提交。
+        // breakdown 写**规范的裸 map**（与在线路同形状,src 是独立列）——形状统一,
+        // 按新权重重算存量样本时才能完整恢复（见 cost:parse_breakdown）。
         let items: Vec<_> = build_pairs(&samples, &turns, &hour_cache)
             .into_iter()
             .map(|(pair, used7, breakdown)| {
@@ -372,15 +367,14 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
                 (pair, used7, json)
             })
             .collect();
-        // 套餐标注：桌面端的采样历史**不带套餐**,本机只有
-        // 「当前快照的套餐」这一个已知量。旧版拿它硬套整段回补区间——换过档的人会被
-        // 把旧套餐的历史标成新套餐,而 `pairs_for_fit` 按套餐筛之后,**标错比不标更糟**
-        // （它会把新套餐的估计往旧套餐拖）。
+        // 套餐标注：桌面端的采样历史**不带套餐**,本机只有「当前快照的套餐」这一个已知量。
+        // 拿它硬套整段回补区间会把换过档的人的旧套餐历史标成新套餐,而 `pairs_for_fit` 按套餐
+        // 筛之后,**标错比不标更糟**（它会把新套餐的估计往旧套餐拖）。
         //
         // 故以 store 记下的**当前套餐起始观测时刻**为界一分为二：从它之后开始的区间标
         // 真套餐,之前的标空串 = **套餐未知**（`pairs_for_fit` 放行,但不会被算成别的
-        // 套餐的账）。没有边界——存量库升上来、或从未成功取过一次数——就沿用旧行为
-        // 整批标当前套餐,免得升级当天把刚建的样本全标成未知。
+        // 套餐的账）。没有边界——存量库、或从未成功取过一次数——就整批标当前套餐,
+        // 免得把刚建的样本全标成未知。
         let plan = sub_store
             .load_snapshot(Platform::Claude)
             .map(|s| s.plan_type)
@@ -454,13 +448,11 @@ pub fn ingest(sub_store: &SubStore, collector_db: &Path, now: i64) -> (usize, us
     (harvested, n)
 }
 
-/// 收割结果 + **采样密度**一行：
-/// 已留存条数 / 跨度 / **间隔中位数**——桌面端源文件只保 14 天,跨度超过它就说明
-/// `desktop_sample` 真的在累积源里已经没有的观测。
+/// 收割结果 + **采样密度**一行：已留存条数 / 跨度 / **间隔中位数**——桌面端源文件只保
+/// 14 天,跨度超过它就说明 `desktop_sample` 真的在累积源里已经没有的观测。
 ///
-/// 间隔取**中位数**而非均值：桌面端只在自己运行时
-/// 采样,关机 / 休眠留下的十几小时空档会把均值拉到实际节律的两倍以上,而这行字的全部用处
-/// 就是让人一眼看出采样密度。
+/// 间隔取**中位数**而非均值：桌面端只在自己运行时采样,关机 / 休眠留下的十几小时空档
+/// 会把均值拉到实际节律的两倍以上,而这行字的全部用处就是让人一眼看出采样密度。
 fn log_density(sub_store: &SubStore, harvested: usize, pairs: usize) {
     let total = sub_store.sample_count(Platform::Claude);
     let span_days = match sub_store.sample_span(Platform::Claude) {
@@ -582,7 +574,7 @@ mod tests {
     }
 
     /// 掉下去的读数丢,没涨的读数**收**——只要它本来就不该涨得动一格
-    /// （2026-09-19 定案,判据见 `calib::Pair::usable`）。
+    /// （判据见 `calib::Pair::usable`）。
     #[test]
     fn dropping_readings_are_dropped_but_flat_ones_are_kept() {
         let turns = vec![turn(10_500, "claude-sonnet-5", 100_000, 0)];
@@ -597,8 +589,8 @@ mod tests {
         assert!(build_pairs(&flat, &heavy, &HourCache::new()).is_empty());
     }
 
-    /// 套餐边界（设计 §9-10 ②）：边界之前**开始**的区间标「套餐未知」,
-    /// 之后的才标真套餐;没有边界 = 整批标真套餐（存量库升上来的行为不变）。
+    /// 套餐边界：边界之前**开始**的区间标「套餐未知」,
+    /// 之后的才标真套餐;没有边界 = 整批标真套餐。
     #[test]
     fn pairs_starting_before_the_plan_boundary_are_marked_plan_unknown() {
         let item = |t0: i64| -> PairItem {

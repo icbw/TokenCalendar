@@ -1,7 +1,7 @@
-// 数据洞察视图：v2 仪表盘 + v3 打磨。
+// 数据洞察视图。
 // 布局: 1) 主图卡（曲线⇄堆叠 + 口径控件 + 图例筛选）; 2) 同口径占比环（环居中
-// 图例分列左右）; 3) 异常日 31 格单行热力条（替代列表）; 4) tokens × 积分双组图
-// （双段堆叠柱 + credit 曲线,区分模型开关）。
+// 图例分列左右）; 3) 异常日 31 格单行热力条; 4) 价格面板（PricingBlock）;
+// 5) tokens × 积分双组图（双段堆叠柱 + credit 曲线,区分模型开关;可选组件）。
 // 手写 SVG 图表见 charts.tsx。
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { events, usageService } from '../../services'
@@ -32,17 +32,15 @@ const fullMonthLabel = (m: string) => {
 // ---- 口径控件（分段控件,样式复用 .seg） ----
 
 type Bucket = 'day' | 'hour'
-/** :project 维 / 时间指标走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series 不变。 */
+/** project 维 / 时间指标走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series。 */
 type Dimension = 'agent' | 'model' | 'project' | 'total'
 type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
 type ChartKind = 'line' | 'stack'
 
-// Seg 分段控件已抽到 ./Seg（Tasks 视图复用;新增 disabled）。
-
 // ---- 主图卡 ----
 
-// 自定义 hook 形态——工具栏与卡片拆成两个返回件,由
-// InsightsView 装配:工具栏固定在滚动区外（设置页同款）,卡片随内容滚动。
+// 自定义 hook 形态:工具栏与卡片拆成两个返回件,由 InsightsView 装配:
+// 工具栏固定在滚动区外,卡片随内容滚动。
 function useTrendBlock() {
   const [bucket, setBucket] = useState<Bucket>('day')
   const [dimension, setDimension] = useState<Dimension>('model')
@@ -70,7 +68,7 @@ function useTrendBlock() {
     }
   }, [])
 
-  // S4-R 范围:7d/30d/90d/All/Custom;project 维筛到单个项目时默认切到该项目生命周期
+  // 范围:7d/30d/90d/All/Custom;project 维筛到单个项目时默认切到该项目生命周期
   const selection = useRangeSelection(dimension === 'project' ? filterKey : '', refreshTick)
   const { startDay, endDay } = selection.range
 
@@ -152,7 +150,7 @@ function useTrendBlock() {
     [],
   )
 
-  // 手改范围:非项目维时清图例筛选（系列集随范围变,沿用）;项目维保留——筛选即项目选择,
+  // 手改范围:非项目维时清图例筛选（系列集随范围变）;项目维保留——筛选即项目选择,
   // 清掉会连带退出项目生命周期
   const rangeSelection = useMemo(
     () => ({
@@ -165,8 +163,8 @@ function useTrendBlock() {
     [selection, dimension],
   )
 
-  // 拆成两个返回件——toolbar（固定行）与 card（随滚动内容）。
-  // S4-R:范围控件（含自定义日期与区间文字）单列第二行,工具栏主行仍保持单行不换行。
+  // 两个返回件:toolbar（固定行）与 card（随滚动内容）。
+  // 范围控件（含自定义日期与区间文字）单列第二行,工具栏主行仍保持单行不换行。
   return {
     toolbar: (
       <>
@@ -252,7 +250,7 @@ function useTrendBlock() {
                 {o.label}
               </button>
             ))}
-            {/* S5:项目维图例即项目选择器,末尾放管理入口（打开主窗口内弹出层,不改筛选）*/}
+            {/* 项目维图例即项目选择器,末尾放管理入口（打开主窗口内弹出层,不改筛选）*/}
             {dimension === 'project' && (
               <button className="legend-item pm-manage-link" onClick={openProjectManager} title="Rename, hide or merge projects">
                 Manage projects…
@@ -288,7 +286,7 @@ function useTrendBlock() {
   }
 }
 
-// ---- 异常日（保留:31 天 z-score） ----
+// ---- 异常日（31 天 z-score） ----
 
 interface OutlierDay {
   ymd: string
@@ -333,7 +331,7 @@ function AnomalyBlock() {
     }
   }, [refreshTick])
 
-  // 逐日 z（热力条上色用）:样本 < 7 或 sd=0 全零窗口不判（起与 Tasks 离群共用 analytics.zScores）。
+  // 逐日 z（热力条上色用）:样本 < 7 或 sd=0 全零窗口不判（与 Tasks 离群共用 analytics.zScores）。
   const zByDay = useMemo(() => {
     const zs = days ? zScores(days.map((d) => d.total)) : null
     if (!days || !zs) return new Map<string, number>()
@@ -369,7 +367,7 @@ function AnomalyBlock() {
             {days.map((d) => {
               const z = zByDay.get(d.ymd)
               const isOut = z !== undefined && Math.abs(z) >= OUTLIER_Z
-              // |z| 强度落档:2~3 浅 / 3~4 中 / ≥4 深（按强度上色）
+              // |z| 强度落档:2~3 浅 / 3~4 中 / ≥4 深
               const zLevel = z === undefined ? '' : ` z${Math.min(4, Math.max(2, Math.floor(Math.abs(z))))}`
               const cls = isOut ? (z! > 0 ? ' is-high' : ' is-low') + zLevel : d.total > 0 ? ' is-flat' : ' is-zero'
               const zTxt = z === undefined ? 'not enough samples' : `${z > 0 ? '+' : ''}${z.toFixed(1)}σ`
@@ -393,7 +391,7 @@ function AnomalyBlock() {
   )
 }
 
-// ---- tokens × 积分（双组图,v3.1 可选组件,默认关） ----
+// ---- tokens × 积分（双组图;可选组件,默认关） ----
 
 function CreditBlock() {
   const [month, setMonth] = useState(() => {
@@ -402,8 +400,8 @@ function CreditBlock() {
   })
   const [summary, setSummary] = useState<CreditSummary | null>(null)
   const [loading, setLoading] = useState(false)
-  const [byModel, setByModel] = useState(false) // 区分模型开关（用户可选,设计 §9.5）
-  const [bucket, setBucket] = useState<'day' | 'hour'>('day') // v3.1 横轴粒度切换
+  const [byModel, setByModel] = useState(false) // 区分模型开关
+  const [bucket, setBucket] = useState<'day' | 'hour'>('day')
   const [refreshTick, setRefreshTick] = useState(0)
 
   useEffect(() => {
@@ -436,7 +434,7 @@ function CreditBlock() {
 
   return (
     <>
-      {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不再 auto 靠右*/}
+      {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不 auto 靠右*/}
       <header className="insight-toolbar">
         <span className="insight-card-title">tokens × credit · CodeBuddy</span>
         <Seg
@@ -500,7 +498,7 @@ function CreditBlock() {
  * + credit 日序列（credit_summary.by_day / by_model_day）。共享横轴:天粒度 =
  * 每日一组柱;小时粒度 = 每日内 24 根小时细柱（横轴仍按天分组,组内并排）。
  * credit 只有日粒度（daily_usage.credit）,小时档下曲线保持按日对齐。
- * 无积分的日断线表达（红线:勿伪装成 0）。 */
+ * 无积分的日断线表达,不伪装成 0。 */
 function ComboBlock({ month, summary, byModel, bucket }: {
   month: string
   summary: CreditSummary
@@ -527,7 +525,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   }, [])
 
   // tokens 侧:该月首日 → 月末（含未来日,tokens 轴恒整月;未来日无数据自然为 0）。
-  // input / output 各拉一条（合计维度也能拿到精确分项,零迁移部分）。
+  // input / output 各拉一条（合计维度也能拿到精确分项）。
   useEffect(() => {
     let cancelled = false
     const [y, m] = month.split('-').map(Number)
@@ -661,16 +659,15 @@ function dayValue(res: RangeSeriesResult, seriesIdx: number, _day: string, dayId
 }
 
 export default function InsightsView() {
-  // CodeBuddy 积分卡 = 可选组件（设置·General 开,默认关）——
+  // CodeBuddy 积分卡是可选组件（设置·General 开,默认关）:
   // 没用过 CodeBuddy 的用户不应看到常驻空引导卡。
   const [showCredit, setShowCredit] = useState(() => getDesignPrefs().insightsCredit)
   useEffect(() => subscribeDesignPrefs((p) => setShowCredit(p.insightsCredit)), [])
 
   const trend = useTrendBlock()
 
-  // 工具栏固定不随滚动——参照设置页结构:工具栏行在
-  // 滚动区外（flex-shrink:0）,只有 .insights-scroll 包着卡片做内容滚动;
-  // 此前整个 .insights-view 是滚动容器,滚动条贯穿工具栏。
+  // 工具栏固定不随滚动（与设置页同构）:工具栏行在滚动区外（flex-shrink:0）,
+  // 只有 .insights-scroll 包着卡片做内容滚动。
   return (
     <div className="insights-view">
       {trend.toolbar}

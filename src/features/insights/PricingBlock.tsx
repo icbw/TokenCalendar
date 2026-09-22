@@ -1,13 +1,11 @@
-// Insights 价格面板（S3）。
-// S1 把价格做成了带生效时间的一等数据、S2 把它与读数接成了五条只读命令,但到
-// 之前**用户一眼都没看见过**。本块是这条线的出口,三件事一张卡一件：
+// Insights 价格面板,三件事一张卡一件：
 //
 //   1) 美元当量 + 用量 × 价格 —— 这段时间的 token 若按官方 API 单价计费值多少钱,
 //      分模型列出,每个模型按它自己的价目生效段切开;
 //   2) 价格梯度 —— 分模型 × 生效期的单价阶梯图（同一模型一条线,降价处是台阶）;
 //   3) 官方价目对照表 —— 四项单价 + 出处,它解释了前两块的数字是怎么来的。
 //
-// **口径红线（-bis,文案里一个字都不能松）**：
+// **口径红线（文案里一个字都不能松）**：
 // - 美元当量**不是账单**。用户付的是固定订阅月费,这个数衡量的是等价价值 /
 //   机会成本,所以一律说「equivalent」「would cost」,绝不说「you spent」。
 // - `usd_unknown` 是「这部分价目是估的」的提示,**不是误差棒**。
@@ -201,7 +199,7 @@ export default function PricingBlock() {
         <RangeControl selection={selection} noun="Usage" />
       </div>
 
-      {/* ---- 1) 美元当量 + 用量 × 价格 ----*/}
+      {/* ---- 1) 美元当量 + 用量 × 价格 ---- */}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">Equivalent API value · {PLATFORM_LABEL[platform]}</span>
@@ -287,7 +285,7 @@ export default function PricingBlock() {
                         <span className="legend-swatch" style={{ background: colorFor(r.model_key) }} />
                         {/* 价目不可信时印 collector 的原始模型键,**不印折价目标的名字**：
                             codex-auto-review 折的是 gpt-5.6-luna,印成「GPT-5.6 Luna」就会与
-                            真正的 Luna 并排出现两行同名,谁也分不出哪行是哪行。*/}
+                            真正的 Luna 并排出现两行同名,谁也分不出哪行是哪行。 */}
                         {r.known ? r.display_name : r.model_key}
                         {!r.known && <span className="price-unknown-mark"> ≈</span>}
                       </td>
@@ -340,7 +338,7 @@ export default function PricingBlock() {
         )}
       </section>
 
-      {/* ---- 2) 价格梯度 ----*/}
+      {/* ---- 2) 价格梯度 ---- */}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">Price gradient · {UNIT_LABEL[unit]}</span>
@@ -399,7 +397,7 @@ export default function PricingBlock() {
         )}
       </section>
 
-      {/* ---- 3) 官方价目对照表 ----*/}
+      {/* ---- 3) 官方价目对照表 ---- */}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">Official price list · {PLATFORM_LABEL[platform]}</span>

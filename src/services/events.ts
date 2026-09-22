@@ -15,7 +15,7 @@ export function onUsageChanged(cb: () => void): Promise<Unlisten> {
   return listen<ChangedKeys>('usage:changed', () => cb())
 }
 
-// 双窗口可见性广播（Rust visibility.rs 单一源），载荷为 bool。
+// 挂件可见性广播（Rust visibility.rs 单一源），载荷为 bool。
 export function onWidgetVisibilityChanged(cb: (visible: boolean) => void): Promise<Unlisten> {
   return listen<boolean>('widget-visibility-changed', (v) => cb(v))
 }
@@ -36,7 +36,7 @@ export function onTimelineAttention(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('timeline:attention', () => cb())
 }
 
-// 时间轴形态广播（set_timeline_form 真变时发），载荷 'board' | 'strip'。
+// 时间轴形态广播（set_timeline_form 真变时发），载荷 'board' | 'strip' | 'peek'。
 export function onTimelineFormChanged(cb: (form: 'board' | 'strip' | 'peek') => void): Promise<Unlisten> {
   return listen<'board' | 'strip' | 'peek'>('timeline-form-changed', (f) => cb(f))
 }
@@ -45,7 +45,7 @@ export function onMainVisibilityChanged(cb: (visible: boolean) => void): Promise
   return listen<boolean>('main-visibility-changed', (v) => cb(v))
 }
 
-// 自绘标题栏：主窗口最大化状态广播（Rust Resized 去重后发），载荷为 bool。
+// 主窗口最大化状态广播（Rust Resized 去重后发，供自绘标题栏），载荷为 bool。
 export function onMainMaximizedChanged(cb: (maximized: boolean) => void): Promise<Unlisten> {
   return listen<boolean>('main-maximized-changed', (m) => cb(m))
 }
@@ -63,8 +63,8 @@ export function onSubscriptionChanged(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('subscription:changed', () => cb())
 }
 
-// 待机监控（Rust 侧待机态翻转后发:进入 = 安静满 10 分钟,退出 = 本地
-// agent 活动 / 用户注意）。载荷恒为 true——前端收到后重查 get_subscription_idle。
+// 待机监控（Rust 侧待机态翻转后发:进入 = 安静满 demand.rs QUIET_SECS（10 分钟）,
+// 退出 = 本地 agent 活动 / 用户注意）。载荷恒为 true——前端收到后重查 get_subscription_idle。
 export function onSubscriptionIdle(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('subscription:idle', () => cb())
 }
@@ -76,13 +76,13 @@ export function onOrbDockChanged(
   return listen<{ docked: boolean; edge: 'left' | 'right' | null }>('orb-dock-changed', (p) => cb(p))
 }
 
-// ㉝悬浮球被拖动（Rust orb_dock 在移动循环结束时判定窗口确实位移后发）：
+// 悬浮球被拖动（Rust orb_dock 在移动循环结束时判定窗口确实位移后发）：
 // 拖动过的这一次悬停不出 hover 提示（前端抑制,指针离开窗口复位）。
 export function onOrbDragged(cb: () => void): Promise<Unlisten> {
   return listen<boolean>('orb-dragged', () => cb())
 }
 
-// ㊻悬浮球「指针让出」（Rust orb_dock：光标离开交互主体 → 整窗对鼠标
+// 悬浮球「指针让出」（Rust orb_dock：光标离开交互主体 → 整窗对鼠标
 // 透明,回到主体 → 恢复）。让出期间 webview 收不到 mouseleave/mousemove,提示浮层
 // 必须由这条信号主动收起,否则会留一块"冻住"的提示挂在画布上。
 export function onOrbPointerPass(cb: (passed: boolean) => void): Promise<Unlisten> {

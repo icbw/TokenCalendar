@@ -10,8 +10,6 @@ mod data_root;
 #[cfg(debug_assertions)]
 mod dev_file_log;
 mod effects;
-#[cfg(test)]
-mod fixture;
 mod orb_dock;
 mod snap;
 mod startup_gate;
@@ -31,7 +29,7 @@ use tauri::{Manager, WindowEvent};
 use collector::store::Store;
 use data_root::DataRoot;
 
-/// 结构化 dev 日志宏：任意表达式拼接（调用方负责不含 token/密钥——凭据安全走查门覆盖）。
+/// 结构化 dev 日志宏：任意表达式拼接（调用方负责不含 token/密钥）。
 /// dev 构建双写文件 + 控制台；release 构建**不展开任何调用**（模块整体不进编译，
 /// 记参也不参与格式化——零成本、零文件写入）。定义在 crate 根：模块被 cfg 后
 /// 调用点（`crate:dev_log!`）仍处处可解析。
@@ -54,15 +52,15 @@ macro_rules! dev_log {
 pub struct AppState {
     /// 数据根（setup 首行解析,运行期不变;全部自有数据落点经此派生）。
     pub data_root: OnceLock<DataRoot>,
-    /// 采集暂停开关（起对采集轮询实际生效）。
+    /// 采集暂停开关（采集轮询据此跳过）。
     pub paused: AtomicBool,
-    /// 可见性单一源（起取代 window_mode 互斥模式）。
+    /// 挂件可见性（可见性单一源）。
     /// 初值为「首次启动」默认，setup 中由 window_state:restore 按落盘状态覆盖。
     pub widget_visible: AtomicBool,
     pub main_visible: AtomicBool,
-    /// 悬浮球可见性（默认 false——新窗口形态默认不弹，托盘/设置页开启）。
+    /// 悬浮球可见性（默认 false——默认不弹，托盘/设置页开启）。
     pub orb_visible: AtomicBool,
-    /// 项目推进时间轴可见性（默认 false——第四窗口默认不弹，托盘/设置页开启）。
+    /// 项目推进时间轴可见性（默认 false——默认不弹，托盘/设置页开启）。
     pub timeline_visible: AtomicBool,
     /// 落盘状态是否已由 `window_state:restore` 装载（false 期间 persist 拒写——
     /// 否则会把 AppState 初值当作「当前状态」覆盖 window-state.json,下次启动悬浮球
@@ -80,16 +78,16 @@ pub struct AppState {
     /// 挂件吸附状态（None = 自由态；写者 = snap 子类化线程与
     /// restore，persist/set_snap_state 消费）。
     pub widget_snap: Mutex<Option<snap::SnapState>>,
-    /// 吸附开关（应急停用杠杆,P3 设置页接线;文件缺省 = 开）。
+    /// 吸附开关（设置页控制;文件缺省 = 开）。
     pub widget_snap_enabled: AtomicBool,
     /// 悬浮球贴边停靠状态（None = 自由态;写者 = orb_dock 子类化
     /// 线程与 restore/命令,persist/get_orb_form 消费）。
     pub orb_dock: Mutex<Option<orb_dock::OrbDockState>>,
-    /// 悬浮球当前形态（true = 展开卡片）。Rust 侧权威副本：几何判定与
-    /// 点击穿透命中不再从窗口尺寸反推（跨屏 DPI 重排会让物理尺寸推不出逻辑尺寸）。
+    /// 悬浮球当前形态（true = 展开卡片）。Rust 侧权威副本：几何判定与点击穿透命中
+    /// 不从窗口尺寸反推（跨屏 DPI 重排会让物理尺寸推不出逻辑尺寸）。
     /// 写者 = set_orb_size 命令与 orb_dock 归位路径。
     pub orb_expanded: AtomicBool,
-    /// 注意力表（内存,不落库;写者 = 采集线程每轮 tick + ack 命令）。
+    /// 等待提醒注意力表（内存,不落库;写者 = 采集线程每轮 tick + ack 命令）。
     pub attention: Mutex<collector::attention::AttentionTable>,
     /// 时间轴形态（看板 / 条态 + 看板几何 + 条态位置宽度;写者 = set_timeline_form
     /// 与条态拖动落定,restore 装载,persist 消费）。
@@ -103,11 +101,9 @@ fn main() {
     tauri::Builder::default()
         // 单实例守卫：挂件常驻 + close=hide 场景下重复启动会堆出双份托盘/挂件；
         // 二次启动转发到首实例（把挂件唤回可）后立即退出。必须最先注册。
-        // dev/安装版隔离：插件互斥体名 = `{identifier}-sim`，两构建
-        // 共用 identifier 时同名——dev 常驻时双击安装版 exe 会被 FindWindowW 转发进
-        // dev 进程并 exit（0)（用户看到的"安装版"实为 dev 窗口，显示 dev 数据目录）。
-        // dev 经 tauri.dev.conf.json 覆盖 identifier（见 package.json dev:full），
-        // 两构建互斥体/窗口类名分流，可并存。
+        // 插件互斥体名 = `{identifier}-sim`：dev 与安装版若共用 identifier,双击安装版 exe 会被
+        // FindWindowW 转发进常驻的 dev 进程并退出。dev 经 tauri.dev.conf.json 覆盖 identifier
+        // （见 package.json dev:full），两构建互斥体/窗口类名分流，可并存。
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Err(e) = visibility::set_visible(app, visibility::WIDGET_LABEL, true) {
                 crate::dev_log!("[single-instance] show widget failed: {}", e);
@@ -232,22 +228,20 @@ fn main() {
         ]))
         .setup(move |app| {
             let handle = app.handle().clone();
-            // dev 文件日志最先初始化（仅 dev 构建;落 %TEMP%\tokencalendar-dev-logs\,
-            // Agent 诊断可读;release 不编译此模块——零写入）
+            // dev 文件日志最先初始化（仅 dev 构建,release 不编译此模块）
             #[cfg(debug_assertions)]
             dev_file_log::init();
             dev_log!("[boot] tokencalendar {} starting", env!("CARGO_PKG_VERSION"));
             // 数据根最先解析（全部自有数据落点的前置依赖;dev/安装版在此分流）
             let _ = handle.state::<AppState>().data_root.set(data_root::init(&handle));
-            // 窗口形态一次性装配（边缘原子组合原样复用，此后不再切换）
+            // 各窗口边缘组合启动装配（见 chrome.rs）
             if let Some(w) = handle.get_webview_window("widget") {
                 chrome::apply_widget_chrome(&w);
             }
             if let Some(w) = handle.get_webview_window("main") {
                 chrome::apply_main_chrome(&w);
             }
-            // 悬浮球：边缘处置同挂件「系统全静默 + CSS 全权」组合
-            // （无材质档，组合固定不切换——）
+            // 悬浮球：边缘处置同挂件「系统全静默 + CSS 全权」组合（无材质档，组合固定不切换）
             if let Some(w) = handle.get_webview_window("orb") {
                 chrome::apply_orb_chrome(&w);
             }
@@ -255,17 +249,15 @@ fn main() {
             if let Some(w) = handle.get_webview_window("timeline") {
                 chrome::apply_timeline_chrome(&w);
             }
-            // Windows「文本大小」感知：WebView2 把辅助功能文本缩放绑在 DPI 上
-            // 整体放大内容,Win32 DPI 不知情 ⇒ 固定尺寸的悬浮球主体/让出区域与实际表盘
-            // 错位（只剩左上角一道弧）。启动先读一次缓存系数,orb_dock 的物理换算乘上它
-            // （必须早于 restore_orb 的归位写入）;运行时改设置由 orb 子类化的
+            // Windows「文本大小」感知：WebView2 把辅助功能文本缩放绑在 DPI 上整体放大内容,
+            // Win32 DPI 不知情 ⇒ 固定尺寸的悬浮球主体/让出区域与实际表盘错位。启动先读一次缓存系数,
+            // orb_dock 的物理换算乘上它（必须早于 restore_orb 的归位写入）;运行时改设置由 orb 子类化的
             // WM_SETTINGCHANGE 刷新并重放（text_scale.rs）。
             text_scale::refresh();
             // 悬浮球贴边停靠：子类化 orb 窗口拦 WM_EXITSIZEMOVE
-            // （松手贴缘→dock 收起/离缘→undock 展开;与 snap.rs 同通道模式,
-            // 各自子类化各自窗口互不干扰）
+            // （松手贴缘→dock 收起/离缘→undock 展开;与 snap.rs 各自子类化各自窗口,互不干扰）
             // ⚠ 必须排在 window_state:restore **之前**：restore_orb 的归位写入要
-            // 经 apply_desired 记「意图」。
+            // 经 apply_desired 记「意图」（后续 DPI 变更可重放的前提）。
             orb_dock::install(&handle);
             // 恢复上次会话的窗口位置/尺寸与可见性标志（不直接 show，
             // 显示统一由前端首帧后的 window_ready 裁决）
@@ -274,8 +266,8 @@ fn main() {
             // 子类化约束条态拖动（钉顶缘横向滑动）并在显示器 / 文本大小变化时重施
             timeline_form::restore(&handle);
             timeline_form::install(&handle);
-            // 边缘吸附：子类化 widget 窗口拦 WM_ENTERSIZEMOVE/
-            // EXITSIZEMOVE/MOVING（S1 通道探针零行为变更，无条件转发消息链）
+            // 挂件网格吸附：子类化 widget 窗口拦 WM_ENTERSIZEMOVE/
+            // EXITSIZEMOVE/MOVING（无条件转发消息链）
             snap::install(&handle);
             // 最小托盘：主窗口关闭 = 隐藏后，退出兜底在此
             tray::init(&handle)?;

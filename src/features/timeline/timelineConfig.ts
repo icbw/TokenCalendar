@@ -1,22 +1,22 @@
-// 项目推进时间轴常量。过去 / 未来天数首期是常量不进设置（/）。
+// 项目推进时间轴常量。
 
-/** 时间窗默认值（进设置：prefs timelinePastDays / timelineFutureDays,0〜30）。
- * 31 天太多——每格只能放一个会话;默认收到 7 + 今天 + 7。 */
+/** 时间窗默认值（可在设置中改：prefs timelinePastDays / timelineFutureDays,0〜30）。
+ * 天数过多时每格只能放一个会话,默认 7 + 今天 + 7。 */
 export const TIMELINE_PAST_DAYS = 7
 export const TIMELINE_FUTURE_DAYS = 7
-/** ：过去每天显示的会话数 / 今天显示的会话数默认值（prefs timelinePastSessions / timelineTodaySessions）。 */
+/** 过去每天显示的会话数 / 今天显示的会话数默认值（prefs timelinePastSessions / timelineTodaySessions）。 */
 export const TIMELINE_PAST_SESSIONS = 1
 export const TIMELINE_TODAY_SESSIONS = 5
 /** 格内滚动：点击格子临时展开到的可见会话数（设置值更大时取设置值）;
- * 格子失焦自动折回设置状态。首期是常量不进设置。 */
+ * 格子失焦自动折回设置状态。不进设置。 */
 export const TIMELINE_EXPANDED_SESSIONS = 5
 
 /** 「⚠ Nd」未动徽章的最小天数（小于此值不显示,避免噪音）。 */
 export const INACTIVE_BADGE_DAYS = 3
 
-/** 格子尺寸范围：
- * 项目列宽 / 会话格高。显示项目数 = min（设置上限, 容量),容量按面板宽除以最小列宽;
- * 超出最小尺寸的窗口在 [min, max] 之间等分,再多留白。横向日程视图删除,其常量随之移除。 */
+/** 格子尺寸范围（逻辑像素）：项目列宽 / 会话格高。格子有最小尺寸,拉伸到最小后不再缩小。
+ * 未设监测项目组时显示项目数 = 容量,容量按面板宽除以最小列宽;
+ * 超出最小尺寸的窗口在 [min, max] 之间等分,再多留白。 */
 export const COL_MIN_PX = 140
 export const COL_MAX_PX = 320
 /** 容量只认看板态的量值：看板区高低于此值 = 窗口还是条态几何（条态窗口高 ≤ 41,看板最小高 200
@@ -27,11 +27,11 @@ export const DEFAULT_CAPACITY = 5
 /** 会话格（一格一会话,向下堆叠）最小高;空日行最小高。 */
 export const ITEM_MIN_PX = 36
 export const EMPTY_DAY_MIN_PX = 26
-/** 顶栏项目表头行高;
+/** 顶栏项目表头行高（顶栏高度由它决定;容纳项目名 + 未动徽章两行）;
  * 左侧日标签列宽。 */
 export const BAR_HEAD_PX = 32
 export const DAY_LABEL_COL_PX = 46
-/** 顶栏右侧按钮区宽:面板右侧留同宽,顶栏表头网格与面板网格列对齐。 */
+/** 顶栏右侧按钮区宽（只有折条按钮）:面板右侧留同宽,顶栏表头网格与面板网格列对齐。 */
 export const BAR_ACTIONS_PX = 36
 /** 外观 alpha 默认值（prefs timelineBgAlpha / timelineBarAlpha / timelineCellAlpha）。 */
 export const TIMELINE_BG_ALPHA = 0.55
@@ -47,7 +47,7 @@ export const STRIP_SHADOW_PAD_PX = 5
 /** 条态无操作（指针不在窗口、无亮起项目）多久后收成窥视态细边。 */
 export const PEEK_DELAY_MS = 5000
 
-/** hover 状态卡显示延迟 / 收尾宽限（对齐 orb ㉝ 的手感档）。 */
+/** hover 状态卡显示延迟 / 收尾宽限（与 orb hover 卡同一手感档）。 */
 export const HOVER_DELAY_MS = 350
 export const HOVER_GRACE_MS = 140
 

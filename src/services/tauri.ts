@@ -1,5 +1,5 @@
 // Tauri 运行环境探测 + invoke 容错封装。
-// 失败统一返回 null，保持旧项目「取数失败 → 降级 mock/空态」的路径不变。
+// 失败统一返回 null，调用方据此走降级（mock / 空态）。
 
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 

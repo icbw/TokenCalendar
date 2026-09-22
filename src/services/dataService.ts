@@ -1,4 +1,4 @@
-// 数据管理契约封装。
+// 数据管理契约封装（设置·Data tab）。
 // 全部经 tryInvoke 容错:非 Tauri 环境（纯前端 dev）返回 null,UI 走降级文案。
 
 import { tryInvoke } from './tauri'

@@ -1,6 +1,6 @@
-//! 窗口几何与可见性持久化。
+//! 窗口几何与可见性持久化（window-state.json）。
 //!
-//! 单一源在 AppState 的两个可见性原子标志；本模块只负责：
+//! 单一源在 AppState 的各窗口可见性原子标志与形态状态；本模块只负责：
 //! - restore：启动时读取 window-state.json，恢复各窗口位置/尺寸 + 填充标志
 //!   （**不直接 show**——显示统一走 window_ready，由前端首帧提交后裁决，保白闪对策）；
 //! - persist：把当前几何写回（Moved/Resized 事件 2s 节流 + 显隐变更时即时写）。
@@ -40,21 +40,20 @@ struct WindowStateFile {
     /// 悬浮球可见性（默认 false——新窗口形态默认不弹）。
     #[serde(default, skip_serializing_if = "is_false")]
     orb_visible: bool,
-    /// 吸附状态（None = 自由态；serde default 向后兼容旧文件）。
+    /// 挂件吸附状态（None = 自由态；serde default 向后兼容旧文件）。
     /// 枚举类型化：坏值（如 edge:"bogus"）在整体反序列化时失败 → 走剥离
     /// 重试路径（几何保住、吸附回自由态），写侧由类型保证无坏值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     widget_snap: Option<crate::snap::SnapState>,
-    /// 吸附开关（应急停用杠杆，P3 设置页接线；default true）。
+    /// 吸附开关（应急停用杠杆，设置页可改；default true）。
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     widget_snap_enabled: bool,
-    /// 贴边停靠态（拖到屏幕边缘松手→收起竖条
-    /// 贴边;serde default 向后兼容）。None = 自由态。
+    /// 悬浮球贴边停靠态（拖到屏幕边缘松手→收起竖条贴边;serde default 向后兼容）。
+    /// None = 自由态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     orb_dock: Option<crate::orb_dock::OrbDockState>,
-    /// 启动形态（「启动恢复上次退出前的形态与位置,
-    /// 首次默认表盘/感知一致性」;serde default 向后兼容——旧文件缺失时按落盘
-    /// 尺寸反推形态）。
+    /// 悬浮球启动形态（启动恢复上次退出前的形态与位置,首次默认表盘;
+    /// serde default 向后兼容——旧文件缺失时按落盘尺寸反推形态）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     orb_expanded: Option<bool>,
     /// 项目推进时间轴几何（serde default 向后兼容旧文件）。
@@ -63,12 +62,11 @@ struct WindowStateFile {
     /// 时间轴可见性（默认 false——新窗口默认不弹）。
     #[serde(default, skip_serializing_if = "is_false")]
     timeline_visible: bool,
-    /// 时间轴形态（board 看板 / strip 条态；S1 只声明字段随文件透传，
-    /// 起由 set_timeline_form 写入并在 restore 恢复上次形态——同 orb）。
+    /// 时间轴形态（board 看板 / strip 条态），由 set_timeline_form 写入、restore 恢复上次形态。
     /// 枚举类型化：坏值整体反序列化失败 → 走剥离重试路径回 None（看板态）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline_form: Option<TimelineForm>,
-    /// 条态水平位置（物理像素 x；屏归属按看板态所在屏；S4 消费）。
+    /// 条态水平位置（物理像素 x；屏归属按看板态所在屏）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline_strip_x: Option<i32>,
     /// 条态内容宽（CSS 像素，前端量出）——启动恢复条态时首帧即用上次宽度，
@@ -101,7 +99,7 @@ fn default_true() -> bool {
 impl Default for WindowStateFile {
     fn default() -> Self {
         // 首次启动（无状态文件）：挂件可见、主窗口隐藏（产品核心是挂件常驻）；
-        // 悬浮球默认隐藏（新形态不弹，托盘/设置页开启）
+        // 悬浮球 / 时间轴默认隐藏，托盘/设置页开启
         Self {
             widget: None,
             main: None,
@@ -131,18 +129,16 @@ fn load(app: &AppHandle) -> WindowStateFile {
     match std::fs::read_to_string(&path) {
         Ok(raw) => match serde_json::from_str(&raw) {
             Ok(file) => file,
-            // 读取防御：吸附字段坏值不应拖垮几何恢复——剥离两个
-            // snap 字段重试（JSON Value 侧删键），仍失败才回默认。
+            // 读取防御：枚举类型化字段坏值不应拖垮几何恢复——剥离这些
+            // 字段重试（JSON Value 侧删键），仍失败才回默认。
             Err(_) => strip_snap_fields_retry(&raw).unwrap_or_default(),
         },
         Err(_) => WindowStateFile::default(),
     }
 }
 
-/// 剥离 `widget_snap*` 字段后重试解析（防坏吸附状态污染几何恢复；曾
-/// 扩到 orb_snap 后又随「悬浮球不吸附」收回，剥离列表保留冗余键无害）。
-/// `timeline_form` 是枚举类型化字段,坏值同样会让整文件反序列化失败,
-/// 一并剥离（连同 `timeline_strip_x`）——否则 S4 写入路径一旦落坏值会拖垮全部几何恢复。
+/// 剥离吸附与时间轴形态字段后重试解析：它们是枚举类型化字段，坏值会让整文件反序列化失败、
+/// 拖垮全部几何恢复。`orb_snap` 已无对应字段，保留在列表里无害。
 fn strip_snap_fields_retry(raw: &str) -> Option<WindowStateFile> {
     let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
     if let Some(obj) = value.as_object_mut() {
@@ -177,17 +173,15 @@ fn read_geom(window: &tauri::WebviewWindow) -> Option<WindowGeom> {
     if window.is_minimized().unwrap_or(true) {
         return None;
     }
-    // 最大化：最大化几何是「向工作区外溢
-    // 一圈边框」的临时态，
-    // 落盘后下次启动被当普通尺寸恢复 → 非 maximized 态却顶满屏幕。返回 None =
+    // 最大化几何是「向工作区外溢一圈边框」的临时态（如 -40,-167 / 2618×1690 vs 工作区
+    // 2560×1368），落盘后下次启动被当普通尺寸恢复 → 非 maximized 态却顶满屏幕。返回 None =
     // persist 保留上次落盘的还原几何；unmaximize 后的 Resized 事件正常落盘。
     if window.is_maximized().unwrap_or(false) {
         return None;
     }
     let PhysicalPosition { x, y } = window.outer_position().ok()?;
     // 尺寸必须记 inner（client）——set_size 的语义就是设置 inner；若记 outer，
-    // 每次「restore→set_size」会把边框再叠一层，decorated 窗口每会话膨胀一圈
-    //。
+    // 每次「restore→set_size」会把边框再叠一层，decorated 窗口每会话膨胀一圈。
     let PhysicalSize { width, height } = window.inner_size().ok()?;
     Some(WindowGeom { x, y, width, height })
 }
@@ -244,9 +238,8 @@ pub fn restore(app: &AppHandle) {
     let mut orb_expanded: Option<bool> = None;
     for (label, geom) in pairs {
         let Some(window) = app.get_webview_window(label) else { continue };
-        // orb 走专用恢复（启动恢复上次退出前的贴边位置,
-        // **首次默认表盘**;订：未贴边一律表盘,竖条只属于贴边）——
-        // 几何为 None（首次启动）也要进,不能按「无记录跳过」。
+        // orb 走专用恢复（恢复上次退出前的贴边位置,首次默认表盘;未贴边一律表盘,
+        // 竖条只属于贴边）——几何为 None（首次启动）也要进,不能按「无记录跳过」。
         if label == "orb" {
             #[cfg(windows)]
             {
@@ -310,7 +303,7 @@ pub fn restore(app: &AppHandle) {
                 ..Default::default()
             };
         }
-        // 启动形态（restore_orb 结果:贴边 = 竖条 false、未贴边/首次 = 表盘 true）
+        // 悬浮球启动形态（restore_orb 结果:贴边 = 竖条 false、未贴边/首次 = 表盘 true）
         // ——前端挂载按它对齐（Rust 侧几何已先按此恢复）。
         if let Some(e) = orb_expanded {
             state.orb_expanded.store(e, std::sync::atomic::Ordering::SeqCst);
@@ -402,7 +395,7 @@ pub fn persist_throttled(app: &AppHandle, state: &AppState) {
 
 // ---------- 吸附状态访问（snap 子类化线程调用；单一源 = AppState） ----------
 
-/// 吸附开关（应急停用杠杆；文件缺省 = 开；仅挂件参与格网吸附——用户
+/// 吸附开关（应急停用杠杆；文件缺省 = 开；仅挂件参与格网吸附，
 /// 悬浮球不格网化，此开关与 orb 无关）。
 pub fn widget_snap_enabled(app: &AppHandle) -> bool {
     app.state::<AppState>()
@@ -410,7 +403,7 @@ pub fn widget_snap_enabled(app: &AppHandle) -> bool {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 指定窗口的吸附状态（None = 自由态；label = widget/orb，未知 label 回 None）。
+/// 指定窗口的吸附状态（None = 自由态；只有 widget 参与吸附，其余 label 回 None）。
 pub fn snap_state_for(app: &AppHandle, label: &str) -> Option<crate::snap::SnapState> {
     let state = app.state::<AppState>();
     let guard = match label {

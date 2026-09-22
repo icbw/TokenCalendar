@@ -1,7 +1,6 @@
-/* Matrix view: toolbar + layout for expanded mode （对齐挂件设计语言：
-   分段控件改挂件同款 pill — 面板底 + 活动段白卡，替代旧描边连体按钮)。
-   热力图是主体——矩阵区 flex:1 全量显示不滚动;overflow 移除,
-   行多时格子按可用高度收缩（格子 min 10px 保底,极端行数才允许容器滚动）。 */
+/* Matrix view: toolbar + layout for expanded mode. 分段控件用挂件同款 pill（面板底 + 活动段白卡）。
+   热力图是主体:矩阵区 flex:1 全量显示不滚动,格子由 UsageMatrixView 按可用宽高
+   等比缩放（8〜17px）。 */
 
 .matrix-view {
   display: flex;
@@ -10,14 +9,13 @@
   height: 100%;
   padding: 12px;
   min-height: 0;
-  /* 图表面板改为覆盖在本区底部的浮层（absolute 锚定）,本区做裁剪边界 */
   position: relative;
   overflow: hidden;
 }
 
-/* 矩阵 + 图表面板的共同舞台——UsageMatrixView 在 style 上生成的
+/* 矩阵 + 图表面板的共同舞台——UsageMatrixView 写入的
    --cell-px/--cell-gap-px/--cells-w 共享变量挂在这里,面板（stage 的直接
-   子元素）才能继承;此前面板是 .matrix-view 的兄弟节点,变量断链。 */
+   子元素,.matrix-view 的兄弟节点）才能继承。 */
 .matrix-stage {
   display: flex;
   flex-direction: column;
@@ -26,7 +24,7 @@
   position: relative;
 }
 
-/* 图表面板浮层化后 .matrix-view 不再需要自己当裁剪边界（stage 接管定位） */
+/* 图表面板浮层由 .matrix-stage 接管定位,.matrix-view 不当裁剪边界（覆盖上方的 relative / overflow） */
 .matrix-view {
   position: static;
   overflow: visible;
@@ -144,23 +142,19 @@
   color: var(--text-faint);
 }
 
-/* ---- v3.2/v3.4:热力图主体化——矩阵占满工具栏以下全部高度（面板浮层不再
-   参与竖向分蛋糕）;格子 CSS 单源封顶 minmax（10px, 24px),只缩不放;行数超
-   可用高度时在本区内裁剪（overflow hidden）,不溢出不滚动。 ---- */
+/* ---- 热力图主体化——矩阵占满工具栏以下全部高度（面板浮层不参与竖向分配）;
+   格子尺寸由 JS 写入 --cell-px;行数超可用高度时在本区内裁剪（overflow hidden）,
+   不溢出不滚动。 ---- */
 .matrix-view .month-matrix {
   flex: 1;
   min-height: 0;
   overflow: hidden;
 }
 
-/* 行数超上限提示（已撤:超限行静默隐藏,避免占一条垂直空间;
-   上限在设置页 Matrix → Max rows 调整） */
-
-/* ---- 图表面板（定稿）:stage 底部透明浮层——
+/* ---- 图表面板:stage 底部透明浮层——
    图表放中列（宽度恒 = --cells-w,居中 = 格子区正下方,slot 中心 = 格子中心,
-   横轴完全对齐）;图标列回面板最右缘（图标本为降干扰,贴边
-   不怕远离）;折叠/展开钮在图标列正下方同一坐标（left 公式以 stage
-   为包含块后失效,统一改右缘锚定）。 ---- */
+   横轴完全对齐）;图标列在面板最右缘;折叠/展开钮在图标列正下方同一坐标
+   （以 stage 为包含块,右缘锚定）。 ---- */
 .matrix-panel {
   position: absolute;
   left: 0;
@@ -224,8 +218,8 @@
   background: var(--zero-bg);
 }
 
-/* 渐变柔光底撤销——全透明。曲线/数据点/tooltip 是 SVG 实色绘制,
-   与容器背景无关,不会跟着透明;热力图行完整从曲线间隙透出。 */
+/* 全透明:曲线/数据点/tooltip 是 SVG 实色绘制,与容器背景无关,
+   热力图行完整从曲线间隙透出。 */
 .matrix-panel-chart-bg {
   display: none;
 }

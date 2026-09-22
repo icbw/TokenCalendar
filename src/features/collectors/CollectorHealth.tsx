@@ -1,4 +1,4 @@
-// CollectorHealth：采集器健康状态条（接真实 CollectorService.ListSources）
+// CollectorHealth：采集器健康状态条（数据来自 CollectorService.ListSources）
 import { useEffect, useState } from 'react'
 import { collectorService, type SourceSummary } from '../../services'
 import './health.css'

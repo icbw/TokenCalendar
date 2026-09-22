@@ -1,27 +1,21 @@
 //! 数据根目录解析。
 //!
-//! - **数据根** = 一切自有运行时数据（collector.db / prefs.json /
-//!   window-state.json / exports）的唯一父目录。
-//!   默认 `<exe 目录>\data`（安装版即 `D:\Program\TokenCalendar\data`）,
-//!   首次启动时惰性创建;创建/写入失败（只读盘、绿色版放只读目录等）→
+//! - **数据根** = 一切自有运行时数据（collector.db / prefs.json / window-state.json / exports）
+//!   的唯一父目录。默认 `<exe 目录>\data`,首次启动时惰性创建;创建/写入失败（只读盘等）→
 //!   回退 `%LOCALAPPDATA%\com.tokencalendar.app\`。
-//! - **指针** `<anchor>\data-root.json`：用户在设置里迁移数据根后,记录新根的
-//!   绝对路径;anchor 固定为 Tauri `app_local_data_dir`（永远可写,不随迁移走）。
+//! - **指针** `<anchor>\data-root.json`：用户在设置里迁移数据根后记录新根的绝对路径;
+//!   anchor 固定为 Tauri `app_local_data_dir`（永远可写,不随迁移走）。
 //!   指针缺失/损坏/指向不存在目录 → 用默认根,不报错。
-//! - dev（debug 构建）与安装版天然隔离：anchor 目录追加 `.dev` 后缀
-//!   （`com.tokencalendar.app.dev`）,两套数据互不可。
+//! - dev（debug 构建）的 anchor 目录追加 `.dev` 后缀（`com.tokencalendar.app.dev`）,与安装版数据互不可。
 //!
-//! 路径解析在启动早期（setup 首行）做一次,结果存 AppState 供全部消费者
-//! （collector / window_state / commands / prefs）取用,运行期不变——迁移
-//! 命令写入新指针后提示用户重启生效。
+//! 路径在 setup 首行解析一次,结果存 AppState 供全部消费者（collector / window_state / commands / prefs）
+//! 取用,运行期不变——迁移命令写入新指针后提示用户重启生效。
 
 use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager};
 
-/// 指针文件名（位于 anchor 目录下）。
 const POINTER_FILE: &str = "data-root.json";
-/// 默认数据根相对 exe 的子目录名。
 const DATA_DIR_NAME: &str = "data";
 
 /// 解析结果。`root` 一定是目录形态的绝对路径;`custom` 仅诊断展示用。
@@ -41,8 +35,8 @@ impl DataRoot {
     pub fn db_path(&self) -> PathBuf {
         self.root.join("collector.db")
     }
-    /// 订阅快照库（与 collector.db 独立——在线账户额度 ≠ 本机用量聚合,
-    /// 数据链路独立;作为数据根成员天然获得迁移/备份语义）。
+    /// 订阅快照库,与 collector.db 独立（在线账户额度与本机用量聚合是两条数据链路）;
+    /// 放在数据根下以随之迁移/备份。
     pub fn subscriptions_db_path(&self) -> PathBuf {
         self.root.join("subscriptions.db")
     }
@@ -133,10 +127,8 @@ pub fn resolve(app: &AppHandle) -> DataRoot {
 }
 
 /// 默认根 = exe 同级 `data\`（安装版 = 安装目录内,卸载器只删自装文件,数据幸存;
-/// dev = target/debug/data,与安装版天然分离——anchor 层已再隔离一层）。
-/// 安装协议：数据缓存跟随安装目录,用户目录只放
-/// 指针/偏好等小型 JSON（anchor）。路径一律运行期由 current_exe 派生,
-/// 代码中不存在任何写死的根路径。
+/// dev = target/debug/data）。数据缓存跟随安装目录,用户目录只放指针/偏好等小型 JSON（anchor）。
+/// 路径一律运行期由 current_exe 派生,不写死根路径。
 fn default_root_of(_app: &AppHandle) -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -144,7 +136,7 @@ fn default_root_of(_app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DATA_DIR_NAME))
 }
 
-/// 解析结果一次性写入 AppState 全局（`AppState.data_root: OnceLock<DataRoot>`）。
+/// 解析并记日志;调用方把结果写入 `AppState.data_root: OnceLock<DataRoot>`。
 pub fn init(app: &AppHandle) -> DataRoot {
     let dr = resolve(app);
     crate::dev_log!(

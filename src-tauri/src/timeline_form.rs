@@ -1,6 +1,6 @@
-//! 时间轴两态：看板（board）↔ 条态（strip）。
+//! 时间轴形态：看板（board）↔ 条态（strip）,条态下另有窥视子态（peek）。
 //!
-//! **形态切换一个执行者**（硬约束 4）：`set_timeline_form` 在 Rust 侧原子完成
+//! **形态切换一个执行者**：`set_timeline_form` 在 Rust 侧原子完成
 //! 尺寸 + 位置 + alwaysOnTop + 可缩放锁,前端只发意图、按 `timeline-form-changed` 跟随,
 //! 不自行补偿位置。
 //!
@@ -13,12 +13,13 @@
 //!   `WM_EXITSIZEMOVE` 落定 `strip_x` 并落盘。拖到另一块屏 → 看板几何随之平移到该屏
 //!   （保持「条与看板同屏」不变式,于是重启恢复与展开都不会跑回旧屏）。
 //!
-//! 多显示器口径（红线）：「显示器枚举 + 该屏 rcWork + 该屏 scale」,不用窗口缓存
+//! 多显示器口径：「显示器枚举 + 该屏 rcWork + 该屏 scale」,不用窗口缓存
 //! scale;scale 乘文本缩放（text_scale.rs：WebView 内容按 DPI × 文本大小渲染,CSS 像素换
 //! 物理必须带上它——跟随系统文本大小,不用 set_zoom 抵消）。
-//! 窥视态 peek：条态的第二档——条态 5 秒无操作（指针不在、无亮起项目,前端计时）
-//! 收成贴顶的短小把手（`PEEK_W_LOGICAL` × `PEEK_H_LOGICAL`,居中于原条;窗口内 CSS 画 4px 半透明条 + 窄阴影,
-//! 整条宽的透明边白底下看不见、又宽易误触 → 缩窄 + 加阴影）,不挡全屏窗口;指针移入 / 出现亮起项目 / 托盘显示 → 回完整条态。
+//!
+//! 窥视态 peek：条态 5 秒无操作（指针不在、无亮起项目,前端计时）收成贴顶的短小把手
+//! （`PEEK_W_LOGICAL` × `PEEK_H_LOGICAL`,居中于原条;窗口内 CSS 画 4px 半透明条 + 窄阴影——
+//! 整条宽的透明边在白底下看不见且易误触）,不挡全屏窗口;指针移入 / 出现亮起项目 / 托盘显示 → 回完整条态。
 //! peek 是运行时子态,不落盘（持久化形态仍是 strip,重启回完整条态再计时）;对前端表现为第三个形态名 "peek"。
 //!
 //! 遮挡自动折：时间轴不进任务栏,被遮住就难召回——看板态下后台线程每
@@ -34,8 +35,7 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview
 use crate::window_state::TimelineForm;
 use crate::AppState;
 
-/// 条态高度（CSS / 逻辑像素;~36,首期常量不进设置）。
-/// 条态加与窥视把手同款窄阴影 → 窗口高 = 36 可见条 + 5 下方阴影透明边
+/// 条态窗口高（CSS / 逻辑像素）= 36 可见条 + 5 下方窄阴影透明边
 /// （左右各 5 的阴影边由前端量宽时计入;与 timeline.css `--tl-edge-pad` 同源）。
 pub const STRIP_H_LOGICAL: f64 = 41.0;
 /// 窥视态窗口尺寸（CSS / 逻辑像素）:宽 = 短把手;高 = 4px 可见条 + 下方 / 两侧留给 CSS 窄阴影的透明边。
@@ -151,7 +151,7 @@ pub fn peek_rect(strip: Rect, scale: f64) -> Rect {
 
 /// 条态宽度更新（不切形态）：只在条态（含窥视态）且宽度有效、确有变化时记下并要求重施几何。
 /// 看板态一律忽略——前端量宽回调与形态广播先后不定（展开时窗口先变大、`timeline-form-changed` 后到）,
-/// 迟到的宽度更新不得把刚展开的看板折回条态（无监测组时展开即缩回）。
+/// 迟到的宽度更新不得把刚展开的看板折回条态。
 pub fn update_strip_width(st: &mut FormState, w: f64) -> bool {
     if st.form != TimelineForm::Strip || !w.is_finite() || w <= 0.0 {
         return false;

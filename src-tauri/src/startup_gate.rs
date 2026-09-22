@@ -1,11 +1,9 @@
 //! 启动闸门：setup 完成前到达的前端 IPC 暂存,setup 末尾按到达顺序重放。
 //!
-//! 根因：Tauri 在 `RunEvent:Ready` 里先按配置逐个创建窗口、**再**调用
-//! setup 闭包;WebView2 建窗期间会泵消息,先建好的窗口页面已加载并发出 IPC——
-//! `get_visibility` / `window_ready` 比 setup 首行早约 240ms 被执行,读到的是 AppState
-//! 初值（悬浮球不可见、未贴边、竖条）,而不是 `window_state:restore` 装载的落盘状态。
-//! 窗口越多（第四窗口 timeline 排在 orb 之后创建）,前面窗口抢跑的时间越长。
-//! 症状：主界面顶栏 Orbit 按钮不亮、悬浮球前端以为「未贴边竖条」而 Rust 已贴边归位。
+//! 原因：Tauri 在 `RunEvent:Ready` 里先按配置逐个创建窗口、**再**调用 setup 闭包;
+//! WebView2 建窗期间会泵消息,先建好的窗口页面已加载并发出 IPC——`get_visibility` /
+//! `window_ready` 会早于 setup 首行被执行,读到 AppState 初值（悬浮球不可见、未贴边、竖条）,
+//! 而不是 `window_state:restore` 装载的落盘状态。窗口越多,前面窗口抢跑的时间越长。
 //!
 //! 做法：包一层 invoke handler——闸门未开时把 `Invoke` 原样入队（前端 promise 挂起等待,
 //! 无需任何前端改动）;setup 末尾 `open` 按序重放。插件命令（事件订阅等）不经此处,

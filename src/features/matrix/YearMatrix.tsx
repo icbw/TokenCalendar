@@ -1,11 +1,9 @@
-// YearMatrix: tokscale-style card widget （自前代项目移植).
-// 53 week-columns x 7 day-rows in a rounded card. 形态精：
-// - chrome（标题/分段控制/操作按钮）改为 hover 浮层（不占常驻空间，热力图
-//   静止时占满卡片，三档面积占比均 ≥ 2/3）；
-// - 尺寸预设三档（large/medium/small，单一源 SIZE_PRESETS），切换即重设
-//   窗口尺寸（Rust 侧几何落盘兜底）；
-// - 格子提示统一用主窗口的 MatrixTooltip 组件与格式（替换原生 title）。
-// 取数层：Tauri invoke（services），聚合逻辑保持不变。
+// YearMatrix: tokscale-style card widget.
+// 53 week-columns x 7 day-rows in a rounded card:
+// - chrome（操作按钮）与月标签均为 hover 浮层，不占常驻空间，热力图静止时占满卡片；
+// - 尺寸预设三档（单一源 SIZE_PRESETS），切换即重设窗口尺寸（Rust 侧几何落盘兜底）；
+// - 格子提示用主窗口的 MatrixTooltip 组件与格式。
+// 取数层：Tauri invoke（services）。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, inTauri, usageService, windowService } from '../../services'
 import { cellVisual } from './matrixScale'
@@ -26,7 +24,7 @@ import './yearMatrix.css'
 type Granularity = 'daily' | 'weekly' | 'cumulative'
 
 const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-/** 粒度单钮循环顺序与显示名（三档分段控制合并为一个图标钮）。 */
+/** 粒度单钮循环顺序与显示名。 */
 const GRANULARITY_CYCLE: Granularity[] = ['daily', 'weekly', 'cumulative']
 const GRANULARITY_LABEL: Record<Granularity, string> = {
   daily: 'Daily',
@@ -36,10 +34,9 @@ const GRANULARITY_LABEL: Record<Granularity, string> = {
 const GAP = 4
 const CELL_MIN = 3
 const CELL_MAX = 18
-// Card chrome deduction for cell fitting （must mirror yearMatrix.css):
-// clientWidth/Height 已不含 border（1px 每侧），扣减只算 padding——横向
-// 8×2=16、纵向 12×2=24（月标签浮层化后不再占布局位，无标签扣减；
-//。原实现把 border 双扣 2px，格子比设计值小一档，已正）。
+// Card chrome deduction for cell fitting （must mirror yearMatrix.css padding):
+// clientWidth/Height 已不含 border，扣减只算 padding——横向 8×2=16、纵向 12×2=24
+// （月标签是浮层，不占布局位，无标签扣减）。
 const CARD_INSET_X = 16
 const CARD_INSET_Y = 24
 
@@ -69,11 +66,10 @@ function weekEndDow(weekStart: WeekStart): number {
   return weekStart === 'sunday' ? 6 : 0
 }
 
-/** 网格日期范围：最右列 = 今天所在周（进行中，未来日
- * 以零值灰格显示），列边界整周对齐（列 = 起始日…起始日前一天）；最左列 =
- * 53 周前的列首（≈ 去年同期最近整周）——53 列恒为完整周列，无截断列。
- * 注意 start 必须回退到「列首」weekday：end 是列尾，-6 天才是本周起始日，
- * 再减 52 整周（bug 教训：只减 364 会得到列尾 weekday，首列收在第一天）。 */
+/** 网格日期范围：最右列 = 今天所在周（进行中，未来日以零值灰格显示），列边界整周对齐
+ * （列 = 起始日…起始日前一天）；最左列 = 53 周前的列首——53 列恒为完整周列，无截断列。
+ * start 必须回退到「列首」weekday：end 是列尾，-6 天才是本周起始日，再减 52 整周
+ * （只减 364 会得到列尾 weekday，首列只剩一天）。 */
 function gridRange(weekStart: WeekStart): { start: Date; end: Date } {
   const today = new Date()
   const end = new Date(today.getFullYear(), today.getMonth(), today.getDate())
@@ -143,8 +139,8 @@ export default function YearMatrix() {
   const [cellSize, setCellSize] = useState(12)
   const wrapRef = useRef<HTMLDivElement>(null)
 
-  // 尺寸预设：档位来自 designPrefs（设置抽屉是写入口，本组件是
-  // 「应用窗口尺寸」的唯一执行者——抽屉只写 pref，这里监听变化调 set_widget_size）。
+  // 尺寸档位来自 designPrefs（设置抽屉是写入口，本组件是「应用窗口尺寸」的唯一执行者——
+  // 抽屉只写 pref，这里监听变化调 set_widget_size）。
   const [sizePreset, setSizePreset] = useState<SizePreset>(() => getDesignPrefs().sizePreset)
   const [locked, setLocked] = useState(() => getDesignPrefs().locked)
   const [weekStart, setWeekStart] = useState<WeekStart>(() => getDesignPrefs().weekStart ?? 'sunday')
@@ -160,8 +156,7 @@ export default function YearMatrix() {
 
   // 档位变化 → 立即重设窗口尺寸（几何落盘由 Rust Resized 节流持久化兜底）。
   // 挂载时不应用：窗口几何以 window-state.json 恢复为准（尊重手动调整过的尺寸）。
-  // snapAnchor=true——停靠顶点有效时切档位以右上角顶点为锚
-  // （贴边后切档位锚吸附位置缩放，不锚左上角漂移）。
+  // snapAnchor=true：停靠顶点有效时切档位以右上角顶点为锚，贴边位置不漂移。
   const appliedPreset = useRef<SizePreset>(getDesignPrefs().sizePreset)
   useEffect(() => {
     if (appliedPreset.current === sizePreset) return
@@ -171,8 +166,8 @@ export default function YearMatrix() {
   }, [sizePreset])
 
   // Load monthly data covering the grid, build day-value map, then derive cells.
-  // 周起始（General 可调）在 load 内即时读取 pref：单一来源，切换档位经
-  // weekStart state 触发本 effect 重载（行序与列边界随之整体平移）。
+  // 周起始在 load 内即时读取 pref（单一来源）；切换经 weekStart state 触发本 effect 重载，
+  // 行序与列边界随之整体平移。
   const load = useCallback(async (g: Granularity) => {
     const weekStart = getDesignPrefs().weekStart ?? 'sunday'
     const endDow = weekEndDow(weekStart)
@@ -209,7 +204,7 @@ export default function YearMatrix() {
       }
     }
 
-    // Build the week grid first （Sunday-first, 53 columns), then aggregate per
+    // Build the week grid first （53 columns, 列边界按 weekStart), then aggregate per
     // week so weekly/cumulative granularity shows one value per week column —
     // GitHub contribution style （whole inactive weeks stay gray, not filled).
     const todayISO = toISO(new Date())
@@ -221,7 +216,7 @@ export default function YearMatrix() {
       const iso = toISO(cursor)
       const raw = dayMap.get(iso)
       const isFuture = iso > todayISO
-      // Future days are transparent （no data yet); past days default to 0.
+      // Future days have no value （null, 显示为零值灰格); past days default to 0.
       const dayValue: number | null = isFuture ? null : raw ?? 0
       week.push({ date: new Date(cursor), iso, value: dayValue })
       if (cursor.getDay() === endDow) {
@@ -235,7 +230,7 @@ export default function YearMatrix() {
     if (g !== 'daily') {
       // Weekly: whole week sum （0 if empty). Cumulative: year-to-date running
       // sum across weeks. Days after today inside the current partial week stay
-      // transparent （null); future weeks stay null too.
+      // null; future weeks stay null too.
       let ytd = 0
       for (const col of cols) {
         const weekRaw = col.reduce<number>((s, c) => s + (c.value ?? 0), 0)
@@ -260,7 +255,6 @@ export default function YearMatrix() {
     load(granularity)
   }, [granularity, load, weekStart])
 
-  // Refresh on usage:changed events.
   useEffect(() => {
     if (!inTauri) return
     let off: (() => void) | null = null
@@ -277,9 +271,8 @@ export default function YearMatrix() {
   }, [granularity, load])
 
   // Responsive cell size: fills the card interior （chrome 与月标签均为 hover
-  // 浮层,不占布局位). Deductions must mirror yearMatrix.css padding:
-  // 横向 8×2=16、纵向 12×2=24（clientWidth/Height 已不含 border,勿双扣;
-  // 正后格子达到设计值 15/12/6)。
+  // 浮层,不占布局位). Deductions must mirror yearMatrix.css padding
+  // （见 CARD_INSET_X/Y；clientWidth/Height 已不含 border,勿双扣)。
   useEffect(() => {
     const el = wrapRef.current
     if (!el) return
@@ -307,14 +300,12 @@ export default function YearMatrix() {
         labels.push(null)
         continue
       }
-      // Mid-month columns: the month "changes" on the first day that belongs to
-      // the new month, but the label anchors to the column of its first Sunday.
+      // 列首日进入新月份时在该列标注；月份从列中间开始时，标签落在下一列
+      // （近似 GitHub 的锚定方式）。
       if (d.getMonth() !== prevMonth) {
         labels.push(MONTH_SHORT[d.getMonth()])
         prevMonth = d.getMonth()
       } else {
-        // If the month starts mid-column, GitHub anchors the label to the
-        // column containing the 1st; approximate: label when day <= 7 gap.
         labels.push(null)
       }
     }
@@ -329,23 +320,21 @@ export default function YearMatrix() {
     return nz[Math.min(nz.length - 1, Math.floor(nz.length * 0.95))]
   }, [cells])
 
-  // Lock state: design pref （localStorage). 语义：锁定 = 只读极简态，
-  // 静止时仅热力图（chrome/月标签隐藏），hover 唤出完整 chrome 但仅解锁钮
-  // 可点；拖动把手随锁定一并移除（位置固定）。解锁路径 = hover 后点锁钮。
+  // Lock state: design pref （localStorage). 锁定 = 只读极简态：静止时仅热力图
+  // （chrome/月标签隐藏），hover 唤出 chrome 但仅解锁钮可点；拖动随锁定一并禁用。
   const toggleLock = useCallback(() => {
     setDesignPrefs({ locked: !getDesignPrefs().locked })
   }, [])
 
-  // 粒度 = 单钮循环：daily → weekly → cumulative → daily。
-  // 旧三档分段控制（pill 底 + 三个命中区）是顶部遮挡面积最大的一块，合并后
-  // 顶部只剩一排图标钮；图标随当前粒度变化（与锁定钮同惯例），title 提示下一档。
+  // 粒度 = 单钮循环：daily → weekly → cumulative → daily。单钮代替分段控制，
+  // 顶部只剩一排图标钮，减少对格子的遮挡；title 显示「当前 → 下一档」。
   const nextGranularity =
     GRANULARITY_CYCLE[(GRANULARITY_CYCLE.indexOf(granularity) + 1) % GRANULARITY_CYCLE.length]
   const cycleGranularity = useCallback(() => {
     setGranularity((g) => GRANULARITY_CYCLE[(GRANULARITY_CYCLE.indexOf(g) + 1) % GRANULARITY_CYCLE.length])
   }, [])
 
-  // 双窗口：展开 = 打开主窗口（两窗口共存，挂件保持显示）。
+  // 展开 = 打开主窗口（两窗口共存，挂件保持显示）。
   const expandFull = useCallback(() => {
     windowService.showMain().catch(console.error)
   }, [])
@@ -384,12 +373,12 @@ export default function YearMatrix() {
   }, [])
 
   // Foreground/background transparency. Background alpha goes into the card's
-  // background COLOR （rgba var) — NOT element opacity — so title/buttons/labels
+  // background COLOR （rgba var) — NOT element opacity — so buttons/labels
   // stay fully opaque and the heatmap cells are never dimmed by the container.
-  // Foreground is element opacity on .year-rows only. ：自定义卡片色与
-  // 对比度派生由 widgetTheme.applyWidgetTheme 统一处理（同一订阅回调内）。
-  // 材质开启且失焦时，卡片底 alpha 抬到补偿起点（host backdrop
-  // 失焦退化是系统行为，B 方案 CSS 补偿，materialTheme 单一源），只升不降。
+  // Foreground is element opacity on .year-rows only. 自定义卡片色与对比度派生由
+  // widgetTheme.applyWidgetTheme 统一处理（同一订阅回调内）。
+  // 材质开启且失焦时，卡片底 alpha 抬到补偿起点（host backdrop 失焦退化是系统行为，
+  // 以 CSS 补偿，materialTheme 单一源），只升不降。
   const focused = useWindowFocus()
   useEffect(() => {
     const apply = (p: DesignPrefs) => {
@@ -402,7 +391,7 @@ export default function YearMatrix() {
     return subscribeDesignPrefs(apply)
   }, [focused])
 
-  // Cell tooltip （与主窗口同组件同格式，替换原生 title)。
+  // Cell tooltip（与主窗口同组件同格式）。
   const [tooltip, setTooltip] = useState<{ anchor: HTMLElement; content: TooltipContent } | null>(null)
   const hideTooltip = useCallback(() => setTooltip(null), [])
 
@@ -430,7 +419,7 @@ export default function YearMatrix() {
       if (!cell) return
       // weekly/cumulative：一格 = 一周聚合，标题标注周起点避免与日期混淆
       const dateLabel = granularity === 'daily' ? cell.iso : `Week of ${col[0].iso}`
-      // 未来格与零值格同款灰色显示，hover 一致：No usage
+      // 未来格与零值格同款灰色显示，hover 文案一致：No usage
       const valueLabel =
         cell.value === null || cell.value === 0
           ? 'No usage'
@@ -445,10 +434,8 @@ export default function YearMatrix() {
   const dragAttr = locked ? undefined : true
 
   // 热力图格子（useMemo）：hover 换格只重渲染 tooltip，不重排 371 个格子。
-  // 收提示的事件**只在 .year-rows（整片网格）上**：
-  // 旧实现每格挂 onMouseLeave，滑动换格必先隐藏、再靠下一格 mouseenter 重绘
-  // ——中间闪一帧；横/纵向穿过格间 4px 缝隙时同样闪。现在入格即换内容、
-  // 指针离开整片网格才收，滑动全程提示常驻。
+  // 收提示只挂在 .year-rows（整片网格）的 onMouseLeave 上：若每格各自收，滑动换格
+  // 或穿过格间缝隙时会先隐藏再重绘，闪一帧。入格即换内容，离开整片网格才收。
   const gridRows = useMemo(
     () => (
       <div
@@ -460,7 +447,7 @@ export default function YearMatrix() {
         {cells.map((col, c) => (
           <div key={c} className="year-col" style={{ gap: GAP }} data-tauri-drag-region={dragAttr}>
             {col.map((cell, r) => {
-              // value === null ⇔ future （transparent); 0 ⇔ real zero →
+              // value === null ⇔ future （CSS 默认零值灰); 0 ⇔ real zero →
               // card-tinted gray via opts.zeroBg （pass the 0 through!)
               const vis = cell.value === null
                 ? null
@@ -498,8 +485,8 @@ export default function YearMatrix() {
           {gridRows}
         </div>
 
-        {/* 月标签浮层：hover 渐变带，不占布局位——
-            格子占满卡片，静止态上下边距严格对称。与 chrome 平级定位。*/}
+        {/* 月标签浮层：hover 渐变带，不占布局位——格子占满卡片，静止态上下边距对称。
+            与 chrome 平级定位。*/}
         {SIZE_PRESETS[sizePreset].labels && (
           <div className="year-month-labels" style={{ gap: GAP }}>
             {monthLabels.map((label, i) => (
@@ -510,12 +497,9 @@ export default function YearMatrix() {
           </div>
         )}
 
-        {/* Chrome 浮层：只剩右上角一排图标钮——粒度循环 /
-            锁定 / 展开 / 重置。标题（纯占位）与三档分段控制（顶部遮挡面积最大的
-            一块）都已删除；浮层不带任何常驻底色，顶部格子在按钮之外全部可见、
-            可 hover。锁定时仅解锁钮可点。
-            悬停文案只留最短标签（粒度 = 「当前 → 下一档」，其余一到两个词），
-            不复述行为说明。*/}
+        {/* Chrome 浮层：右上角一排图标钮——粒度循环 / 锁定 / 展开 / 重置。
+            浮层不带常驻底色，按钮之外的顶部格子全部可见、可 hover。
+            锁定时仅解锁钮可点。悬停文案只留最短标签。*/}
         <div className="year-chrome" data-tauri-drag-region={dragAttr}>
           <div className="year-actions">
             <button
@@ -545,11 +529,9 @@ export default function YearMatrix() {
         </div>
       </div>
 
-      {/* topReserve = chrome 条带底边（= 卡片顶部内边距带 12px，按钮与格子
-          完全不重叠）：上方落位不得压到 hover 唤出的按钮排。
-          compact = 单行变体：挂件窗矮，两行浮层（≈52px）会压住
-          邻行，往下滑看不到自己 hover 的行；收成单行（≈24px）后浮层永远落在
-          锚点矩形之外，**hover 的那一行任何档位下都不会被压住**。*/}
+      {/* topReserve = chrome 条带底边（= 卡片顶部内边距带 12px）：上方落位不得压到
+          hover 唤出的按钮排。compact = 单行变体：挂件窗矮，两行浮层（≈52px）会压住
+          邻行；单行（≈24px）时浮层恒落在锚点矩形之外，hover 的那一行任何档位下都不被遮挡。*/}
       <MatrixTooltip
         content={tooltip?.content ?? null}
         anchor={tooltip?.anchor ?? null}
@@ -561,8 +543,8 @@ export default function YearMatrix() {
 }
 
 /** 全部 chrome 图标：12px / strokeWidth 2.2（12px 下等效 ~1.1px，压在格子上
- * 仍可辨）。12px 是硬约束——按钮高度 = 图标高度 = 12px = 卡片顶部内边距带，
- * 这样整条浮层不压任何格子。 */
+ * 仍可辨）。12px 是硬约束——按钮高度 = 图标高度 = 卡片顶部内边距带，
+ * 整条浮层不压任何格子。 */
 const CHROME_ICON = {
   width: 12,
   height: 12,
@@ -575,10 +557,9 @@ const CHROME_ICON = {
   'aria-hidden': true,
 } as const
 
-/** 视图切换图标：⇄ 双箭头 = 「切换 / 循环」的通用语汇（
- * 「看不出是切换」——原先按档位换形状的三枚状态图标读不出可点性）。
- * 当前档位不再由图标承载：热力图形态本身一眼可辨（weekly 整列同色、
- * cumulative 逐列递增），悬停另有 title 提示「当前档 — 点击切到下一档」。 */
+/** 视图切换图标：⇄ 双箭头 = 「切换 / 循环」的通用语汇，比按档位换形状更能读出可点性。
+ * 当前档位不由图标承载：热力图形态本身可辨（weekly 整列同色、cumulative 逐列递增），
+ * 悬停 title 另有「当前 → 下一档」。 */
 function SwitchViewIcon() {
   return (
     <svg {...CHROME_ICON}>

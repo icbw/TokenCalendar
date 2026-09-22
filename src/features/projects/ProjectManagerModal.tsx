@@ -1,6 +1,6 @@
-// 项目管理弹出层（主窗口内 modal,不新开 Tauri 窗口）。
+// 项目管理弹出层:主窗口内 modal,不新开 Tauri 窗口。
 // 由 FullWindow 常驻挂载;开合只切 is-open 类（visibility + pointer-events）——
-// 红线:透明窗口内浮层禁止条件卸载（WINDOW_RENDERING_GUIDE,脏像素残影）,本层 DOM 恒在。
+// 透明窗口内浮层禁止条件卸载（否则留脏像素残影）,本层 DOM 恒在。
 // 面板内容复用 Settings·Projects 同一组件与设置页面板样式;关闭时 active = false 只停取数。
 import { useEffect, useState } from 'react'
 import ProjectManager from './ProjectManager'

@@ -5,7 +5,7 @@
 //!   <workspaceHash>/<sessionId>/index.json`——递归扫全部 history 根;
 //! - 会话元数据库 `%APPDATA%/CodeBuddy CN/codebuddy-sessions.vscdb`（国际版 `CodeBuddy/`
 //!   同名兜底）：VS Code 式 `ItemTable`,键 `session:<conversationId>` → JSON
-//!   `{cwd, title, customTitle?, isPlayground?, ...}`——只读项目与标题。
+//!   `{cwd, title, customTitle?, isPlayground?, ...}`——只读项目与标题（见下「项目」）。
 //!
 //! 结构：`requests[]` 追加式（无模型字段!），每条：
 //! `usage.{inputTokens, outputTokens, totalTokens, cacheTokens,
@@ -15,18 +15,16 @@
 //! （cache-exclusive,与全源统一）,output 保持 provider 值,total 取 provider total。
 //!
 //! 增量游标：单文件 JSON（非 JSONL）,offset 不适用——用「已处理 request 条数」：
-//! generation 不变跳过;count > len（重写/清空）→ 归零重读。
+//! generation 不变跳过;count > len（重写/清空）→ 归零重读（已聚合不回滚）。
 //! 大体积 messages 由 serde derive 按字段跳过,不构建 Value 树。
 //!
-//! 模型归属：本地消息
-//! `<会话>/messages/<id>.json` 的 `extra.modelId`（`extra` 是 JSON 字符串;按 `requests[].messages`
-//! 顺序取首条非 helper、requestId 相符的消息,通常下标 0 的 user 消息即带; 642/642 覆盖,
-//! 与旧导入账本重叠 630 条中 628 条一致）→ 缺失 `unknown`。`auto`（智能路由,本地不知实际模型）
-//! 视为未解析;`custom-local:*`（用户自配模型）原样入库。
+//! 模型归属（纯本地）：本地消息 `<会话>/messages/<id>.json` 的 `extra.modelId`（`extra` 是 JSON
+//! 字符串;按 `requests[].messages` 顺序取首条非 helper、requestId 相符的消息,通常下标 0 的 user
+//! 消息即带）→ 缺失 `unknown`。`auto`（智能路由,本地不知实际模型）视为未解析;`custom-local:*`
+//! （用户自配模型）原样入库。
 //!
-//! 积分：`requests[].usage.credit`
-//! → `daily_usage.credit`。与旧导入账本重叠 630 条中 537 条逐条相等,合计约低 0.7%;
-//! 官网另计的辅助请求（本地无 history）不在本地,整体约低 2〜3%。
+//! 积分：`requests[].usage.credit`（= 该请求各消息 `statsSnapshot.credit` 之和）→ `daily_usage.credit`。
+//! 官网另计的辅助请求本地没有 history,故本地合计比官网账单略低（约 2〜3%）。
 //!
 //! 轮与时间：`requests[]` 天然请求级 → 每条带 usage 的 request = 1 轮
 //! （turn_seq = 下标 + 1,model_calls = 1、tool_calls = 0——`messages` 只是 id 列表,
@@ -516,7 +514,7 @@ mod tests {
 
     #[test]
     fn parses_cache_exclusive_input() {
-        // 实证样本:in=293013 out=7631 total=300644 cache=221184 miss=71829 write=0
+        // 真实样本:in=293013 out=7631 total=300644 cache=221184 miss=71829 write=0
         let raw = request_json(1_787_914_300_234, &usage_json(293013, 7631, 300644, 221184, 71829, 0));
         let req: IndexRequest = serde_json::from_str(&raw).unwrap();
         let (day, hour, t) = parse_request(&req).unwrap();
@@ -559,7 +557,7 @@ mod tests {
         assert_eq!((t.input, t.total), (10, 15));
     }
 
-    /// PHASE12 S2:真实结构 index.json 走完整 collect——一 request 一轮、项目 unknown、时间 NULL、守恒。
+    /// 真实结构 index.json 走完整 collect——一 request 一轮、项目 unknown、时间 NULL、守恒。
     #[test]
     fn s2_requests_become_turns() {
         let dir = std::env::temp_dir().join(format!("tc_cb_s2_{}", std::process::id()));

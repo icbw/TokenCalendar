@@ -1,5 +1,4 @@
 // 线上契约形状：与 src-tauri/src/commands.rs 的 serde 定义严格对齐（snake_case）。
-// 冻结此契约，采集器按此实现真实数据源。
 // 装配层消费的驼峰形状见 types.ts，由各 service 做一次映射。
 
 export interface MatrixQuery {
@@ -15,7 +14,7 @@ export interface MatrixRow {
   label: string
   /** 下标 0 = 1 号；null = 未来日期（≠0）。 */
   values: (number | null)[]
-  /** 契约扩展：与 values 平行的请求/对话数（未来日为 0）。 */
+  /** 与 values 平行的请求/对话数（未来日为 0）。 */
   message_counts?: number[]
   month_total: number
 }
@@ -68,7 +67,7 @@ export interface ChangedKeys {
   revision: number
 }
 
-// ---- 数据洞察----
+// ---- 数据洞察 ----
 
 /** credit 月报（daily_usage 源本地积分聚合;口径见 store.credit_summary）。
  * has_data=false = 该月无积分数据（≠0）,UI 走空态文案不渲染数值。 */
@@ -84,7 +83,7 @@ export interface CreditDayPointContract {
   credit: number
 }
 
-/** credit 按模型×日序列（双组图;与 commands.rs CreditModelDaySlice 对齐）。 */
+/** credit 按模型×日序列（与 commands.rs CreditModelDaySlice 对齐）。 */
 export interface CreditModelDaySliceContract {
   key: string
   label: string
@@ -195,7 +194,7 @@ export interface TaskListArgs {
 export interface TaskRowContract {
   agent: string
   session_id: string
-  /** 解析后的有效项目键（S5:合并目标 / __scratch / 原键）。 */
+  /** 解析后的有效项目键（合并目标 / __scratch / 原键）。 */
   project: string
   /** 有效项目展示名（alias 优先）。 */
   project_label: string
@@ -211,9 +210,9 @@ export interface TaskRowContract {
   wall_ms: number | null
   model_ms: number | null
   tool_ms: number | null
-  /** API / 工具错误（S4-R 起不含用户中止）。 */
+  /** API / 工具错误（不含用户中止）。 */
   error_count: number
-  /** 用户中止的轮数（S4-R）。 */
+  /** 用户中止的轮数。 */
   aborted_count: number
   subagent_count: number
   subagent_calls: number
@@ -253,7 +252,7 @@ export interface TaskTurnContract {
   subagent_calls: number
   error_count: number
   retry_count: number
-  /** 用户中止（S4-R,与 error_count 分列）。 */
+  /** 用户中止（与 error_count 分列）。 */
   aborted: boolean
   input_tokens: number
   output_tokens: number
@@ -288,7 +287,7 @@ export interface GapHistogramContract {
   beyond_ms: number
 }
 
-/** get_project_span（project?) 返回（S4-R）:给定项目 = 生命周期（daily_project 首末日）;
+/** get_project_span（project?) 返回:给定项目 = 生命周期（daily_project 首末日）;
  * 省略 = 全部数据首末日（All 范围起点）;无数据 = null。 */
 export interface DaySpanContract {
   first_day: string

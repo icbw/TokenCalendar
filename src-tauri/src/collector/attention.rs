@@ -13,11 +13,11 @@
 //! `state = complete`;WorkBuddy 无显式信号 → 启发式（末事件为 assistant message 且静默
 //! ≥ `HEURISTIC_SETTLE_MS`,中途 assistant 文本之后仍可能继续调工具）。
 //!
-//! 自动退出:`attention_watch` 守护线程**只在有未确认提示时**
+//! 自动退出（前台自动确认）:`attention_watch` 守护线程**只在有未确认提示时**
 //! 醒着（`watch_needs`）,喂入前台窗口;进前台时刻取系统前台切换事件,不靠轮询。
 //! 宗旨「等待要提醒,正在对话不保持」,且**宁可多亮、不漏提醒**：
 //! - 只作用于 `waiting`;`tool_pending`（等批权限,agent 被阻塞）只靠源写入退出,从不自动确认。
-//! - **到窗口面前即全部熄灭**：
+//! - **到窗口面前即全部熄灭**（只熄当前会话会让单窗口宿主里的并行会话长亮）：
 //!   宿主窗口在前台且人在（键鼠闲置 < `INPUT_IDLE_MS`）→ 该窗口下**所有**等待一视同仁（单窗口宿主 =
 //!   同宿主全部会话,按标题消歧的宿主 = 该项目的会话）：进前台**之前**就亮的,停留 ≥ `FOREGROUND_DWELL_MS`
 //!   后确认;在前台期间新亮的先**暂压**（`held`）,答完后人还在这个窗口里动过键鼠且已过 `HELD_ACK_MS`
@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// 未配对工具静默超过此值 → tool_pending（Claude Code 的 tool_result 要等权限批准后才写入,
-/// ≈「在等你批权限」;与长时间工具有歧义,S3 按误报率调）。
+/// ≈「在等你批权限」;与长时间工具有歧义,取值按误报率权衡）。
 pub const TOOL_PENDING_MS: i64 = 90_000;
 /// 启发式「答完」信号的静默确认时长。
 pub const HEURISTIC_SETTLE_MS: i64 = 60_000;
@@ -233,7 +233,7 @@ impl AttentionTable {
         self.removed.retain(|(_, _, since)| now - since <= idle_ms);
     }
 
-    /// 当前派生快照（子会话不列出;按 since 先后,「不做优先级排序」）。
+    /// 当前派生快照（子会话不列出;按 since 先后,不做优先级排序）。
     pub fn items(&self, now: i64, idle_ms: i64) -> Vec<AttentionItem> {
         let fg_since = self.fg.as_ref().map(|f| f.since);
         let mut out: Vec<AttentionItem> = self

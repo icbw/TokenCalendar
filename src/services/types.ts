@@ -1,4 +1,4 @@
-// 装配层内部形状：沿用旧项目 bindings 的驼峰命名，把移植 diff 压到最小。
+// 装配层内部形状（驼峰命名）。
 // 线上 snake_case 契约（contract.ts）→ 此处驼峰形状的映射在各 service 内完成。
 
 import type { TaskSortField } from './contract'
@@ -7,7 +7,7 @@ export interface UsageRow {
   key: string
   label: string
   values: (number | null)[] | null
-  /** 契约扩展：与 values 平行的请求/对话数。 */
+  /** 与 values 平行的请求/对话数。 */
   messageCounts?: number[]
   monthTotal: number
 }
@@ -41,8 +41,7 @@ export interface ExportResult {
   format: string
 }
 
-// WindowMode（expanded|widget 互斥模式）随 get_mode/set_mode 退役，
-// 窗口身份由入口装配决定（main.tsx → FullWindow / widget.tsx → WidgetWindow），
+// 窗口身份由入口装配决定（main.tsx → FullWindow / widget.tsx → WidgetWindow 等），
 // 可见性状态在 windowService.WindowVisibility + 事件广播。
 
 export interface QueryOptions {
@@ -53,7 +52,7 @@ export interface QueryOptions {
   normalization: 'global' | 'perRow'
 }
 
-// ---- 项目维与任务分析（契约 snake_case 见 contract.ts,service 映射在 S4）----
+// ---- 项目维与任务分析（契约 snake_case 见 contract.ts）----
 
 export interface DayRange {
   startDay: string
@@ -78,7 +77,7 @@ export interface TaskPageReq {
 export interface TaskRow {
   agent: string
   sessionId: string
-  /** 有效项目键（S5 解析层）。 */
+  /** 有效项目键（project_meta 解析层）。 */
   project: string
   projectLabel: string
   /** 原始目录键（hover 真实路径）。 */

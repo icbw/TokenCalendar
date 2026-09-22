@@ -1,11 +1,4 @@
-//! 订阅价格与读数的**只读查询面**。
-//!
-//! S1 把价格做成了带生效时间的一等数据、-4 把额度读数做成了时间序列,但两者到此
-//! 为止都只有**写入方**在用——价目只被 `cost.rs` 在算钱时查一次,读数序列的两个读口
-//! 挂着 `#[allow（dead_code)]`。本模块是它们第一次**对外**：五条命令,只读、零网络、
-//! 不碰任何写连接。
-//!
-//! 五条命令分两组：
+//! 订阅价格与读数的**只读查询面**：五条命令,只读、零网络、不碰任何写连接。
 //!
 //! | 组 | 命令 | 出什么 |
 //! | --- | --- | --- |
@@ -18,7 +11,7 @@
 //! 两条口径红线,写在这里免得展示层自己发明：
 //!
 //! - **美元当量 ≠ 账单**。`usd` 是「这些 token 若按官方 API 单价计费值多少钱」,
-//!   而用户付的是固定月费（-bis）。文案一律说「相当于」。
+//!   而用户付的是固定月费。文案一律说「相当于」。
 //! - **取价只有一个入口**。分模型用量的单价取自 [`cost:priced_at`],即 `cost_of`
 //!   自己用的那把尺子——回落模型与 `codex-auto-review` 的路由折价都发生在那里,
 //!   绕过它去查价目表会得出另一个数。
@@ -46,8 +39,7 @@ fn platform_of(s: &str) -> Result<Platform, String> {
 /// 本地日期 `YYYY-MM-DD` 的第 `hour` 小时的起点（unix 秒）。
 ///
 /// 夏令时的"空洞小时"（本地时钟跳过的那一小时）取其后第一个真实存在的时刻
-/// ——那个小时里本来就不可能有用量记录,这一步只是不让它把整行丢掉。
-/// 本机（Asia/Shanghai）没有夏令时,这条退路是为别的时区留的。
+/// ——那个小时里不可能有用量记录,这一步只是不让它把整行丢掉。
 fn local_hour_ts(day: &str, hour: u8) -> Option<i64> {
     use chrono::TimeZone;
     let d = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
@@ -63,8 +55,7 @@ fn local_hour_ts(day: &str, hour: u8) -> Option<i64> {
 
 /// 某平台**全部模型的全部生效期**（按 match_key、生效期升序）。
 ///
-/// 绝大多数模型只有一行;有第二行的那个模型就是被官方降过价的——价格梯度图里的台阶
-/// 正是这些行。
+/// 有第二行的模型就是被官方降过价的,价格梯度图里的台阶正是这些行。
 #[tauri::command]
 pub fn get_price_models(platform: String) -> Result<Vec<PriceRow>, String> {
     Ok(price::rows_for(platform_of(&platform)?))
@@ -120,7 +111,7 @@ pub struct ModelUsageRow {
     pub display_name: String,
     /// 全部段的价目都可信才为真。
     pub known: bool,
-    /// 用户发起的对话轮次（COLLECTOR_GUIDE 红线口径）。
+    /// 用户发起的对话轮次。
     ///
     /// **它不按价目段切分**：轮次只有日粒度,把一天的轮次摊到两段上就是造数据。
     /// 跨降价那天的模型,这个数仍然是整个区间的合计。
@@ -316,8 +307,8 @@ pub fn get_quota_readings(
 
 /// 日级汇总（`[from_day, to_day]` 闭区间,本地日期 `YYYY-MM-DD`;`kind` 省略 = 全部种类）。
 ///
-/// 口径提醒（HANDOFF）：`gain_pct` 是**下界不是账单**——滚动窗口里消耗与过期同时
-/// 发生;要讲「这天用了多少」必须同时看 `carry_secs`,它说明这笔涨幅是跨多久攒出来的。
+/// `gain_pct` 是**下界不是账单**——滚动窗口里消耗与过期同时发生;
+/// 要讲「这天用了多少」必须同时看 `carry_secs`,它说明这笔涨幅是跨多久攒出来的。
 #[tauri::command]
 pub fn get_quota_days(
     platform: String,
@@ -461,7 +452,7 @@ mod tests {
         assert!(r.known);
     }
 
-    /// **S2 验收的核心**：模型在区间中间被降价 ⇒ 分成两段,各按各自的价算,
+    /// 模型在区间中间被降价 ⇒ 分成两段,各按各自的价算,
     /// 而同区间里没降价的模型一段都不多。
     #[test]
     fn a_price_drop_splits_that_model_and_leaves_the_others_alone() {

@@ -1,17 +1,16 @@
-// Matrix view chart panel （user feedback):
-// the single chart element below the heatmap — preset = all-series multi-model
-// curves （same main chart as the Insights view, reusing get_range_series +
-// LineChart/StackedBarChart); click a matrix row name → replace with that row's
-// breakdown curves, click again → back to preset （same logic as Insights row
-// linkage). "Total" toggle: preset switches to a single all-source curve.
-// Collapsible （collapsed keeps only the title row). Panel state （selected row /
-// collapsed / total) is held by FullWindow, survives view switches.
-// no legend row （matrix already shows row names next to it — duplicates
-// cost vertical space); chart height 150 so a tall matrix is never squeezed.
-import { useEffect, useMemo, useState } from 'react'
+// Matrix view chart panel: the single chart element below the heatmap — preset =
+// all-series multi-model curves （same main chart as the Insights view, reusing
+// get_range_series + LineChart/StackedBarChart); click a matrix row name → replace
+// with that row's breakdown curves, click again → back to preset. "Total" toggle:
+// preset switches to a single all-source curve. Collapsible （collapsed keeps only
+// the title row). Panel state （selected row / collapsed / total) is held by
+// FullWindow, survives view switches.
+// No legend row （matrix already shows row names next to it — duplicates cost
+// vertical space); chart height 150 so a tall matrix is never squeezed.
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { events, usageService } from '../../services'
 import type { BreakdownDay } from '../../services'
-import { LineChart, StackedBarChart, type SeriesSpec } from '../insights/charts'
+import { LineChart, StackedBarChart, type CellColumns, type SeriesSpec } from '../insights/charts'
 import { projectDisplayName } from '../insights/analytics'
 import type { GroupBy } from './UsageMatrixView'
 
@@ -19,7 +18,7 @@ const pad2 = (n: number) => String(n).padStart(2, '0')
 const ymd = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
 
 export interface MatrixPanelProps {
-  /** :project 维 → 选中行走 get_project_breakdown（每日 Agent 构成）,
+  /** project 维 → 选中行走 get_project_breakdown（每日 Agent 构成）,
    * 预设走 get_effort_series（project, total);曲线口径恒为 tokens,不跟随矩阵指标。 */
   groupBy: GroupBy
   /** null = preset （all series); otherwise = matrix row key （row linkage). */
@@ -46,6 +45,8 @@ export default function MatrixPanel({
   const [unavailable, setUnavailable] = useState(false)
   const [loading, setLoading] = useState(false)
   const [refreshTick, setRefreshTick] = useState(0)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const columns = useCellColumns(bodyRef)
 
   useEffect(() => {
     let timer = 0
@@ -183,9 +184,8 @@ export default function MatrixPanel({
   return (
     <section className="matrix-panel">
       <header className="matrix-panel-header">
-        {/* 右缘竖排图标列（v3.6 折叠钮移出列尾入右下角）:Stack / Lines /
-            Total——compact 图表两侧边距加倍后图标列落在图表区内侧右缘,
-            不再叠出区外;文字标签改图标,悬浮 title 提示语义。*/}
+        {/* 右缘竖排图标列:Stack / Lines / Total（悬浮 title 提示语义）。compact 图表两侧
+            边距让图标列落在图表区内侧右缘,不叠出区外;折叠钮不在列内,固定在右下角。*/}
         <button
           className={`matrix-panel-icon${kind === 'stack' ? ' is-active' : ''}`}
           onClick={() => setKind('stack')}
@@ -215,13 +215,12 @@ export default function MatrixPanel({
         )}
       </header>
 
-      {/* 折叠/展开箭头:固定右下角同一位置——折叠后也锚在同一坐标,
-          两个状态一个位置,不跳动。*/}
+      {/* 折叠/展开箭头固定右下角:折叠后也锚在同一坐标,两个状态一个位置,不跳动。*/}
       <button className="matrix-panel-collapse" onClick={onToggleCollapsed} title="Collapse chart panel">
         <ChevronDownIcon />
       </button>
 
-      <div className="matrix-panel-body">
+      <div className="matrix-panel-body" ref={bodyRef}>
         {loading && series === null && <div className="insight-empty">Loading…</div>}
         {!loading && unavailable && <div className="insight-empty">Data unavailable (service not running)</div>}
         {!loading && !unavailable && (series === null || series.length === 0 || series.every((s) => s.values.every((v) => v === 0))) && (
@@ -229,9 +228,9 @@ export default function MatrixPanel({
         )}
         {series !== null && series.length > 0 && !series.every((s) => s.values.every((v) => v === 0)) && (
           kind === 'line' ? (
-            <LineChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} />
+            <LineChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
           ) : (
-            <StackedBarChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} />
+            <StackedBarChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
           )
         )}
       </div>
@@ -239,8 +238,31 @@ export default function MatrixPanel({
   )
 }
 
-/* 图标（v3.6 折叠/展开箭头统一右下角同位）:12px stroke 线性风格,
-   currentColor,与标题栏窗口钮同尺度。 */
+/** 读 .matrix-stage 上的共享列变量（--cell-px / --cell-gap-px,由 UsageMatrixView 写入）,
+ * 让图表的点 / 柱与格子中心对齐。格宽一变格子区宽（= 面板中列宽）就变,借 ResizeObserver 重读。 */
+function useCellColumns(ref: React.RefObject<HTMLDivElement | null>): CellColumns | undefined {
+  const [cols, setCols] = useState<CellColumns | undefined>(undefined)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const read = () => {
+      const cs = getComputedStyle(el)
+      const cell = parseFloat(cs.getPropertyValue('--cell-px'))
+      const gap = parseFloat(cs.getPropertyValue('--cell-gap-px'))
+      setCols((prev) => {
+        if (!(cell > 0) || !(gap >= 0)) return undefined
+        return prev && prev.cell === cell && prev.gap === gap ? prev : { cell, gap }
+      })
+    }
+    read()
+    const ro = new ResizeObserver(read)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [ref])
+  return cols
+}
+
+/* 图标:12px stroke 线性风格,currentColor,与标题栏窗口钮同尺度。 */
 function ChevronDownIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">

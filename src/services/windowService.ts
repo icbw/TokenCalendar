@@ -1,4 +1,4 @@
-// 窗口可见性封装（取代退役的 getMode/setMode 互斥模式）。
+// 窗口可见性封装。
 // 几何/可见性单一源在 Rust 侧（visibility.rs）：前端只发意图
 // （show/hide/toggle），状态以 window_ready 后端裁决 + 可见性事件广播为准。
 // 浏览器布局调试：直接打开 /widget.html 即挂件入口（多入口装配，无 URL 参数约定）。
@@ -8,9 +8,7 @@ import { inTauri, tryInvoke } from './tauri'
 export interface WindowVisibility {
   widget: boolean
   main: boolean
-  /** 悬浮球（get_visibility 载荷三键齐发）。 */
   orb: boolean
-  /** 项目推进时间轴（第四键）。 */
   timeline: boolean
 }
 
@@ -48,7 +46,7 @@ export function hideMain(): Promise<void> {
 export function toggleMain(): Promise<void> {
   return apply('main', 'toggle')
 }
-// ---- 悬浮球（第三窗口；托盘/设置页/主界面顶栏 Orbit 按钮共用） ----
+// ---- 悬浮球（托盘/设置页/主界面顶栏 Orbit 按钮共用） ----
 export function showOrb(): Promise<void> {
   return apply('orb', 'show')
 }
@@ -60,7 +58,7 @@ export function toggleOrb(): Promise<void> {
   return apply('orb', 'toggle')
 }
 
-// ---- 项目推进时间轴（第四窗口；托盘/设置页共用，状态以 timeline-visibility-changed 为准） ----
+// ---- 项目推进时间轴（托盘/设置页共用，状态以 timeline-visibility-changed 为准） ----
 export function showTimeline(): Promise<void> {
   return apply('timeline', 'show')
 }
@@ -71,8 +69,7 @@ export function toggleTimeline(): Promise<void> {
   return apply('timeline', 'toggle')
 }
 
-/** 时间轴两态（看板 / 条态）。 */
-/** board = 看板;strip = 贴顶条;peek = 条态收成几像素细边。 */
+/** 时间轴形态：board = 看板;strip = 贴顶条;peek = 条态收成几像素细边（运行时子态,不落盘）。 */
 export type TimelineForm = 'board' | 'strip' | 'peek'
 
 export async function getTimelineForm(): Promise<TimelineForm | null> {
@@ -141,26 +138,24 @@ export async function orbUndock(
 
 /** 主窗口导航中转键（openMainAtView 写 / FullWindow 消费）。
  * **必须 localStorage**：orb 与 main 是两个 WebView 窗口,sessionStorage 按
- * 窗口隔离（orb 写入 main 永远读不到——旧版按钮「只唤起不跳转」的根因）;
- * localStorage 跨窗口共享,且其它窗口写入会触发 main 的 storage 事件
- * （窗口已启动只是隐藏时也能即时导航,与 designPrefs 桥同款机制）。 */
+ * 窗口隔离（orb 写入 main 永远读不到）;localStorage 跨窗口共享,且其它窗口写入
+ * 会触发 main 的 storage 事件（窗口已启动只是隐藏时也能即时导航,与 designPrefs 桥同款机制）。 */
 export const MAIN_NAV_KEY = 'tokencalendar.main.nav'
 
-/** 打开主窗口并定位指定视图/tab（orb「订阅设置」按钮跳转;
+/** 打开主窗口并定位指定视图/tab（如 orb「订阅设置」按钮;
  * 位置经 localStorage 中转,FullWindow 挂载消费一次 + 常驻 storage 事件监听）。 */
 export async function openMainAtView(view: string, tab?: string): Promise<void> {
   try {
     localStorage.setItem(MAIN_NAV_KEY, JSON.stringify({ view, tab }))
   } catch {
-    /* private mode */
+    /* localStorage 不可用（隐私模式）时仅唤起不跳转 */
   }
   await apply('main', 'show')
 }
 
 /** 恢复设计默认 widget 尺寸（重置按钮 / 宽高比锁回吸共用）。
- * ：snapAnchor=true 时后端在 set_size 后以停靠顶点为锚
- * 重算位置（右上角保持在该顶点）——仅档位切换路径使用；比例锁回写/重置按钮
- * 不传（手动拉伸例外）。 */
+ * snapAnchor=true 时后端在 set_size 后以停靠顶点为锚重算位置（右上角保持在该顶点）
+ * ——仅档位切换路径使用；比例锁回写/重置按钮不传（手动拉伸例外）。 */
 export async function setWidgetSize(
   width: number,
   height: number,
@@ -184,10 +179,10 @@ export async function mainClose(): Promise<void> {
   await tryInvoke<null>('main_close')
 }
 
-// ---- 毛玻璃材质（spike；Rust 侧 effects.rs） ----
+// ---- 毛玻璃材质（Rust 侧 effects.rs） ----
 
-/** 应用窗口材质档。effect=null = 关闭。返回是否成功——失败时调用方回退
- * 关闭档（探测失败静默回退哲学，设计文档 ：apply 失败不得拖垮窗口）。 */
+/** 应用窗口材质档。effect=null = 关闭。返回是否成功——失败时调用方静默回退
+ * 关闭档（apply 失败不得拖垮窗口）。 */
 export async function setWindowMaterial(
   label: 'widget' | 'main',
   effect: 'mica' | 'acrylic' | null,

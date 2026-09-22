@@ -1,11 +1,12 @@
 //! 采集器本地存储（app_data_dir/collector.db，rusqlite bundled）。
 //!
-//! 与旧项目（事件表 + 去重键 + retention）的最大差异：事件不落明细库——
-//! 契约所需的最低粒度即 `day × agent × model`（矩阵/钻取/导出全是这个粒度），
-//! 因此只存聚合表。幂等性由「游标与聚合同事务提交、游标严格不重复消费」保证。
+//! 事件不落明细库:契约所需的最低粒度即 `day × agent × model`（矩阵/钻取/导出全是这个粒度），
+//! 用量只存聚合表;轮 / 会话另有原始层与物化层（见 task_store.rs）。
+//! 幂等性由「游标与聚合同事务提交、游标严格不重复消费」保证。
+//! collector.db 是用量历史唯一的持久副本:口径变更只就地升级已有行（migrations.rs）,不清库重扫。
 //!
 //! 聚合表与常驻表：
-//! - `daily_usage` 聚合表（PRIMARY KEY 去重，upsert += 累加;v11 起含源本地 `credit` 积分）
+//! - `daily_usage` 聚合表（PRIMARY KEY 去重，upsert += 累加;含源本地 `credit` 积分）
 //! - `source_cursor` 每源每 scope 的增量游标（JSON）
 //! - `source_state` 每源健康状态（list_sources 的数据源）
 //! - `project_meta` 项目管理映射（别名 / 隐藏 / 合并,常驻不随迁移清空,见 collector/project_meta.rs）
@@ -22,11 +23,10 @@ use rusqlite::Connection;
 #[derive(Default)]
 pub struct Batch {
     /// （day, agent_key, model_key) → [input, output, total, turns, cache_read, cache_write] 累加量。
-    /// turns = 对话轮次（request_count 列,守则）;cache 两列 v7 起落库（源原始口径,
-    /// 不参与 input/total 换算,见守则）。
+    /// turns = 对话轮次（request_count 列）;cache 两列是源原始口径,不参与 input/total 换算。
     pub entries: BTreeMap<(String, String, String), [i64; 6]>,
     /// （day, hour, agent_key, model_key) → [input, output, total, cache_read, cache_write] 累加量
-    /// （小时粒度,与日聚合同事务提交;hour = 本地时 0-23）。
+    /// （与日聚合同事务提交;hour = 本地时 0-23）。
     pub hourly: BTreeMap<(String, u8, String, String), [i64; 5]>,
     /// （day, agent_key, model_key) → 源本地积分累加量（只由带积分的源写入,须与同格 usage 同批）。
     pub credits: BTreeMap<(String, String, String), f64>,
@@ -69,7 +69,7 @@ impl Batch {
         self.add_hour(day, None, agent, model, input, output, total, turns);
     }
 
-    /// 带 hour 的完整入口。日表照常累加（日视图口径永不变）,
+    /// 带 hour 的入口。日表照常累加（日视图口径不变）,
     /// 小时表仅在有 hour 时累加。
     pub fn add_hour(
         &mut self,
@@ -178,7 +178,7 @@ pub struct TurnPart {
     pub input: i64,
     pub output: i64,
     pub total: i64,
-    /// cache 两项落到原始层——口径变更要能只读库内原始层就地重算（migrations.rs 开篇原则）。
+    /// cache 两项落到原始层,口径变更才能只读库内原始层就地重算。
     /// **必须带 `serde（default)`**:本结构随 `TurnAcc.parts` 序列化进游标,缺字段会让旧游标
     /// 整条反序列化失败 → 该源从零重扫 → 历史整份重复入账。
     #[serde(default)]
@@ -197,7 +197,7 @@ pub struct TurnRow {
     /// 首条响应的本地日（无响应 = 轮首本地日）。
     pub day: String,
     pub project_key: String,
-    /// 首条响应的模型（守则无响应 = 最近已知模型 / unknown）。
+    /// 首条响应的模型（无响应 = 最近已知模型 / unknown）。
     pub model_key: String,
     pub started_at: i64,
     pub ended_at: i64,
@@ -211,7 +211,7 @@ pub struct TurnRow {
     /// API / 工具错误（不含用户中止）。
     pub error_count: i64,
     pub retry_count: i64,
-    /// 用户主动中止（S4-R:Codex turn_aborted、ZCode cancelled_by_user、DSH interrupted、
+    /// 用户主动中止（Codex turn_aborted、ZCode cancelled_by_user、DSH interrupted、
     /// 零响应即被下一次输入顶掉）;与 error_count 分列,不互相计入。
     pub aborted: bool,
     pub parts: Vec<TurnPart>,
@@ -281,8 +281,8 @@ pub struct SourceState {
     pub events_collected: i64,
 }
 
-// 数据洞察:credit 月报的查询结果（经 commands.rs 映射为 serde 契约)。
-/// 积分池成员（CodeBuddy / WorkBuddy 共享积分）。通用积分统计（按订阅来源切换）见 ROADMAP 待定项。
+// credit 月报的查询结果（经 commands.rs 映射为 serde 契约）。
+/// 积分池成员（CodeBuddy / WorkBuddy 共享积分）。
 pub const CREDIT_POOL_AGENTS: &[&str] = &["codebuddy", "workbuddy"];
 /// 积分按模型分布的来源 agent。
 pub const CREDIT_MODEL_AGENT: &str = "codebuddy";
@@ -299,7 +299,7 @@ pub struct CreditDayRow {
     pub credit: f64,
 }
 
-/// credit 按模型×日序列（双组图）:一个模型的逐日 credit。
+/// credit 按模型×日序列:一个模型的逐日 credit。
 pub struct CreditModelDayRow {
     pub key: String,
     pub label: String,
@@ -340,7 +340,7 @@ pub struct Store {
     /// `take_turn_span` 取走）——订阅侧的本地活动信号。要区间而不只要最晚一条：
     /// 最晚一条只能证明「用户刚才在工作」,而首轮回填 / 整会话重建的批次里最晚一条
     /// 往往也是新的,区间起点才能把「这批 token 是刚消耗的」与「这批是历史补导」
-    /// 分开。
+    /// 分开（见 subscription/demand.rs）。
     turn_span: Option<(i64, i64)>,
     /// 已提交批次的 token 明细（源 id → 模型 → [输入, 输出, 缓存读, 缓存写]）。
     /// 采集线程每源 collect 后 `take_source_usage` 取走——订阅取数时机的本地信号:
@@ -349,19 +349,14 @@ pub struct Store {
     pending_usage: BTreeMap<String, BTreeMap<String, [i64; 4]>>,
 }
 
-/// 当前 schema 版本。
-/// v7 / v8 / v9 均未发布即被取代（补齐轮 / 会话列与原始层;S3 两个轮次;
-/// S4-R 中止与错误分列:turn_raw / turn 加 aborted、daily_project 加 aborted_count）,
-/// 用户 6 → 10 一次清库。v11 = daily_usage 加 `credit`（源本地积分,取代官网导出导入）→ 清库重扫。
-/// v12 = Claude Code 续聊 / fork 副本文件按行 uuid 折进根会话（新表 seen_line / session_alias）→ 清库重扫。
-/// v13 = 项目归属口径:Claude Code 按会话文件所在文件夹（源自己的分组）、ZCode 子会话继承根会话、
-/// Codex 会话行取源 `threads.cwd` → **就地升级**（migrations.rs,备份后重算已有行,不清库）。
+/// 当前 schema 版本（`PRAGMA user_version`）。v13 起每次升版对应 migrations.rs 里一个就地升级步骤:
+/// v13 项目归属口径、v14 正文件夹名误作项目键、v15 Claude Code total 改四项和并给原始层补 cache 列。
 pub const SCHEMA_VERSION: i64 = 15;
-/// 低于此版本的库仍走清库重建（结构差异逐版累积,已发布用户最低 v10 = 0.5.7）;v12 起只就地迁移。
+/// 低于此版本的库走一次清库重建到此版本（结构差异逐版累积,无法就地补齐）;此后只就地迁移。
 const LEGACY_RESET_VERSION: i64 = 12;
 
-/// 迁移时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
-/// （迁移曾漏重建 source_cursor;由测试 `reset_drop_and_create_lists_match` 守护）。
+/// 清库重建时 DROP 的表清单——必须与 RESET_SCHEMA 的 CREATE 清单逐一对应
+/// （由测试 `reset_drop_and_create_lists_match` 守护）。
 const RESET_TABLES: &[&str] = &[
     "daily_usage",
     "hourly_usage",
@@ -567,10 +562,10 @@ impl Store {
 
     fn init(mut conn: Connection) -> Result<Self, String> {
         // 常驻表（迁移不清）：source_state 健康状态、
-        // project_meta 项目管理映射（用户维护的元数据,清库重扫后原样生效）。
-        // request_model（CodeBuddy 官网导出对账账本）随导入功能于 v11 退役:积分 / 模型改由源本地数据提供,
-        // 旧库一次性 DROP（原始 xlsx 仍留在数据根 imports 目录,程序不再读取）。
-        // 清库重扫的表统一在 RESET_SCHEMA,由 user_version 迁移 DROP + CREATE。
+        // project_meta 项目管理映射（用户维护的元数据,清库重建后原样生效）。
+        // request_model 是不再使用的 CodeBuddy 官网导出对账账本,旧库遇到即 DROP
+        // （原始 xlsx 仍留在数据根 imports 目录,程序不读取）。
+        // 随清库重建的表统一在 RESET_SCHEMA。
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 4000;
@@ -595,35 +590,9 @@ impl Store {
              );",
         )
         .map_err(|e| e.to_string())?;
-        // 版本迁移：v1 无 request_count 列;v2 = 模型调用行数（差一个数量级);
-        // v3 = zcode distinct turn（其余源仍行级);v4 = 全源对话轮次（claude/wb
-        // pending 流式);v5 = codex 也接入 pending（其 token_count 是 API 回合级,
-        // event_msg/user_message 才是用户输入)→ 清库重扫。
-        // v6 = 小时粒度:新增 hourly_usage（day,hour,agent,model),
-        // 清 daily_usage+source_cursor 重扫（游标已推进,历史行补不上小时维)。
-        // v7 = 合并迁移: 新表 session / turn / daily_project（项目维与时间成本,
-        // 现有三表主键与读 SQL 不动); daily_usage / hourly_usage 加 cache_read_tokens /
-        // cache_write_tokens（双组图三段); Codex 轮信号改 event_msg/task_started
-        // （主会话;user_message 保留兼容)→ 清库重扫。
-        // v9 = （未发布即取代):Claude 缺 origin 的零调用输入不成轮、
-        // ZCode 子会话不计 request_count → 清库重扫。
-        // v11 = daily_usage 加 credit（CodeBuddy / WorkBuddy 源本地积分;官网导出导入与 request_model 退役)
-        // → 清库重扫。
-        // v12 = Claude Code 续聊 / fork 副本文件折进根会话（seen_line 已计行 + session_alias 别名;
-        // 复轮数 / token 跨文件重复计数)→ 清库重扫。
-        // v13 = 项目归属（无表结构变化):Claude Code 按会话文件所在文件夹、ZCode 子会话继承根会话、
-        // Codex 会话行取 threads.cwd（旧口径把 `cd` 后的轮 / 子目录里的子代理拆成子目录伪项目并折进 Scratch)
-        // → 就地升级已有行,不清库（migrations.rs)。
-        // v8 =（未发布即取代):轮原始层 turn_raw / turn_part、turn.ended_at、
-        // session.subagent_calls;Claude token 按响应 id 去重、Claude 注入输入不计轮、
-        // WorkBuddy 纯文本回复 usage 入账 → 清库重扫。
-        // 口径语义与实现模式见 §对话轮。
-        // v15 = Claude Code 的 total 口径:Anthropic 的 input_tokens 是 cache-exclusive 且无 provider total,
-        // 旧口径 total = input + output 退化成「约等于 output」,低估约 100〜220 倍 →
-        // total 改四项和;原始层 turn_raw / turn_part 补 cache 两列,存量按日格 cache 分摊回填
-        // → 就地升级,不清库（migrations.rs）。
-        // v13 起迁移纪律（migrations.rs）:结构用 CREATE IF NOT EXISTS / ALTER 补齐,口径用库内原始层就地重算,
-        // 不再清库重扫。v12 之前的库结构与现行差异太大（原始层 / credit / seen_line 逐版新增）,仍走一次清库到 v12。
+        // 版本迁移:< LEGACY_RESET_VERSION 的库 DROP + CREATE 一次到该版本;
+        // 之后逐版就地升级（migrations.rs,每步一个 IMMEDIATE 事务）:结构用 CREATE IF NOT EXISTS / ALTER 补齐,
+        // 口径用库内原始层就地重算,源里已不存在的行原样保留。迁移前的备份由 `open` 负责。
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if version < LEGACY_RESET_VERSION {
             let drops: String = RESET_TABLES.iter().map(|t| format!("DROP TABLE IF EXISTS {t};\n")).collect();
@@ -682,14 +651,30 @@ impl Store {
         Ok(())
     }
 
-    /// 同 crate 采集子模块的只读查询入口（`task_query`;写路径仍只走 commit）。
+    /// 同 crate 采集子模块的只读查询入口（如 `task_query`;写路径仍只走 commit）。
     pub(super) fn conn(&self) -> &Connection {
         &self.conn
     }
 
-    /// 同 crate 采集子模块的写事务入口（`project_meta` 的用户映射写入;不经 commit）。
+    /// 同 crate 采集子模块的写事务入口（如 `project_meta` 的用户映射写入;不经 commit）。
     pub(super) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    /// 源侧元数据里的会话标题就地写到已有会话行（只改变了的行;不建新会话行）。返回改写行数。
+    pub(super) fn sync_session_titles(&mut self, agent: &str, titles: &[(&str, &str)]) -> Result<usize, String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        {
+            let mut stmt = tx
+                .prepare_cached("UPDATE session SET title = ?3 WHERE agent_key = ?1 AND session_id = ?2 AND title IS NOT ?3")
+                .map_err(|e| e.to_string())?;
+            for (id, title) in titles {
+                changed += stmt.execute(rusqlite::params![agent, id, title]).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 
     /// 按离开阈值重算 daily_project 全表（只读原始层 turn_raw / turn_part,不动游标）,
@@ -964,31 +949,6 @@ impl Store {
         }
     }
 
-    /// 失效某源全部聚合：清该源 daily_usage、
-    /// hourly_usage、session / turn_raw / turn_part / turn / daily_project、seen_line / session_alias
-    /// 与全部游标,下轮 collect 从头重读。同事务:半清状态不落盘。
-    pub fn invalidate_source(&mut self, source_id: &str) -> Result<u64, String> {
-        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        let n = tx
-            .execute("DELETE FROM daily_usage WHERE agent_key = ?1", [source_id])
-            .map_err(|e| e.to_string())?;
-        for sql in [
-            "DELETE FROM hourly_usage WHERE agent_key = ?1",
-            "DELETE FROM session WHERE agent_key = ?1",
-            "DELETE FROM turn_raw WHERE agent_key = ?1",
-            "DELETE FROM turn_part WHERE agent_key = ?1",
-            "DELETE FROM turn WHERE agent_key = ?1",
-            "DELETE FROM daily_project WHERE agent_key = ?1",
-            "DELETE FROM seen_line WHERE agent_key = ?1",
-            "DELETE FROM session_alias WHERE agent_key = ?1",
-            "DELETE FROM source_cursor WHERE source_id = ?1",
-        ] {
-            tx.execute(sql, [source_id]).map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(n as u64)
-    }
-
     pub fn source_state(&self, source_id: &str) -> SourceState {
         let row = self
             .conn
@@ -1094,7 +1054,7 @@ impl Store {
     }
 
     /// 行钻取：kind="agent" → 每日模型构成；kind="model" → 每日 Agent 构成。
-    /// 未来日期不产出 breakdown day（旧契约）。
+    /// 未来日期不产出 breakdown day。
     pub fn breakdown(&self, kind: &str, key: &str, month: &str, today: NaiveDate) -> Option<Vec<StoreBreakdownDay>> {
         let (y, m) = parse_month(month)?;
         let first = NaiveDate::from_ymd_opt(y, m, 1)?;
@@ -1305,12 +1265,12 @@ impl Store {
         Some(RangeSeries { series_keys, series_labels, points })
     }
 
-    /// credit 月报（数据洞察;v11 起读 daily_usage 的源本地积分）。
+    /// credit 月报（读 daily_usage 的源本地积分）。
     ///
-    /// 口径（沿用导入时代的「CodeBuddy 积分池」语义,通用积分统计见 ROADMAP 待定项）：
+    /// 口径：
     /// - 月度总量 / 按日走势 = `CREDIT_POOL_AGENTS`（CodeBuddy + WorkBuddy 共享积分池）;
     /// - 按模型分布 / 模型×日 = 只取 `CREDIT_MODEL_AGENT`（CodeBuddy;WorkBuddy 模型维由其矩阵行展示）;
-    /// - requests = 带积分格的 request_count 之和;
+    /// - requests = 带积分格的 request_count 之和（对话轮次口径）;
     /// - has_data = 该月池内是否有任何积分（无积分月份 UI 走空态,不渲染 0）。
     pub fn credit_summary(&self, month: &str) -> Option<CreditSummary> {
         parse_month(month)?;
@@ -1369,7 +1329,7 @@ impl Store {
             }
         }
 
-        // 按模型×日（双组图）:与 by_model 同一口径。
+        // 按模型×日:与 by_model 同一口径。
         // 只有有积分的日;连续日轴由调用方（命令层）补零。
         let mut by_model_day: Vec<CreditModelDayRow> = Vec::new();
         if has_data {
@@ -1410,9 +1370,8 @@ impl Store {
     /// **分模型 × 小时**用量四项 `[输入, 输出, 缓存读, 缓存写]`。
     ///
     /// 订阅侧的价目按**时刻**取（`price:price_at`）,所以这里给到小时而不是天：
-    /// 一个模型真被降价时,分界线落在哪一天的哪一刻就从哪一刻切开,不需要「这一天
-    /// 算旧价还是新价」这种人为规则。小时表与日表在 codex / claude-code 两源上逐位
-    /// 相等,所以用它不损失任何量。
+    /// 模型降价的分界线落在哪一刻就从哪一刻切开,不需要「这一天算旧价还是新价」的人为规则。
+    /// 小时表与日表在 codex / claude-code 两源上逐位相等,用它不损失量。
     pub fn model_usage_hours(
         &self,
         agent_key: &str,
@@ -1440,7 +1399,7 @@ impl Store {
     }
 
     /// 同区间的**分模型用户轮次**（`daily_usage.request_count` 口径
-    /// = 用户发起的对话轮次,COLLECTOR_GUIDE 红线,不是模型调用 / 工具调用）。
+    /// = 用户发起的对话轮次,不是模型调用 / 工具调用）。
     ///
     /// 只到天——小时表里没有这一列。所以它**不按价目段切分**,只挂在模型上
     /// （切分一天的轮次得靠按 token 比例摊,那是造数据）。
@@ -1641,7 +1600,7 @@ impl Store {
         )
     }
 
-    /// smoke 诊断（S4-R）:物化轮 （中止轮数, 带错误轮数, Σerror, 既中止又带错误的轮数)。
+    /// smoke 诊断:物化轮 （中止轮数, 带错误轮数, Σerror, 既中止又带错误的轮数)。
     pub fn test_abort_error_stats(&self, agent: &str) -> (i64, i64, i64, i64) {
         let q = |sql: &str| self.conn.query_row(sql, [agent], |r| r.get::<_, i64>(0)).unwrap_or(-1);
         (
@@ -1652,7 +1611,7 @@ impl Store {
         )
     }
 
-    /// v12 诊断:（已计行数, 会话别名数 = 被折进根会话的副本文件数)。
+    /// 诊断:（已计行数, 会话别名数 = 被折进根会话的副本文件数)。
     pub fn test_family_stats(&self, agent: &str) -> (i64, i64) {
         let q = |sql: &str| self.conn.query_row(sql, [agent], |r| r.get::<_, i64>(0)).unwrap_or(-1);
         (
@@ -1711,7 +1670,7 @@ pub fn agent_label(key: &str) -> String {
     }
 }
 
-/// model_key → 展示名（未知模型键原样返回;unknown 是对账未命中的兜底行）。
+/// model_key → 展示名（未知模型键原样返回;unknown 是模型缺失的兜底行）。
 pub fn model_label(key: &str) -> String {
     match key {
         "unknown" => "Unknown".to_string(),
@@ -1845,28 +1804,10 @@ mod tests {
     }
 
     #[test]
-    fn days_in_month_matches_fixture_semantics() {
+    fn days_in_month_handles_leap_years() {
         assert_eq!(days_in_month(2026, 9), 30);
         assert_eq!(days_in_month(2026, 2), 28);
         assert_eq!(days_in_month(2024, 2), 29);
-    }
-
-    #[test]
-    fn invalidate_source_clears_usage_and_cursors_only() {
-        let mut s = Store::open_in_memory().unwrap();
-        insert(&mut s, "2026-09-01", "codebuddy", "unknown", 10, 5, 15);
-        insert(&mut s, "2026-09-01", "zcode", "glm", 1, 1, 2);
-        let mut b = Batch::default();
-        b.cursors.push(("f1".into(), "{\"count\":3}".into()));
-        s.commit("codebuddy", &b).unwrap();
-
-        let cleared = s.invalidate_source("codebuddy").unwrap();
-        assert_eq!(cleared, 1, "只清 codebuddy 的 daily_usage 行");
-        assert!(s.get_cursor("codebuddy", "f1").is_none());
-        // 其他源毫发无损
-        let agents = s.month_rows("2026-09", "agent", "total", TODAY).unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].key, "zcode");
     }
 
     fn credit_row(s: &mut Store, agent: &str, model: &str, day: &str, credit: f64) {
@@ -2004,81 +1945,8 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_unreleased_v9_resets_to_current() {
-        // v9 仅存在于开发库:turn_raw / turn / daily_project 缺 aborted 列,中止轮混在 error_count 里 → 清库重扫。
-        let dir = std::env::temp_dir().join(format!("tc_v10_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join("migrate9.db");
-        let _ = std::fs::remove_file(&db);
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            let v9_schema = RESET_SCHEMA
-                .replace("    aborted        INTEGER NOT NULL DEFAULT 0,\n", "")
-                .replace("    aborted_count  INTEGER NOT NULL DEFAULT 0,\n", "");
-            assert!(!v9_schema.contains("aborted"), "构造的 v9 schema 不应含 aborted 列");
-            conn.execute_batch(&format!(
-                "{v9_schema}
-                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','codex','m',10,3);
-                 INSERT INTO source_cursor VALUES ('codex','files','{{}}',1);
-                 PRAGMA user_version = 9;"
-            ))
-            .unwrap();
-        }
-        {
-            let store = Store::open(&db).unwrap();
-            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, SCHEMA_VERSION);
-            assert!(store.get_cursor("codex", "files").is_none(), "游标清空 = 全量重扫");
-            assert!(store.export_rows("2026-09").unwrap().is_empty());
-            for (t, c) in [("turn_raw", "aborted"), ("turn", "aborted"), ("daily_project", "aborted_count")] {
-                assert!(table_columns(&store, t).contains(&c.to_string()), "{t}.{c}");
-            }
-        }
-        for f in ["migrate9.db", "migrate9.db-wal", "migrate9.db-shm"] {
-            let _ = std::fs::remove_file(dir.join(f));
-        }
-    }
-
-    #[test]
-    fn migration_from_v10_adds_credit_and_drops_request_model() {
-        // v10 = 0.5.7 发布库:daily_usage 无 credit 列、request_model 对账账本有数据 → 清库重扫 + 账本退役。
-        let dir = std::env::temp_dir().join(format!("tc_v11_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join("migrate10.db");
-        let _ = std::fs::remove_file(&db);
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            let v10_schema = RESET_SCHEMA.replace("    credit            REAL    NOT NULL DEFAULT 0,
-", "");
-            assert!(!v10_schema.contains("credit"), "构造的 v10 schema 不应含 credit 列");
-            conn.execute_batch(&format!(
-                "{v10_schema}
-                 CREATE TABLE request_model (source_id TEXT NOT NULL, request_id TEXT NOT NULL, model_key TEXT NOT NULL,
-                     client TEXT, day TEXT, credit REAL, PRIMARY KEY (source_id, request_id));
-                 INSERT INTO request_model VALUES ('codebuddy','r1','glm','CodeBuddyIDE','2026-09-01',1.5);
-                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','codebuddy','glm',10,1);
-                 INSERT INTO source_cursor VALUES ('codebuddy','f','{{}}',1);
-                 PRAGMA user_version = 10;"
-            ))
-            .unwrap();
-        }
-        {
-            let store = Store::open(&db).unwrap();
-            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, SCHEMA_VERSION);
-            assert!(store.get_cursor("codebuddy", "f").is_none(), "游标清空 = 全量重扫");
-            assert!(store.export_rows("2026-09").unwrap().is_empty());
-            assert!(table_columns(&store, "daily_usage").contains(&"credit".to_string()));
-            assert!(table_columns(&store, "request_model").is_empty(), "对账账本退役");
-        }
-        for f in ["migrate10.db", "migrate10.db-wal", "migrate10.db-shm"] {
-            let _ = std::fs::remove_file(dir.join(f));
-        }
-    }
-
-    #[test]
-    fn migration_from_v11_adds_seen_line_and_session_alias() {
-        // v11 = 0.5.9 发布库:无 seen_line / session_alias → 清库重扫（Claude fork 副本折进根会话是口径变更）。
+    fn migration_from_v11_resets_but_keeps_project_meta() {
+        // v11 库:无 seen_line / session_alias → 清库重建。
         let dir = std::env::temp_dir().join(format!("tc_v12_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("migrate11.db");
@@ -2113,68 +1981,6 @@ mod tests {
         for f in ["migrate11.db", "migrate11.db-wal", "migrate11.db-shm"] {
             let _ = std::fs::remove_file(dir.join(f));
         }
-    }
-
-    #[test]
-    fn migration_from_unreleased_v8_resets_to_current() {
-        // v8 仅存在于开发库:schema 与 v9 相同,但 Claude 零调用行 / ZCode 子会话轮次口径变了 → 清库重扫。
-        let dir = std::env::temp_dir().join(format!("tc_v9_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join("migrate8.db");
-        let _ = std::fs::remove_file(&db);
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(&format!(
-                "{RESET_SCHEMA}
-                 INSERT INTO daily_usage (day, agent_key, model_key, total_tokens, request_count) VALUES ('2026-09-01','zcode','m',10,3);
-                 INSERT INTO source_cursor VALUES ('zcode','db','{{}}',1);
-                 PRAGMA user_version = 8;"
-            ))
-            .unwrap();
-        }
-        {
-            let store = Store::open(&db).unwrap();
-            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, SCHEMA_VERSION);
-            assert!(store.get_cursor("zcode", "db").is_none(), "游标清空 = 全量重扫");
-            assert!(store.export_rows("2026-09").unwrap().is_empty());
-        }
-        for f in ["migrate8.db", "migrate8.db-wal", "migrate8.db-shm"] {
-            let _ = std::fs::remove_file(dir.join(f));
-        }
-    }
-
-    #[test]
-    fn migration_from_unreleased_v7_resets_to_current() {
-        // v7 仅存在于开发库（未发布）:session 缺 subagent_calls、无原始层 → 重开清库升到当前版本。
-        let dir = std::env::temp_dir().join(format!("tc_v8_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join("migrate7.db");
-        let _ = std::fs::remove_file(&db);
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE session (agent_key TEXT, session_id TEXT, project_key TEXT, parent_id TEXT, title TEXT,
-                     started_at INTEGER, ended_at INTEGER, subagent_count INTEGER, PRIMARY KEY (agent_key, session_id));
-                 INSERT INTO session VALUES ('codex','s','p',NULL,NULL,1,2,0);
-                 PRAGMA user_version = 7;",
-            )
-            .unwrap();
-        }
-        {
-            let store = Store::open(&db).unwrap();
-            let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, SCHEMA_VERSION);
-            assert!(table_columns(&store, "session").contains(&"subagent_calls".to_string()));
-            assert!(table_columns(&store, "turn").contains(&"ended_at".to_string()));
-            for t in ["turn_raw", "turn_part"] {
-                assert!(!table_columns(&store, t).is_empty(), "缺原始层 {t}");
-            }
-            assert!(store.test_sessions("codex").is_empty(), "v7 开发库数据随迁移清空");
-        }
-        let _ = std::fs::remove_file(&db);
-        let _ = std::fs::remove_file(dir.join("migrate7.db-wal"));
-        let _ = std::fs::remove_file(dir.join("migrate7.db-shm"));
     }
 
     fn part(day: &str, model: &str, total: i64, calls: i64, mark: i64) -> TurnPart {
@@ -2262,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_source_clears_task_layers_and_replace_session_rebuilds() {
+    fn replace_session_rebuilds_task_layers() {
         let mut s = Store::open_in_memory().unwrap();
         let mut b = Batch::default();
         b.add_usage("2026-09-01", Some(9), "zcode", "m", Tokens { input: 3, output: 0, total: 3, cache_read: 0, cache_write: 0 }, 1);
@@ -2277,12 +2083,6 @@ mod tests {
         s.commit("zcode", &b).unwrap();
         assert_eq!(s.test_turns("zcode").len(), 1);
         assert!(s.test_project_conservation().is_empty(), "{:?}", s.test_project_conservation());
-        s.invalidate_source("zcode").unwrap();
-        assert_eq!(s.test_task_stats("zcode").0, 0);
-        assert!(s.test_turns("zcode").is_empty() && s.test_sessions("zcode").is_empty());
-        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM daily_project", [], |r| r.get(0)).unwrap();
-        let p: i64 = s.conn.query_row("SELECT COUNT(*) FROM turn_part", [], |r| r.get(0)).unwrap();
-        assert_eq!((n, p), (0, 0));
     }
 
     #[test]
@@ -2301,7 +2101,7 @@ mod tests {
 
     #[test]
     fn reset_drop_and_create_lists_match() {
-        // 守则 §3.5:迁移 DROP 清单与 CREATE 清单逐一对应（多一张 = 残表,少一张 = 缺表）。
+        // 迁移 DROP 清单与 CREATE 清单逐一对应（多一张 = 残表,少一张 = 缺表）。
         let created: BTreeSet<&str> = RESET_SCHEMA
             .split("CREATE TABLE IF NOT EXISTS ")
             .skip(1)
@@ -2325,9 +2125,9 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v6_resets_and_adds_phase12_schema() {
+    fn migration_from_v6_resets_and_drops_ledger() {
         // 模拟 v6 旧库（无 cache 列、无三张新表;对账账本有数据）重开:
-        // init 应 DROP 重建清库表 + 推版本到当前;request_model（v11 退役）一并删除。
+        // init 应 DROP 重建清库表 + 推版本到当前;request_model 一并删除。
         let dir = std::env::temp_dir().join(format!("tc_v7_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("migrate.db");
@@ -2368,7 +2168,7 @@ mod tests {
             for t in ["session", "turn_raw", "turn_part", "turn", "daily_project"] {
                 assert!(!table_columns(&store, t).is_empty(), "缺新表 {t}");
             }
-            // 对账账本随导入功能退役
+            // 对账账本被删除
             assert!(table_columns(&store, "request_model").is_empty());
         }
         {

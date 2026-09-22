@@ -1,27 +1,22 @@
-// OrbWindow：悬浮球窗口（完整两态）。
-// 独立根类 .orb-shell（设计红线：不进 .shell 体系——主窗口样式只属于
-// .is-expanded、挂件样式只属于 .is-widget，orb 颜色变量按窗口拆分 --orb-*）。
+// OrbWindow：悬浮球窗口（两态）。
+// 独立根类 .orb-shell：不进 .shell 体系（主窗口样式只属于 .is-expanded、挂件样式只属于
+// .is-widget），orb 颜色变量按窗口拆分 --orb-*。
 //
 // 两态：
-// - 收起态 = 竖向外轮廓贴片条：**外轮廓色 = 周额度**（额度消耗沿轮廓向下褪色,
-//   包含语义「外包内」）,**内条 = 5 小时额度**;双击展开;
-// - 展开态 = 周额度环 + 中央 5h 表盘（110px 正圆,≈ 旧版「内圈」量级）：
-//   表盘内 = 5h 剩余大数（**只显示剩余,不带总量**）/ 5h 重置时刻（HH:MM 直接
-//   读数,非文字标签）;底部两行 = 周重置倒计时（上）与平台 + 套餐名（下,
-//   无状态点）。功能按钮移出外圈,在右侧排成一列悬挂按钮。
-//   尺寸切换走 set_orb_size（窗口 resizable=false,程序化是唯一入口——
-//）。
+// - 收起态 = 竖向外轮廓贴片条：外轮廓 = 周额度（水位随消耗向下退,「外包内」）,
+//   内条 = 5 小时额度;双击展开;
+// - 展开态 = 周额度环 + 中央 5h 表盘（110px 正圆）：表盘内 = 5h 剩余大数（只显示剩余,
+//   不带总量）/ 5h 重置时刻（HH:MM）;底部两行 = 周重置倒计时（上）与平台 + 套餐名（下）。
+//   功能按钮在表盘右侧排成一列悬挂按钮。
+//   尺寸切换走 set_orb_size（窗口 resizable=false,程序化是唯一入口）。
 //
-// 读数口径（单侧,全窗口一致）：所有数字与图形都表示**剩余量**——徽章 =
-// 周额度剩余、表盘大数 = 5h 剩余、环长 = 各自剩余占比、收起态竖条 = 剩余。
-// 旧版展开态数字走已用而环走剩余,同一枚表盘里出现两个语义相反的读数。
+// 读数口径（单侧,全窗口一致）：所有数字与图形都表示**剩余量**——表盘大数 = 5h 剩余、
+// 环长 = 各自剩余占比、收起态竖条 = 剩余。
 //
-// 数据：get_subscription_snapshots 初查 + subscription:changed 事件重查（Rust
-// 轮询 daemon 发）+ 30s 兜底节流轮询。状态四态互斥文案（预案）：
-// ok / auth_failed（重新登录 agent CLI）/ plan_inactive（续费后自动恢复）/
-// network_failed（静默保留旧数据）。
-// 主题：复用挂件族 sync hook（卡片色/WCAG 派生）映射到 --orb-* 变量；材质
-// hook 不装配（orb 首期无毛玻璃材质档）。
+// 数据：get_subscription_snapshots 初查 + subscription:changed 事件重查（Rust 轮询 daemon 发）
+// + 5 分钟一次漏事件兜底。状态文案见 statusHint。
+// 主题：复用挂件族 sync hook（卡片色/WCAG 派生）映射到 --orb-* 变量；不装配材质 hook
+// （orb 无毛玻璃材质档）。
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
 import { events, subscriptionService, windowService, type OrbDockState, type PlatformIdleState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
@@ -31,10 +26,9 @@ import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
 import './orb.css'
 
-/** 挂件派生主题 → --orb-* 变量镜像（orb.css 消费 --orb-* 键,GUIDE 红线：
- * 颜色变量按窗口拆分,不复用 --widget-card-*。映射在此处单点完成,widgetTheme
- * 单一源不动）。scheme 内置色（未自定义卡片色）时变量缺省,orb.css 兜底值
- * 已是蓝白透明族。 */
+/** 挂件派生主题 → --orb-* 变量镜像（orb.css 消费 --orb-* 键,颜色变量按窗口拆分,
+ * 不复用 --widget-card-*。映射在此处单点完成,widgetTheme 不动）。scheme 内置色
+ * （未自定义卡片色）时变量缺省,由 orb.css 的蓝白透明兜底值生效。 */
 function applyOrbThemeVars(): void {
   const root = document.documentElement
   const theme = deriveWidgetTheme(getDesignPrefs())
@@ -63,62 +57,42 @@ function useOrbThemeSync(): void {
 }
 
 /** 两态窗口尺寸（逻辑像素;tauri.conf.json 初始值 = COLLAPSED）。
- * 收起态窗口 = 竖条本体 24×84 + **每边 16px 透明呼吸位**（㉑,
- * :旧版仅 4px,竖条投影（10px 模糊）与描边发光被窗口边界硬切出
- * 直边——「竖条主体周围的阴影被截断」;Rust 侧 PILL_W/H_LOGICAL 与此同源,
- * 贴边归位按「本体距屏缘 4px」反算、透明边距出屏）;
- * 展开态 = 表盘 + 外挂按钮列（⑯:表盘 150 + 间隙 6 +
- * 按钮列宽 = 内容宽,窗口四周留 16〜20px 呼吸位给 drop-shadow）。
- * ——⑯ 把展开态整体缩到旧版「内圈」量级（旧壳体 300×312 → 表盘 150）,
- * 环内所有浮标（徽章胶囊/左右信息/Manage 按钮）撤除。
- * ⑰：悬挂按钮 28 → 19px（约缩 1/3）→ 内容宽
- * 150+6+19=175,窗口宽随之 216 → 207（呼吸位不变）。 */
+ * 收起态窗口 = 竖条本体 24×84 + 每边 16px 透明呼吸位,否则竖条投影与描边发光被窗口
+ * 边界硬切出直边。与 Rust 侧 PILL_W/H_LOGICAL 同源;贴边归位按「本体距屏缘 4px」反算、
+ * 透明边距出屏。 */
 const COLLAPSED_SIZE = { w: 56, h: 116 }
-/** 展开态窗口尺寸（逻辑像素）。**㉝ 二次订（「容器范围
- * 太小限制了 hover 的显示位置」）**：窗口不再紧贴内容——留出的透明区是
- * **hover 提示的落点空间**。旧版 207×190 只比内容大 32×40,提示（最宽 188,
- * 跟随光标右下 12px）在表盘大半区域都放不下 → 翻到光标另一侧,光标一越过分界
- * 就在「跟着光标」与「贴窗边」两个槽位之间横跳（看着晃眼）。主体之外的透明区
- * 已经点击穿透（WM_NCHITTEST → HTTRANSPARENT,㉒）,多出来的画布不抢鼠标。
- * 内容在窗口内的位置**仍是旧版 207×190 里的偏移（左 16 / 上 20）**——窗口变大
- * 不会让卡片在屏幕上挪位（CSS 见 orb.css 的 .orb-shell.is-expanded .orb-orb）。
- * **㉝ 四次订**：容器改为**绕表盘视觉中心对称**——
- * Windows 按**窗口矩形中心**判定窗口属于哪台显示器（DPI 切换、系统对「跨屏」的
- * 判断都吃这个中心）。上一版只在右侧加画布 ⇒ 中心比视觉中心右偏 264px,拖到
- * 双屏接缝附近时「窗口中心已过缝、表盘视觉中心还没过」,系统提前把窗口判给
- * 另一侧屏。改成对称后,视觉中心过缝
- * 的那一刻才等于窗口中心过缝,系统的判定与人的感知一致。
+/** 展开态窗口尺寸（逻辑像素）。窗口不紧贴内容：多出的透明区是 hover 提示的落点空间
+ * （提示最宽约 188,跟随光标右下 12px;窗口太小时提示会在两个槽位间来回翻）。主体之外的
+ * 透明区点击穿透（WM_NCHITTEST → HTTRANSPARENT）,画布不抢鼠标。
+ * 容器绕表盘视觉中心对称：Windows 按窗口矩形中心判定窗口属于哪台显示器（DPI 切换、
+ * 跨屏判断都用这个中心）;不对称时拖到双屏接缝附近,窗口中心先于表盘过缝,系统提前
+ * 把窗口判给另一侧屏,主体会瞬间缩放。
  * ⇒ 内容偏移 = （235, 100),即 padL + 55 = W/2、padT + 55 = H/2（表盘 110×110,
- * 视觉中心在内容块左上 （55,55) 处）。右侧画布因此仍有 213（按钮列提示走得下）。
- * ⚠ 与 Rust 的 EXPANDED_W/H_LOGICAL、EXPANDED_PAD_L/T_LOGICAL 必须同源。 */
+ * 视觉中心在内容块左上 （55,55) 处）。右侧画布 213（按钮列提示放得下）。
+ * ⚠ 与 Rust 的 EXPANDED_W/H_LOGICAL、EXPANDED_PAD_L/T_LOGICAL 及 orb.css 的
+ * .orb-shell.is-expanded .orb-orb 必须同源。 */
 const EXPANDED_SIZE = { w: 580, h: 310 }
 
-/** 展开态交互主体尺寸（内容区 132×110）与它在窗口内的左上偏移——与 Rust 穿透
- * 命中区/边界钳制同源（EXPANDED_INNER_W/H_LOGICAL + EXPANDED_PAD_L/T_LOGICAL）。
- * ㉒：透明呼吸位已不接收鼠标（WM_NCHITTEST → HTTRANSPARENT），右键菜单的
- * 运动范围必须 clamp 在主体内,否则弹到透明边距上点不到。
- * 三轮：盘径 150 → 130 → 118 → 110 ⇒ 主体 175×150 → … → 132×110。 */
+/** 展开态交互主体尺寸（内容区 132×110）——与 Rust 穿透命中区/边界钳制同源
+ * （EXPANDED_INNER_W/H_LOGICAL）。透明呼吸位不接收鼠标（WM_NCHITTEST → HTTRANSPARENT），
+ * 右键菜单的位置必须 clamp 在主体内,否则弹到透明边距上点不到。 */
 const EXPANDED_INNER = { w: 132, h: 110 }
-/** 内容在窗口内的左上偏移：**左右/上下都围绕表盘视觉中心对称**（见 EXPANDED_SIZE
- * 注释）——235 + 55 = 580/2,100 + 55 = 310/2（盘径 110,视觉中心在内容块左上
- * （55,55)）。与 Rust `EXPANDED_PAD_L/T_LOGICAL` 同源（CSS 里同值一并改）。 */
+/** 内容在窗口内的左上偏移：左右/上下都围绕表盘视觉中心对称（见 EXPANDED_SIZE）——
+ * 235 + 55 = 580/2,100 + 55 = 310/2。与 Rust `EXPANDED_PAD_L/T_LOGICAL` 同源（CSS 里同值一并改）。 */
 const EXPANDED_PAD = { l: 235, t: 100 }
 
-/** 表盘几何（viewBox 150×150 定值,外层 CSS 缩放——球 110 / 150 比例）：
- * 壳体 r74 / 周额度环 r70（内缩 4px 留出一圈玻璃边）/ 中央 5h 表盘 60px
- *。 */
+/** 表盘几何（viewBox 150×150 定值,外层 CSS 缩放到 110px）：
+ * 壳体 r74 / 周额度环 r70（内缩 4px 留出一圈玻璃边）/ 中央 5h 表盘 60px。 */
 const DIAL_VIEW = 150
 const DIAL_R = 74
 const RING_R = 70
 
-/** 竖条水位跨度（㉘）：外轮廓纵向 0〜84（描边线宽 3 居中在 y=1.5/82.5）,取 85
+/** 竖条水位跨度：外轮廓纵向 0〜84（描边线宽 3 居中在 y=1.5/82.5）,取 85
  * 作「全空」终点——水位线 y = SPAN − （SPAN + FADE)×剩余比例。 */
 const PILL_LEVEL_SPAN = 85
-/** 水位线淡出高度：水位线
- * 往上 FADE 像素内由实色渐隐到没有,灰轨道与实色之间因此是一条软过渡。
- * 水位线的行程顺带补上这一段（100% 时线抬到 −FADE,淡出段正好落在轮廓上缘
- * 之外——否则满额度时顶边会被淡掉一块）。值别调太大：余量很低时两侧只剩
- * 一小截,淡出会把它整段吃掉,反而不利于看额度。 */
+/** 水位线淡出高度：水位线往上 FADE 像素内由实色渐隐,灰轨道与实色之间是软过渡而非截断。
+ * 水位线的行程补上这一段（100% 时线抬到 −FADE,淡出段落在轮廓上缘之外——否则满额度时
+ * 顶边会被淡掉一块）。值不宜大：余量很低时两侧只剩一小截,淡出会把它整段吃掉。 */
 const PILL_LEVEL_FADE = 6
 /** 水位遮罩矩形的高度（只影响淡出在渐变里的归一化位置,见 PILL_LEVEL_FADE）：
  * 矩形只需盖住水位线以下,取一个远大于轮廓高度的定值即可。 */
@@ -128,31 +102,28 @@ const PILL_LEVEL_RECT_H = 200
  * 没有新快照也要重算,否则读数不动时倒计时会冻住。**只触发重渲染,不查后端**。 */
 const TICK_MS = 30_000
 /** 每多少个节拍补查一次快照（= 5 分钟）：快照的即时性由 `subscription:changed`
- * 负责,这条只是「万一漏了一次事件」的兜底。旧版每 30s 直查一次,注释却写着
- * 「30s 内不重复 invoke」的节流——那个节流从来不存在。 */
+ * 负责,这条只是「万一漏了一次事件」的兜底。 */
 const RESNAP_EVERY_TICKS = 10
 
-/** 手动刷新的反馈时长（㉖）：下限 = 扫掠弧至少走完一轮（看得）;上限兜住
+/** 手动刷新的反馈时长：下限 = 扫掠弧至少走完一轮（看得）;上限兜住
  * 「收不到完成信号」的情形——`fetched_at` 只在**成功**取数时推进,所以网络/
- * 凭据失败那几轮（快照保留旧值）只能靠上限收束,别把上限调太大。 */
+ * 凭据失败那几轮（快照保留旧值）只能靠上限收束,上限不宜大。 */
 const REFRESH_MIN_MS = 1200
 const REFRESH_MAX_MS = 4000
 
-/** hover 提示显示延迟：指针
- * 在同一区域停满这段时间才出提示——扫过/路过不出。0.35s 是后定的档
- * （初版 0.55s 手感偏慢）,比系统工具提示（≈1s）快一档。 */
+/** hover 提示显示延迟：指针在同一区域停满这段时间才出提示——扫过/路过不出。
+ * 比系统工具提示（≈1s）快一档。 */
 const HOVER_DELAY_MS = 350
-/** 提示收尾宽限（㉝）：指针离开一个提示区时不立刻收——相邻区域横移途中要
- * 经过不产出提示的空隙（环 → 悬挂按钮、文本行 → 环）,立刻收会闪一帧并让
- * 用户重等一轮延迟。留这一小段等人接手,没人接才真收。 */
+/** 提示收尾宽限：指针离开一个提示区时不立刻收——相邻区域横移途中要
+ * 经过不产出提示的空隙（环 → 悬挂按钮、文本行 → 环）,立刻收会闪一帧并
+ * 重等一轮延迟。留这一小段等下一区接手,没人接才真收。 */
 const HOVER_GRACE_MS = 140
-/** 拖动抑制时长：窗口被拖动过后,
- * 这一段内不出提示,超时自动恢复。**不用「指针离开窗口」复位**——拖动完光标
- * 往往还停在球上（窗口跟着光标走）,等它离开等于永远不恢复。取 1.5s：够让
- * 「拖完顺手看一眼」的瞬间不弹提示,又不至于让人以为提示坏了。 */
+/** 拖动抑制时长：窗口被拖动过后,这一段内不出提示,超时自动恢复。
+ * 不用「指针离开窗口」复位——拖动完光标往往还停在球上（窗口跟着光标走）,
+ * 等它离开等于永远不恢复。1.5s 够让拖完的瞬间不弹提示,又不至于像提示坏了。 */
 const HOVER_MUTE_MS = 1500
 
-/** 刷新反馈三态（㉖）：waiting = 扫掠 + 压暗（取数中）→ landing = 新值落库、
+/** 刷新反馈三态：waiting = 扫掠 + 压暗（取数中）→ landing = 新值落库、
  * 摘掉压暗让涨跌走位 → idle。两段各自的下限/上限见上。 */
 type RefreshPhase = 'idle' | 'waiting' | 'landing'
 
@@ -161,13 +132,11 @@ function capitalize(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 }
 
-/** 平台显示名（⑱ ：codex → 「GPT」——界面显示「GPT Plus」;
- * 其它平台默认首字母大写）。 */
+/** 平台显示名：codex → 「GPT」（界面显示「GPT Plus」）;其它平台首字母大写。 */
 function platformLabel(platform: string): string {
   return platform.toLowerCase() === 'codex' ? 'GPT' : capitalize(platform)
 }
 
-/** 百分比读数文本（无数据 → —;其余取整）。 */
 function pctText(v: number | null): string {
   return v === null ? '—' : String(Math.round(v))
 }
@@ -177,16 +146,15 @@ function windowOf(snap: SubscriptionSnapshot | undefined, kind: string) {
   return snap?.windows.find((w) => w.kind === kind)
 }
 
-/** 窗口「未使用」统一判据：窗口存在
- * 但零消耗。两平台对「还没开始用」的表示不一致——Codex 给「当前 + 窗口长度」
- * 的滚动 resets_at（每次取数都往后漂的假窗口尾）,Claude 给 resets_at = null。
- * 判据只取 used_percent（与 resets_at 无关）⇒ 表盘 / 周行 / 提示统一切到 idle
- * 读数,首次消耗后自动回到真实读数。 */
+/** 窗口「未使用」统一判据：窗口存在但零消耗。两平台对「还没开始用」的表示不一致——
+ * Codex 给「当前 + 窗口长度」的滚动 resets_at（每次取数都往后漂的假窗口尾）,
+ * Claude 给 resets_at = null。判据只取 used_percent（与 resets_at 无关）⇒ 表盘 / 周行 /
+ * 提示统一切到 idle 读数,首次消耗后自动回到真实读数。 */
 function windowIdle(w: { used_percent: number } | undefined): boolean {
   return w != null && w.used_percent <= 0
 }
 
-/** 四态互斥文案（预案;auth_failed 与 plan_inactive 语义勿混）：
+/** 状态文案（auth_failed 与 plan_inactive 语义勿混）：
  * auth_failed = 凭据失效,需要用户重新登录 agent CLI;
  * plan_inactive = 凭据仍有效但订阅过期/降级,续费后自动恢复,用户零操作。 */
 function statusHint(status: string): { text: string; level: 'ok' | 'warn' | 'error' | 'muted' } {
@@ -209,8 +177,7 @@ function statusHint(status: string): { text: string; level: 'ok' | 'warn' | 'err
 }
 
 /** 重置时刻（unix 秒 → 本地「HH:MM」;None/已过 → null）。
- * ⑱：5h 窗口重置在数小时内,显示具体时刻比「剩余时长」更直接
- * （表盘内不再出现 5H 文字标签,直接把时刻当标签）。 */
+ * 5h 窗口重置在数小时内,显示具体时刻比「剩余时长」更直接,表盘内直接把时刻当标签。 */
 function clockAt(resetsAt: number | null | undefined): string | null {
   if (!resetsAt) return null
   const t = resetsAt * 1000
@@ -219,8 +186,7 @@ function clockAt(resetsAt: number | null | undefined): string | null {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-/** 重置倒计时（unix 秒 → 「6d 21h 45m」天/时/分三段;None/已过 → null）。
- * ⑱：周重置读数改三段格式（旧版 h≥24 时省略分钟,读数精度不够直观）。 */
+/** 重置倒计时（unix 秒 → 「6d 21h 45m」天/时/分三段;None/已过 → null）。 */
 function countdownDetailed(resetsAt: number | null | undefined): string | null {
   if (!resetsAt) return null
   const diff = resetsAt * 1000 - Date.now()
@@ -234,18 +200,16 @@ function countdownDetailed(resetsAt: number | null | undefined): string | null {
   return `${m}m`
 }
 
-/** hover 提示内容：原生 title 提示退役——它走
- * 系统方角样式（与玻璃族毫无血缘）,还把四段口径挤成一行长句,又长又与光标
- * 所指位置无关。改为自绘玻璃浮层,**按指针所在位置只给对应的那一条口径**：
- * 周额度环 / 中央 5h 表盘 / 套餐行（状态）/ 周重置行（绝对时刻）/ 悬挂按钮。
- * 排版两级 = 小字标签（口径名）+ 主读数 + 补充行,与表盘「大数 / 重置时刻」
- * 同族权重。 */
+/** hover 提示内容：自绘玻璃浮层（不用原生 title——系统方角样式与玻璃族不搭,且与光标
+ * 所指位置无关）,按指针所在位置只给对应的那一条口径：周额度环 / 中央 5h 表盘 /
+ * 套餐行（状态）/ 周重置行（绝对时刻）/ 悬挂按钮。
+ * 排版两级 = 小字标签（口径名）+ 主读数 + 补充行。 */
 interface TipContent {
   /** 口径名（小字全大写淡色;动作类提示可省）。 */
   label?: string
   /** 读数行：第一条 = 主读数,其余 = 补充口径（权重递减）。 */
   lines: string[]
-  /** 四态色（仅状态类提示用;与套餐行状态点同源,值 = statusHint 的 level）。 */
+  /** 四态色（仅状态类提示用;值 = statusHint 的 level）。 */
   level?: 'ok' | 'warn' | 'error' | 'muted'
 }
 
@@ -267,8 +231,8 @@ const TIP_EDGE = 4
 /** 可用落点区间（窗口内坐标,已含边距）= 窗口矩形 ∩ 当前显示器工作区,再按提示
  * 自身尺寸收边。两者都要看：
  * - 窗口边界：出窗即被 WebView 裁掉,没有第二块画布（这也是收起态不做提示的
- * 根本原因:56px 宽放不下任何可读提示）;
- * - 工作区：展开态窗口右侧/底部是提示位画布,**允许挂出屏外**（贴近屏边时会被
+ * 原因:56px 宽放不下任何可读提示）;
+ * - 工作区：展开态窗口四周是提示位画布,**允许挂出屏外**（贴近屏边时会被
  * 边界钳制推出去）,提示落在屏外那一半就白搭——所以取交集,可用区比窗口小。
  * 返回值保证 max ≥ min（窗口比工作区还小时退化为贴左上）。 */
 function tipSpan(w: number, h: number): { minX: number; minY: number; maxX: number; maxY: number } {
@@ -302,8 +266,7 @@ function tipSpan(w: number, h: number): { minX: number; minY: number; maxX: numb
 }
 
 /** 提示落点：光标右下 12px 起手,放不下才翻到光标另一侧（左上）,最后钳进可用区。
- * ㉝ 二次订：窗口给提示留出了画布（见 EXPANDED_SIZE）,绝大多数光标位置下
- * 「右下」都放得下,不再来回翻。 */
+ * 窗口给提示留了画布（见 EXPANDED_SIZE）,绝大多数光标位置下「右下」都放得下。 */
 function placeTip(x: number, y: number, w: number, h: number): { left: number; top: number } {
   const s = tipSpan(w, h)
   let left = x + TIP_GAP
@@ -324,19 +287,17 @@ export default function OrbWindow() {
   // 圆角方案档（与挂件/主面板同档对齐 → --widget-card-radius，orb 卡片复用该档位值）。
   useRadiusSchemeSync('widget')
 
-  // 悬浮球窗口全程透明（透明检查清单同款）：宿主层不得有不透明默认背景
+  // 悬浮球窗口全程透明：宿主层不得有不透明默认背景
   useLayoutEffect(() => {
     document.documentElement.classList.add('mode-widget')
   }, [])
 
-  // 两态（启动恢复上次退出前的贴边位置,首次默认表盘;
-  // 订：未贴边一律表盘）。初值 = 表盘占位,挂载即以 Rust 权威形态（get_orb_form）
-  // 校准——**不按 window.innerWidth 猜**：页面可能早于 Rust restore 归位加载,那时窗口
-  // 还是配置初始尺寸 56×116,猜成竖条后挂载对齐会把刚恢复的表盘缩回竖条（复发根因之一）。
+  // 两态：启动时贴边则恢复竖条,未贴边一律表盘。初值 = 表盘占位,挂载即以 Rust 权威形态
+  // （get_orb_form）校准——**不按 window.innerWidth 猜**：页面可能早于 Rust restore 归位加载,
+  // 那时窗口还是配置初始尺寸 56×116,猜成竖条后挂载对齐会把刚恢复的表盘缩回竖条。
   const [expanded, setExpanded] = useState(true)
-  // 贴边停靠：docked = Rust 侧判定结果（拖动松手
-  // 贴缘 dock / 离缘 undock 广播,重启由 get_orb_dock 恢复）;边缘自位置承担,
-  // 前端只跟形态。
+  // 贴边停靠：docked = Rust 侧判定结果（拖动松手贴缘 dock / 离缘 undock 广播,重启由
+  // get_orb_dock 恢复）;边缘由位置承担,前端只跟形态。
   const [dock, setDock] = useState<OrbDockState | null>(null)
   // 挂载恢复：停靠态 + 形态取 Rust 权威值（几何 Rust restore 已归位;IPC 经启动闸门,
   // 必在 restore 之后应答）,再按该形态做一次幂等尺寸对齐（内容锚定,位置不动）。
@@ -359,7 +320,7 @@ export default function OrbWindow() {
   // 前端只切 React 形态,不再跟手调 set_orb_size——两次位置补偿叠加会让卡片横窜。
   useEffect(() => {
     let off: (() => void) | null = null
-    // 挂载期竞态：`.then` 回填 unlisten 时清理函数可能已经
+    // 挂载期竞态（StrictMode 双挂载）：`.then` 回填 unlisten 时清理函数可能已经
     // 跑过（off 仍为 null）,导致第一个监听器永不注销、事件回调执行两次。disposed
     // 标记兜住：卸载后才到达的 unlisten 立即执行。
     let disposed = false
@@ -391,9 +352,9 @@ export default function OrbWindow() {
   }, [])
 
   const [snapshots, setSnapshots] = useState<SubscriptionSnapshot[]>([])
-  // 本窗口 = orb；绑定多平台时显示上次选中的平台（启动恢复
-  // 上次,不再固定第一个）。按平台 id 记——绑定集合变化时下标会错位;持久化在
-  // designPrefs.orbPlatform,跟随订阅（prefs.json 异步校准 / 跨窗口广播）。
+  // 本窗口 = orb；绑定多平台时显示上次选中的平台（启动恢复）。按平台 id 记——绑定集合
+  // 变化时下标会错位;持久化在 designPrefs.orbPlatform,跟随订阅（prefs.json 异步校准 /
+  // 跨窗口广播）。
   const [activePlatformId, setActivePlatformId] = useState<SubscriptionPlatform | undefined>(
     () => getDesignPrefs().orbPlatform,
   )
@@ -410,8 +371,8 @@ export default function OrbWindow() {
   useEffect(() => {
     let off: (() => void) | null = null
     let disposed = false
-    // 先订阅、注册完成后再初查（审计 P3-,与待机那条 effect 同款）：初查若与
-    // 注册并行,注册窗口期内的变更事件不会重放——读数会陈旧到下一轮。
+    // 先订阅、注册完成后再初查（与待机那条 effect 同款）：初查若与注册并行,
+    // 注册窗口期内的变更事件不会重放——读数会陈旧到下一轮。
     void events.onSubscriptionChanged(refresh).then((unlisten) => {
       if (disposed) unlisten()
       else off = unlisten
@@ -436,8 +397,8 @@ export default function OrbWindow() {
     return () => window.clearInterval(timer)
   }, [refresh])
 
-  // 待机监控：Rust 侧待机态跟随——翻转（进入/退出）时发 subscription:idle,
-  // 这里重查;待机态在 Rust 内存,重启即全亮无需恢复。
+  // 待机监控：Rust 侧待机态翻转（进入/退出）时发 subscription:idle,这里重查;
+  // 待机态在 Rust 内存,重启即全亮无需恢复。
   const [idleStates, setIdleStates] = useState<PlatformIdleState[]>([])
   useEffect(() => {
     const query = () => {
@@ -445,8 +406,8 @@ export default function OrbWindow() {
     }
     let off: (() => void) | null = null
     let disposed = false
-    // 先订阅、注册完成后再补查（审计 P3-）：初查若与监听注册并行,注册窗口
-    // 期内的翻转事件不会重放——亮度状态会陈旧到下次翻转。
+    // 先订阅、注册完成后再补查：初查若与监听注册并行,注册窗口期内的翻转事件
+    // 不会重放——亮度状态会陈旧到下次翻转。
     void events.onSubscriptionIdle(query).then((unlisten) => {
       if (disposed) unlisten()
       else off = unlisten
@@ -465,9 +426,9 @@ export default function OrbWindow() {
   useEffect(() => {
     subscriptionService.applyIdleEnabled(idleOn)
   }, [idleOn])
-  // 用户注意（手动刷新 / 展开 / 切换平台 = 用户注意到悬浮球
-  // → 退出待机）。本地先摘掉待机态立即恢复亮度,不等 Rust 翻转事件往返;Rust 侧
-  // 清零安静计数后广播 subscription:idle,重查结果为权威。
+  // 用户注意（手动刷新 / 展开 / 切换平台 = 用户注意到悬浮球 → 退出待机）。本地先摘掉
+  // 待机态立即恢复亮度,不等 Rust 翻转事件往返;Rust 侧清零安静计数后广播
+  // subscription:idle,重查结果为权威。
   const clearStandbyLocally = useCallback(() => {
     setIdleStates((s) => (s.some((x) => x.idle) ? s.map((x) => ({ ...x, idle: false })) : s))
   }, [])
@@ -484,12 +445,11 @@ export default function OrbWindow() {
   const snap = boundSnaps[activePlatform]
   // 读数单一来源：快照只走 get_subscription_snapshots + subscription:changed。
   // 取数由本地 token 探针驱动（本机一有新 token 就取）+ 兜底间隔覆盖网页用量,
-  // 两条触发源在 Rust 侧汇成同一份快照,前端不再做多通道择新。
-  // 待机：
-  // 安静起点 = 最近一次本地 agent 活动 / 用户注意,Rust 侧是**全局**一个数,
-  // 两个平台的 idle 恒相同（idle.rs）。这里仍按「所有已绑定平台都待机」判,
-  // 是为了不依赖那个实现细节——整体待机才减淡 50%（.is-standby,orb.css）;
-  // 取全局安静态而非按显示中平台判定,单平台显示下切换平台不会亮度跳变。
+  // 两条触发源在 Rust 侧汇成同一份快照,前端不做多通道择新。
+  // 待机（standby,判据「安静起点距今满 10 分钟」）：安静起点 = 最近一次本地 agent 活动 /
+  // 用户注意,Rust 侧是**全局**一个数,两个平台的 idle 恒相同（idle.rs）。这里仍按「所有
+  // 已绑定平台都待机」判,是为了不依赖那个实现细节——整体待机才减淡 50%（.is-standby,
+  // orb.css）;不按显示中平台判定,切换平台不会亮度跳变。
   const idleMap = new Map(idleStates.map((s) => [s.platform, s.idle]))
   const standby =
     idleOn &&
@@ -500,17 +460,16 @@ export default function OrbWindow() {
   // 「剩余 = 100 − 已用」换算（口径单侧）。
   const remain7d = w7d ? Math.max(0, Math.min(100, 100 - w7d.used_percent)) : null
   const remain5h = w5h ? Math.max(0, Math.min(100, 100 - w5h.used_percent)) : null
-  // 未使用态（㉞ = 5h 表盘 / ㉟ = 7d 周行）：判据与显示口径见 windowIdle。
+  // 未使用态（5h 表盘 / 7d 周行）：判据与显示口径见 windowIdle。
   const fiveIdle = windowIdle(w5h)
   const weekIdle = windowIdle(w7d)
   const hint = statusHint(snap?.status ?? 'idle')
-  // 竖条外轮廓水位线：周额度剩余 ↦
-  // 遮罩矩形的纵向位移——100% → 线抬到 −FADE（整圈含顶边全亮）,0% → 落在 SPAN
-  // （连淡出段一起沉到轮廓下方 = 全灭）。㉙ 起把淡出段的行程一并算进来。
+  // 竖条外轮廓水位线（从顶部往下、两侧一起退）：周额度剩余 ↦ 遮罩矩形的纵向位移——
+  // 100% → 线抬到 −FADE（整圈含顶边全亮）,0% → 落在 SPAN（连淡出段一起沉到轮廓下方 = 全灭）。
   const pillLevelY =
     PILL_LEVEL_SPAN - (PILL_LEVEL_SPAN + PILL_LEVEL_FADE) * ((remain7d ?? 0) / 100)
 
-  // 两态切换：程序化 set_orb_size;
+  // 两态切换：程序化 set_orb_size（orb 不参与格网吸附）;
   // dock 态展开 = undock（离开贴边语义,清 Rust 状态,屏内生长归位在 Rust）。
   const applySize = useCallback((target: 'expanded' | 'collapsed') => {
     const size = target === 'expanded' ? EXPANDED_SIZE : COLLAPSED_SIZE
@@ -521,9 +480,9 @@ export default function OrbWindow() {
     setExpanded(true)
     noteAttention()
     if (dock) {
-      // dock 态双击（无拖动）：竖条贴在缘上,直接 set_size（240) 会把卡片推出屏外
-      // ——展开尺寸 + 屏内归位由 orb_undock 原子完成（工作区/DPI 物理像素只在
-      // Rust 可得）;前端不再调 set_orb_size（否则位置补偿算两遍）。
+      // dock 态双击（无拖动）：竖条贴在缘上,直接设展开尺寸会把卡片推出屏外——
+      // 展开尺寸 + 屏内归位由 orb_undock 原子完成（工作区/DPI 物理像素只在 Rust 可得）;
+      // 前端不调 set_orb_size（否则位置补偿算两遍）。
       const edge = dock.edge
       setDock(null)
       windowService.orbUndock(edge, EXPANDED_SIZE.w, EXPANDED_SIZE.h).catch(console.error)
@@ -538,12 +497,10 @@ export default function OrbWindow() {
     applySize('collapsed')
   }, [applySize])
 
-  // 右键菜单（减法：展开/刷新/打开设置都有既有交互入口
-  // （双击、刷新按钮、Manage 按钮）——菜单只留「隐藏悬浮球」一项;隐藏后从
-  // 托盘/设置页/顶栏 Orbit 钮可再开）
-  // 弹出位置按菜单实际
-  // 尺寸 clamp 到窗口内;收起态放不下菜单。处理器在刷新段之后（收起态右键 =
-  // 刷新,要用到 refreshNow——提前定义会撞 TDZ）。
+  // 右键菜单只留「隐藏悬浮球」一项：展开/刷新/打开设置都有既有入口（双击、刷新钮、
+  // 订阅设置钮）;隐藏后从托盘/设置页/顶栏 Orbit 钮可再开。
+  // 弹出位置按菜单实际尺寸 clamp 到交互主体内;收起态放不下菜单。处理器在刷新段之后
+  // （收起态右键 = 刷新,要用到 refreshNow——提前定义会撞 TDZ）。
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   // 菜单尺寸（首次弹出时测量正;缺省按典型值钳制避免首帧越界）
   const menuRef = useRef<HTMLDivElement | null>(null)
@@ -554,10 +511,8 @@ export default function OrbWindow() {
       setMenuSize((s) => (s.w === r.width && s.h === r.height ? s : { w: r.width, h: r.height }))
     }
   }, [menu])
-  // 菜单钳制范围 = 交互主体（㉒）：透明区不接收鼠标,菜单越出主体就点不到。
-  // 主体位置改用显式偏移（㉝ 二次订）——旧式「（窗口 − 主体)/2」假定主体
-  // 居中,窗口改成「主体贴左上 + 右侧/底部留提示位画布」后不成立（会算出 72/50
-  // 的假内缩,把菜单顶到离主体 56px 的地方）;EXPANDED_PAD 与 Rust 命中区同源。
+  // 菜单钳制范围 = 交互主体：透明区不接收鼠标,菜单越出主体就点不到。主体位置用显式
+  // 偏移 EXPANDED_PAD（与 Rust 命中区同源）,不按「（窗口 − 主体)/2」推算。
   const menuStyle = menu
     ? {
         left: Math.max(
@@ -570,7 +525,7 @@ export default function OrbWindow() {
         ),
       }
     : undefined
-  // 浮层铁律：菜单 DOM 常驻不卸载——隐藏=移出视口+visibility,禁止条件渲染
+  // 浮层 DOM 常驻不卸载：隐藏 = 移出视口 + visibility,禁止条件渲染
   const closeMenu = useCallback(() => setMenu(null), [])
   useEffect(() => {
     if (!menu) return
@@ -591,19 +546,16 @@ export default function OrbWindow() {
     closeMenu()
     windowService.hideOrb().catch(console.error)
   }, [closeMenu])
-  // 展开态刷新按钮。
-  // ㉖：反馈从
-  // 「图标转 800ms」升级为**两枚进度环同时进入扫描态**——周额度环与中央 5h
-  // 表盘各跑一条白光短弧,余量弧同时压暗（**读数不清零**,数字/弧长仍是真值）。
+  // 手动刷新：周额度环与中央 5h 表盘同时进入扫描态——各跑一条白光短弧,余量弧压暗
+  // （**读数不清零**,数字/弧长仍是真值）。
   // 时长取真时刻：Rust `refresh_subscriptions_now` 只 wake + 立刻转发事件
   // （抓取在 daemon 线程,落地后另发一次）,所以「数据已落库」只能靠
   // fetched_at 越过点击时刻判定。
   //
-  // 三态（用户追问「只有前半段没有后半段」后拆分,同㉖）：
-  //   waiting = 已发起、还没见新数据 → 扫掠弧 + 余量弧压暗（第一段:取数中）;
+  // 三态：
+  //   waiting = 已发起、还没见新数据 → 扫掠弧 + 余量弧压暗（取数中）;
   //   landing = 新数据已落库 → **立刻摘掉压暗**,让「涨/跌」在正常亮度下走位
-  //             （第二段:落位;余量弧自己的 CSS 过渡负责把差值滑出来）,
-  //             扫掠弧继续留到下限再收;
+  //             （余量弧自己的 CSS 过渡负责把差值滑出来）,扫掠弧继续留到下限再收;
   //   idle = 全停。
   // 数据始终不来（失败时 `fetched_at` 不推进）→ 由上限直接回 idle。
   const [phase, setPhase] = useState<RefreshPhase>('idle')
@@ -642,9 +594,8 @@ export default function OrbWindow() {
     refreshTimer.current = window.setTimeout(() => setPhase('idle'), rest(REFRESH_MIN_MS))
   }, [snapshots, phase])
   // 右键：展开态 = 「Hide orb」菜单;收起态 = **刷新**。
-  // 竖条只有一个手势位——左键是拖动（drag-region deep）+ 双击展开,再挂单击
-  // 刷新就得靠延迟跟双击抢判据;而菜单
-  // 在竖条窗口里放不下。故收起态右键 = 刷新：语义单义、零延迟。
+  // 竖条的左键已是拖动（drag-region deep）+ 双击展开,再挂单击刷新就得靠延迟跟双击
+  // 抢判据;而菜单在竖条窗口里放不下。故收起态右键 = 刷新：语义单义、零延迟。
   const onContextMenu = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault()
@@ -657,7 +608,7 @@ export default function OrbWindow() {
     [expanded, refreshNow],
   )
 
-  // 周期切换（多绑定时点击竖条底部标记循环;单平台无感）。选中平台落 designPrefs
+  // 切换订阅（多绑定时点悬挂按钮循环;单平台时按钮禁用）。选中平台落 designPrefs
   // （启动恢复）;点击本身 = 用户注意,退出待机。
   const cyclePlatform = useCallback(() => {
     noteAttention()
@@ -667,7 +618,7 @@ export default function OrbWindow() {
     setDesignPrefs({ orbPlatform: next })
   }, [boundSnaps, activePlatform, noteAttention])
 
-  // ---- hover 提示浮层（㉕：替代原生 title,DOM 常驻遵铁律） ----
+  // ---- hover 提示浮层（DOM 常驻） ----
   // 位置：环/表盘这类大面积区域跟光标（12px 偏移,越界翻转+钳制）;16px 悬挂
   // 按钮锚按钮中心（光标贴边时提示会跟着抖）。提示本体 pointer-events:none
   // 在 CSS——跟随光标的浮层若挡住光标会立刻触发 mouseleave,提示闪成一片。
@@ -681,9 +632,8 @@ export default function OrbWindow() {
     const r = tipRef.current.getBoundingClientRect()
     setTipSize((s) => (s.w === r.width && s.h === r.height ? s : { w: r.width, h: r.height }))
   }, [tipKey])
-  // 显示时机状态机：悬停延迟 +
-  // 拖动抑制。运行态全部走 ref——它们只驱动定时器与判定,不进渲染（内容/位置
-  // 仍走 state 的 tip,单点触发重渲染）。
+  // 显示时机状态机：悬停延迟 + 拖动抑制。运行态全部走 ref——它们只驱动定时器与判定,
+  // 不进渲染（内容/位置仍走 state 的 tip,单点触发重渲染）。
   const tipShowTimer = useRef(0) // 待显示定时器
   const tipHideTimer = useRef(0) // 待收尾定时器（宽限,见 HOVER_GRACE_MS）
   const tipTarget = useRef('') // 指针所在提示区键（'' = 不在任何提示区）
@@ -768,10 +718,9 @@ export default function OrbWindow() {
     },
     [hoverTip],
   )
-  // 拖动抑制（㉝）：按下 / 按住拖动 / 拖动结束三条路径都汇入 muteTips——
+  // 拖动抑制：按下 / 按住拖动 / 拖动结束三条路径都汇入 muteTips——
   // HOVER_MUTE_MS 内不出提示,超时自动恢复,不必再靠 mouseleave 复位。
-  // ⚠ 拖动走系统模态移动循环：webview 收不到期间的 mousemove,连**鼠标抬起事件
-  // 根本不会送达**。
+  // ⚠ 拖动走系统模态移动循环：webview 收不到期间的 mousemove,鼠标抬起事件也不会送达。
   // 所以抑制不能靠 mouseup 收尾,改由三条自洽信号维持：
   //  按下（mousedown）即抑制; 移动循环结束由 Rust 判定真实位移后广播
   // orb-dragged 再续一段; 拖动中万一有 mousemove 漏进来,事件自带的 buttons≠0
@@ -797,7 +746,7 @@ export default function OrbWindow() {
       off?.()
     }
   }, [muteTips])
-  // 指针让出（㊻）：光标离开交互主体 → Rust 把整窗对鼠标透明（画布不再挡下层
+  // 指针让出：光标离开交互主体 → Rust 把整窗对鼠标透明（画布不再挡下层
   // 程序的 hover / 点击）。穿透期间 webview 收不到 mouseleave,提示会"冻"在屏上
   // ——收到让出信号立刻清掉。
   useEffect(() => {
@@ -821,22 +770,21 @@ export default function OrbWindow() {
   }, [expanded, dock, clearTip])
   const tipStyle = tip?.on ? placeTip(tip.x, tip.y, tipSize.w, tipSize.h) : undefined
 
-  // 环内读数（⑱）：表盘 = 5h 剩余 + 5h 重置时刻（HH:MM）;
-  // 下方 = 周重置倒计时（6d 21h 45m 三段格式）。
-  // ㉞：fiveIdle 时表盘与提示都走 idle 分支,reset5h 不参与显示——Codex 在
+  // 环内读数：表盘 = 5h 剩余 + 5h 重置时刻（HH:MM）;下方 = 周重置倒计时（三段格式）。
+  // fiveIdle 时表盘与提示都走 idle 分支,reset5h 不参与显示——Codex 在
   // 未使用时给的是不断后漂的假窗口尾,显示它等于报一个永远「5 小时后」的时刻。
   const reset5h = clockAt(w5h?.resets_at)
   const weekReset = countdownDetailed(w7d?.resets_at)
   const weekStamp = stampAt(w7d?.resets_at)
 
-  // plan 行 = ● + 平台名 + 套餐名（⑱：codex 显示名映射为 GPT——
-  // 「Codex Plus」改显示「GPT Plus」;大小写显式归一,上游曾见 "codex Plus"）。
+  // plan 行 = 平台名 + 套餐名（codex 显示名映射为 GPT;大小写显式归一,上游曾
+  // "codex Plus"）。
   const planLabel = snap?.plan_type && snap.plan_type !== 'unknown' ? snap.plan_type : boundSnaps.length ? 'Subscription' : 'Not bound'
   const planTitle = snap?.platform
     ? `${platformLabel(snap.platform)} ${capitalize(planLabel)}`
     : capitalize(planLabel)
 
-  // 分位置提示内容（㉕）：每条只给该位置对应的口径,不再把四段口径串成一句。
+  // 分位置提示内容：每条只给该位置对应的口径。
   // 该窗口无数据（未绑定/凭据失效）→ 退化为状态提示,正好解释读数为什么是「—」。
   const statusTip: TipContent = {
     label: snap ? planTitle : undefined,
@@ -876,7 +824,7 @@ export default function OrbWindow() {
       ? { label: 'Subscriptions', lines: [`Switch · ${activePlatform + 1} / ${boundSnaps.length}`] }
       : { lines: ['Only one subscription bound'] }
 
-  // 表盘区域判定（㉕）：环与中央表盘各有提示,用几何判定而非 DOM 命中——
+  // 表盘区域判定：环与中央表盘各有提示,用几何判定而非 DOM 命中——
   // 表盘 SVG 与 gauge 都是 pointer-events:none,鼠标事件一律落在容器上;底部
   // 两行/套餐行是真实元素（自带提示）,事件冒泡到容器时让行,勿覆盖。
   const dialRef = useRef<HTMLDivElement | null>(null)
@@ -917,9 +865,9 @@ export default function OrbWindow() {
     <div
       className={`orb-shell${expanded ? ' is-expanded' : ''}${standby ? ' is-standby' : ''}`}
       // 右键 / 双击只挂在**内容容器**（.orb-pill / .orb-orb）上：shell 是整个窗口
-      // （100vw×100vh),挂它等于"透明画布也响应右键"。㊻：OS 侧由 Rust 指针让出
+      // （100vw×100vh),挂它等于"透明画布也响应右键"。OS 侧由 Rust 指针让出
       // 解决（光标离开主体 → 整窗对鼠标透明）,这里是前端纵深——真漏进来一块
-      // 画布区右键也不再响应（画布右键弹菜单、还挡住下层程序）。
+      // 画布区右键也不响应。
       // 提示收尾两处兜底： 按下即收 + 抑制——拖动走 OS 移动循环,期间 webview
       // 收不到 mousemove、也收不到 mouseup,只靠「拖动结束」的 orb-dragged 兜不住
       // （拖动中若有 mousemove 漏进来就会重新冒提示）;按钮豁免,点按钮不抑制
@@ -931,38 +879,26 @@ export default function OrbWindow() {
       onMouseLeave={clearTip}
     >
       {/* ---- 收起态：竖向外轮廓贴片条（外轮廓=周额度褪色,内条=5h） ----*/}
-      {/* drag-region 判定器只认 HTMLElement——
-          SVG 子树整体跳过,S4 往 svg/rect/stop 上挂的属性全部无效,点在
-          描边环（竖条唯一显眼视觉）上永远拖不动。根 = 容器挂 "deep"
-          （tauri ≥2.11：子树内任意点触发拖动,交互元素 button 天然豁免,
-          值=false 可再挖洞）,子元素属性全量撤除。*/}
-      {/* 右键刷新（㉗）：收起态的右键手势在 shell 的 onContextMenu 里处理;
-          刷新状态类挂在本容器上,驱动扫描态（扫掠弧 + 压暗）与落位过渡。*/}
+      {/* drag-region 判定器只认 HTMLElement,SVG 子树整体跳过（点在描边环上拖不动）。
+          故容器挂 "deep"（tauri ≥2.11：子树内任意点触发拖动,交互元素 button 天然豁免,
+          值=false 可再挖洞）,子元素不挂 drag 属性。*/}
+      {/* 刷新状态类挂在本容器上,驱动扫描态（扫掠弧 + 压暗）与落位过渡。*/}
       <div
         className={`orb-pill${expanded ? ' is-hidden' : ''}${refreshing ? ' is-refreshing' : ''}${waiting ? ' is-waiting' : ''}`}
         data-tauri-drag-region="deep"
-        // ㊻：右键（收起态 = 刷新）与双击展开收窄到竖条本体上——不再由 shell
-        // 整窗承接（is-hidden 时 pointer-events:none,天然互斥）。
+        // 右键（收起态 = 刷新）与双击展开只挂在竖条本体上,不由 shell 整窗承接
+        // （is-hidden 时 pointer-events:none,天然互斥）。
         onContextMenu={onContextMenu}
         onDoubleClick={expand}
       >
         <div className="orb-pill-track">
-          {/* 外轮廓 = 周额度（⑲,与展开态表盘外环同源）：轨道 rect（淡）+ 整圈
+          {/* 外轮廓 = 周额度（与展开态表盘外环同源）：轨道 rect（淡）+ 整圈
               进度轮廓（青 → 蓝 → 紫三段渐变）——stop 类与表盘外环共用
               （orb-weekly-stop-*,颜色单点定义在 CSS）。
-              ⚠ 两个历史几何坑（⑲ 复,此前进度弧从未真正显示,截图只
-              「灰色外圈 + 两条横线」）：
-               旧版给 rect 挂了 rotate（90 12 42)——21×81 的竖向 rect 绕自身
-                 中心转 90° 会变成 81×21 的横条,超出 24×84 的 viewBox 被裁,
-                 只剩两条横向描边残段可;
-               旧版 dasharray 硬编码 169,而真实周长 = 2×（21−18) + 2×（81−18)
-                 + 2π×9 ≈ 188.6——即使不旋转也永远缺 ≈10% 的弧。
-              ⑲：撤 rotate + pathLength=100 归一（`剩余 100` 写法与表盘
-              外环一字不差）。
-              **㉘**：进度语义从「沿轮廓走一圈的弧」
-              改成「水位」——整圈轮廓常亮,由 orbPillLevelMask 遮罩切掉水位线
-              以上的部分,于是余量减少时**两侧竖边一起向下退**,与内条自下而
-              上的线性消耗读法对齐（旧版从 12 点起步绕圈,读不出「消耗」）。*/}
+              进度语义是「水位」：整圈轮廓常亮,由 orbPillLevelMask 遮罩切掉水位线以上的部分,
+              余量减少时**两侧竖边一起向下退**,与内条自下而上的线性消耗读法对齐。
+              ⚠ 几何约束：rect 不能加 rotate（21×81 竖向 rect 转 90° 会超出 24×84 的 viewBox
+              被裁）;弧长统一用 pathLength=100 归一,不硬编码周长（圆角矩形真实周长 ≈ 188.6）。*/}
           <svg className="orb-pill-outline" viewBox="0 0 24 84" aria-hidden="true">
             <defs>
               <linearGradient id="orbOutlineFade" x1="0" y1="0" x2="0" y2="1">
@@ -970,12 +906,10 @@ export default function OrbWindow() {
                 <stop className="orb-weekly-stop-mid" offset="0.5" />
                 <stop className="orb-weekly-stop-lo" offset="1" />
               </linearGradient>
-              {/* 水位遮罩（㉘）：矩形整体纵向平移 = 水位线,线以上被遮住。
-                  矩形在宽高上都留了余量,只靠 transform 移动——动画因此走
-                  CSS（transform 过渡最稳）,不依赖任何 SVG 几何属性的过渡。
-                  ㉙：遮罩内容从「纯白」换成**上黑下白的竖向渐变**（object-
-                  BoundingBox,跟着矩形一起平移）——水位线往上 PILL_LEVEL_FADE
-                  像素内渐隐,灰轨道到实色之间不再一刀切。*/}
+              {/* 水位遮罩：矩形整体纵向平移 = 水位线,线以上被遮住。
+                  矩形在宽高上都留了余量,只靠 transform 移动——动画走 CSS（transform 过渡最稳）,
+                  不依赖任何 SVG 几何属性的过渡。遮罩内容是**上黑下白的竖向渐变**（objectBoundingBox,
+                  跟着矩形一起平移）——水位线往上 PILL_LEVEL_FADE 像素内渐隐,灰轨道到实色之间不一刀切。*/}
               <linearGradient id="orbPillLevelFade" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0" stopColor="#000" />
                 <stop offset={PILL_LEVEL_FADE / PILL_LEVEL_RECT_H} stopColor="#fff" />
@@ -1002,7 +936,7 @@ export default function OrbWindow() {
                 mask="url(#orbPillLevelMask)"
               />
             </g>
-            {/* 刷新扫掠弧（㉗,与展开态表盘同族）：常态全透明,刷新时沿轮廓
+            {/* 刷新扫掠弧（与展开态表盘同族）：常态全透明,刷新时沿轮廓
                 奔跑（不受水位遮罩影响,扫描是「取数中」而非读数）*/}
             <rect x="1.5" y="1.5" width="21" height="81" rx="9" fill="none" strokeWidth="3"
               className="orb-pill-sweep" pathLength="100" />
@@ -1012,28 +946,21 @@ export default function OrbWindow() {
             <div className="orb-pill-inner-fill" style={{ height: `${remain5h ?? 0}%` }} />
           </div>
         </div>
-        {/* 平台切换标记撤除——回归
-            「收起态视觉只留竖条本体」;多平台切换收敛到展开卡片头部 chip
-            （与状态点/刷新钮同区,语义有上下文可解释）。*/}
       </div>
 
       {/* ---- 展开态：周额度环 + 中央 5h 表盘 ----*/}
-      {/* 形态基线：外圈 = 周额度进度环（壳体 110px 正圆,viewBox 150 等比缩放）
-          ≈ 旧版「内圈」（中央 5h 表盘）的量级。环内四件内容（⑱）：5h 剩余
-          大数（只显示剩余,不带总量）/ 5h 重置时刻 HH:MM / 平台 + 套餐名一行
-          （无状态点、无 Active 文字;状态文案落 hover 提示）/ 周重置倒计时
-          （纯文字,不加粗无背景）。
-          徽章胶囊、左右信息浮标、Manage 按钮等旧浮标均不再回加——完整口径
-          （剩余/总量/重置）与状态文案由环长本身 **分位置 hover 提示**
-          承载（零视觉占用但不丢数据;㉕ 起提示是自绘玻璃浮层,不再用原生
-          title——按指针在环内/表盘/文本行上的位置各给对应的一条口径）。
-          功能按钮移出外圈：右侧一列悬挂按钮,从上到下 = 订阅设置（设置图标,
-          启动主界面并直达 Settings·Subscriptions tab）/ 刷新 / 缩小 / 切换订阅
-          （多订阅时可用）。容器 deep 子树拖动,按钮豁免。*/}
+      {/* 形态基线：外圈 = 周额度进度环（壳体 110px 正圆,viewBox 150 等比缩放）。
+          环内四件内容：5h 剩余大数（只显示剩余,不带总量）/ 5h 重置时刻 HH:MM /
+          平台 + 套餐名一行（无状态点;状态文案落 hover 提示）/ 周重置倒计时（纯文字）。
+          完整口径（剩余/总量/重置）与状态文案由环长本身分位置 hover 提示承载
+          （零视觉占用但不丢数据）,环内不再加浮标。
+          功能按钮在外圈外：右侧一列悬挂按钮,从上到下 = 订阅设置（启动主界面并直达
+          Settings·Subscriptions tab）/ 刷新 / 缩小 / 切换订阅（多订阅时可用）。
+          容器 deep 子树拖动,按钮豁免。*/}
       <div
         className={`orb-orb${expanded ? '' : ' is-hidden'}`}
         data-tauri-drag-region="deep"
-        // ㊻：右键（展开态 = Hide orb 菜单）收窄到内容块,画布区不再响应。
+        // 右键（展开态 = Hide orb 菜单）只挂在内容块上,画布区不响应。
         onContextMenu={onContextMenu}
       >
         <div
@@ -1064,7 +991,7 @@ export default function OrbWindow() {
               className="orb-orb-fill" cx="75" cy="75" r={RING_R} pathLength="100" fill="none"
               style={{ strokeDasharray: `${remain7d ?? 0} 100` }}
             />
-            {/* 刷新扫掠弧（㉖）：常态全透明,`.is-refreshing` 时沿环奔跑
+            {/* 刷新扫掠弧：常态全透明,`.is-refreshing` 时沿环奔跑
                 （与余量弧同径同宽的白光短弧——余量弧压暗,读数不清零）*/}
             <circle
               className="orb-orb-sweep" cx="75" cy="75" r={RING_R} pathLength="100" fill="none"
@@ -1076,12 +1003,11 @@ export default function OrbWindow() {
             <FiveGauge pct={remain5h} resetAt={reset5h} idle={fiveIdle} />
           </div>
 
-          {/* 底部两行（⑱;㊱ 起顺序与权重调整）：上排 = 周重置倒计时（较宽的
-              读数）,下排 = 平台 + 套餐名（不加粗 / 缩小字号;**状态点已删**——
-              连接状态文案本就落 hover 提示,点属冗余）。两行位置由 CSS 的 bottom
-              决定,与 DOM 顺序无关（这里按「套餐行 → 重置行」书写）。
-              两张文本各自挂提示（㉕）：套餐行 → 状态文案;重置行 → 绝对时刻。
-              不挂 onMouseLeave（㉝）：行内 → 环/按钮横移时若先收再显会闪一帧,
+          {/* 底部两行：上排 = 周重置倒计时（较宽的读数）,下排 = 平台 + 套餐名（不加粗 / 小字号;
+              不带状态点——连接状态文案在 hover 提示里）。两行位置由 CSS 的 bottom 决定,
+              与 DOM 顺序无关（这里按「套餐行 → 重置行」书写）。
+              两张文本各自挂提示：套餐行 → 状态文案;重置行 → 绝对时刻。
+              不挂 onMouseLeave：行内 → 环/按钮横移时若先收再显会闪一帧,
               交给 dial 的判定与宽限收尾（leaveTip 由容器统一兜底）。*/}
           <div
             className="orb-orb-plan"
@@ -1110,7 +1036,7 @@ export default function OrbWindow() {
         </div>
 
         {/* 外挂按钮列（外圈外部;从上到下：管理订阅 / 刷新 / 缩小 / 切换订阅）。
-            提示一律走自绘浮层（㉕）：title 属原生工具提示,视觉与玻璃族不搭。*/}
+            提示一律走自绘浮层,不用原生 title。*/}
         <div className="orb-orb-hang">
           <button
             className="orb-hang-btn"
@@ -1152,9 +1078,9 @@ export default function OrbWindow() {
         </div>
       </div>
 
-      {/* hover 提示浮层（㉕;DOM 常驻——铁律,透明 WebView2 上条件
-          卸载留脏像素）。两级排版：小字标签 = 口径名,主读数 + 补充行;状态类
-          提示行首带四态点（与套餐行状态点同源）。pointer-events:none 见 CSS。*/}
+      {/* hover 提示浮层（DOM 常驻——透明 WebView2 上条件卸载留脏像素）。
+          两级排版：小字标签 = 口径名,主读数 + 补充行;状态类提示行首带四态点。
+          pointer-events:none 见 CSS。*/}
       <div
         ref={tipRef}
         className={`orb-tip${tip?.on ? '' : ' is-hidden'}`}
@@ -1174,8 +1100,7 @@ export default function OrbWindow() {
         ))}
       </div>
 
-      {/* 右键菜单（只留隐藏项;DOM 常驻浮层,铁律;
-           位置钳回窗口内+收起态忽略）*/}
+      {/* 右键菜单（只有隐藏项;DOM 常驻浮层;位置钳在交互主体内,收起态不弹）*/}
       <div
         ref={menuRef}
         className={`orb-menu${menu ? '' : ' is-hidden'}`}
@@ -1188,13 +1113,9 @@ export default function OrbWindow() {
 }
 
 /** 中央 5h 主表盘：环形进度 + 剩余大数 + 重置时刻。
- * 口径单侧——环长与数字都是「剩余量」（与收起态竖条同向）。
- * ——⑱：环内不再出现总量（/ 100）与 5H 文字标签,只留 5h 剩余大数
- * （36 → 30px）与 5h 重置时刻（HH:MM;总量与重置倒计时仍在表盘 title）。
- * ——㉞：窗口存在但零消耗（idle）→ 主读数「5h」+ 副行「idle」（满环不变）,
- * 两平台「未使用」的读数形态就此统一（取代假时刻 / 横杠两种表示）。
- * ——㊱ → 三档：盘径 92 → 80 → 68 → 60px、主读数 30 → 26 → 22
- * → 20px、副行 12 → 11 → 10 → 9px（盘内留白持续收紧）。 */
+ * 口径单侧——环长与数字都是「剩余量」（与收起态竖条同向）;总量与重置口径在 hover 提示里。
+ * 窗口存在但零消耗（idle）→ 主读数「5h」+ 副行「idle」（满环不变）,两平台「未使用」
+ * 的读数形态由此统一。 */
 function FiveGauge({ pct, resetAt, idle }: { pct: number | null; resetAt: string | null; idle: boolean }) {
   const r = 46 // viewBox 100 固定半径,外层 CSS 缩放到 60px
   const circ = 2 * Math.PI * r
@@ -1210,9 +1131,9 @@ function FiveGauge({ pct, resetAt, idle }: { pct: number | null; resetAt: string
           </linearGradient>
         </defs>
         <circle cx="50" cy="50" r={r} className="orb-gauge-track" strokeWidth="6.5" fill="none" />
-        {/* 动画值写 inline style 而不是 SVG 属性（㉖）：只有 CSS 属性才能可靠
+        {/* 动画值写 inline style 而不是 SVG 属性：只有 CSS 属性才能可靠
             触发 .orb-gauge-fill 上的 transition（presentation attribute → CSS
-            的映射各实现不一致,数据落位这一段不能压在它上面）*/}
+            的映射各实现不一致）*/}
         <circle
           cx="50" cy="50" r={r}
           className="orb-gauge-fill"
@@ -1220,7 +1141,7 @@ function FiveGauge({ pct, resetAt, idle }: { pct: number | null; resetAt: string
           style={{ strokeDasharray: circ, strokeDashoffset: circ * (1 - shown / 100) }}
           transform="rotate(-90 50 50)"
         />
-        {/* 刷新扫掠弧（㉖）：与余量弧同起点（rotate（-90) → 12 点）+ 同宽,
+        {/* 刷新扫掠弧：与余量弧同起点（rotate（-90) → 12 点）+ 同宽,
             pathLength 归一到 100 供 CSS 的 dashoffset 动画使用*/}
         <circle
           cx="50" cy="50" r={r}

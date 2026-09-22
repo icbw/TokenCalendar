@@ -1,13 +1,10 @@
-//! 最小托盘（小步版）：「主窗口关闭 = 隐藏」必须给退出兜底，
-//! 完整托盘菜单（采集暂停/导出等）仍归。
+//! 系统托盘：「主窗口关闭 = 隐藏」的退出兜底与窗口显隐入口。
 //!
-//! 行为（左键不再切换挂件）：
-//! - 菜单：挂件 ✓ / 主窗口 ✓ / 退出（勾选态随窗口显隐实时同步）；
+//! - 菜单：挂件 / 主窗口 / 悬浮球 / 时间轴四个勾选项 + 退出（勾选态随窗口显隐实时同步）；
 //! - 左键单击 = **显示主界面**（show 语义而非 toggle——挂件是常驻贴片，
 //!   开关语义别扭;重复点击左键也不该把主界面藏回去）；
 //! - 右键 = 菜单；
-//! - 显隐反馈 = 窗口本身（不再发 tray:action toast，
-//!   弹泡提示全部去除）。
+//! - 显隐反馈 = 窗口本身，不发 toast / 弹泡提示。
 
 use std::sync::atomic::Ordering;
 
@@ -21,9 +18,7 @@ use crate::AppState;
 const TRAY_ID: &str = "tokencalendar-tray";
 const ID_TOGGLE_WIDGET: &str = "toggle_widget";
 const ID_TOGGLE_MAIN: &str = "toggle_main";
-/// 悬浮球显隐（第三勾选项）。
 const ID_TOGGLE_ORB: &str = "toggle_orb";
-/// 项目推进时间轴显隐（第四勾选项）。
 const ID_TOGGLE_TIMELINE: &str = "toggle_timeline";
 const ID_QUIT: &str = "quit";
 
@@ -118,7 +113,6 @@ pub fn init(app: &AppHandle) -> Result<(), tauri::Error> {
     Ok(())
 }
 
-/// 托盘发起的切换：执行即可（窗口显隐本身即反馈,无 toast）。
 fn tray_toggle(app: &AppHandle, label: &str, _display: &str) {
     if let Err(e) = visibility::toggle(app, label) {
         crate::dev_log!("[tray] toggle {} failed: {}", label, e);

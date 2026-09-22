@@ -1,5 +1,5 @@
-/* 项目推进时间轴窗口样式（空壳 → S2 只读看板）。
-   透明前提：宿主 .timeline-shell 全透明。起看板 = 两张独立卡片（顶栏 .tl-bar + 面板
+/* 项目推进时间轴窗口样式（只读看板）。
+   透明前提：宿主 .timeline-shell 全透明。看板 = 两张独立卡片（顶栏 .tl-bar + 面板
    .timeline-body,中间透明间隙,对齐主界面 titlebar / shell-main）。窗口风格两档（chrome.rs
    apply_timeline_style_chrome）：
    - .is-floating（Shadow,默认）= 主窗口组合：DWM 阴影 + ROUND,外缘 8px 全透明呼吸位
@@ -8,8 +8,8 @@
    条态恒 flat（Rust 施加),呼吸位只挂 .is-board。
    颜色：消费挂件派生变量（--widget-card-* 由 widgetTheme hook 写入,scheme 内置值
    在 tokens.css）与主题 tokens（--accent 等）,选择器独立不复用 .shell / .is-widget。
-   拖动：只有顶栏 .tl-bar 挂 data-tauri-drag-region="deep"（逐元素挂载——
-   该属性只作用 mousedown target 不继承）;看板区是交互区。
+   拖动：只有顶栏 .tl-bar 挂 data-tauri-drag-region="deep"（须逐元素挂载——该属性只作用
+   mousedown target 不继承）;看板区是交互区。
    层次：面板 / 顶栏 / 会话格三档背景 alpha 可调;左侧日期标签全透明悬挂在
    面板背景上;今天的大格不画强调描边。
    看板：CSS Grid,列 [日标签 | N 项目]、日期向下。 */
@@ -149,14 +149,14 @@
   opacity: 0.55;
 }
 
-/* 项目列头（顶栏内） */
+/* 项目列头（顶栏内）:项目名与未动天数同一行,名字先省略,徽标不缩 */
 .tl-proj {
   position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
+  flex-direction: row;
+  align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 5px;
   min-width: 0;
   min-height: 0;
   padding: 0 6px;
@@ -166,7 +166,7 @@
 }
 .tl-proj-label {
   min-width: 0;
-  flex: none;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -184,7 +184,7 @@
   background: var(--tl-line);
   white-space: nowrap;
 }
-/* S3 注意力：弱提示（「弱于订阅悬浮球失效色,强于常态一档」）。
+/* 注意力：弱提示（弱于订阅悬浮球失效色,强于常态一档）。
    waiting = 淡底 + 缓慢呼吸点;pending（工具久未回）= 次色静态点。点击行头确认。 */
 .tl-proj.is-waiting,
 .tl-proj.is-pending {
@@ -208,7 +208,7 @@
 .tl-proj.is-pending .tl-dot {
   background: color-mix(in srgb, var(--tl-accent) 45%, var(--widget-card-text-muted, #888));
 }
-/* S5 降级：聚焦时宿主窗口不存在 → 灰色「上次停在这里」,点击回退打开目录 */
+/* 降级：聚焦时宿主窗口不存在 → 灰色「上次停在这里」,点击回退打开目录 */
 .tl-proj.is-stale {
   cursor: pointer;
 }
@@ -233,8 +233,8 @@
     animation: none;
   }
 }
-/* 格子。（空格子不画边框、有活动格上热力底）→ ：
-   每日格按会话向下拆成多格（.tl-item）,行高随内容、面板可滚动。
+/* 格子：空格子不画边框、有活动格上热力底;每日格按会话向下拆成多格（.tl-item）,
+   行高随内容、面板可滚动。
    格子尺寸范围见 timelineConfig（模板 minmax）,窗口缩到最小尺寸后不再缩小。 */
 .tl-cell {
   display: flex;
@@ -246,7 +246,7 @@
   border-radius: 6px;
   box-sizing: border-box;
 }
-/* 空格子：今天与过去同一浅底（今天的空格不再染主题色）;未来空格不画 */
+/* 空格子：今天与过去同一浅底（今天的空格不染主题色）;未来空格不画 */
 .tl-cell.is-empty:not(.is-future) {
   background: color-mix(in srgb, var(--widget-card-border) 28%, transparent);
 }
@@ -433,7 +433,7 @@
   color: var(--widget-card-text-muted, var(--text-muted));
 }
 
-/* ---------- S4 条态（/） ----------
+/* ---------- 条态 ----------
    形态单一源在 Rust（set_timeline_form 原子执行尺寸 / 位置 / 置顶）;这里只按 .is-strip / .is-board
    切换两层可见性。条态层常驻 DOM：看板态 visibility:hidden 仍参与布局,ResizeObserver 才量得到
    .tl-strip-inner 的 max-content 宽（传给 Rust 定窗口宽）——勿改成 display:none / 条件渲染。
@@ -527,7 +527,7 @@
   }
 }
 
-/* 窥视态（白底下看不见 + 整条宽易误触 → 短把手 + 窄阴影）：窗口 = Rust PEEK_W × PEEK_H
+/* 窥视态：短把手 + 窄阴影（白底下也看得,且不像整条那样易误触）。窗口 = Rust PEEK_W × PEEK_H
    （88 × 9,居中于原条）,条内容隐藏（visibility 保留布局,量宽不断）:after 画贴顶 4px 半透明把手,
    两侧 / 下方透明边留给 3px 阴影。几何与 timeline_form.rs PEEK_*_LOGICAL 同源。指针移入即回完整条态。 */
 .timeline-shell.is-peek .tl-strip {

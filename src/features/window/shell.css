@@ -1,11 +1,9 @@
-/* 主窗口外壳（现代化）：frameless + 自绘标题栏 + 四层栅格。
-   设计语言对齐挂件卡片（tokens v2）。
-   边缘策略：外缘呼吸位**全透明** + DWM 系统阴影充当
-   悬浮投影——主窗口与挂件同为可缩放 frameless（THICKFRAME），系统阴影压不掉
-转正即可；卡片自身不再画 CSS 投影（避免双重阴影 + CSS
-   阴影在透明环边缘被窗口矩形硬切）。标题栏保留半透明条（实体感）。
+/* 主窗口外壳：frameless + 自绘标题栏 + 四层栅格，设计语言对齐挂件卡片。
+   边缘策略：外缘呼吸位**全透明**，由 DWM 系统阴影充当悬浮投影——主窗口与挂件同为
+   可缩放 frameless（THICKFRAME），系统阴影压不掉，索性转正；卡片自身不画 CSS 投影
+   （否则双重阴影，且 CSS 阴影在透明环边缘被窗口矩形硬切）。标题栏保留半透明条（实体感）。
    注意：挂件窗口宿主也挂 .shell 类（.shell.is-widget）——主窗口样式**只属于
-   .is-expanded**；挂件宿主必须保持全透明全出血。 */
+   .is-expanded**；挂件宿主必须保持全透明全出血（窗口即卡片）。 */
 
 .shell {
   display: flex;
@@ -32,8 +30,7 @@
 }
 
 /* ---- 第一层：自绘标题栏（半透明悬浮条，圆角独立于内容卡片） ----
-   alpha 走 --shell-bg-alpha（默认 0.8，设置页可调；
-   与挂件 bgOpacity 零关联——解耦约定的延续）。 */
+   alpha 走 --shell-bg-alpha（默认 0.8，设置页可调；与挂件 bgOpacity 互不关联）。 */
 .titlebar {
   display: flex;
   align-items: center;
@@ -61,8 +58,7 @@
 }
 
 .titlebar-logo {
-  /* CSS 渐变紫贴图 → app 图标（img 资产,与 bundle 图标同源）;
-     图标自带圆角与玻璃描边,CSS 不再加 border-radius 叠加 */
+  /* app 图标（img 资产，与 bundle 图标同源）自带圆角与玻璃描边，CSS 不再叠加 border-radius */
   width: 18px;
   height: 18px;
   object-fit: contain;
@@ -112,7 +108,7 @@
   color: #fff;
 }
 
-/* 顶层视图 seg（文字按钮与 Widget 同款组件形式,不再用图形）。
+/* 顶层视图 seg（文字按钮，与 Widget 同款组件形式）。
    标题栏底是半透明条,.seg 的 zero-bg 底在此不可见——激活态用白卡 + 阴影。 */
 .titlebar-view {
   border-radius: var(--radius-sm);
@@ -136,7 +132,7 @@
   margin-right: 4px;
 }
 
-/* ---- 内容行：内容卡片（矩阵视图 / 设置视图共用容器，设置入主区） ---- */
+/* ---- 内容行：内容卡片（矩阵视图 / 设置视图共用容器） ---- */
 .shell-body {
   flex: 1;
   min-height: 0;
@@ -162,13 +158,11 @@
   border: none;
 }
 
-/* ---- spike：主窗口毛玻璃材质态（material-on 由 materialTheme
-   挂载）。Mica/Acrylic 背板填满窗口矩形（呼吸位与卡片圆角外均透材质），
-   CSS 圆角裁不住 DWM 背板——圆角切换 DWM 单源（Rust 联动 ROUND/DONOTROUND，
-   本文件不动圆角）；.shell-main 改半透明叠色让材质透出（78% 为 spike 起点，
-   调优）。最大化态保持转实底语义之上的透明度即可：color-mix 特异性
-   高于 .is-maximized 覆盖链，最大化时系统自动方角 + 呼吸位归零，材质透出
-   只来自卡片底叠色。 ---- */
+/* ---- 主窗口毛玻璃材质态（material-on 由 materialTheme 挂载）。
+   Mica/Acrylic 背板填满窗口矩形（呼吸位与卡片圆角外均透材质），CSS 圆角裁不住
+   DWM 背板——圆角由 DWM 单源控制（Rust 联动 ROUND/DONOTROUND，本文件不动圆角）；
+   .shell-main 改半透明叠色让材质透出。color-mix 特异性高于 .is-maximized 覆盖链，
+   最大化时系统自动方角 + 呼吸位归零，材质透出只来自卡片底叠色。 ---- */
 html.material-on .shell.is-expanded .shell-main {
   background: color-mix(in srgb, var(--panel) 78%, transparent);
 }

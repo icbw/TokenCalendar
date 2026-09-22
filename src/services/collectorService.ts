@@ -1,5 +1,4 @@
-// Collector 契约封装：来源健康面板 + 暂停开关（对齐旧 CollectorService 的子集：
-// 前端 UI 只消费 ListSources/GetPaused/SetPaused）。
+// Collector 命令封装：来源健康面板、暂停开关、采集频率、挂件网格吸附开关。
 
 import type { SourceSummaryContract } from './contract'
 import type { SourceSummary } from './types'

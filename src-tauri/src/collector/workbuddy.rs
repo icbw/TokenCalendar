@@ -2,29 +2,28 @@
 //!
 //! 口径：
 //! - `providerData.rawUsage` 存在的 `function_call` 行与 **assistant `message` 行**（纯文本
-//!   最终回复的 usage 挂在 message 行上,本机 71 条,旧口径漏计）；
+//!   最终回复的 usage 挂在 message 行上,漏掉会少计）；
 //! - cache_read = `prompt_cache_hit_tokens`（clamp ≥0）；input = prompt_tokens - cache_read
 //!   （prompt 已含 cache hit,拆出 cache-exclusive input）；output = completion_tokens；
 //! - total = `rawUsage.total_tokens`（含 cache 与 reasoning,不重复加总）,≤0 时回退 input+output；
-//! - 时间戳：顶层 `timestamp` 数字,> 1e10 视为毫秒否则秒（旧口径）；
+//! - 时间戳：顶层 `timestamp` 数字,> 1e10 视为毫秒否则秒；
 //! - 模型：`providerData.requestModelId` 优先 → `providerData.model` → "unknown"。
-//! - 积分：`rawUsage.credit` 按行入 `daily_usage.credit`（与该行 usage 同格）。本机 2147 行
-//!   全带、`messageId` 无重复行;按 `conversationRequestId` 汇总与旧官网导出 WorkBuddy 行 79 个重叠中 76 个相等。
+//! - 积分：`rawUsage.credit` 按行入 `daily_usage.credit`（与该行 usage 同格）。带 usage 的行都带 credit、
+//!   `messageId` 无重复行,按行入账不会重计。
 //!
 //! 对话轮计数：`type=="message" && role=="user"` 是真实用户输入（function_call
 //! 是模型发起的**工具调用**,不是对话,勿计入）→ 置 pending 标志,下一条带 rawUsage
-//! 的行按其模型计 1 turn 并清位;pending 持久化进游标。v8:子代理文件
+//! 的行按其模型计 1 turn 并清位;pending 持久化进游标。子代理文件
 //! （`<session>/subagents/agent-*.jsonl`）的提示行不计轮。
 //!
 //! 轮与时间：用户 message 开轮;带 usage 的行 = 模型调用（按
 //! `providerData.messageId` 去重）;`function_call.callId` → `function_call_result.callId`
-//! 配对算 tool_ms;assistant message `status=="incomplete"` 计错（S4-R 复核:源不区分截断 / 失败 /
+//! 配对算 tool_ms;assistant message `status=="incomplete"` 计错（源不区分截断 / 失败 /
 //! 中断,不当作用户中止;零响应被下一次输入顶掉的轮由累加器记中止）。会话 = `sessionId`,
-//! 子代理文件 parent = 上两级目录名;
-//! 项目 = 行级 `cwd`;标题（内容列）= `ai-title.aiTitle`。
+//! 子代理文件 parent = 上两级目录名（= 主会话文件名 = 主 sessionId）;
+//! 项目 = 文件所在文件夹（行内 `cwd` 只用于还原可读路径）;标题（内容列）= `ai-title.aiTitle`。
 //!
-//! db（session 级 estimated 口径）与 traces 兜底源不接入——避免低质量数据混入
-//! 主指标。
+//! db（session 级 estimated 口径）与 traces 兜底源不接入——避免低质量数据混入主指标。
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -305,7 +304,7 @@ mod tests {
             WorkBuddyAdapter::parse_line(r#"{"id":"m1","timestamp":1757000000000,"type":"message","role":"user","content":[{"t":1}]}"#),
             WbLine::UserInput
         ));
-        // assistant 的 message 行 → 忽略
+        // 无 rawUsage 的 assistant message 行 → 忽略
         assert!(matches!(
             WorkBuddyAdapter::parse_line(r#"{"id":"m2","timestamp":1757000000000,"type":"message","role":"assistant"}"#),
             WbLine::None
@@ -320,12 +319,12 @@ mod tests {
 
     #[test]
     fn assistant_message_usage_counts() {
-        // v8:纯文本最终回复（assistant message 带 rawUsage）入账
+        // 纯文本最终回复（assistant message 带 rawUsage）入账
         let msg = r#"{"id":"m9","timestamp":1757000000000,"type":"message","role":"assistant","status":"completed","sessionId":"s1","providerData":{"messageId":"mid9","model":"glm-5.3","rawUsage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_cache_hit_tokens":0}}}"#;
         assert!(matches!(WorkBuddyAdapter::parse_line(msg), WbLine::Usage { .. }));
     }
 
-    // ---------- PHASE12 S2:冻结样本行（2026-09-15 本机真实结构,键集保持,正文脱敏） ----------
+    // ---------- 冻结样本行（本机真实结构,键集保持,正文脱敏） ----------
 
     const T: i64 = 1_788_602_400_000;
     fn row(ty: &str, dt: i64, extra: &str) -> String {

@@ -1,13 +1,12 @@
-// materialTheme: 毛玻璃 spike（材质档位应用 + 失焦补偿）。
+// materialTheme: 毛玻璃材质档位应用 + 失焦补偿。
 // 档位单一源在 designPrefs（widgetMaterial/mainMaterial）；本模块把档位变成
 // Rust 调用（set_window_material）与伴随形态（material-on 类、DWM ROUND 由
 // Rust 侧联动）。Mica 亮暗显式绑定当前生效 scheme（apply_mica 的 dark 参数，
 // 不随系统漂移），scheme 变化时整体重应用。
 //
-// 失焦补偿：挂件 host backdrop 材质随失焦退化
-// （变暗/退纯色）是系统设计，无参数可规避——补偿 = 失焦时把卡片底 alpha
-// 抬到起点配方（浅色 .65–.8 / 深色 .55–.7，此处取中值），
-// 只升不降。spike 后调优，非定论。
+// 失焦补偿：挂件 host backdrop 材质随失焦退化（变暗/退纯色）是系统设计，
+// 无参数可规避——补偿 = 失焦时把卡片底 alpha 抬到起点配方
+// （浅色 .65–.8 / 深色 .55–.7，此处取中值），只升不降。TODO: 数值待调优。
 import { useEffect, useState } from 'react'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, type DesignPrefs } from './designPrefs'
 import { inTauri } from '../../services/tauri'
@@ -15,7 +14,7 @@ import { setWindowMaterial } from '../../services/windowService'
 
 export type MaterialLabel = 'widget' | 'main'
 
-/** 失焦补偿 alpha 起点。 */
+/** 失焦补偿 alpha 起点（配方区间中值）。 */
 export const BLUR_COMPENSATION_LIGHT = 0.72
 export const BLUR_COMPENSATION_DARK = 0.62
 

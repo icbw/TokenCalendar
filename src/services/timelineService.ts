@@ -113,7 +113,7 @@ export interface AttentionItem {
   projectKey: string
   /** 【内容列】 */
   title: string | null
-  /** 桌面宿主线索（S5;只透传,聚焦目标由 Rust 登记表决定）。 */
+  /** 桌面宿主线索（只透传,聚焦目标由 Rust 登记表决定）。 */
   host: string | null
   state: AttentionState
   since: number

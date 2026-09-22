@@ -1,4 +1,4 @@
-// 范围控件（-R）:7d / 30d / 90d / All / Custom 分段 + 自定义起止日期 +
+// 范围控件:7d / 30d / 90d / All / Custom 分段 + 自定义起止日期 +
 // 解析后的区间文字;选定单个项目时,非项目生命周期模式下给「Project span」按钮。
 // 状态与规则在 useRangeSelection,本组件只渲染与转发。
 import { useEffect, useState } from 'react'

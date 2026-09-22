@@ -1,7 +1,7 @@
-// FullWindow：主窗口薄壳（现代化：frameless + 自绘标题栏 + 四层栅格）。
+// FullWindow：主窗口薄壳（frameless + 自绘标题栏 + 四层栅格）。
 // 层次：TitleBar（品牌 + 窗口控制）/ Toolbar（矩阵视角与筛选，UsageMatrixView 内）
-// / 内容 / StatusFooter（采集状态）。：设置自右缘窄面板改为内容区独立
-// 设置页（SettingsPage，三子 tab），标题栏齿轮 = 矩阵 ⇄ 设置顶层视图切换。
+// / 内容 / StatusFooter（采集状态）。设置是内容区独立设置页（SettingsPage），
+// 标题栏齿轮 = 主视图 ⇄ 设置顶层视图切换。
 // 窗口操作 Rust 命令（main_minimize/toggle_maximize/close）；拖动区用
 // data-tauri-drag-region；最大化状态经 main-maximized-changed 广播切换圆角与按钮态。
 import { useCallback, useEffect, useLayoutEffect, useState } from 'react'
@@ -22,16 +22,14 @@ import { useMaterialSync } from '../settings/materialTheme'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
 import './shell.css'
 
-// 矩阵与图表拆成两个独立视图按钮——'matrix'（热力图）
-// 与 'insights'（洞察图表）本来就是两个视图,共用主内容区三态互斥;齿轮（settings)
-// 逻辑不变。'matrix' 视图 = 矩阵 + 下方全系列联动曲线（跟随矩阵 groupBy）。
-// 'tasks'（任务列表）为第三个视图按钮,与 matrix / insights 三态互斥。
+// 主内容区四态互斥：'matrix'（热力图）/ 'insights'（洞察图表）/ 'tasks'（任务列表）
+// 三个视图按钮 + 齿轮 'settings'。'matrix' 视图 = 矩阵 + 下方全系列联动曲线（跟随矩阵 groupBy）。
 type MainView = 'matrix' | 'insights' | 'tasks' | 'settings'
 
 export default function FullWindow() {
   useShowOnLoad()
   // 主界面主题（顶栏/主体/边框取色 + 顶栏 alpha）仅主窗口消费；
-  // 挂件窗口不读这些变量，独立性验收=改主界面取色挂件外围零变化。
+  // 挂件窗口不读这些变量，改主界面取色挂件外围零变化。
   useMainThemeSync()
   // 毛玻璃材质档（本窗口自己的 mainMaterial 键；Rust 联动
   // DWM ROUND，CSS 侧 material-on 类切半透明叠色）。
@@ -101,17 +99,17 @@ export default function FullWindow() {
     return () => window.removeEventListener('storage', onStorage)
   }, [applyMainNav])
 
-  // 9.1 联动：'model' 视图的曲线跟随矩阵 groupBy（Model 视角 → 全模型曲线;
+  // 'matrix' 视图的曲线跟随矩阵 groupBy（Model 视角 → 全模型曲线;
   // Agent 视角 → 全 Agent 曲线）。groupBy 状态提升到 FullWindow,UsageMatrixView
-  // 受控消费;切到 chart 视图再回来时保持上次视角。
+  // 受控消费;切到其它视图再回来时保持上次视角。
   const [matrixGroupBy, setMatrixGroupByState] = useState<MatrixGroupBy>('agent')
-  // v3.1 图表面板状态（会话记忆,切视图/重启窗口不丢——保持在 FullWindow 不随
-  // 面板卸载重置）:选中行（null = 预设全系列）、折叠、合计模式。
+  // 图表面板状态（放在 FullWindow,切视图不随面板卸载重置）:
+  // 选中行（null = 预设全系列）、折叠、合计模式。
   const [panelRow, setPanelRow] = useState<string | null>(null)
   const [panelCollapsed, setPanelCollapsed] = useState(false)
   const [panelTotalOnly, setPanelTotalOnly] = useState(false)
   // 进出 project 维时清掉面板选中行——项目键与 agent / model 键不同族,
-  // 带过去只会钻取出空曲线（agent ⇄ model 之间的既有行为不动）。
+  // 带过去只会钻取出空曲线（agent ⇄ model 之间切换保留选中行）。
   const setMatrixGroupBy = useCallback(
     (g: MatrixGroupBy) => {
       if (g !== matrixGroupBy && (matrixGroupBy === 'project' || g === 'project')) setPanelRow(null)
@@ -169,7 +167,7 @@ export default function FullWindow() {
     }
   }, [])
 
-  // 应用更新（设置·About 的自动更新开关，默认开）：安装版启动后延迟检查，
+  // 应用更新（设置·About 的自动更新开关，默认关）：安装版启动后延迟检查，
   // 有新版直接下载并安装（签名校验在 updater 插件内完成；Windows 上应用会随
   // 安装器退出）。dev 构建整段跳过——dev 的 identifier 与安装版不同，
   // 在 dev 里执行安装会把正式版装进系统。
@@ -206,8 +204,7 @@ export default function FullWindow() {
         onDoubleClick={toggleMaximize}
       >
         <div className="titlebar-brand" data-tauri-drag-region>
-          {/* 品牌位用 app 图标（原 CSS 渐变紫贴图弃用）,
-              资产与 bundle 图标同源（src-tauri/icons/128x128.png 拷贝）*/}
+          {/* 品牌位用 app 图标,资产与 bundle 图标同源（src-tauri/icons/128x128.png 拷贝）*/}
           <img className="titlebar-logo" src={appLogo} alt="" aria-hidden="true" />
           <span className="titlebar-title">TokenCalendar</span>
         </div>
@@ -229,8 +226,7 @@ export default function FullWindow() {
           >
             Widget
           </button>
-          {/* 按钮名回归原版——Matrix / Insights（文字 seg,
-              与 Widget 同款组件形式）;三态互斥,再点活动按钮回 matrix。*/}
+          {/* Matrix / Insights 文字 seg（与 Widget 同款组件形式）;三态互斥,再点活动按钮回 matrix。*/}
           <button
             className={`seg titlebar-view${view === 'matrix' ? ' is-active' : ''}`}
             onClick={() => setView('matrix')}
@@ -291,8 +287,8 @@ export default function FullWindow() {
                   固定高度可折叠;点行名联动替换预设曲线,再点恢复（逻辑与 chart 页
                   行联动一致）。矩阵内部行名点击经 onRowSelect 上抛。
                   matrix-stage 包裹矩阵+面板——面板消费的 --cells-w 等
-                  共享变量在 UsageMatrixView 内部生成,必须是其后代才能继承
-                  （此前面板是兄弟节点,变量断链 → 图表错位/按钮飞出）。*/}
+                  共享变量在 UsageMatrixView 内部生成,面板必须是其后代才能继承
+                  （作兄弟节点时变量断链 → 图表错位/按钮飞出）。*/}
               <div className="matrix-stage">
                 <UsageMatrixView
                   groupBy={matrixGroupBy}

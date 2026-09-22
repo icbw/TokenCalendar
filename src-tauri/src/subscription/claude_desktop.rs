@@ -1,9 +1,8 @@
 //! Claude 桌面端额度采样（Claude 平台的零凭据补充数据源）。
 //!
-//! 背景：主路径读 `~/.claude/.credentials.json`,只有 CLI /
-//! VS Code 扩展运行时才续期该文件;**Claude 桌面端**（含其 Code 标签页拉起的
-//! claude.exe）自持登录态,不回写这份文件——只用桌面端的用户,文件内 token 过期后
-//! 悬浮球永远停在 auth_failed。
+//! 主路径读 `~/.claude/.credentials.json`,只有 CLI / VS Code 扩展运行时才续期该文件;
+//! **Claude 桌面端**（含其 Code 标签页拉起的 claude.exe）自持登录态,不回写这份文件——
+//! 只用桌面端的用户,文件内 token 过期后悬浮球会一直停在 auth_failed。
 //!
 //! 桌面端自己每 ~15 分钟把订阅用量采样写进 `plan-usage-history.json`：
 //! `{"version":2,"samples":[{"t":<unix ms>,"org":"<uuid>","u":{"fh":<5h %>,"sd":<7d %>}}]}`
@@ -217,8 +216,7 @@ fn build(t: i64, fh: f64, sd: f64, now: i64) -> Option<SubscriptionSnapshot> {
 ///
 /// `probe_growth` 判 `NoGrowth` 的前提就是手上有一条**比上次读数更新**的样本,只是
 /// 没涨。但 5h / 7d 都是**滚动窗口**：离开期间旧用量不断过期,「没涨」里其实还藏着
-/// 「掉了」——旧版把这条样本整个丢掉、快照原样保留,于是球上的余量停在偏低的旧值,
-/// 要等复工那一笔 token 或手动刷新才纠正,而此刻明明已经握着更新的样本。
+/// 「掉了」;若丢掉这条样本,球上的余量会停在偏低的旧值,直到复工那一笔 token 或手动刷新。
 ///
 /// 这里只做**下**（样本低出一个取整位以上才改;涨的那一路走 `Growth` 正常取数,
 /// ±1 以内当整数取整噪声不动），并且：

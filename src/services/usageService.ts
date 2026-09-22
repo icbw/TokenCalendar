@@ -1,5 +1,4 @@
-// Usage 契约的取数封装：契约 snake_case → 内部驼峰形状。
-// 对齐旧 UsageService.GetMonthlyMatrix / GetBreakdown 的语义（含失败返回 null）。
+// Usage 契约的取数封装：契约 snake_case → 内部驼峰形状；失败返回 null。
 
 import type {
   BreakdownDay,
@@ -47,7 +46,7 @@ export async function getBreakdown(kind: string, key: string, month: string): Pr
   return tryInvoke<BreakdownDay[]>('get_breakdown', { kind, key, month })
 }
 
-/** credit 月报（数据洞察;snake_case → 驼峰一次映射）。 */
+/** credit 月报（snake_case → 驼峰一次映射）。 */
 export interface CreditModelSlice {
   key: string
   label: string
@@ -99,7 +98,7 @@ export async function getCreditSummary(month: string): Promise<CreditSummary | n
   }
 }
 
-// ---- 时间范围序列----
+// ---- 时间范围序列 ----
 
 export interface RangeSeriesQuery {
   startDay: string

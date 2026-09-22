@@ -32,7 +32,7 @@ fn clone_db(src: &PathBuf, out: &PathBuf) -> PathBuf {
     dst
 }
 
-/// **读数时间序列两层的真库迁移**（-4）：在真库副本上跑一遍开库顺序,
+/// **读数时间序列两层的真库迁移**：在真库副本上跑一遍开库顺序,
 /// 核对 `desktop_sample` 一行不动、 已收割的读数全部就地回填进 `quota_reading`、
 ///  `quota_daily` 由它完整长出来且与整表重建逐位相同、 再开一次什么都不变。
 #[test]
@@ -180,79 +180,6 @@ fn generations(s: &SubStore) -> Vec<(String, i64, String, i64)> {
     it.flatten().collect()
 }
 
-/// 权重表升版后的存量重算：在真库副本上跑一遍启动顺序（open → recompute → refit）,
-/// 核对「一行不丢、可恢复的全部抬到当前世代、标定仍拿得到样本」。
-#[test]
-#[ignore]
-fn weight_version_bump_recomputes_real_db() {
-    let Some(src) = real_db() else {
-        eprintln!("没有找到真库,跳过（设 TC_SUB_DB=<路径>）");
-        return;
-    };
-    let out = std::env::var_os("TC_SMOKE_OUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("tc_sub_smoke");
-    let _ = std::fs::remove_dir_all(&out);
-    let dst = clone_db(&src, &out);
-    println!("真库副本 → {}", dst.display());
-
-    let before_rows: i64 = {
-        let s = SubStore::open(&dst).expect("open");
-        // open 已经跑完就地升级;先记下升级后、重算前的世代分布
-        println!("--- 升级后 / 重算前 ---");
-        for g in generations(&s) {
-            println!("  platform={} weight_ver={} plan={} rows={}", g.0, g.1, g.2, g.3);
-        }
-        for p in [Platform::Claude, Platform::Codex] {
-            super::calib::refit_from_store(&s, p);
-            println!(
-                "  refit(旧世代) {}: scale={:.6} n={}",
-                p.as_str(),
-                super::calib::scale(p),
-                super::calib::sample_count(p)
-            );
-        }
-        s.conn_for_smoke()
-            .query_row("SELECT COUNT(*) FROM usage_pair", [], |r| r.get(0))
-            .unwrap()
-    };
-
-    let s = SubStore::open(&dst).expect("reopen");
-    println!("--- 重算 ---");
-    let mut doubtful_total = 0usize;
-    for p in [Platform::Claude, Platform::Codex] {
-        let (done, doubtful) = s.recompute_stale_costs(p).expect("recompute");
-        doubtful_total += doubtful;
-        println!("  {}: 重算 {done} 行,存疑 {doubtful} 行", p.as_str());
-        super::calib::refit_from_store(&s, p);
-        println!(
-            "  refit(新世代) {}: scale={:.6} n={}",
-            p.as_str(),
-            super::calib::scale(p),
-            super::calib::sample_count(p)
-        );
-    }
-    println!("--- 重算后 ---");
-    for g in generations(&s) {
-        println!("  platform={} weight_ver={} plan={} rows={}", g.0, g.1, g.2, g.3);
-    }
-
-    let after_rows: i64 = s
-        .conn_for_smoke()
-        .query_row("SELECT COUNT(*) FROM usage_pair", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(before_rows, after_rows, "重算不许丢行");
-
-    // 幂等：再跑一遍应当是空操作
-    for p in [Platform::Claude, Platform::Codex] {
-        let (done, _) = s.recompute_stale_costs(p).expect("recompute again");
-        assert_eq!(done, 0, "{} 第二次重算必须是空操作", p.as_str());
-    }
-    println!("幂等：第二次重算 0 行");
-    println!("存疑（breakdown 恢复不了）共 {doubtful_total} 行——不删,留库当档案");
-}
-
 /// 每行的 `（id, t1, cost, breakdown)`（重算前后对拍用）。
 fn pair_costs(s: &SubStore) -> Vec<(i64, i64, f64, String)> {
     let mut st = s
@@ -265,13 +192,15 @@ fn pair_costs(s: &SubStore) -> Vec<(i64, i64, f64, String)> {
     it.flatten().collect()
 }
 
-/// 的真库：`price_model` 就地迁移 + 按时刻取价 + 代价单位改美元当量。
+/// `price_model` 就地迁移 + 按时刻取价 + 代价单位改美元当量的真库。
 ///
 /// 在真库**副本**上跑一遍启动顺序（open → price:load_from → recompute → refit）,核对：
 /// - `price_model` 由就地迁移建好并填上出厂种子,**既有行一条不少**;
-/// - 存量行的 `cost` 是一次**纯量纲换算**：旧值 × 0.002 = 新值（旧单位 1 = $0.002）,
+/// - 世代 2 的存量行,`cost` 是一次**纯量纲换算**：旧值 × 0.002 = 新值（旧单位 1 = $0.002）,
 ///   逐行核对;偏离的行单独列出来（那就是真的改了价的模型）;
 /// - `scale` 相应地 ×500,于是 `cost × scale`（= 预计消耗百分点）**逐行不变** ⇒ 零回归;
+/// - 更早世代的行按当前价目重算,不留在旧世代;
+/// - 重算后标定仍拿得到样本（有可用行的平台 n > 0）;
 /// - 重算幂等,存疑行不删。
 #[test]
 #[ignore]
@@ -289,34 +218,40 @@ fn price_model_migration_on_real_db() {
     println!("真库副本 → {}", dst.display());
 
     // ---- 升级前：旧构建看到的库长什么样 ----
-    // 这个库是**还没迁移过**的旧库,还是已经被跑过一次的新库？两种都要能跑：
-    // 「迁移前必落备份」「旧值 × 0.002 = 新值」这两条只在真的发生迁移时成立,
-    // 无条件断言会让本用例对同一个库**只能跑一次**。
+    // 这个库可能是还没迁移过的旧库,也可能是已经跑过一次的新库,两种都要能跑：
+    // 「迁移前必落备份」「旧值 × 0.002 = 新值」只在真的发生迁移时成立,
+    // 无条件断言会让本用例对同一个库只能跑一次。
     // 想重新走一遍迁移路径：TC_SUB_DB 指向 data/backups/subscriptions-pre-*.db。
-    let (needs_schema, needs_recompute, legacy_pairs): (bool, bool, i64) = {
+    // **两件独立的事**,别混：结构升级（缺表 / 缺列,要备份）与派生值重算（不改结构）。
+    // 恢复一份"迁移中"的备份就会出现"结构已齐、行还旧"——那时该重算不该备份。
+    // 结构缺口直接问 `SubStore:schema_gaps`（开库用的同一个判据）,不在这里另抄一份。
+    let (needs_schema, pre_ver, legacy_pairs): (bool, std::collections::BTreeMap<i64, i64>, i64) = {
         let c = rusqlite::Connection::open(&dst).unwrap();
-        let has_price: bool = c
+        let gaps = SubStore::schema_gaps(&c);
+        let has_ver: bool = c
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_model'",
+                "SELECT COUNT(*) FROM pragma_table_info('usage_pair') WHERE name = 'weight_ver'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
             .unwrap()
             > 0;
-        let stale: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM usage_pair WHERE weight_ver <> 0 AND weight_ver < ?1",
-                [super::cost::WEIGHT_VERSION],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        println!("--- 升级前 --- price_model 存在={has_price}, 待重算行={stale}");
-        let n = c.query_row("SELECT COUNT(*) FROM usage_pair", [], |r| r.get(0)).unwrap();
-        // **两件独立的事**,别混：建表是结构变更（要备份）,重算是派生值刷新（不改结构）。
-        // 恢复一份"迁移中"的备份就会出现"表已在、行还旧"——那时该重算不该备份。
-        (!has_price, stale > 0, n)
+        // 没有 weight_ver 列的库,升级时 ALTER 的默认值是 1（首个权重表）
+        let sql = if has_ver {
+            "SELECT id, weight_ver FROM usage_pair"
+        } else {
+            "SELECT id, 1 FROM usage_pair"
+        };
+        let mut st = c.prepare(sql).unwrap();
+        let pre_ver: std::collections::BTreeMap<i64, i64> =
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+        let n = pre_ver.len() as i64;
+        println!("--- 升级前 --- 结构缺口={gaps:?}");
+        (gaps.any(), pre_ver, n)
     };
-    println!("  ⇒ 需要建表={needs_schema} 需要重算={needs_recompute}");
+    let needs_recompute =
+        pre_ver.values().any(|v| *v != 0 && *v < super::cost::WEIGHT_VERSION as i64);
+    println!("  ⇒ 需要结构升级={needs_schema} 需要重算={needs_recompute}");
 
     // ---- open：就地迁移（建表 + upsert 种子 + 迁移前备份） ----
     let s = SubStore::open(&dst).expect("open");
@@ -330,9 +265,9 @@ fn price_model_migration_on_real_db() {
         .unwrap_or(0);
     println!("  迁移前备份：{backups} 份");
     if needs_schema {
-        assert!(backups >= 1, "结构变更前必须落备份（红线）");
+        assert!(backups >= 1, "结构升级前必须落备份（红线）");
     } else {
-        assert_eq!(backups, 0, "没有结构变更就不该无谓备份");
+        assert_eq!(backups, 0, "没有结构升级就不该无谓备份");
     }
 
     let price_rows = s.price_rows();
@@ -360,10 +295,10 @@ fn price_model_migration_on_real_db() {
     // ---- 重算前的 cost（= 旧构建按世代 2 相对权重算出来的值） ----
     let before = pair_costs(&s);
 
-    // 顺手演示**为什么 mod.rs 必须把重算排在标定装载之前**：此刻库里的 cost 还是旧
+    // 演示**为什么 mod.rs 必须把重算排在标定装载之前**：此刻库里的 cost 还是旧
     // 单位（1 单位 = $0.002）,而 PRIOR_SCALE 已经是新单位的 1 %/美元 —— 两者相差 500
     // 倍,于是 calib 的"隐含比值可信带"会把绝大多数样本判成离谱值踢掉。
-    // 这不是回归,是一个**不该出现的中间态**:启动顺序保证它不会发生。
+    // 这是一个**不该出现的中间态**,启动顺序保证它不会发生。
     for p in [Platform::Claude, Platform::Codex] {
         super::calib::refit_from_store(&s, p);
         println!(
@@ -386,13 +321,25 @@ fn price_model_migration_on_real_db() {
     assert_eq!(before.len(), after.len(), "重算不许丢行");
 
     // ---- 逐行核对量纲换算 ----
-    // 旧代价单位 1 = 1000 个 Sonnet 5 输入 token 当量 = 1000 × 2 USD/Mtok ÷ 1e6 = $0.002
+    // 旧代价单位 1 = 1000 个 Sonnet 5 输入 token 当量 = 1000 × 2 USD/Mtok ÷ 1e6 = $0.002。
+    // 只有世代 2（相对权重）→ 美元当量是纯量纲换算;更早的世代权重本身不同,重算是真的改价,
+    // 只核对它们被重算到了当前世代。
     const OLD_UNIT_USD: f64 = 0.002;
+    const UNIT_CHANGE_FROM: i64 = 2;
     let mut exact = 0usize;
     let mut drifted = vec![];
+    let mut repriced = 0usize;
     for ((id, t1, old_cost, body), (_, _, new_cost, _)) in before.iter().zip(after.iter()) {
         if super::cost::parse_breakdown(body).is_empty() {
             continue; // 存疑行的原值不动,不参与对拍
+        }
+        match pre_ver.get(id).copied().unwrap_or(0) {
+            UNIT_CHANGE_FROM => {}
+            v if v > 0 && v < UNIT_CHANGE_FROM => {
+                repriced += 1;
+                continue;
+            }
+            _ => continue,
         }
         let want = old_cost * OLD_UNIT_USD;
         let rel = if want != 0.0 { ((new_cost - want) / want).abs() } else { new_cost.abs() };
@@ -402,6 +349,16 @@ fn price_model_migration_on_real_db() {
             drifted.push((*id, *t1, *old_cost, want, *new_cost, rel));
         }
     }
+    let behind: i64 = s
+        .conn_for_smoke()
+        .query_row(
+            "SELECT COUNT(*) FROM usage_pair WHERE weight_ver <> 0 AND weight_ver < ?1",
+            [super::cost::WEIGHT_VERSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    println!("--- 早于世代 {UNIT_CHANGE_FROM} 的行按当前价目重算 {repriced} 行,仍落后于当前世代 {behind} 行 ---");
+    assert_eq!(behind, 0, "重算之后不许有行停在旧世代");
     if needs_recompute {
         println!("--- 量纲换算对拍（旧值 × {OLD_UNIT_USD} 应等于新值）---");
         println!("  逐位相符 {exact} 行,偏离 {} 行", drifted.len());
@@ -430,9 +387,8 @@ fn price_model_migration_on_real_db() {
     // ⇒ 判据不变。逐行两边各算一遍,逐个核对 usable 的结论相同。
     //
     // **只隔离"换单位"这一件事**：两边调的是**同一个** `usable`,只是一边喂旧量纲的
-    // 代价配旧量纲的带心、另一边喂新的。此前这里手抄了一份旧判据,于是判据本身一改
-    // 就会把两件不相干的改动混成一笔——改成调同一个函数之后
-    // 这道对拍对将来的判据改动自动免疫。
+    // 代价配旧量纲的带心、另一边喂新的。不另抄一份旧判据,否则判据本身一改就会把
+    // 两件不相干的改动混成一笔。
     let usable_flips: Vec<i64> = {
         let mut st = s
             .conn_for_smoke()
@@ -487,8 +443,8 @@ fn price_model_migration_on_real_db() {
     //
     // 读数是整数百分比 ⇒ 一段消耗若不够动一个百分点,Δ 就是 0,而 `usable` 目前要求
     // Δ > 0 ⇒ 这条样本被整条丢掉,**它的 cost 也一起离开了分母**。这会把 ΣΔ/Σcost
-    // 抬高。下面把两种算法都打出来,供筛选层的取舍用（抬采样下界那个方案
-    // 已被否决——区间长度同时是监测节奏的量,不该拿它当筛子）。
+    // 抬高。下面把两种算法都打出来,供筛选层的取舍用（不靠抬采样下界解决：区间长度
+    // 同时是监测节奏的量,不该拿它当筛子）。
     {
         let mut st = s
             .conn_for_smoke()
@@ -535,32 +491,26 @@ fn price_model_migration_on_real_db() {
         assert_eq!(total, after.len() as i64, "诊断只读,不许动行");
     }
 
-    // ---- 重算后：scale 与旧构建的值互为量纲换算 ----
+    // ---- 重算后：样本准入与逐行换算都已对拍 ⇒ 拟合出的 scale 恰好 ×500 ----
     println!("--- 重算后 ---");
     for g in generations(&s) {
         println!("  platform={} weight_ver={} plan={} rows={}", g.0, g.1, g.2, g.3);
     }
-    // 旧构建在**同一个库**上的输出。
-    // 拿它当跨构建的锚：新 scale × $0.002/旧单位应当还原成这个数。
-    // 带宽给 5%——这台机器每天都在新增样本,拟合值会小幅漂移,但不该整体位移。
-    const CLAUDE_SCALE_OLD_BUILD: f64 = 0.001852;
     for p in [Platform::Claude, Platform::Codex] {
         super::calib::refit_from_store(&s, p);
         let sa = super::calib::scale(p);
         let na = super::calib::sample_count(p);
         println!("  refit(重算后) {}: scale={:.6} %/美元 n={}", p.as_str(), sa, na);
+        let rows: i64 = s
+            .conn_for_smoke()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_pair WHERE platform = ?1 AND weight_ver <> 0",
+                [p.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rows == 0 || na > 0, "{} 有可用行,标定却一条样本都拿不到", p.as_str());
         println!("    折回旧单位 = {:.8} %/旧代价单位", sa * OLD_UNIT_USD);
-        if needs_recompute && matches!(p, Platform::Claude) && na > 0 {
-            let back = sa * OLD_UNIT_USD;
-            println!(
-                "    旧构建实测 {CLAUDE_SCALE_OLD_BUILD:.6} ⇒ 相对差 {:.3}%",
-                (back / CLAUDE_SCALE_OLD_BUILD - 1.0) * 100.0
-            );
-            assert!(
-                (back / CLAUDE_SCALE_OLD_BUILD - 1.0).abs() < 0.05,
-                "scale 折回旧单位后应还原旧构建实测值（{CLAUDE_SCALE_OLD_BUILD}）,实得 {back}"
-            );
-        }
         // 预计消耗 = cost × scale ⇒ 两个因子一个 ×0.002 一个 ×500,乘积不变
         println!("    ⇒ cost × scale 不变 ⇒ 取数时机零回归");
     }
@@ -615,8 +565,7 @@ fn claude_pairs(s: &SubStore) -> Vec<(i64, i64, f64, String)> {
 /// - Codex 从 0 条样本变成有样本,且 `scale` 由出厂预设 1.0 变成值;
 /// - 读数收割进 `desktop_sample` 且带上套餐;
 /// - **第二次 ingest 是空操作**（水位线生效,不重复建同一段区间的样本）;
-/// - 首次扫描读了多少文件 / 多少字节 / 花了多久——这是"回溯上限"那个常量的依据,
-///   不能靠推测（`HORIZON_DAYS` 的注释直接引用这里跑出来的数）。
+/// - 首次扫描读了多少文件 / 多少字节 / 花了多久——`HORIZON_DAYS` 的取值依据来自这里。
 #[test]
 #[ignore]
 fn codex_rollout_backfill_on_real_db() {
@@ -639,7 +588,7 @@ fn codex_rollout_backfill_on_real_db() {
         super::calib::refit_from_store(&s, p);
     }
     // 把副本上的 Codex 快照时间**倒拨**,好让「rollout 读数比上次取数新」这个条件成立。
-    // 真机上它要等下一次真的用 Codex 才出现,而这条路（零请求推进快照）正是要验的；
+    // 真机上它要等下一次真的用 Codex 才出现,而这条路（零请求推进快照）正是本用例要验的；
     // 倒拨的是副本,用的是真实 rollout 文件,跑的是同一份代码。
     if let Some(mut sn) = s.load_snapshot(Platform::Codex) {
         sn.fetched_at = Some(0);
@@ -813,13 +762,13 @@ fn real_collector_db() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// 套餐差异三件事的真库：
+/// 套餐差异三件事的真库（倍率表、套餐边界、冷启动次序）：
 ///
 /// - **零回归**：本机当前套餐（Claude Max 5x / Codex edu）的倍率是 1.0 ⇒ `prior_scale`
 ///   与真库上拟合出来的 `scale` 逐位不变;
 /// - **倍率表**：把各档折算出来的预设打出来,核对方向（配额小的档系数更大）;
-/// - **套餐边界**：真库里 `plan_since` 缺席（换档才写）⇒ `bootstrap` 的标注与加这条
-///   之前逐行相同,一行都不该变成「套餐未知」;
+/// - **套餐边界**：真库里 `plan_since` 缺席（换档才写）⇒ `bootstrap` 的标注与没有这条
+///   时逐行相同,一行都不该变成「套餐未知」;
 /// - **冷启动次序**：模拟全新安装——空的 subscriptions.db + 还没写盘的 collector.db,
 ///   核对「读数收割进去了、样本一条建不出来、水位线仍是 None」（正是这个 None 让
 ///   `mod.rs` 的闸门保持冷启动态、跟着 collector 首扫写盘重试）,再用真 collector.db
@@ -979,13 +928,13 @@ fn plan_aware_priors_on_real_db() {
     );
 }
 
-/// **一个 5h 窗口值多少钱——按套餐分开直接数**。
+/// **一个 5h 窗口值多少钱——按套餐分开直接数**（不依赖任何回归）。
 ///
-/// 起因：本机登录了两个 Codex 订阅账号（edu / plus），用完一个就切另一个。两个账号
+/// 本机登录了两个 Codex 订阅账号（edu / plus），用完一个就切另一个。两个账号
 /// **各有各的 5h 窗口**，而 rollout 把它们的读数写在同一条时间线上，只能靠 `plan_type`
-/// 区分。于是「窗口值多少钱」这件事必须**按套餐分开量**，否则量到的是两个窗口的混合。
+/// 区分。于是「窗口值多少钱」必须**按套餐分开量**，否则量到的是两个窗口的混合。
 ///
-/// 做法（比旧版的「用量从 ≤2% 爬到 ≥95%」更硬）：**同一个 `resets5` 就是同一个窗口实例**。
+/// 做法：**同一个 `resets5` 就是同一个窗口实例**。
 /// 把某套餐的读数按窗尾分组，每组取首尾算涨幅、把区间内的调用折成美元；
 /// 组内若夹着**另一个套餐的读数**（= 那段时间人在另一个账号上）就判为污染、整组不要
 /// ——那段涨幅是本账号的，代价却混进了别人的。
@@ -1023,9 +972,8 @@ fn codex_window_dollars_by_plan_on_real_db() {
         .collect();
     println!("读数里出现过的套餐：{plans:?}");
 
-    // ---- 对照：旧办法——在**混合**时间线上找
-    // 「used5 从 ≤2% 爬到 ≥95%」的连续段。两个账号各有各的窗口却写在同一条线上,
-    // 段首段尾可能分属两个账号 ⇒ 量到的不是任何一个窗口。
+    // ---- 对照：在**混合**时间线上找「used5 从 ≤2% 爬到 ≥95%」的连续段。
+    // 两个账号各有各的窗口却写在同一条线上,段首段尾可能分属两个账号 ⇒ 量到的不是任何一个窗口。
     {
         let cost_between = |t0: i64, t1: i64| -> f64 {
             let mut b: std::collections::BTreeMap<String, [i64; 4]> = Default::default();
@@ -1122,7 +1070,7 @@ fn codex_window_dollars_by_plan_on_real_db() {
             println!("  {plan:<5} 没有可用的窗口实例（涨幅够小的 {too_small} 个 / 被另一账号污染的 {polluted} 个）");
             continue;
         }
-        // 满窗美元 = 代价 / 涨幅 × 100;取中位数
+        // 满窗美元 = 代价 / 涨幅 × 100;取中位数（均值会被个别长尾拉走）
         let mut full: Vec<f64> = kept.iter().map(|(d, c)| c / d * 100.0).collect();
         full.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = full[full.len() / 2];
@@ -1177,10 +1125,10 @@ fn codex_fit_by_plan_on_real_db() {
     }
 }
 
-/// **抽样偏差：标定用的区间 vs 全部区间**。
+/// **抽样偏差：标定用的区间 vs 全部区间**（按套餐分开）。
 ///
 /// 回归只吃「端点链上、两端同套餐、没跨重置、`usable` 放行」的区间；直接测量吃的是
-/// 整个窗口。两者的差就是里那条「代价与涨幅的时序错位」——这里把它拆成
+/// 整个窗口。两者的差来自代价与涨幅的时序错位——这里把它拆成
 /// 三层，同一批读数、同一把价目，只改纳入范围：
 ///
 /// - **全部**：端点链上两端同套餐、没跨重置的区间（物理上有意义的全体）；
@@ -1215,7 +1163,7 @@ fn codex_pair_sampling_bias_by_plan_on_real_db() {
         scan.readings.iter().filter(|r| !r.plan.is_empty()).map(|r| r.plan.clone()).collect();
     let mut cur = 0usize;
     // （plan, dt, delta, cost) —— 一次遍历把三层要的东西都算出来
-    let mut rows: Vec<(String, i64, f64, f64, bool, i64)> = vec![];
+    let mut rows: Vec<(String, i64, f64, f64, bool)> = vec![];
     for w in ends.windows(2) {
         let (a, b) = (w[0], w[1]);
         while cur < scan.calls.len() && scan.calls[cur].t <= a.t {
@@ -1233,10 +1181,6 @@ fn codex_pair_sampling_bias_by_plan_on_real_db() {
         if a.plan != b.plan || a.plan.is_empty() || breakdown.is_empty() {
             continue;
         }
-        // 跨重置的区间两端不在同一个窗口里，Δ 根本没有意义 —— 这是物理，不是筛子
-        if matches!((a.resets5, b.resets5), (Some(x), Some(y)) if y > x) {
-            continue;
-        }
         let (cost, unknown) = super::cost::cost_of_breakdown(Platform::Codex, &breakdown, b.t);
         if cost <= 0.0 {
             continue;
@@ -1252,33 +1196,24 @@ fn codex_pair_sampling_bias_by_plan_on_real_db() {
             unknown_cost: unknown,
             aged_cost: 0.0,
         };
-        // 窗尾**后退**的幅度（负数 = 前移,已在上面挡掉;这里只会是 >=0）
-        let back = match (a.resets5, b.resets5) {
-            (Some(x), Some(y)) if x > y => x - y,
-            _ => 0,
-        };
+        // 跨重置 / 换账号的区间两端不在同一个窗口里,Δ 没有意义——这是物理,不是筛子。
+        // 判据与线上同一段代码（`Pair:window_changed`）。
+        if pair.window_changed() {
+            continue;
+        }
         rows.push((
             a.plan.clone(),
             b.t - a.t,
             b.used5 - a.used5,
             cost,
             pair.usable(super::calib::scale(Platform::Codex)),
-            back,
         ));
     }
 
     for plan in &plans {
         println!("--- {plan} ---");
-        let mine: Vec<&(String, i64, f64, f64, bool, i64)> =
-            rows.iter().filter(|r| &r.0 == plan).collect();
-        let back: Vec<&&(String, i64, f64, f64, bool, i64)> =
-            mine.iter().filter(|r| r.5 > 0).collect();
-        println!(
-            "  端点链上窗尾后退的区间 {} 个（>10 分钟的 {} 个 = 新判据会丢掉的）",
-            back.len(),
-            back.iter().filter(|r| r.5 > 600).count()
-        );
-        let report = |label: &str, sel: &dyn Fn(&&(String, i64, f64, f64, bool, i64)) -> bool| {
+        let mine: Vec<&(String, i64, f64, f64, bool)> = rows.iter().filter(|r| &r.0 == plan).collect();
+        let report = |label: &str, sel: &dyn Fn(&&(String, i64, f64, f64, bool)) -> bool| {
             let v: Vec<_> = mine.iter().filter(|r| sel(r)).collect();
             let d: f64 = v.iter().map(|r| r.2).sum();
             let c: f64 = v.iter().map(|r| r.3).sum();
@@ -1330,14 +1265,15 @@ fn codex_account_fingerprint_from_real_auth_json() {
     println!("note_account 的边界语义通过（从无到有 / 不变 / 换账号 / 空值）");
 }
 
-/// **同套餐双账号的结构性痕迹**。
+/// **同套餐双账号的结构性痕迹**（本机历史上有过两个 plus 账号并用的时期）。
 ///
 /// rollout 不带任何账号字段，但**窗尾骗不了人**：一个账号的 `resets_at` 在窗口内不变、
 /// 窗口滚动时向前跳，**永远不会往回走**（空窗时它 ≈ `now + 窗长`，仍是向前）。所以
 /// 同一个 `plan_type` 的相邻读数里出现**窗尾后退**，只能是换了另一个账号。
 ///
-/// 这一条把后退次数按套餐、按日期数出来，并数出**有多少个已建样本的两端跨在后退处**
-/// ——那就是「两端同套餐但不同账号」的污染量。
+/// 这一条只扫 rollout 读数，按套餐、按日期数出四类痕迹：窗尾不变而用量下跌、一天内过多的
+/// 7d 窗尾、窗尾乒乓、后退幅度分档。结论已落在线上：后退超过 `calib:TAIL_DRIFT_SLACK_SECS`
+/// 的区间由 `Pair:window_changed` 判为换账号丢弃，账号指纹纪元见 `store:account_since`。
 #[test]
 #[ignore]
 fn codex_same_plan_two_accounts_trace() {
@@ -1378,10 +1314,8 @@ fn codex_same_plan_two_accounts_trace() {
             );
         }
         // ⓪ **最硬的一条**：窗尾一模一样（= 同一个窗口实例）而已用百分比却掉了。
-        //    一个账号在同一个窗口里用量只增不减 ⇒ 这只能是两条独立的窗口序列在交替,
-        //    而且两个账号恰好报了同一个窗尾……不,窗尾相同就是同一个实例,所以更强：
-        //    掉下去只可能是**另一个账号的读数插了进来**,而它碰巧共享窗尾是不可能的
-        //    ——所以这里真正要数的是「窗尾不变、用量下跌」这个组合本身。
+        //    一个账号在同一个窗口里用量只增不减,掉下去只可能是**另一个账号的读数插了进来**
+        //    ——所以这里数的是「窗尾不变、用量下跌」这个组合本身。
         {
             let mut drops: Vec<(i64, f64, f64)> = vec![];
             for w in mine.windows(2) {
@@ -1713,116 +1647,10 @@ fn codex_rejected_intervals_by_reason_on_real_db() {
     }
 }
 
-/// **滚动窗口正：长区间不是不能用，是不能拿 Δ 直接算**。
+/// **量缓存读在额度口径里的系数**。
 ///
-/// 5h 是**滚动**窗口，所以两次读数之间计数器的变化是
-///
-/// ```text
-///   Δ = scale × （这段时间新花的 − 这段时间从窗口尾部老掉的)
-///   老掉的 = 发生在 （t0−5h, t1−5h] 的那些调用
-/// ```
-///
-/// 现行估计量把「老掉的」当成 0，于是区间越长越低估 ⇒ `MAX_PAIR_SECS = 1800` 把长区间
-/// 整个赶出去。而**钱恰恰在长区间里**（真库：edu 的 50 个长区间占了 64% 的代价）。
-///
-/// 这一条把正量算出来对拍：同一批区间，`Σ Δ / Σ 新花的` vs `Σ Δ / Σ（新花的−老掉的)`，
-/// 并与不依赖回归的直接测量对读。**只量，不改生效逻辑。**
-#[test]
-#[ignore]
-fn codex_rolling_window_correction_on_real_db() {
-    /// 5h 窗口长度（秒）。
-    const WINDOW: i64 = 5 * 3_600;
-    /// 计数器贴顶时 Δ 带不出信息（再花也不动），一律排除。
-    const SATURATED: f64 = 99.0;
-
-    let now = chrono::Utc::now().timestamp();
-    let scan = super::codex_rollout::scan(now - 120 * 86_400, 0, &Default::default());
-    if let Some(src) = real_db() {
-        let out = std::env::var_os("TC_SMOKE_OUT")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("tc_rolling_fix");
-        let _ = std::fs::remove_dir_all(&out);
-        super::price::load_from(&SubStore::open(&clone_db(&src, &out)).expect("open"));
-    }
-    // 前缀和式的「任意区间代价」：调用按时刻有序，二分定位后逐笔折算。
-    let cost_in = |t0: i64, t1: i64| -> f64 {
-        if t1 <= t0 {
-            return 0.0;
-        }
-        let lo = scan.calls.partition_point(|c| c.t <= t0);
-        let hi = scan.calls.partition_point(|c| c.t <= t1);
-        let mut b: std::collections::BTreeMap<String, [i64; 4]> = Default::default();
-        for c in &scan.calls[lo..hi] {
-            let slot = b.entry(c.model.clone()).or_insert([0; 4]);
-            for (i, v) in c.tokens.iter().enumerate() {
-                slot[i] += v;
-            }
-        }
-        super::cost::cost_of_breakdown(Platform::Codex, &b, t1).0
-    };
-
-    let mut ends: Vec<&super::codex_rollout::Reading> = vec![];
-    for r in &scan.readings {
-        match ends.last() {
-            None => ends.push(r),
-            Some(prev) if r.t - prev.t >= super::calib::MIN_PAIR_SECS => ends.push(r),
-            _ => {}
-        }
-    }
-    for plan in ["edu", "plus"] {
-        // （dt, Δ, 新花的, 老掉的)
-        let mut rows: Vec<(i64, f64, f64, f64)> = vec![];
-        for w in ends.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a.plan != b.plan || a.plan != plan {
-                continue;
-            }
-            // 跨重置 / 换账号的区间照旧排除——那是物理，正不了
-            if matches!((a.resets5, b.resets5), (Some(x), Some(y)) if y != x && (y > x || x - y > 600))
-            {
-                continue;
-            }
-            if a.used5 >= SATURATED || b.used5 >= SATURATED {
-                continue; // 计数器贴顶，Δ 无信息
-            }
-            let inflow = cost_in(a.t, b.t);
-            if inflow <= 0.0 {
-                continue;
-            }
-            let aged = cost_in(a.t - WINDOW, b.t - WINDOW);
-            rows.push((b.t - a.t, b.used5 - a.used5, inflow, aged));
-        }
-        println!("
-=== {plan}：{} 段（已排除跨重置 / 换账号 / 计数器贴顶）===", rows.len());
-        for (label, only_short) in [("只用 ≤30 分钟", true), ("全部（含长区间）", false)] {
-            let sel: Vec<&(i64, f64, f64, f64)> =
-                rows.iter().filter(|r| !only_short || r.0 <= 1_800).collect();
-            let n = sel.len();
-            let d: f64 = sel.iter().map(|r| r.1).sum();
-            let i: f64 = sel.iter().map(|r| r.2).sum();
-            let o: f64 = sel.iter().map(|r| r.3).sum();
-            println!(
-                "  {label:<18} {n:>5} 段  Σ涨幅 {d:>7.0} 点  Σ新花 ${i:>8.2}  Σ老掉 ${o:>8.2}",
-            );
-            println!(
-                "        朴素  Σ涨幅/Σ新花        = {:>6.2} %/美元",
-                if i > 0.0 { d / i } else { 0.0 }
-            );
-            println!(
-                "        修正  Σ涨幅/Σ(新花−老掉) = {:>6.2} %/美元",
-                if i - o > 0.0 { d / (i - o) } else { 0.0 }
-            );
-        }
-    }
-}
-
-/// ** 量缓存读在额度口径里的系数**。
-///
-/// 拆抽样偏差之后剩下的那个问题：那批并行会话按官方价目折出 $67.64 的
-/// 「等价用量」，而 5h 计数器一个点都没动（53% → 53%）。$67.64 × 8.13 ≈ 550 个百分点，
-/// 窗口总共才 100 个 ⇒ **额度不是按美元当量走的**。最可能的解释是**缓存读在额度口径里
-/// 比在价目口径里便宜得多**，而那批调用 88% 是缓存读。
+/// 存在按官方价目折出大额「等价用量」、5h 计数器却一个点都没动的区间,而这类区间
+/// 以缓存读为主 ⇒ 要么缓存读在额度口径里比在价目口径里便宜得多,要么是计数器滞后。
 ///
 /// 把每个区间的有效代价拆成两半做一次**过原点的两元回归**：
 ///
@@ -1830,12 +1658,12 @@ fn codex_rolling_window_correction_on_real_db() {
 ///   Δ用量% = a × 非缓存代价（输入 + 输出 + 缓存写） + b × 缓存读代价
 /// ```
 ///
-/// - `b ≈ 0` ⇒ 缓存读在额度口径里不计（或几乎不计）。这就是结论，`cost.rs` 要分出
+/// - `b ≈ 0` ⇒ 缓存读在额度口径里不计（或几乎不计），`cost.rs` 要分出
 ///   **价目口径**与**额度口径**两把尺子。
-/// - `b ≈ a` ⇒ 假设不成立，那几个异常区间是**计数器滞后**而不是缓存便宜，换方向查。
+/// - `b ≈ a` ⇒ 假设不成立，那几个异常区间是**计数器滞后**而不是缓存便宜。
 ///
-/// 这条测量能把两种解释分开：**滞后不会与缓存占比相关，缓存便宜会**。所以两种结果
-/// 都是收获。**只量，不改生效逻辑。**
+/// 这条测量能把两种解释分开：**滞后不会与缓存占比相关，缓存便宜会**。
+/// **只量，不改生效逻辑。**
 ///
 /// 三层证据，互相独立：
 /// 1. 过原点两元 OLS + 标准误（`b` 与 0、与 `a` 各差几个标准误）；
@@ -2112,7 +1940,7 @@ fn codex_cache_read_quota_coefficient_on_real_db() {
         }
     }
 
-    // 最后把「Δ=0 但代价过大」的大额区间逐条摊开——就是它们引出来的
+    // 最后把「Δ=0 但代价过大」的大额区间逐条摊开,看各自的缓存占比
     println!("\n════ 最贵的「Δ=0 但代价过大」区间（缓存占比逐条）════");
     let mut worst: Vec<&Obs> = obs.iter().filter(|o| o.1 == "Δ=0 但代价过大").collect();
     worst.sort_by(|a, b| (b.6 + b.7).partial_cmp(&(a.6 + a.7)).unwrap());
@@ -2133,14 +1961,13 @@ fn codex_cache_read_quota_coefficient_on_real_db() {
     }
 }
 
-/// **-bis 额度口径的 token 权重**。
+/// **额度口径的 token 权重**。
 ///
-/// 上一条（[`codex_cache_read_quota_coefficient_on_real_db`]）按**美元**拆两半，给出
-/// `b/a ≈ 1.8` ——缓存读的每一美元比非缓存的每一美元**更吃额度**，与「缓存读不计」
-/// 的猜想方向相反。但「每美元」本身是价目口径的量，两个自变量里混着四种单价与多个
-/// 模型，`a` 到底是输入还是输出的系数说不清。
+/// 上一条（[`codex_cache_read_quota_coefficient_on_real_db`]）按**美元**拆两半，但「每美元」
+/// 本身是价目口径的量，两个自变量里混着四种单价与多个模型，`a` 到底是输入还是输出的
+/// 系数说不清。
 ///
-/// 这一条换到**token 空间**直接问那句话：额度计数器按什么权重数 token？
+/// 这一条换到**token 空间**直接问：额度计数器按什么权重数 token？
 ///
 /// ```text
 ///   Δ用量% = α×输入（Mtok) + β×输出（Mtok) + γ×缓存读（Mtok) + δ×缓存写（Mtok)
@@ -2485,7 +2312,7 @@ fn mmdd(t: i64) -> String {
         .unwrap_or_default()
 }
 
-/// **S2 查询面真库核对**：五条命令的本体各跑一遍真库副本,核对
+/// **查询面真库核对**：五条命令的本体各跑一遍真库副本,核对
 ///  价目表出得来,且某个时刻每个键恰好一行;
 ///  分模型用量对 `hourly_usage` **token 守恒**、对 `cost_of` **代价逐位相同**;
 ///  读数两层按序、条数与库里的 `SELECT COUNT（*)` 对得上。

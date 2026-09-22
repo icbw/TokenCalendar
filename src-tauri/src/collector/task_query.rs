@@ -1,5 +1,5 @@
 //! 只读查询面（命令层 `get_project_* / get_task_* / get_effort_series / get_gap_histogram`
-//! 的存储侧）。只读 `session` / `turn` / `daily_project`,与既有五个读入口并列,不改其 SQL。
+//! 的存储侧）。只读 `session` / `turn` / `daily_project`,与 store.rs 的用量读入口并列,不改其 SQL。
 //!
 //! 口径：
 //! - 项目维矩阵 / 钻取 / 时间成本曲线读 `daily_project`（已套离开阈值;token / turns 与 daily_usage
@@ -8,10 +8,10 @@
 //! - 任务列表 / 逐轮明细读物化层 `turn`（只含根会话,子会话已并入父轮）;任务 = 有轮的根会话,
 //!   `turns` = 物化轮行数（含零调用轮）,`steps` = Σ model_calls。
 //! - 空档直方图读 `turn.gap_ms`（原始值）,within = gap ≤ 阈值（与 daily_project.idle_ms 同判据）。
-//! - 数据跨度（S4-R,时间过滤）:单个项目 = daily_project 中该键的首末日（项目生命周期,
+//! - 数据跨度（时间过滤用）:单个项目 = daily_project 中该键的首末日（项目生命周期,
 //!   按轮的本地日）;不指定项目 = daily_usage ∪ daily_project 的首末日（「All」范围起点）。
-//! - 中止与错误分列（S4-R）:TaskRow.aborted_count / TaskTurn.aborted 与 error_count 互不计入。
-//! - 项目管理解析层（S5）:项目维（group_by / 切片 / 筛选 = project）一律经
+//! - 中止与错误分列:TaskRow.aborted_count / TaskTurn.aborted 与 error_count 互不计入。
+//! - 项目管理解析层:项目维（group_by / 切片 / 筛选 = project）一律经
 //!   `project_meta:resolve_cte` 的 `pmap（raw_key, eff_key)`:合并归目标、短会话折叠进 `__scratch`、
 //!   隐藏的原始键不出现;显示名 alias 优先。agent / model / total 维不经解析层,数字不受影响。
 //! - `title` 是内容列（store:CONTENT_COLUMNS）:只随 IPC 回 UI 做本地可视化,本模块类型
@@ -52,7 +52,7 @@ fn dim_col(dim: &str) -> Option<&'static str> {
     })
 }
 
-/// 一组 key 的展示名:project 维 alias 优先,无 alias 的同名不同路径退回完整路径（/）。
+/// 一组 key 的展示名:project 维 alias 优先,无 alias 的同名不同路径退回完整路径。
 fn labels_for(dim: &str, keys: &[String], aliases: &HashMap<String, String>) -> Vec<String> {
     match dim {
         "agent" => keys.iter().map(|k| agent_label(k)).collect(),
@@ -124,9 +124,9 @@ pub struct TaskRow {
     pub wall_ms: Option<i64>,
     pub model_ms: Option<i64>,
     pub tool_ms: Option<i64>,
-    /// API / 工具错误（S4-R 起不含用户中止）。
+    /// API / 工具错误（不含用户中止）。
     pub error_count: i64,
-    /// 用户中止的轮数（S4-R）。
+    /// 用户中止的轮数。
     pub aborted_count: i64,
     pub subagent_count: i64,
     pub subagent_calls: i64,
@@ -160,7 +160,7 @@ pub struct TaskTurn {
     pub subagent_calls: i64,
     pub error_count: i64,
     pub retry_count: i64,
-    /// 用户中止（S4-R,与 error_count 分列）。
+    /// 用户中止（与 error_count 分列）。
     pub aborted: bool,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -188,14 +188,13 @@ pub struct TimelineCell {
     pub sessions: i64,
     /// 当日出现的 agent 展示名（去重,按键排序）。
     pub agents: Vec<String>,
-    /// 当日各根会话（**最新开始的在前**,前端纵向视图按会话向下拆格;横向取首条 + `+N`）。
+    /// 当日各根会话（**最新活动的在前**,前端纵向视图按会话向下拆格;横向取首条 + `+N`）。
     pub items: Vec<TimelineSession>,
 }
 
 /// 格子内的一条会话。`title` 是内容列,仅本地可视化,禁止进入导出。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TimelineSession {
-    /// agent 展示名。
     pub agent: String,
     /// agent 键（双击跳转 `open_agent_session` 的入参;展示一律用 `agent`）。
     pub agent_key: String,
@@ -204,8 +203,8 @@ pub struct TimelineSession {
     pub title: Option<String>,
     /// 该会话当日首轮开始时刻（Unix 毫秒）。
     pub started_at: i64,
-    /// 该会话当日最后活动时刻（末轮 ended_at,缺失时取 started_at：排序依据——「最新活动的
-    /// 会话」而不是「最新创建的会话」,与 Claude app 新消息置顶的原则一致）。
+    /// 该会话当日最后活动时刻（末轮 ended_at,缺失时取 started_at）。排序依据是「最新活动的
+    /// 会话」而不是「最新创建的会话」,与 Claude app 新消息置顶一致。
     pub last_active_at: i64,
     pub turns: i64,
     pub tokens: i64,
@@ -237,7 +236,7 @@ pub struct TimelineResult {
     pub projects: Vec<TimelineProject>,
 }
 
-/// `get_project_timeline` 日跨度上限（含端点;看板首期 31 天,留余量防误用）。
+/// `get_project_timeline` 日跨度上限（含端点;远大于看板实际跨度,只防误用）。
 pub const TIMELINE_DAYS_MAX: usize = 366;
 
 #[derive(Debug, Clone, Serialize)]
@@ -776,10 +775,9 @@ impl Store {
         }
         drop(stmt);
         // 3) 会话列表:按 （eff_key, day, 会话) 汇总物化层 turn,关联 session.title。
-        //    Claude Code 续聊 / fork 会把整份
-        //    历史复制成新 session_id（同标题三个会话 `session.started_at` 逐毫秒相同,轮数 4 / 14 / 15
-        //    递增）。同 （agent, session.started_at) 的会话视为同一对话,只保留**最后活动最新**的那份;
-        //    排序也改按最后活动时刻（末轮 ended_at）而不是创建时刻。
+        //    Claude Code 续聊 / fork 会把整份历史复制成新 session_id（各副本 `session.started_at` 逐毫秒相同,
+        //    轮数递增）,否则一天内同一对话重复占条目:同 （agent, session.started_at) 的会话视为同一对话,
+        //    只保留**最后活动最新**的那份;排序按最后活动时刻（末轮 ended_at）而不是创建时刻。
         let sql = format!(
             "WITH {cte}
              SELECT p.eff_key, t.day, t.agent_key, t.session_id, s.title, MIN(t.started_at),
@@ -904,7 +902,7 @@ mod tests {
 
     const OFF: &ScratchRule = &ScratchRule::OFF;
 
-    const T: i64 = 1_788_602_400_000; // 2026-09-05 本地日内
+    const T: i64 = 1_788_602_400_000; // 本地 2026-09-05 日内
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()
@@ -1236,7 +1234,7 @@ mod tests {
         assert_eq!(sorted.total, 1);
     }
 
-    // ---------- PHASE14 S2 项目推进时间轴 ----------
+    // ---------- 项目推进时间轴 ----------
 
     fn tl(s: &Store, from: &str, to: &str) -> TimelineResult {
         s.project_timeline(from, to, today(), OFF).unwrap()

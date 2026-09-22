@@ -1,10 +1,8 @@
-//! 采集器：把本机四类 AI Agent 的 token 用量聚合进 collector.db。
+//! 采集器：把本机各 AI Agent 的 token 用量聚合进 collector.db。
 //!
 //! 运行模型：setup 时 spawn 一个 daemon 线程——启动首轮采集,之后按采集频率增量轮询（默认 30s,设置·General 五档可选）。
-//! 单源失败只降级该源状态（source_state 表）,不拖垮整体（AGENTS.md 容错铁律）。
-//! UI 只读聚合结果（commands.rs）,批次提交后 emit `usage:changed`（预留链路）。
-//!
-//! 口径与容错设计。
+//! 单源失败只降级该源状态（source_state 表）,不拖垮整体。
+//! UI 只读聚合结果（commands.rs）,批次提交后 emit `usage:changed`。
 
 pub mod attention;
 pub mod claude_code;
@@ -22,7 +20,7 @@ pub mod text;
 pub mod turns;
 pub mod workbuddy;
 pub mod zcode;
-/// 真实四源 smoke（仅测试编译,本机手动 `cargo test -- --ignored` 触发)。
+/// 真实数据源 smoke（仅测试编译,本机手动 `cargo test -- --ignored` 触发)。
 #[cfg(test)]
 mod smoke;
 
@@ -43,16 +41,13 @@ use store::Store;
 pub const TAIL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// 采集频率可选档位（秒;设置·General「Collect every」,前端 designPrefs.sanitize 同域）。
 pub const POLL_INTERVAL_CHOICES_SECS: [u64; 5] = [30, 60, 120, 180, 300];
-/// 默认采集频率（秒）。
 pub const POLL_INTERVAL_DEFAULT_SECS: u64 = 30;
-/// prefs.json 键名。
 pub const POLL_INTERVAL_PREFS_KEY: &str = "collectIntervalSecs";
 /// 睡眠分片:改频率后最迟一个分片即按新值判定（缩短立即生效,不必睡满旧间隔）。
 const POLL_SLEEP_TICK: Duration = Duration::from_secs(1);
 
 static POLL_INTERVAL_SECS: AtomicU64 = AtomicU64::new(POLL_INTERVAL_DEFAULT_SECS);
 
-/// 当前采集频率。
 pub fn poll_interval() -> Duration {
     Duration::from_secs(POLL_INTERVAL_SECS.load(Ordering::SeqCst))
 }
@@ -165,7 +160,7 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// RFC3339 时间串 → （本地日, 本地小时 0-23)（小时粒度）。
+/// RFC3339 时间串 → （本地日, 本地小时 0-23)。
 pub fn rfc3339_to_local_day_hour(s: &str) -> Option<(String, u8)> {
     let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Local);
     Some((dt.format("%Y-%m-%d").to_string(), dt.hour() as u8))
@@ -176,20 +171,20 @@ pub fn rfc3339_to_millis(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp_millis())
 }
 
-/// Unix 毫秒 → 本地日（起六源全走 `millis_to_local_day_hour`,仅测试沿用）。
+/// Unix 毫秒 → 本地日（仅测试使用;生产路径统一走 `millis_to_local_day_hour`）。
 #[cfg(test)]
 pub fn millis_to_local_day(millis: i64) -> Option<String> {
     let dt = Local.timestamp_millis_opt(millis).single()?;
     Some(dt.format("%Y-%m-%d").to_string())
 }
 
-/// Unix 毫秒 → （本地日, 本地小时 0-23)（小时粒度）。
+/// Unix 毫秒 → （本地日, 本地小时 0-23)。
 pub fn millis_to_local_day_hour(millis: i64) -> Option<(String, u8)> {
     let dt = Local.timestamp_millis_opt(millis).single()?;
     Some((dt.format("%Y-%m-%d").to_string(), dt.hour() as u8))
 }
 
-/// 数字时间戳（秒或毫秒自适应,≤0 无效）→ 毫秒。旧 WorkBuddy 口径：> 1e10 视为毫秒。
+/// 数字时间戳（秒或毫秒自适应,≤0 无效）→ 毫秒：> 1e10 视为毫秒。
 pub fn epoch_number_to_millis(v: f64) -> Option<i64> {
     if v <= 0.0 {
         return None;
@@ -229,23 +224,23 @@ pub struct FileCursor {
     /// Codex：本文件是子代理会话（session_meta.parent_thread_id 非空）→ 不计轮。
     #[serde(default)]
     pub subagent: bool,
-    /// Codex：本文件已出现过 task_started → 旧 user_message 信号不再置位（防同轮双计）。
+    /// Codex：本文件已出现过 task_started → user_message 信号不再置位（防同轮双计）。
     #[serde(default)]
     pub task_signal: bool,
     /// 轮累加器（会话 / 当前轮 / 未配对工具 / 响应去重窗口）。
     #[serde(default)]
     pub turn: turns::TurnState,
-    /// v12（Claude）：文件排序键——首个带 uuid 行的时间 / 尾部最后一条带时间戳行的时间（毫秒;0 = 未扫过）。
+    /// Claude：文件排序键——首个带 uuid 行的时间 / 尾部最后一条带时间戳行的时间（毫秒;0 = 未扫过）。
     /// 续聊 / fork 副本文件复制了根会话的历史行,按此排序保证根文件先处理（mtime 不可靠:根文件事后
     /// 会追加无时间戳的元数据行）。
     #[serde(default)]
     pub first_ts: i64,
     #[serde(default)]
     pub last_ts: i64,
-    /// v12（Claude）：会话族已判定（首个带 uuid 的行已处理）。
+    /// Claude：会话族已判定（首个带 uuid 的行已处理）。
     #[serde(default)]
     pub family_resolved: bool,
-    /// v12（Claude）：本文件是某根会话的续篇（续聊 / fork 副本）→ 归属该根会话,只计未见过的行。
+    /// Claude：本文件是某根会话的续篇（续聊 / fork 副本）→ 归属该根会话,只计未见过的行。
     #[serde(default)]
     pub family_root: Option<String>,
 }
@@ -351,7 +346,7 @@ fn run(app: AppHandle, mut store: Store) {
     crate::dev_log!("[collector] thread started");
 
     // daily_project 套用的离开阈值与运行时值（prefs 载入）不一致 → 全表重算一次
-    // （新库 / 迁移清库后标记缺失、上次 set_idle_threshold 重算失败,均在此自愈）。
+    // （新库标记缺失、上次 set_idle_threshold 重算失败,均在此自愈）。
     let threshold = task_store::idle_threshold_ms();
     if store.project_threshold_marker() != Some(threshold) {
         match store.recompute_projects(threshold) {
@@ -388,17 +383,14 @@ fn run(app: AppHandle, mut store: Store) {
                         store.record_failure(meta.id, &e.code, &e.message);
                     }
                 }
-                // 订阅取数的本地信号：
-                // 本源刚提交的轮里有**最近**事件 = 用户正在 agent 工作 → 悬浮球退出待机,
-                // 并把新增 token 交给 demand.rs 排定取数（重任务开头的大量写入要立刻
-                // 反映到读数上）。
+                // 订阅取数的本地信号：本源刚提交的轮里有**最近**事件 = 用户正在 agent 工作 → 悬浮球退出待机,
+                // 并把新增 token 交给 demand.rs 排定取数（重任务开头的大量写入要立刻反映到读数上）。
                 //
                 // 两道闸分开：
                 // - **活动信号**看区间终点——最晚一轮在窗口内就算「用户在工作」;
-                // - **取数账目**要求区间起点也在窗口内。首轮回填 / 整会话重建的批次里
-                //   最晚一轮往往也是新的（用户刚用过 agent）,旧判据会把同批的几个月历史
-                //   token 当成「刚刚消耗」交给 demand：既凭空触发取数,又会落一条 cost 巨大、
-                //   涨幅很小的标定样本,把换算系数压到近乎零（calib.rs 的和之比拟合）。
+                // - **取数账目**要求区间起点也在窗口内。首轮回填 / 整会话重建的批次里最晚一轮往往也是新的,
+                //   若只看终点,会把同批的几个月历史 token 当成「刚刚消耗」交给 demand：既凭空触发取数,
+                //   又会落一条 cost 巨大、涨幅很小的标定样本,把换算系数压到近乎零（calib.rs 的和之比拟合）。
                 //   混批宁可整批不计——少算一轮账目只是这一段估偏小,算错一轮却会持久跑偏。
                 let usage = store.take_source_usage(meta.id);
                 if let Some((first, last)) = store.take_turn_span() {
@@ -538,7 +530,7 @@ struct ChangedKeys {
 /// usage:changed 订号（采集线程与命令面共用,单调递增）。
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
-/// 广播 `usage:changed`（采集批次提交后;起 `set_idle_threshold` 重算后复用）。
+/// 广播 `usage:changed`（采集批次提交后、`set_idle_threshold` 重算后）。
 pub fn notify_usage_changed(app: &AppHandle, months: &BTreeSet<String>) {
     let payload = ChangedKeys {
         months: months.iter().cloned().collect(),

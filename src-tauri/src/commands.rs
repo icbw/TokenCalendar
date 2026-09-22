@@ -1,7 +1,5 @@
-//! 前端命令面 = 冻结的数据契约（形状对齐旧项目 Wails 绑定，
-//! 命名统一 snake_case）。起数据来源 = collector.db 聚合（fixture 退役为
-//! 纯测试资产）；契约形状不变，仅 SourceSummary 增补契约已有的可选字段
-//! schema_fingerprint。调整：可见性原语移入 visibility.rs。
+//! 前端命令面 = 数据契约（命名统一 snake_case）。数据来源 = collector.db 聚合，
+//! 契约形状由前端类型对齐；可见性原语在 visibility.rs。
 
 use std::sync::atomic::Ordering;
 
@@ -34,7 +32,7 @@ pub struct MatrixRow {
     pub label: String,
     /// 长度 = days_in_month；null=未来日期（≠0），单位=token 数。
     pub values: Vec<Option<i64>>,
-    /// 契约扩展：与 values 平行的请求/对话数（未来日为 0）。
+    /// 与 values 平行的请求/对话数（未来日为 0）。
     pub message_counts: Vec<i64>,
     pub month_total: i64,
 }
@@ -178,7 +176,7 @@ pub fn get_breakdown(kind: String, key: String, month: String, state: State<'_, 
         .collect())
 }
 
-// ---------- 数据洞察命令（credit 月报 + 时间范围序列,只读增量扩展） ----------
+// ---------- 数据洞察命令（credit 月报 + 时间范围序列,只读） ----------
 
 /// credit 月报（daily_usage 源本地积分聚合）。口径见 store.credit_summary:
 /// 总量=CodeBuddy+WorkBuddy 共享积分池;模型分布=CodeBuddy 行;无数据≠0（has_data)。
@@ -196,7 +194,7 @@ pub struct CreditDayPoint {
     pub credit: f64,
 }
 
-/// credit 按模型×日序列（双组图）。
+/// credit 按模型×日序列（双组图用）。
 #[derive(Debug, Serialize)]
 pub struct CreditModelDaySlice {
     pub key: String,
@@ -370,7 +368,7 @@ pub fn get_range_series(query: RangeSeriesQuery, state: State<'_, AppState>) -> 
     })
 }
 
-// ---------- 项目维与任务命令（只读 daily_project / turn / session,与既有命令并列） ----------
+// ---------- 项目维与任务命令（只读 daily_project / turn / session） ----------
 //
 // 口径见 collector/task_query.rs 文件头。任务类型里的 `title` 是内容列:只随 IPC 回 UI,
 // 任何导出 / 文件序列化路径一律不得引用这些类型（export_month 只读 daily_usage）。
@@ -518,7 +516,7 @@ pub fn get_effort_series(
     })
 }
 
-/// 数据跨度（S4-R,时间过滤）:`project` 给定 → 该项目生命周期（daily_project 首末日）;
+/// 数据跨度（时间过滤用）:`project` 给定 → 该项目生命周期（daily_project 首末日）;
 /// 省略 → 全部数据首末日（daily_usage ∪ daily_project,「All」范围起点）。无数据 → null。
 #[tauri::command]
 pub fn get_project_span(project: Option<String>, state: State<'_, AppState>) -> Result<Option<DaySpan>, String> {
@@ -926,7 +924,7 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<AutostartInfo, Str
 // ---------- Export 命令（聚合明细落盘） ----------
 
 fn export_month(app: &AppHandle, month: &str, format: &str) -> Result<ExportResult, String> {
-    // 校验月份格式（与旧契约一致）
+    // 校验月份格式
     month_dim(month)?;
 
     let rows: Vec<(String, String, String, i64)> = {
@@ -971,7 +969,7 @@ pub fn export_month_json(app: AppHandle, month: String) -> Result<ExportResult, 
     export_month(&app, &month, "json")
 }
 
-// ---------- 数据管理命令 ----------
+// ---------- 数据管理命令（设置·数据 tab） ----------
 
 #[derive(Debug, Serialize)]
 pub struct DataInfo {
@@ -1040,7 +1038,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         if from.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else if let Err(e) = std::fs::copy(&from, &to) {
-            // 单文件失败不拖垮整体（容错铁律）:记录并继续
+            // 单文件失败不拖垮整体:记录并继续
             eprintln!("[migrate] copy {} failed: {}", from.display(), e);
         }
     }
@@ -1214,13 +1212,11 @@ fn write_prefs_atomic(path: &std::path::Path, json: &str) -> Result<(), String> 
 // ---------- Window 命令（可见性原语在 visibility.rs，此处仅挂件尺寸） ----------
 
 /// 恢复设计默认 widget 尺寸（重置按钮 / 宽高比锁回吸共用）。
-/// 起直接作用于 widget 窗口，无模式判断；几何落盘由 Resized
-/// 事件的节流持久化兜底。
+/// 几何落盘由 Resized 事件的节流持久化兜底。
 ///
-/// `snap_anchor` = true 且吸附状态有效时，set_size
-/// 后以**停靠顶点为锚**重算位置——窗口右上角保持在该顶点（-2 原点语义），
-/// 停靠后切档位不再锚左上角漂移。缺省 None = 现状行为（只 set_size 不动位）；
-/// 比例锁回写/重置按钮不传参（手动拉伸例外，F5 分流）。
+/// `snap_anchor` = true 且吸附状态有效时，set_size 后以**停靠顶点为锚**重算位置——
+/// 窗口右上角保持在该顶点，停靠后切档位不会锚左上角漂移。缺省 None = 只 set_size 不动位；
+/// 比例锁回写/重置按钮不传参。
 ///
 /// 坐标口径：SnapState.work/pitch 为物理像素快照；显示器变化时按当前工作区
 /// 重算顶点绝对坐标（顶点索引相对右上角不变）。set_size 走 LogicalSize，
@@ -1240,8 +1236,7 @@ pub fn set_widget_size(
     Ok(())
 }
 
-/// 前置：悬浮球尺寸切换——**仅程序化路径**（窗口
-/// resizable=false 禁手动拉伸：悬浮球不需要任何形变功能）。
+/// 悬浮球尺寸切换——**仅程序化路径**（窗口 resizable=false,悬浮球不提供手动形变）。
 /// 无 snap_anchor 参数——orb 不参与格网吸附，尺寸切换不做顶点锚定。
 ///
 /// 调用方 = **手动形态切换**（自由态展开/折叠、挂载时按当前态校准）。拖到屏幕
@@ -1255,7 +1250,7 @@ pub fn set_orb_size(app: AppHandle, width: f64, height: f64) -> Result<(), Strin
         .ok_or("orb window not found")?;
     // 尺寸切换走「内容锚定」版本：容器绕表盘视觉中心对称后,两态内容偏移差很大
     // （16/16 vs 235/100）,裸 set_size 会让卡片在屏上平移。跨屏时按内容所在显示器
-    // 的 scale 换算,并同步 Rust 侧形态状态（几何判定不再从窗口尺寸反推）。
+    // 的 scale 换算,并同步 Rust 侧形态状态（几何判定不从窗口尺寸反推）。
     #[cfg(windows)]
     {
         crate::orb_dock::set_size_anchored(&window, width, height);
@@ -1266,9 +1261,8 @@ pub fn set_orb_size(app: AppHandle, width: f64, height: f64) -> Result<(), Strin
 }
 
 /// 顶点锚重算：set_size 后右上角回贴 SnapState 停靠顶点。仅挂件使用
-///。任何一步
-/// 数据缺失（无吸附状态/无工作区）都静默跳过——锚定失败退化为现状行为
-/// （只改尺寸），不阻塞档位切换。
+/// （悬浮球不参与格网吸附）。任何一步数据缺失（无吸附状态/无工作区）都静默跳过——
+/// 退化为只改尺寸，不阻塞档位切换。
 fn anchor_to_snap_vertex(app: &AppHandle, window: &tauri::WebviewWindow, w: f64, _h: f64) {
     let Some(state) = crate::window_state::snap_state_for(app, window.label()) else { return };
     if state.pitch <= 0 {
@@ -1315,14 +1309,14 @@ fn current_work_rect(window: &tauri::WebviewWindow) -> Option<[i32; 4]> {
     Some([rc.left, rc.top, rc.right, rc.bottom])
 }
 
-/// 非 Windows 无 Win32 工作区来源，锚点重算静默跳过（与吸附检测同哲学）。
+/// 非 Windows 无 Win32 工作区来源，锚点重算静默跳过。
 #[cfg(not(windows))]
 fn current_work_rect(_window: &tauri::WebviewWindow) -> Option<[i32; 4]> {
     None
 }
 
 // ---------- 主窗口控制（自绘标题栏） ----------
-// 按项目约定窗口操作 Rust：前端只发意图命令，不放开 core:window 权限面。
+// 窗口操作 Rust：前端只发意图命令，不放开 core:window 权限面。
 
 #[tauri::command]
 pub fn main_minimize(app: AppHandle) -> Result<(), String> {

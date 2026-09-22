@@ -1,6 +1,6 @@
 // 共享口径工具:项目展示名、时间成本格式化、z-score 离群判定。
 // 矩阵（UsageMatrixView / MatrixPanel）、洞察（InsightsView）与 Tasks 视图共用,口径单一源。
-// S5:项目键是解析层的有效键（合并目标 / __scratch / 原键）,展示名优先取后端标签缓存（alias）。
+// 项目键是解析层的有效键（合并目标 / __scratch / 原键）,展示名优先取后端标签缓存（alias）。
 import { cachedProjectLabel } from '../../services/projectLabels'
 
 /** 与 Rust turns:UNKNOWN_PROJECT 对齐（无目录源 / 解析失败）。 */
@@ -54,7 +54,7 @@ export function formatDuration(ms: number | null | undefined): string {
   return `${h}h ${m}m`
 }
 
-// ---- z-score（异常日同款阈值）----
+// ---- z-score（与 InsightsView 异常日同款阈值）----
 
 export const OUTLIER_Z = 2.0
 export const OUTLIER_MIN_SAMPLES = 7

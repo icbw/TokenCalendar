@@ -1,45 +1,43 @@
-// TimelineWindow：项目推进时间轴窗口（S1 接线壳 → S2 只读看板）。
-// 第四窗口（label=timeline），常驻第二屏的跨项目看板——**独立窗口,不是主窗口
-// tab**（主窗口按热力图格子最小不变形尺寸保持形态,任何塞进
-// 主窗口的视图都继承该约束;Timeline 尺寸由第二屏决定,与主窗口解耦是需求）。
+// TimelineWindow：项目推进时间轴窗口（只读看板）。
+// 第四窗口（label=timeline），常驻第二屏的跨项目看板——**独立窗口,不是主窗口 tab**：
+// 主窗口按热力图格子最小不变形尺寸保持形态,塞进主窗口的视图都继承该约束;Timeline 尺寸由第二屏决定。
 //
 // 装配对齐 WidgetWindow 模式：useShowOnLoad（首帧后由 Rust 按可见性单一源裁决
 // show）+ 主题 / 圆角 hook（与挂件同档）+ html.mode-widget 透明类。**不装配材质
-// hook**（省一处 DWM 风险面,透明度走 CSS alpha）。
+// hook**（同 orb：省一处 DWM 风险面,透明度走 CSS alpha）。
 // 独立根类 .timeline-shell,不进 .shell.is-expanded / .is-widget 类名体系
-// （GUIDE 红线：颜色变量按窗口拆分,消费 --widget-card-* 派生值但不复用挂件选择器）。
+// （颜色变量按窗口拆分,消费 --widget-card-* 派生值但不复用挂件选择器）。
 //
-// S2 看板：
+// 看板：
 // - 数据 = get_project_timeline（today−past, today+future) 一条只读命令;挂载查一次,
 //   usage:changed 去抖重查,每分钟核对本地日变化（跨零点整窗平移）。
-// - 视图只有一个：项目管理视图（项目为列、时间向下,行高随内容,超出看板区可滚动）。横向日程视图
-//   用户多次后删除（不符合时间线需求,无使用价值）;prefs timelineOrientation 随之退役。
+// - 视图只有一个：项目为列、时间向下,行高随内容,超出看板区可滚动。
 // - 每格显示哪些会话：过去的日期每天 timelinePastSessions 条（默认 1）,今天
 //   timelineTodaySessions 条（默认 5）;选取按 timelinePick（latest 最新 / earliest 最早 / longest
 //   tokens 最多）;格内与日期一律按时间从旧到新自上而下,timelineReverse 整体反转。
-//   以上是格子的「设置状态」;会话数超出时走格内滚动：今天格内
+//   以上是格子的「设置状态」;会话数超出时走格内滚动（见 SessionCell）：今天格内
 //   上滑翻看当天全部会话,过去日点击展开到 5 条可滚动,格子失焦自动折回设置状态。
-// - 项目集：设置·Projects 的 Timeline projects 组（prefs
+// - 项目集 = 固定监测项目组：设置·Projects 的 Timeline projects 组（prefs
 //   timelinePinnedKeys,原始键经 effective_key 解析,顺序即列序）非空时**只显示组内项目**,全部显示不随窗口
 //   拉伸裁掉（放不下横向滚动）,组内项目在时间窗内无活动也保留空列;组为空时回退为按 last_day 倒序、按窗口
-//   容量显示最近项目。时间轴窗口不再有 pin 按钮,设置上限 timelineMaxProjects 退役。
+//   容量显示最近项目。时间轴窗口本身没有 pin 按钮。
 // - 格子尺寸有范围（timelineConfig）：窗口在范围内拉伸时等分,到最小尺寸后不再缩小
 //   （容量减少 / 出滚动条）,超过最大尺寸留白。
-// - 项目行 hover 状态卡：常驻 DOM 只切可见性（浮层铁律：透明 WebView2 条件卸载留残影）。
-// - 顶栏：项目名表头独立成一张圆角半透明卡片,与下方面板卡片之间
-//   留透明间隙;右侧放折条按钮;去掉 Timeline 标题、日期范围与 `+N more`。顶栏表头与面板是两张同列模板
+// - 项目行 hover 状态卡：常驻 DOM 只切可见性（透明 WebView2 条件卸载留残影）。
+// - 顶栏（对齐主界面）：项目名表头独立成一张圆角半透明卡片,与下方面板卡片之间
+//   留透明间隙;右侧放折条按钮。顶栏表头与面板是两张同列模板
 //   的网格,面板右侧留 BAR_ACTIONS_PX 使两者等宽列对齐,横向滚动由面板同步到顶栏。
 //   左侧日期列全透明「悬挂」在面板背景上;面板 / 顶栏 / 会话格三档背景 alpha 进设置。
 // - 窗口风格（prefs timelineWindowStyle）：shadow（默认）= 主窗口同款 DWM 阴影 + 外缘 8px 透明呼吸位;
 //   flat = 无系统阴影、卡片全出血。边缘组合由 Rust set_timeline_style 施加,条态恒 flat。
 // - 拖动只在顶栏（data-tauri-drag-region="deep" 逐元素挂载,可点击的亮起行头除外）;看板区是交互区。
 //
-// S3 注意力:get_attention 会话级快照,挂载查一次 + timeline:attention 事件重查
+// 注意力:get_attention 会话级快照,挂载查一次 + timeline:attention 事件重查
 // （Rust 采集线程每轮派生,有变化才发）。按原始目录键 → effective_key 折叠到项目行:任一未确认
 // waiting → 亮起（缓慢呼吸点 + 淡底,弱提示不弹窗）;仅未确认 tool_pending → 弱亮（次色静态点）;
 // 点击项目行头 = 确认该项目全部未确认等待（同一会话下一段等待自动复位）。running 不提示,只进 hover 卡。
 //
-// S4 条态:形态单一源在 Rust（get_timeline_form + timeline-form-changed）,前端只发意图
+// 条态:形态单一源在 Rust（get_timeline_form + timeline-form-changed）,前端只发意图
 // set_timeline_form——尺寸 / 位置 / 置顶由 Rust 原子执行,这里不补偿位置。条态层常驻 DOM（看板态
 // visibility:hidden,仍参与布局）,ResizeObserver 量出条内容的 CSS 宽随意图传给 Rust。条上 = 项目名
 // （看板同序的监测项目,另补上亮起但不在其中的项目）;亮起项目名呼吸闪烁、可点击确认,
@@ -51,7 +49,7 @@
 // （指针不在、没有亮起项目）后收成 peek 几像素近透明细边,不挡全屏窗口。指针移入细边 / 出现亮起项目 →
 // 回完整条态,方便及时跳转。有亮起项目时不收。
 //
-// S5 桌面窗口聚焦:亮起的项目行头 / 条上项目名点击 = focus_agent_window（该项目最早的未确认
+// 桌面窗口聚焦:亮起的项目行头 / 条上项目名点击 = focus_agent_window（该项目最早的未确认
 // waiting,没有则 tool_pending）→ Rust 按 agent（+ host）登记表找进程的可见顶层窗口前置并确认;同项目其余
 // 未确认条目随之确认。found=false（agent 已关,条目已被 Rust 移除）→ 该项目本地标记 stale:灰色「上次停在
 // 这里」,点击回退打开目录并清标记;项目再次亮起也清标记。
@@ -111,8 +109,8 @@ import './timeline.css'
 
 type PickRule = 'latest' | 'earliest' | 'longest'
 
-/** ：一格里显示哪几条会话——按规则选出 limit 条,再按时间从旧到新排（reverse = 最新在上）。
- * ：「时间」= 当日最后活动时刻（lastActiveAt）,不是创建时刻——早创建但仍在活跃的会话排在
+/** 一格里显示哪几条会话——按规则选出 limit 条,再按时间从旧到新排（reverse = 最新在上）。
+ * 「时间」= 当日最后活动时刻（lastActiveAt）,不是创建时刻——早创建但仍在活跃的会话排在
  * 最新位置,与 Claude app 新消息置顶的原则一致。earliest 仍按首轮开始时刻取「最早的几条」。 */
 function pickItems(items: TimelineSession[], rule: PickRule, limit: number, reverse: boolean): TimelineSession[] {
   const sorted = [...items]
@@ -148,7 +146,7 @@ interface SessionCellProps {
   heatOf: (tokens: number) => number
 }
 
-/** 有会话的日格。会话数超过设置值时：
+/** 有会话的日格（格内滚动）。会话数超过设置值时：
  * - 今天：格高固定为设置的条数,格内列出当天全部会话（时间旧→新,最新在下;reverse 反转）,初始停在
  * pick 规则代表的一端（latest → 最新端,earliest → 最早端）,上滑翻看其余会话,到头即止。
  * pick = longest 选出的会话在时间上不连续,今天保持设置状态,与过去日同走点击展开。
@@ -382,12 +380,12 @@ export default function TimelineWindow() {
   useWidgetThemeSync()
   useRadiusSchemeSync('widget')
 
-  // 全程透明（透明检查清单）：宿主层不得有不透明默认背景
+  // 全程透明：宿主层不得有不透明默认背景
   useLayoutEffect(() => {
     document.documentElement.classList.add('mode-widget')
   }, [])
 
-  // ---- prefs（置顶 / 方向 / 上限 / 天数）:storage 桥跨窗口同步,主窗口改设置这里即时跟随 ----
+  // ---- prefs（监测组 / 天数 / 会话选取 / 外观）:storage 桥跨窗口同步,主窗口改设置这里即时跟随 ----
   const [prefs, setPrefs] = useState<TimelinePrefs>(() => readPrefs(getDesignPrefs()))
   useEffect(() => subscribeDesignPrefs((p) => setPrefs(readPrefs(p))), [])
   const { pins, pastDays, futureDays, pastSessions, todaySessions, pick, reverse, autoStripSecs, floating, heat, accent, bgAlpha, barAlpha, cellAlpha } = prefs
@@ -397,7 +395,7 @@ export default function TimelineWindow() {
     void windowService.setTimelineStyle(floating)
   }, [floating])
 
-  // ---- S4 形态：Rust 单一源,挂载查一次 + 事件跟随 ----
+  // ---- 形态：Rust 单一源,挂载查一次 + 事件跟随 ----
   const [form, setForm] = useState<TimelineForm>('board')
   useEffect(() => {
     let disposed = false
@@ -463,7 +461,7 @@ export default function TimelineWindow() {
     return () => window.clearInterval(id)
   }, [])
 
-  // ---- S3 注意力：挂载查一次 + timeline:attention 事件重查 ----
+  // ---- 注意力：挂载查一次 + timeline:attention 事件重查 ----
   const [attention, setAttention] = useState<AttentionItem[]>([])
   const loadAttention = useCallback(async () => {
     const items = await timelineService.getAttention()
@@ -585,7 +583,7 @@ export default function TimelineWindow() {
     }
     return m
   }, [attention, rawToEff])
-  // S5:聚焦失败（宿主窗口不存在）的项目,灰色降级直到点击回退或再次亮起
+  // 聚焦失败（宿主窗口不存在）的项目,灰色降级直到点击回退或再次亮起
   const [stale, setStale] = useState<Set<string>>(() => new Set())
   useEffect(() => {
     setStale((prev) => {
@@ -607,7 +605,7 @@ export default function TimelineWindow() {
     }
     void timelineService.focusAgentWindow(target.agent, target.sessionId).then((found) => {
       if (found === null) {
-        // 命令不可用（非 Tauri / IPC 失败）→ 退回 S3 行为:只确认
+        // 命令不可用（非 Tauri / IPC 失败）→ 退回只确认
         void timelineService.ackAttention(target.agent, target.sessionId)
         return
       }
@@ -628,7 +626,7 @@ export default function TimelineWindow() {
     if (folderByKey.get(key)) void projectService.openProjectFolder(key)
   }
 
-  // ---- S4 条态：项目名列表（看板同序的监测项目 + 补上亮起的组外项目）/ 量宽 / 折叠 ----
+  // ---- 条态：项目名列表（看板同序的监测项目 + 补上亮起的组外项目）/ 量宽 / 折叠 ----
   const stripProjects = useMemo(() => {
     const inHead = new Set(visible.map((p) => p.key))
     const lit = ordered.filter((p) => {
@@ -731,7 +729,7 @@ export default function TimelineWindow() {
     for (const p of visible) m.set(p.key, new Map(p.cells.map((c) => [c.day, c])))
     return m
   }, [visible])
-  // 日期轴：默认旧在上、新在下（今天与未来在底部）;reverse 整体反转（两种视图同口径）
+  // 日期轴：默认旧在上、新在下（今天与未来在底部）;reverse 整体反转
   const days = useMemo(() => (reverse ? [...(data?.days ?? [])].reverse() : data?.days ?? []), [data, reverse])
   const todayKey = data?.today ?? today
   // 热力底：会话 tokens 相对可见范围最大值开方归一（小格子也看得）,0.14〜0.5;
@@ -968,7 +966,7 @@ export default function TimelineWindow() {
           </div>
         </div>
       </div>
-      {/* S4 条态层：常驻 DOM（看板态 visibility:hidden 仍参与布局,供量宽）。整条可拖动,亮起项目名是按钮
+      {/* 条态层：常驻 DOM（看板态 visibility:hidden 仍参与布局,供量宽）。整条可拖动,亮起项目名是按钮
           （按钮天然豁免 drag-region,点击 = 确认）;双击展开（条态不可缩放,tauri 双击最大化不生效）。*/}
       <div className="tl-strip" aria-hidden={!strip} data-tauri-drag-region="deep" onDoubleClick={expandToBoard}>
         <div className="tl-strip-inner" ref={stripInnerRef}>

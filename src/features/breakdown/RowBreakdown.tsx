@@ -1,6 +1,5 @@
-// 行展开面板 v2：div 堆叠条升级为 SVG 双模式图表——
-// 曲线（默认,多系列平滑）⇄ 堆叠柱;数据仍是服务端 BreakdownDay（每日构成）,
-// 前端转成 SeriesSpec。配色沿用稳定哈希色板（charts.colorFor 同源）。
+// 行展开面板：SVG 双模式图表——曲线（默认,多系列平滑）⇄ 堆叠柱;
+// 数据是服务端 BreakdownDay（每日构成）,前端转成 SeriesSpec。配色沿用稳定哈希色板（charts.colorFor 同源）。
 import { useMemo, useState } from 'react'
 import type { BreakdownDay } from '../../services'
 import { LineChart, StackedBarChart, colorFor, type SeriesSpec } from '../insights/charts'

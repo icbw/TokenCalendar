@@ -11,13 +11,13 @@
 //!    turns（= Σ turn_mark) 取 `turn_part`（事件自身的日与模型,与 daily_usage 逐格守恒）;
 //!    时间与工具 / 错误取 `turn_raw`（轮的日与模型）,wall / idle / aborted_count 只算根会话。
 //!
-//! 中止与错误分列（S4-R）:`aborted`（0/1,用户主动中止）与 `error_count`（API / 工具错误）互不计入;
+//! 中止与错误分列:`aborted`（0/1,用户主动中止）与 `error_count`（API / 工具错误）互不计入;
 //! 物化时子轮的 error 并入父轮,aborted 只取父轮自身。
 //!
 //! 离开阈值：运行时值 = designPrefs `idleThresholdMin`（启动载入、`set_idle_threshold` 下发）。
 //! 改阈值 = `recompute_all` 全表重算 daily_project（只读原始层）;表内套用的阈值记在
 //! source_cursor（`__tasks`, `idle_threshold_ms`) 标记里,采集线程启动时与运行时值不一致即重算
-//! （迁移清库会连带清标记,自然触发一次）。
+//! （清库重建会连带清标记,自然触发一次）。
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering};

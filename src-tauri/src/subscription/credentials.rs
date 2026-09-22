@@ -1,4 +1,4 @@
-//! 凭据文件读取与 token 静默刷新（核心安全层）。
+//! 凭据文件读取与 token 静默刷新（订阅链路的安全层）。
 //!
 //! 红线：
 //! - 凭据文件**只读不写**——刷新得到的新 token 只存内存,不回写 agent 自己的
@@ -9,7 +9,7 @@
 //!
 //! 刷新失败分级：
 //! - 400/401/403 + invalid_grant 类 = **永久失效**（订阅过期撤销 refresh token,
-//!   Codex 形态 invalid_refresh_token）→ Dead,判死后本周期零网络;
+//!   Codex 的形态是 invalid_refresh_token）→ Dead,判死后本周期零网络;
 //! - 超时/5xx/DNS = 瞬态 → 不降级凭据状态,下轮照常。
 
 use serde_json::Value;
@@ -74,9 +74,8 @@ pub struct RawCredential {
     /// **账号指纹**（Codex 的 `auth.json` → `tokens.account_id` 的哈希前缀;Claude 侧
     /// 凭据里没有等价字段,留 None）。
     ///
-    /// 为什么要它：一台机器可以登录**多个**账号并来回切,而每个账号有自己独立的额度
-    /// 窗口。`plan_type` 只是个代理——本机 2026-07 就出现过**两个都是 plus** 的账号
-    /// 交替使用,代理完全失效。
+    /// 一台机器可以登录**多个**账号并来回切,每个账号有独立的额度窗口。`plan_type` 只是
+    /// 代理,两个同为 plus 的账号交替使用时它完全失效。
     ///
     /// **存哈希不存原值**：链路只需要「和上次是不是同一个」这一个判断,原值进不了库
     /// （`meta` 不存任何凭据类原文）。
@@ -97,12 +96,11 @@ pub fn jwt_claim_json(token: &str) -> Option<Value> {
     Some(payload)
 }
 
-/// 便捷单 claim 读取。
 pub fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
     jwt_claim_json(token)?.get(claim).cloned()
 }
 
-/// 极简 base64url → bytes → UTF-8 → serde_json（无新依赖,手写解码 ~30 行）。
+/// 极简 base64url → bytes → UTF-8 → serde_json（手写解码,不引新依赖）。
 mod base64_lite_decode {
     use serde_json::Value;
 
@@ -300,9 +298,8 @@ fn refresh_codex(refresh_token: &str) -> RefreshOutcome {
 }
 
 fn refresh_claude(refresh_token: &str) -> RefreshOutcome {
-    // Claude Code 公开 client_id + 固定 scope。
-    // 端点/UA 均按校准：只有 platform.claude.com 有效
-    // （console.anthropic.com 已 404）,且限流桶认 `claude-cli/<v> （external, cli)`
+    // Claude Code 公开 client_id + 固定 scope。只有 platform.claude.com 有效
+    // （console.anthropic.com 返回 404）,且限流桶认 `claude-cli/<v> （external, cli)`
     // ——换别的 UA 直接 429（与 usage 端点同族机制,见 claude.rs 模块头）。
     let body = serde_json::json!({
         "grant_type": "refresh_token",

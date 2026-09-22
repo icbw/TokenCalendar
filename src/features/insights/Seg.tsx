@@ -1,5 +1,4 @@
-// 分段控件（口径控件,样式复用 .seg / .toolbar-group）。
-// 自 InsightsView 抽出供 Tasks 视图复用;新增 disabled。
+// 分段控件（样式复用 .seg / .toolbar-group）,Insights 与 Tasks 视图共用。
 // 禁用态用 aria-disabled + is-disabled 而非原生 disabled:原生禁用按钮不派发鼠标事件,
 // hover 提示（title）在 WebView 里不可靠,而「为什么不可选」正是要靠提示说明。
 

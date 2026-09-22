@@ -1,4 +1,4 @@
-// UsageMatrix：自写月矩阵核心组件（S0 Spike 决策：不采用 react-grid-heatmap）
+// UsageMatrix：自写月矩阵核心组件（不用 react-grid-heatmap）
 // CSS Grid 布局：固定行头 + 31 列 + 行总量；P95+log1p 色阶（global/perRow）；
 // 状态视觉（future/zero/estimated/error/today/selected）；自写 tooltip；键盘导航
 import { useMemo, useRef, useState, useCallback } from 'react'
@@ -11,7 +11,7 @@ export interface MatrixRow {
   label: string
   subtitle?: string
   values: (number | null)[] // null = 未来/不可用（非 0）
-  /** 与 values 平行的请求/对话数（契约扩展;hover messages 用）。 */
+  /** 与 values 平行的请求/对话数（hover messages 用）。 */
   counts?: (number | null)[]
   cellOpts?: (day: number) => { estimated?: boolean; error?: boolean }
   total: number
@@ -27,11 +27,11 @@ export interface UsageMatrixProps {
   headerMutedFrom?: number
   scaleMode: 'global' | 'perRow'
   selected: { rowKey: string; day: number } | null
-  /** v3.1 面板联动的选中行（行名高亮 + is-selected-row）;与 cell selected 独立。 */
+  /** 面板联动的选中行（行名高亮 + is-selected-row）;与 cell selected 独立。 */
   selectedRow?: string | null
   onSelectCell(rowKey: string, day: number): void
   onSelectRow(rowKey: string): void
-  /** :格值格式化（缺省 token 紧凑格式;时间成本指标传 formatDuration）。 */
+  /** 格值格式化（缺省 token 紧凑格式;时间成本指标传 formatDuration）。 */
   formatValue?: (v: number) => string
   /** hover 读数单位（缺省 "tokens";wait / human 时间指标传对应单位）。 */
   valueUnit?: string
@@ -63,7 +63,7 @@ export default function UsageMatrix({
 
   // 色阶 cap：global = 全部非零值 P95；perRow = 每行非零值 P95
 // 用 P95 而非 P99：让中段值落在 t=0.3~0.8 区间，颜色梯度明显
-// 高于 cap 的格子用更深色调（normalCellBackground 内 is-peak 分支）单独凸显
+// 高于 cap 的格子落峰值档（matrixScale bucketIndex = 4）单独凸显
   const globalCap = useMemo(
     () => p95Cap(rows.flatMap((r) => r.values.filter((v): v is number => v !== null))),
     [rows],
@@ -79,8 +79,8 @@ export default function UsageMatrix({
     [scaleMode, globalCap, rowCap],
   )
 
-  // hover （对齐用户参考截图）：标题 = 年月日（月缩写缩窄）,
-  // 行 = tokens · 对话数（compact 格式,与挂件 tooltip 的 compact 一致）。
+  // hover 格式：标题 = 年月日（月缩写缩窄）,
+  // 行 = tokens · 对话数（compact 格式,与挂件 tooltip 一致）。
   const showTooltip = useCallback((rowKey: string, day: number, el: HTMLElement) => {
     const row = rows.find((r) => r.key === rowKey)
     if (!row) return
@@ -110,7 +110,7 @@ export default function UsageMatrix({
     setTooltip(null)
   }, [])
 
-  // 键盘导航（快捷键的子集：方向键/Enter/Esc）
+  // 键盘导航：方向键/Enter/Esc
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (!selected || rows.length === 0) return
     const rowIdx = rows.findIndex((r) => r.key === selected.rowKey)
@@ -144,7 +144,6 @@ export default function UsageMatrix({
       tabIndex={0}
       onKeyDown={onKeyDown}
     >
-      {/* 表头*/}
       <div className="matrix-header">
         <div className="matrix-header-label" />
         <div className="matrix-header-days">
@@ -162,7 +161,6 @@ export default function UsageMatrix({
         <div className="matrix-header-total">Total</div>
       </div>
 
-      {/* 行*/}
       {rows.map((row) => {
         const cap = capFor(row.key)
         return (
@@ -207,7 +205,7 @@ export default function UsageMatrix({
                     }}
                     onBlur={handleLeave}
                   >
-                    {/* 格子纯色块：数值仅 tooltip 显示*/}
+                    {/* 格子纯色块：数值仅 tooltip 显示 */}
                   </button>
                 )
               })}
@@ -217,7 +215,7 @@ export default function UsageMatrix({
         )
       })}
 
-      {/* Tooltip（共享组件，统一挂件/主窗口格式）*/}
+      {/* Tooltip（与挂件共用组件同格式） */}
       <MatrixTooltip content={tooltip?.content ?? null} anchor={tooltip?.anchor ?? null} />
     </div>
   )

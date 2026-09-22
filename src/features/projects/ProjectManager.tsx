@@ -1,13 +1,12 @@
 // 项目管理面板:Settings·Projects tab 与主窗口内弹出层（ProjectManagerModal）共用。
 // 结构:规则区（自动折叠开关 + 两个阈值 + Unknown 归 Scratch + Scratch 显隐）/ 列表区（筛选 · 排序 · 批量条 · 表格）。
-// 时间轴监测：名称列左侧 pin 图标切换;置顶行在任何排序下都额外提前
-// （按置顶先后）;筛选条 All 与 Active 之间的 pin 按钮 = 只看置顶。
+// 时间轴监测:名称列左侧 pin 图标切换;置顶行在任何排序下都额外提前（按置顶先后）;筛选条 All 与 Active 之间的
+// pin 按钮 = 只看置顶。
 // 数据:list_project_meta（每目录键一行,状态按当前规则解析）;写操作经 projectService,成功后后端发 usage:changed,
 // 本面板与各分析视图经既有监听重取。active = false 时不取数（弹出层常驻 DOM,关闭时只停取数）。
 // 行存在性语义见 Rust project_meta.rs:Rename / Hide / Unhide / Keep 都让键脱离自动规则;Reset 回到自动态。
-// 状态徽章：Active / Scratch 徽章可点击切换——
-// Active → Scratch = 合并进 Scratch 伪项目（手动归入）;Scratch → Active = 手动归入的先取消合并,再 Keep（留 meta 行,
-// 规则不再作用）。Hidden / Merged 徽章不可点。
+// 状态徽章:Active / Scratch 徽章可点击切换——Active → Scratch = 合并进 Scratch 伪项目（手动归入）;
+// Scratch → Active = 手动归入的先取消合并,再 Keep（留 meta 行,规则不再作用）。Hidden / Merged 徽章不可点。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, projectService } from '../../services'
 import type { ProjectMetaList, ProjectMetaRow, ProjectStatus, ScratchRuleInfo, WriteResult } from '../../services'
@@ -89,7 +88,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
   const [turnsDraft, setTurnsDraft] = useState('')
 
   // 时间轴置顶（prefs timelinePinnedKeys,存原始目录键,置顶先后即时间轴列序;storage 桥跨窗口同步——这里改,
-  // timeline 窗口即时跟随）。置顶集 = 时间轴监测的项目集,只在这里管理（时间轴窗口的 pin 按钮已删）;
+  // timeline 窗口即时跟随）。置顶集 = 时间轴监测的项目集,只在这里管理;
   // 为空时时间轴回退为按窗口容量显示最近项目。
   const [pins, setPins] = useState<string[]>(() => getDesignPrefs().timelinePinnedKeys ?? [])
   useEffect(() => subscribeDesignPrefs((p) => setPins(p.timelinePinnedKeys ?? [])), [])
