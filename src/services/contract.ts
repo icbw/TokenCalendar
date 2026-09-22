@@ -1,11 +1,15 @@
 // 线上契约形状：与 src-tauri/src/commands.rs 的 serde 定义严格对齐（snake_case）。
 // 装配层消费的驼峰形状见 types.ts，由各 service 做一次映射。
 
+/** token 指标:四个分项互斥,total = input + cache_write + cache_read + output（collector v16 口径;
+ * Codex 少量源事件只报 total、无分项,这部分不归属任何分项）。input = 未命中缓存的输入。 */
+export type TokenMetric = 'total' | 'input' | 'cache_write' | 'cache_read' | 'output'
+
 export interface MatrixQuery {
   month: string
   group_by: 'agent' | 'model'
   bucket: 'day' // 契约保留位：后端仅支持 day，week/cumulative 由前端聚合
-  metric: 'total' | 'input' | 'output'
+  metric: TokenMetric
   normalization: 'global' | 'perRow'
 }
 
@@ -114,7 +118,7 @@ export interface RangeSeriesQueryContract {
   end_day: string
   bucket: 'day' | 'hour'
   dimension: 'agent' | 'model' | 'total'
-  metric: 'total' | 'input' | 'output'
+  metric: TokenMetric
   filter_dimension?: 'agent' | 'model'
   filter_key?: string
 }
@@ -134,8 +138,8 @@ export interface RangeSeriesResultContract {
 // ---- 项目维与任务分析（与 commands.rs / collector/task_query.rs 对齐）----
 // 调用约定:get_project_month_rows / get_task_turns 参数名 snake_case（rename_all），其余单词参数。
 
-/** 项目维 metric:token 三列 + 计数 + 时间成本（wait = Σ wall_ms 等待,human = Σ idle_ms 人工,毫秒,并列不相加）。 */
-export type ProjectMetric = 'total' | 'input' | 'output' | 'turns' | 'model_calls' | 'tool_calls' | 'wait' | 'human'
+/** 项目维 metric:token 指标 + 计数 + 时间成本（wait = Σ wall_ms 等待,human = Σ idle_ms 人工,毫秒,并列不相加）。 */
+export type ProjectMetric = TokenMetric | 'turns' | 'model_calls' | 'tool_calls' | 'wait' | 'human'
 export type ProjectGroupBy = 'project' | 'agent' | 'model'
 
 /** get_project_month_rows 参数（返回 MatrixResult;message_counts = Σ turns）。 */

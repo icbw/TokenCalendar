@@ -2,6 +2,7 @@
 // 矩阵（UsageMatrixView / MatrixPanel）、洞察（InsightsView）与 Tasks 视图共用,口径单一源。
 // 项目键是解析层的有效键（合并目标 / __scratch / 原键）,展示名优先取后端标签缓存（alias）。
 import { cachedProjectLabel } from '../../services/projectLabels'
+import type { TokenMetric } from '../../services'
 
 /** 与 Rust turns:UNKNOWN_PROJECT 对齐（无目录源 / 解析失败）。 */
 export const UNKNOWN_PROJECT_KEY = 'unknown'
@@ -31,6 +32,22 @@ export function projectTooltip(key: string): string {
 
 /** 时间成本指标（毫秒值;与 token 并列不相加）。 */
 export type TimeMetric = 'wait' | 'human'
+
+/** token 分项（互斥,相加 = Tokens 总量）。工具栏顺序:Tokens → Input → Cache write → Cache read → Output。
+ * input = 未命中缓存的输入;cache_write = 写入提示缓存的输入（价格面板「缓存写」);
+ * cache_read = 命中缓存、从缓存读出的输入（价格面板「缓存读」）。 */
+export type TokenPart = 'input' | 'cache_write' | 'cache_read' | 'output'
+export const TOKEN_PARTS: TokenPart[] = ['input', 'cache_write', 'cache_read', 'output']
+
+/** label = 图表 / 图例全名;short = 工具栏按钮（Insights 工具栏单行不换行,默认 1120 宽窗口下放得下）。 */
+export const TOKEN_METRIC_LABELS: Record<TokenMetric, { label: string; short: string; hint: string; unit: string }> = {
+  total: { label: 'Tokens', short: 'Tokens', hint: 'Total tokens = input + cache write + cache read + output', unit: 'tokens' },
+  input: { label: 'Input', short: 'Input', hint: 'Input tokens not served from cache (cache miss)', unit: 'input tokens' },
+  cache_write: { label: 'Cache write', short: 'Cache W', hint: 'Cache write: input tokens written to the prompt cache', unit: 'cache-write tokens' },
+  cache_read: { label: 'Cache read', short: 'Cache R', hint: 'Cache read: input tokens served from the prompt cache (cache hit)', unit: 'cache-read tokens' },
+  output: { label: 'Output', short: 'Output', hint: 'Output tokens', unit: 'output tokens' },
+}
+export const TOKEN_METRICS: TokenMetric[] = ['total', ...TOKEN_PARTS]
 
 export function isTimeMetric(m: string): m is TimeMetric {
   return m === 'wait' || m === 'human'

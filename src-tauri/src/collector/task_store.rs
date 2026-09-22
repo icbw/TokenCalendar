@@ -485,10 +485,11 @@ pub fn recompute_day(conn: &Connection, agent: &str, day: &str, idle_threshold_m
         .map_err(err)?;
     conn.prepare_cached(
         "INSERT INTO daily_project (day, agent_key, model_key, project_key, turns, model_calls, subagent_calls,
-                                    input_tokens, output_tokens, total_tokens)
+                                    input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens)
          SELECT p.day, p.agent_key, p.model_key, r.project_key, SUM(p.turn_mark), SUM(p.model_calls),
                 SUM(CASE WHEN s.parent_id IS NOT NULL THEN p.model_calls ELSE 0 END),
-                SUM(p.input_tokens), SUM(p.output_tokens), SUM(p.total_tokens)
+                SUM(p.input_tokens), SUM(p.output_tokens), SUM(p.total_tokens),
+                SUM(p.cache_read_tokens), SUM(p.cache_write_tokens)
          FROM turn_part p
          JOIN turn_raw r ON r.agent_key = p.agent_key AND r.session_id = p.session_id AND r.turn_seq = p.turn_seq
          LEFT JOIN session s ON s.agent_key = p.agent_key AND s.session_id = p.session_id

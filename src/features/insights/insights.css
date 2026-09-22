@@ -82,6 +82,16 @@
   display: none;
 }
 
+/* 指标组 v16 起多两项（Cache W / Cache R）:按钮内距收紧 2px,标题不折行,默认 1120 宽仍单行放下 */
+.insight-toolbar .seg {
+  padding: 4px 7px;
+}
+
+.insight-toolbar .insight-card-title {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ---- 范围条（Insights / Tasks 共用）:工具栏主行下方的独立固定行,承载
    7d/30d/90d/All/Custom 分段、自定义起止日期、解析后的区间文字与「Project span」按钮。
    允许换行（日期输入 + 提示在窄窗下放不下时下折,不横向滚动藏掉错误提示）。 ---- */

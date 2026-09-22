@@ -29,6 +29,17 @@
 //!   日粒度与 `daily_usage` 逐格精确（末位行吃取整余数）,轮粒度是近似。被采集器再次读到的会话
 //!   会用源值整行覆盖近似值;源已消失的会话保留近似值,不丢行。
 //! - `turn` / `daily_project` 不加列（本就由原始层物化重算）,迁移末尾走 `recompute_all`。
+//!
+//! v16 = 「总 tokens = 各分项之和」的口径（UI 把 input / cache_write / cache_read / output 拆成独立指标）:
+//! - ZCode 的 `input_tokens` 含 cache 命中,
+//!   改为与其余五源一致的 cache-exclusive:`input -= cache_read + cache_write`。
+//! - 原始层 `turn_part` 的 cache 两列只有 v15 之后采集的行与 Claude（已回填）是真值,其余五源的历史行
+//!   为 0。按日格缺口（`daily_usage` cache − Σ turn_part cache）分摊回填:权重 = 该行「total 里未归属的部分」
+//!   （cache-exclusive 源为 `total − input − output − cache`,ZCode 为正前 input 里的 cache 份额）。
+//!   日粒度与 `daily_usage` 逐格精确,轮粒度是近似;被采集器再次读到的会话由源值整行覆盖,读不到的保留。
+//! - `daily_project` 补 cache 两列（项目维也能按 cache 指标出图）,末尾 `recompute_all` 物化。
+//! - 不改任何 `total_tokens`。Codex 有少量源事件只报 `total_tokens`、分项全 0（源里就没有拆分）,
+//!   这部分 total 不归属任何分项,如实保留。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -529,6 +540,134 @@ pub fn upgrade_v15(conn: &Connection) -> Res<V15Report> {
     Ok(report)
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct V16Report {
+    /// 回填了 cache 的 turn_part 行数（历史行 cache 两列为 0 的日格缺口）。
+    pub part_cache_rows: usize,
+    /// input 改为 cache-exclusive 的 ZCode 行数（daily / hourly / turn_part 三表合计）。
+    pub zcode_input_rows: usize,
+    /// 同步改写的「跨迁移仍开着的轮」游标数。
+    pub cursors_synced: usize,
+}
+
+/// v15 → v16 就地升级（调用方包在同一事务里）。幂等：日格缺口补齐后为 0;ZCode 行正后
+/// `total ≠ input + output`（cache > 0 时）,不会被二次扣减。
+pub fn upgrade_v16(conn: &Connection) -> Res<V16Report> {
+    const ZCODE: &str = "zcode";
+    for c in ["cache_read_tokens", "cache_write_tokens"] {
+        add_column(conn, "daily_project", c)?;
+    }
+    let mut report = V16Report::default();
+
+    //  原始层 cache 历史回填:按 （agent, 日, 模型) 格的缺口分摊,total 不动。
+    let cells: Vec<(String, String, String, i64, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT u.agent_key, u.day, u.model_key,
+                        u.cache_read_tokens - p.cr, u.cache_write_tokens - p.cw
+                 FROM daily_usage u
+                 JOIN (SELECT agent_key, day, model_key, SUM(cache_read_tokens) cr, SUM(cache_write_tokens) cw
+                       FROM turn_part GROUP BY agent_key, day, model_key) p
+                   ON p.agent_key = u.agent_key AND p.day = u.day AND p.model_key = u.model_key
+                 WHERE u.cache_read_tokens > p.cr OR u.cache_write_tokens > p.cw",
+            )
+            .map_err(err)?;
+        let it = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))
+            .map_err(err)?;
+        it.flatten().collect()
+    };
+    for (agent, day, model, miss_r, miss_w) in cells {
+        let (miss_r, miss_w) = (miss_r.max(0), miss_w.max(0));
+        let rows: Vec<(String, i64, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, turn_seq,
+                            CASE WHEN ?1 = 'zcode' THEN input_tokens - cache_read_tokens - cache_write_tokens
+                                 ELSE total_tokens - input_tokens - output_tokens - cache_read_tokens - cache_write_tokens END
+                     FROM turn_part WHERE agent_key = ?1 AND day = ?2 AND model_key = ?3
+                     ORDER BY session_id, turn_seq",
+                )
+                .map_err(err)?;
+            let it = stmt
+                .query_map(params![agent, day, model], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?.max(0)))
+                })
+                .map_err(err)?;
+            it.flatten().collect()
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        // 未归属份额全 0（理论上不会,兜底）时按行均分。
+        let weights: Vec<i64> = if rows.iter().all(|r| r.2 == 0) { vec![1; rows.len()] } else { rows.iter().map(|r| r.2).collect() };
+        let sum: i128 = weights.iter().map(|w| *w as i128).sum();
+        let share = |m: i64, w: i64| ((m as i128 * w as i128) / sum) as i64;
+        // 取整余数给权重最大的行（余数 < 行数,落在最大份额上最不失真）。
+        let heavy = weights.iter().enumerate().max_by_key(|(_, w)| **w).map(|(i, _)| i).unwrap_or(0);
+        let rest_r = miss_r - weights.iter().map(|w| share(miss_r, *w)).sum::<i64>();
+        let rest_w = miss_w - weights.iter().map(|w| share(miss_w, *w)).sum::<i64>();
+        for (i, ((sid, seq, _), w)) in rows.iter().zip(weights.iter()).enumerate() {
+            let extra = if i == heavy { (rest_r, rest_w) } else { (0, 0) };
+            let (cr, cw) = (share(miss_r, *w) + extra.0, share(miss_w, *w) + extra.1);
+            if cr == 0 && cw == 0 {
+                continue;
+            }
+            conn.execute(
+                "UPDATE turn_part SET cache_read_tokens = cache_read_tokens + ?4, cache_write_tokens = cache_write_tokens + ?5
+                 WHERE agent_key = ?1 AND session_id = ?2 AND turn_seq = ?3 AND day = ?6 AND model_key = ?7",
+                params![agent, sid, seq, cr, cw, day, model],
+            )
+            .map_err(err)?;
+            report.part_cache_rows += 1;
+        }
+    }
+
+    //  ZCode input → cache-exclusive。只动仍是「total = input + output」形态的行（幂等）。
+    for t in ["daily_usage", "hourly_usage", "turn_part"] {
+        report.zcode_input_rows += conn
+            .execute(
+                &format!(
+                    "UPDATE {t} SET input_tokens = MAX(input_tokens - cache_read_tokens - cache_write_tokens, 0)
+                     WHERE agent_key = ?1 AND cache_read_tokens + cache_write_tokens > 0
+                       AND total_tokens = input_tokens + output_tokens"
+                ),
+                [ZCODE],
+            )
+            .map_err(err)?;
+    }
+
+    //  turn_raw 的 input / cache 列 = 其 turn_part 行之和（原始层内部自洽;无 part 的行不动）。
+    conn.execute(
+        "UPDATE turn_raw SET
+             input_tokens = (SELECT SUM(p.input_tokens) FROM turn_part p
+                 WHERE p.agent_key = turn_raw.agent_key AND p.session_id = turn_raw.session_id AND p.turn_seq = turn_raw.turn_seq),
+             cache_read_tokens = (SELECT SUM(p.cache_read_tokens) FROM turn_part p
+                 WHERE p.agent_key = turn_raw.agent_key AND p.session_id = turn_raw.session_id AND p.turn_seq = turn_raw.turn_seq),
+             cache_write_tokens = (SELECT SUM(p.cache_write_tokens) FROM turn_part p
+                 WHERE p.agent_key = turn_raw.agent_key AND p.session_id = turn_raw.session_id AND p.turn_seq = turn_raw.turn_seq)
+         WHERE EXISTS (SELECT 1 FROM turn_part p
+                 WHERE p.agent_key = turn_raw.agent_key AND p.session_id = turn_raw.session_id AND p.turn_seq = turn_raw.turn_seq)",
+        [],
+    )
+    .map_err(err)?;
+
+    //  跨迁移仍开着的轮（累加器在游标里,下一批 flush 整行覆盖 turn_part）:把回填后的 cache 写回游标。
+    // ZCode 的轮按会话从源库整份重建,游标不带累加器,不需要同步。
+    let agents: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT source_id FROM source_cursor WHERE source_id <> ?1").map_err(err)?;
+        let it = stmt.query_map([ZCODE], |r| r.get::<_, String>(0)).map_err(err)?;
+        it.flatten().collect()
+    };
+    for a in agents {
+        report.cursors_synced += sync_open_turn_cursors(conn, &a)?;
+    }
+
+    //  daily_project（含新 cache 两列）/ turn 由原始层物化重算。
+    super::task_store::recompute_all(conn, super::task_store::idle_threshold_ms())?;
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +933,98 @@ mod tests {
         assert_eq!(v, 12, "备份是迁移前的库");
         assert_eq!(keys(&b, "session", "claude-code", "S"), vec!["e:/W/Demo/src".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v15 形态 → v16:ZCode input 改 cache-exclusive、原始层 cache 历史按日格缺口回填、
+    /// daily_project 带上 cache 两列;逐格守恒;二次运行无改动。
+    #[test]
+    fn v16_splits_zcode_input_and_backfills_raw_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(RESET_SCHEMA).unwrap();
+        // 退回 v15 形态:daily_project 没有 cache 两列
+        conn.execute_batch(
+            "DROP TABLE daily_project;
+             CREATE TABLE daily_project (day TEXT NOT NULL, agent_key TEXT NOT NULL, model_key TEXT NOT NULL,
+                 project_key TEXT NOT NULL, turns INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
+                 tool_calls INTEGER NOT NULL DEFAULT 0, wall_ms INTEGER NOT NULL DEFAULT 0, model_ms INTEGER NOT NULL DEFAULT 0,
+                 tool_ms INTEGER NOT NULL DEFAULT 0, idle_ms INTEGER NOT NULL DEFAULT 0, subagent_calls INTEGER NOT NULL DEFAULT 0,
+                 error_count INTEGER NOT NULL DEFAULT 0, aborted_count INTEGER NOT NULL DEFAULT 0,
+                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                 total_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, agent_key, model_key, project_key));",
+        )
+        .unwrap();
+        // zcode:input 含 cache（total = input + output）;原始层 cache 为 0（v15 之前采集）。
+        // codebuddy:日表 cache 真值,原始层一行已有真值（v15 后采集）、两行为 0（历史）。
+        conn.execute_batch(
+            "INSERT INTO daily_usage (day, agent_key, model_key, input_tokens, output_tokens, total_tokens, request_count,
+                                      cache_read_tokens, cache_write_tokens) VALUES
+                ('2026-09-10','zcode','glm',1000,50,1050,2,900,0),
+                ('2026-09-10','codebuddy','ds',30,30,1060,3,1000,0);
+             INSERT INTO hourly_usage (day, hour, agent_key, model_key, input_tokens, output_tokens, total_tokens,
+                                       cache_read_tokens, cache_write_tokens) VALUES
+                ('2026-09-10',9,'zcode','glm',1000,50,1050,900,0);
+             INSERT INTO session (agent_key, session_id, project_key, parent_id, started_at) VALUES
+                ('zcode','Z','e:/W/Z',NULL,1), ('codebuddy','C','e:/W/C',NULL,1);
+             INSERT INTO turn_raw (agent_key, session_id, turn_seq, day, project_key, model_key, started_at, ended_at,
+                                   input_tokens, output_tokens, total_tokens, model_calls) VALUES
+                ('zcode','Z',1,'2026-09-10','e:/W/Z','glm',1,2,400,20,420,1),
+                ('zcode','Z',2,'2026-09-10','e:/W/Z','glm',3,4,600,30,630,1),
+                ('codebuddy','C',1,'2026-09-10','e:/W/C','ds',1,2,10,10,320,1),
+                ('codebuddy','C',2,'2026-09-10','e:/W/C','ds',3,4,10,10,520,1),
+                ('codebuddy','C',3,'2026-09-10','e:/W/C','ds',5,6,10,10,220,1);
+             INSERT INTO turn_part (agent_key, session_id, turn_seq, day, model_key, input_tokens, output_tokens,
+                                    total_tokens, cache_read_tokens, model_calls, turn_mark) VALUES
+                ('zcode','Z',1,'2026-09-10','glm',400,20,420,0,1,1),
+                ('zcode','Z',2,'2026-09-10','glm',600,30,630,0,1,1),
+                ('codebuddy','C',1,'2026-09-10','ds',10,10,320,0,1,1),
+                ('codebuddy','C',2,'2026-09-10','ds',10,10,520,0,1,1),
+                ('codebuddy','C',3,'2026-09-10','ds',10,10,220,200,1,1);",
+        )
+        .unwrap();
+
+        let r = upgrade_v16(&conn).unwrap();
+        assert_eq!((r.part_cache_rows, r.zcode_input_rows), (4, 4), "zcode 2 行 + codebuddy 2 行回填;zcode 日/小时/2 part 改 input");
+
+        // 四项和恒等:日 / 小时 / 原始层 / 项目维
+        for t in ["daily_usage", "hourly_usage", "turn_part", "turn_raw", "daily_project"] {
+            let bad: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {t} WHERE total_tokens <> input_tokens + output_tokens + cache_read_tokens + cache_write_tokens"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bad, 0, "{t} 四项和恒等");
+        }
+        // 权重 = 未归属份额:zcode 按 input 400:600 分 900;codebuddy 按 300:500 分缺口 800
+        let parts: Vec<(String, i64, i64)> = {
+            let mut stmt = conn.prepare("SELECT agent_key, input_tokens, cache_read_tokens FROM turn_part ORDER BY agent_key, turn_seq").unwrap();
+            let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            it.flatten().collect()
+        };
+        assert_eq!(
+            parts,
+            vec![
+                ("codebuddy".into(), 10, 300),
+                ("codebuddy".into(), 10, 500),
+                ("codebuddy".into(), 10, 200),
+                ("zcode".into(), 40, 360),
+                ("zcode".into(), 60, 540),
+            ]
+        );
+        // 项目维与日表逐格守恒（含 cache 两列）
+        let gap: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM daily_usage u JOIN (SELECT day, agent_key, model_key, SUM(input_tokens) i,
+                     SUM(cache_read_tokens) cr, SUM(total_tokens) t FROM daily_project GROUP BY 1, 2, 3) p
+                   USING (day, agent_key, model_key)
+                 WHERE p.i <> u.input_tokens OR p.cr <> u.cache_read_tokens OR p.t <> u.total_tokens",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gap, 0);
+
+        assert_eq!(upgrade_v16(&conn).unwrap(), V16Report::default(), "幂等");
     }
 }

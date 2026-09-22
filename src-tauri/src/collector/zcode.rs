@@ -1,7 +1,9 @@
 //! ZCode 适配器：`~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表（rowid 增量）。
 //!
-//! 口径：total = `provider_total_tokens`，为 0/NULL 时兜底 `computed_total_tokens`；input/output 取原始列
-//! （cache 分项独立列,不并入）；仅 `status='completed'` 计入；时间取 `started_at`（Unix 毫秒）→ 本地日。
+//! 口径：total = `provider_total_tokens`，为 0/NULL 时兜底 `computed_total_tokens`；output 取原始列;
+//! **input = 原始 `input_tokens` − cache 两列**（ZCode 的 `input_tokens` 含 cache 命中,源库逐行
+//! `provider_total = input + output`、`input ≥ cache_read`;v16 起与其余五源同为 cache-exclusive,
+//! 于是 `total = input + output + cache_read + cache_write` 逐行成立）；仅 `status='completed'` 计入；时间取 `started_at`（Unix 毫秒）→ 本地日。
 //! 数据库被 ZCode 进程实时写入（WAL）：只读打开 + busy_timeout,BUSY 视为可重试降级。
 //!
 //! 请求数：行级增量不写 request_count 粗值（一轮含多次模型调用,按行 +1 会虚高）。每次有新行都对
@@ -305,15 +307,17 @@ impl ZcodeAdapter {
 }
 
 /// model_usage 一行的 token 口径（采集行级路径与任务同步共用,保证 daily_usage 与 turn_part 同源）：
-/// total = provider 优先,0/NULL 兜底 computed;cache 两列为可选列（缺失传 None）。
+/// total = provider 优先,0/NULL 兜底 computed;cache 两列为可选列（缺失传 None）;
+/// input 源值含 cache → 减去 cache 两列得 cache-exclusive 口径（见文件头）。
 fn row_tokens(input: Option<i64>, output: Option<i64>, provider_total: Option<i64>, computed_total: Option<i64>, cache_read: Option<i64>, cache_write: Option<i64>) -> Tokens {
     let provider = provider_total.unwrap_or(0);
+    let (cache_read, cache_write) = (clamp0(cache_read.unwrap_or(0)), clamp0(cache_write.unwrap_or(0)));
     Tokens {
-        input: clamp0(input.unwrap_or(0)),
+        input: clamp0(input.unwrap_or(0) - cache_read - cache_write),
         output: clamp0(output.unwrap_or(0)),
         total: if provider > 0 { provider } else { computed_total.unwrap_or(0).max(0) },
-        cache_read: clamp0(cache_read.unwrap_or(0)),
-        cache_write: clamp0(cache_write.unwrap_or(0)),
+        cache_read,
+        cache_write,
     }
 }
 
@@ -700,6 +704,15 @@ impl ZcodeAdapter {
 
 #[cfg(test)]
 mod tests {
+
+    /// 源 `input_tokens` 含 cache 命中（实证行:in=217124 / cacheRead=216704 / out=239 / total=217363）
+    /// → input 减 cache 后四项和 = provider total。
+    #[test]
+    fn input_excludes_cache_so_parts_sum_to_total() {
+        let t = row_tokens(Some(217_124), Some(239), Some(217_363), None, Some(216_704), None);
+        assert_eq!((t.input, t.cache_read, t.output, t.total), (420, 216_704, 239, 217_363));
+        assert_eq!(t.input + t.output + t.cache_read + t.cache_write, t.total);
+    }
     use super::*;
     use chrono::Datelike;
     use crate::collector::store::days_in_month;

@@ -350,8 +350,9 @@ pub struct Store {
 }
 
 /// 当前 schema 版本（`PRAGMA user_version`）。v13 起每次升版对应 migrations.rs 里一个就地升级步骤:
-/// v13 项目归属口径、v14 正文件夹名误作项目键、v15 Claude Code total 改四项和并给原始层补 cache 列。
-pub const SCHEMA_VERSION: i64 = 15;
+/// v13 项目归属口径、v14 正文件夹名误作项目键、v15 Claude Code total 改四项和并给原始层补 cache 列、
+/// v16 ZCode input 改 cache-exclusive + 原始层 cache 历史回填 + daily_project 补 cache 列。
+pub const SCHEMA_VERSION: i64 = 16;
 /// 低于此版本的库走一次清库重建到此版本（结构差异逐版累积,无法就地补齐）;此后只就地迁移。
 const LEGACY_RESET_VERSION: i64 = 12;
 
@@ -511,6 +512,8 @@ CREATE TABLE IF NOT EXISTS daily_project (
     input_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     total_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, agent_key, model_key, project_key)
 );
 -- v12:已计行（派生数据）。Claude Code 续聊 / fork 把整份历史复制进新会话文件（行 uuid 不变、sessionId 改写）,
@@ -530,6 +533,21 @@ CREATE TABLE IF NOT EXISTS session_alias (
     PRIMARY KEY (agent_key, alias)
 );";
 
+
+/// token 指标 → 聚合表列。四个分项互斥,`total = input + output + cache_read + cache_write`
+/// （COLLECTOR_GUIDE Codex 少量只报 total 的源事件除外）。未知指标回落 total。
+pub fn token_metric_col(metric: &str) -> &'static str {
+    match metric {
+        "input" => "input_tokens",
+        "output" => "output_tokens",
+        "cache_read" => "cache_read_tokens",
+        "cache_write" => "cache_write_tokens",
+        _ => "total_tokens",
+    }
+}
+
+/// 命令层校验用:受支持的 token 指标。
+pub const TOKEN_METRICS: &[&str] = &["total", "input", "output", "cache_read", "cache_write"];
 
 pub fn days_in_month(y: i32, m: u32) -> u32 {
     let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
@@ -626,6 +644,13 @@ impl Store {
                 tx.execute_batch("PRAGMA user_version = 15").map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 crate::dev_log!("[collector] schema -> 15 in place: {:?}", report);
+            }
+            if version < 16 {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                let report = super::migrations::upgrade_v16(&tx)?;
+                tx.execute_batch("PRAGMA user_version = 16").map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
+                crate::dev_log!("[collector] schema -> 16 in place: {:?}", report);
             }
         }
         Ok(Store { conn, live: BTreeMap::new(), turn_span: None, pending_usage: BTreeMap::new() })
@@ -993,17 +1018,13 @@ impl Store {
         })
     }
 
-    /// 月度矩阵（group_by: "agent" | "model"；metric: "total" | "input" | "output"）。
+    /// 月度矩阵（group_by: "agent" | "model"；metric 见 `token_metric_col`）。
     /// 键集 = 月内有记录的 key；无记录日按 null ≠ 0 语义补位；行按月总量降序。
     pub fn month_rows(&self, month: &str, group_by: &str, metric: &str, today: NaiveDate) -> Option<Vec<StoreRow>> {
         let (y, m) = parse_month(month)?;
         let first = NaiveDate::from_ymd_opt(y, m, 1)?;
         let dim = days_in_month(y, m) as usize;
-        let metric_col = match metric {
-            "input" => "input_tokens",
-            "output" => "output_tokens",
-            _ => "total_tokens",
-        };
+        let metric_col = token_metric_col(metric);
         let (key_col, label_of) = match group_by {
             "model" => ("model_key", Box::new(model_label) as Box<dyn Fn(&str) -> String + Send>),
             _ => ("agent_key", Box::new(agent_label) as Box<dyn Fn(&str) -> String + Send>),
@@ -1152,7 +1173,7 @@ impl Store {
     ///
     /// - bucket: "day"（daily_usage 表）| "hour"（hourly_usage 表,bucket = day+HH）
     /// - dimension: "agent" | "model" | "total"（单系列全合计）
-    /// - metric: "total" | "input" | "output"
+    /// - metric: 见 `token_metric_col`
     /// - filter: 可选维度筛选（Some（（dim,key)) 只保留该维度指定 key 的行;
     ///   dim 必须与聚合维度同族——agent 维可用 agent 筛,model 维可用 model 筛;
     ///   跨族筛选在 SQL 里同样成立（如 model 维度只看 zcode 的系列构成）。
@@ -1172,11 +1193,7 @@ impl Store {
             "hour" => ("hourly_usage", "day || ' ' || printf('%02d', hour)"),
             _ => ("daily_usage", "day"),
         };
-        let metric_col = match metric {
-            "input" => "input_tokens",
-            "output" => "output_tokens",
-            _ => "total_tokens",
-        };
+        let metric_col = token_metric_col(metric);
         // 聚合维度与筛选谓词相互独立:任一维都可作为系列轴,另一维用 filter 收窄。
         let (key_col, label_of): (&str, Box<dyn Fn(&str) -> String + Send>) = match dimension {
             "model" => ("model_key", Box::new(model_label)),

@@ -1,7 +1,7 @@
 // 装配层内部形状（驼峰命名）。
 // 线上 snake_case 契约（contract.ts）→ 此处驼峰形状的映射在各 service 内完成。
 
-import type { TaskSortField } from './contract'
+import type { TaskSortField, TokenMetric } from './contract'
 
 export interface UsageRow {
   key: string
@@ -48,7 +48,7 @@ export interface QueryOptions {
   month: string
   groupBy: 'agent' | 'model'
   bucket: 'day'
-  metric: 'total' | 'input' | 'output'
+  metric: TokenMetric
   normalization: 'global' | 'perRow'
 }
 

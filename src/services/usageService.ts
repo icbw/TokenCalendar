@@ -12,6 +12,7 @@ import type {
   ProjectMonthRowsArgs,
   RangeSeriesQueryContract,
   RangeSeriesResultContract,
+  TokenMetric,
 } from './contract'
 import type { QueryOptions, UsageResult, UsageRow } from './types'
 import { tryInvoke } from './tauri'
@@ -105,7 +106,7 @@ export interface RangeSeriesQuery {
   endDay: string
   bucket: 'day' | 'hour'
   dimension: 'agent' | 'model' | 'total'
-  metric: 'total' | 'input' | 'output'
+  metric: TokenMetric
   filterDimension?: 'agent' | 'model'
   filterKey?: string
 }

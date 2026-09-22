@@ -5,11 +5,11 @@
 // 手写 SVG 图表见 charts.tsx。
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { events, usageService } from '../../services'
-import type { CreditSummary, RangeSeriesPoint, RangeSeriesResult } from '../../services'
+import type { CreditSummary, RangeSeriesPoint, RangeSeriesResult, TokenMetric } from '../../services'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
-import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, COMBO_IN, COMBO_OUT, COMBO_CREDIT, type ComboSeries, type SeriesSpec } from './charts'
+import { DonutChart, LineChart, StackedBarChart, ComboChart, colorFor, colorShades, COMBO_IN, COMBO_OUT, COMBO_CREDIT, type ComboSeries, type SeriesSpec } from './charts'
 import { formatFull } from '../matrix/matrixScale'
-import { OUTLIER_Z, TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
+import { OUTLIER_Z, TIME_METRIC_LABELS, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_PARTS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip, zScores } from './analytics'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import PricingBlock from './PricingBlock'
@@ -34,7 +34,7 @@ const fullMonthLabel = (m: string) => {
 type Bucket = 'day' | 'hour'
 /** project 维 / 时间指标走 get_effort_series（仅 day 粒度）;其余组合走 get_range_series。 */
 type Dimension = 'agent' | 'model' | 'project' | 'total'
-type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
+type Metric = TokenMetric | 'wait' | 'human'
 type ChartKind = 'line' | 'stack'
 
 // ---- 主图卡 ----
@@ -50,6 +50,8 @@ function useTrendBlock() {
   const [kind, setKind] = useState<ChartKind>('line')
   const [filterKey, setFilterKey] = useState<string>('') // '' = 全部
   const [data, setData] = useState<RangeSeriesResult | null>(null)
+  /** 单模型分项:TOKEN_PARTS 顺序的四条序列（仅 partsMode 时拉取）。 */
+  const [parts, setParts] = useState<(RangeSeriesResult | null)[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [refreshTick, setRefreshTick] = useState(0)
 
@@ -90,9 +92,19 @@ function useTrendBlock() {
     return (data?.seriesKeys ?? []).map((k, i) => ({ key: k, label: seriesLabel(k, data?.seriesLabels[i]) }))
   }, [data, seriesLabel])
 
+  // 模型维筛到单个模型 + Tokens 指标 → 该模型按 token 分项出图（柱高 / 分项和 = 总量）
+  const partsMode = dimension === 'model' && !!filterKey && metric === 'total'
+
   useEffect(() => {
     let cancelled = false
     setLoading(true)
+    const partsReq = partsMode
+      ? Promise.all(
+          TOKEN_PARTS.map((m) =>
+            usageService.getRangeSeries({ startDay, endDay, bucket: effectiveBucket, dimension, metric: m, filterDimension: dimension, filterKey }),
+          ),
+        )
+      : Promise.resolve(null)
     const req =
       dimension === 'project' || isTimeMetric(metric)
         ? usageService.getEffortSeries({
@@ -112,20 +124,22 @@ function useTrendBlock() {
             filterDimension: dimension === 'total' || !filterKey ? undefined : dimension,
             filterKey: dimension === 'total' || !filterKey ? undefined : filterKey,
           })
-    void req.then((res) => {
+    void Promise.all([req, partsReq]).then(([res, partRes]) => {
       if (cancelled) return
       setData(res)
+      setParts(partRes)
       setLoading(false)
     })
     return () => {
       cancelled = true
     }
-  }, [startDay, endDay, effectiveBucket, dimension, metric, filterKey, refreshTick])
+  }, [startDay, endDay, effectiveBucket, dimension, metric, filterKey, refreshTick, partsMode])
 
   const series: SeriesSpec[] = useMemo(() => {
     if (!data) return []
+    if (partsMode && parts && data.seriesKeys.length > 0) return partSeries(data, parts, filterKey)
     return data.seriesKeys.map((k, i) => ({ key: k, label: seriesLabel(k, data.seriesLabels[i]), values: data.points.map((p) => p.values[i] ?? 0) }))
-  }, [data, seriesLabel])
+  }, [data, parts, partsMode, filterKey, seriesLabel])
   const timeFmt = isTimeMetric(metric) ? formatDuration : undefined
   const buckets = data?.points.map((p) => p.bucket) ?? []
 
@@ -134,14 +148,14 @@ function useTrendBlock() {
     () =>
       series
         .filter(() => dimension !== 'total')
-        .map((s) => ({ key: s.key, label: s.label, value: s.values.reduce((a, b) => a + b, 0) }))
+        .map((s) => ({ key: s.key, label: s.label, color: s.color, value: s.values.reduce((a, b) => a + b, 0) }))
         .filter((s) => s.value > 0)
         .sort((a, b) => b.value - a.value),
     [series, dimension],
   )
   const donutUnit = isTimeMetric(metric)
     ? TIME_METRIC_LABELS[metric].unit
-    : metric === 'total' ? 'tokens' : metric === 'input' ? 'input tokens' : 'output tokens'
+    : TOKEN_METRIC_LABELS[metric].unit
 
   const pickFilter = useCallback(
     (k: string) => {
@@ -212,9 +226,7 @@ function useTrendBlock() {
         <Seg
           value={metric}
           options={[
-            { v: 'total' as Metric, label: 'Tokens', hint: 'Total tokens' },
-            { v: 'input' as Metric, label: 'Input', hint: 'Input tokens' },
-            { v: 'output' as Metric, label: 'Output', hint: 'Output tokens' },
+            ...TOKEN_METRICS.map((m) => ({ v: m as Metric, label: TOKEN_METRIC_LABELS[m].short, hint: TOKEN_METRIC_LABELS[m].hint })),
             ...(['wait', 'human'] as const).map((m) => {
               const off = dimension === 'agent' || dimension === 'model'
               return {
@@ -284,6 +296,24 @@ function useTrendBlock() {
       </section>
     ),
   }
+}
+
+/** 单模型的 token 分项序列:四个分项（+ 源里只报总量、无分项的余量）按范围总量从多到少排序,
+ * 依次取该模型本色由深到浅——最多的分项与该模型的总量同色,堆叠柱最深的一段在底部。
+ * 全零分项不出现;每个桶的分项和恒等于总量。 */
+function partSeries(total: RangeSeriesResult, parts: (RangeSeriesResult | null)[], modelKey: string): SeriesSpec[] {
+  const totals = total.points.map((p) => p.values[0] ?? 0)
+  const specs = TOKEN_PARTS.map((m, j) => ({
+    key: `${modelKey}::${m}`,
+    label: TOKEN_METRIC_LABELS[m].label,
+    values: totals.map((_, i) => parts[j]?.points[i]?.values[0] ?? 0),
+  }))
+  const rest = totals.map((t, i) => Math.max(0, t - specs.reduce((a, s) => a + s.values[i], 0)))
+  specs.push({ key: `${modelKey}::unitemized`, label: 'Unitemized', values: rest })
+  const sum = (v: number[]) => v.reduce((a, b) => a + b, 0)
+  const shown = specs.filter((s) => sum(s.values) > 0).sort((a, b) => sum(b.values) - sum(a.values))
+  const shades = colorShades(modelKey, shown.length)
+  return shown.map((s, i) => ({ ...s, color: shades[i] }))
 }
 
 // ---- 异常日（31 天 z-score） ----

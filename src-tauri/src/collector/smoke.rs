@@ -367,3 +367,39 @@ fn codebuddy_collect_vs_rename() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("collect rounds={rounds}; writer: {}", String::from_utf8_lossy(&out.stdout).trim());
 }
+
+/// v16 就地迁移 + 真实六源采集:对安装版 collector.db 的**副本**（TC_V16_DB）打开（触发备份与迁移）,
+/// 再跑两遍真实适配器;打印各源四项和残差、项目维守恒与一个模型的分项序列。
+#[test]
+#[ignore]
+fn v16_parts_sum_on_db_copy() {
+    let path = std::env::var_os("TC_V16_DB").expect("TC_V16_DB = collector.db 副本路径");
+    let mut store = Store::open(std::path::Path::new(&path)).expect("open copy");
+    let residual = |store: &Store, table: &str| -> Vec<(String, i64, i64, i64)> {
+        let mut stmt = store
+            .conn()
+            .prepare(&format!(
+                "SELECT agent_key, SUM(total_tokens), SUM(total_tokens - input_tokens - output_tokens - cache_read_tokens - cache_write_tokens),
+                        SUM(total_tokens <> input_tokens + output_tokens + cache_read_tokens + cache_write_tokens)
+                 FROM {table} GROUP BY 1"
+            ))
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().flatten().collect()
+    };
+    let v: i64 = store.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    let mut out = format!("user_version = {v}\n");
+    for t in ["daily_usage", "hourly_usage", "turn_part", "turn_raw", "daily_project"] {
+        out.push_str(&format!("after migration {t:<13} (agent, total, total - parts, rows off) = {:?}\n", residual(&store, t)));
+    }
+    for pass in 1..=2 {
+        for adapter in default_adapters() {
+            let r = adapter.collect(&mut store);
+            out.push_str(&format!("pass {pass} [{}] events={:?}\n", adapter.meta().id, r.map(|o| o.events).map_err(|e| e.message)));
+        }
+    }
+    for t in ["daily_usage", "hourly_usage", "turn_part", "daily_project"] {
+        out.push_str(&format!("after collect   {t:<13} (agent, total, total - parts, rows off) = {:?}\n", residual(&store, t)));
+    }
+    out.push_str(&format!("project conservation issues = {:?}\n", store.test_project_conservation()));
+    println!("{out}");
+}

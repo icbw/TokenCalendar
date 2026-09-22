@@ -3,7 +3,7 @@
 //!
 //! 口径：
 //! - 项目维矩阵 / 钻取 / 时间成本曲线读 `daily_project`（已套离开阈值;token / turns 与 daily_usage
-//!   逐格守恒）。metric = total / input / output（token）| turns | model_calls | tool_calls |
+//!   逐格守恒）。metric = total / input / output / cache_read / cache_write（token）| turns | model_calls | tool_calls |
 //!   wait（Σ wall_ms,只算根会话）| human（Σ idle_ms,只算根会话）。
 //! - 任务列表 / 逐轮明细读物化层 `turn`（只含根会话,子会话已并入父轮）;任务 = 有轮的根会话,
 //!   `turns` = 物化轮行数（含零调用轮）,`steps` = Σ model_calls。
@@ -34,6 +34,8 @@ pub fn project_metric_col(metric: &str) -> Option<&'static str> {
         "total" => "total_tokens",
         "input" => "input_tokens",
         "output" => "output_tokens",
+        "cache_read" => "cache_read_tokens",
+        "cache_write" => "cache_write_tokens",
         "turns" => "turns",
         "model_calls" => "model_calls",
         "tool_calls" => "tool_calls",

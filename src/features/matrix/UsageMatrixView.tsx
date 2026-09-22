@@ -6,17 +6,17 @@ import UsageMatrix, { MatrixRow } from './UsageMatrix'
 import RowBreakdown from '../breakdown/RowBreakdown'
 import { generateMockData } from '../../mock/mockData'
 import { events, usageService } from '../../services'
-import type { BreakdownDay } from '../../services'
+import type { BreakdownDay, TokenMetric } from '../../services'
 import type { UsageRow } from '../../services/types'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
-import { TIME_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip } from '../insights/analytics'
+import { TIME_METRIC_LABELS, TOKEN_METRICS, TOKEN_METRIC_LABELS, formatDuration, isTimeMetric, projectDisplayName, projectTooltip } from '../insights/analytics'
 import './matrixView.css'
 
 /** project 维走 get_project_month_rows / get_project_breakdown;agent / model 维走月矩阵命令。 */
 export type GroupBy = 'agent' | 'model' | 'project'
 type Bucket = 'day' | 'week' | 'cumulative'
 /** wait / human = 时间成本（毫秒,并列不相加）,仅 project 维可选（其余维度无时间数据）。 */
-type Metric = 'total' | 'input' | 'output' | 'wait' | 'human'
+type Metric = TokenMetric | 'wait' | 'human'
 /** 排序策略按视图分账：各视图各自记忆互不串扰。
  * byTotal（激活 = 按总量,未激活 = 按名称）;family（家族聚合,仅 model 视图生效）叠加在 byTotal 之上。 */
 type ViewSort = Record<GroupBy, { byTotal: boolean; family: boolean }>
@@ -181,7 +181,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       WINDOW_MONTHS.map((m) =>
         (effectiveGroupBy === 'project'
           ? usageService.getProjectMonthRows(m, 'project', metric)
-          : usageService.getMonthlyMatrix({ month: m, groupBy: effectiveGroupBy, metric: metric as 'total' | 'input' | 'output', bucket: 'day', normalization: scaleMode })
+          : usageService.getMonthlyMatrix({ month: m, groupBy: effectiveGroupBy, metric: metric as TokenMetric, bucket: 'day', normalization: scaleMode })
         ).then((res) => ({ m, res })),
       ),
     ).then((list) => {
@@ -405,14 +405,14 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
         <span className="matrix-month">{RANGE_LABEL}{useMock ? ' (demo)' : ''}</span>
         <div className="toolbar-groups">
           <div className="toolbar-group">
-            {(['total', 'input', 'output'] as Metric[]).map((m) => (
+            {TOKEN_METRICS.map((m) => (
               <button
                 key={m}
                 className={`seg${metric === m ? ' is-active' : ''}`}
-                title={m === 'total' ? 'Total tokens' : m === 'input' ? 'Input tokens' : 'Output tokens'}
+                title={TOKEN_METRIC_LABELS[m].hint}
                 onClick={() => setMetric(m)}
               >
-                {m === 'total' ? 'Tokens' : m === 'input' ? 'Input' : 'Output'}
+                {TOKEN_METRIC_LABELS[m].short}
               </button>
             ))}
             {/* 时间成本指标（与 token 并列,不相加）;非 project 维禁用 + 提示*/}
@@ -512,7 +512,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
           }
           onSelectRow={toggleExpand}
           formatValue={isTimeMetric(metric) ? formatDuration : undefined}
-          valueUnit={isTimeMetric(metric) ? TIME_METRIC_LABELS[metric].unit : undefined}
+          valueUnit={isTimeMetric(metric) ? TIME_METRIC_LABELS[metric].unit : TOKEN_METRIC_LABELS[metric].unit}
         />
       </div>
 

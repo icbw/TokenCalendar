@@ -40,6 +40,19 @@ let familySlot = 0
 
 /** 系列 → 稳定色:族间精选紫蓝系色相 + 族内明度分层（最多 5 层,超出回绕并降饱和）。 */
 export function colorFor(key: string): string {
+  const { h, s, l } = colorParts(key)
+  return hsl(h, s, l)
+}
+
+/** 同一系列的 n 级深浅（[0] = colorFor（key) 本色,逐级变浅到接近底色）。
+ * 用于单模型的 token 分项:分项按量从多到少依次取色,最多的与该模型总量同色。 */
+export function colorShades(key: string, n: number): string[] {
+  const { h, s, l } = colorParts(key)
+  const top = 0.88 // 最浅一级:白底上仍可辨
+  return Array.from({ length: n }, (_, i) => hsl(h, s, n <= 1 ? l : l + ((top - l) * i) / (n - 1)))
+}
+
+function colorParts(key: string): { h: number; s: number; l: number } {
   const fam = familyOf(key)
   let entry = familyRegistry.get(fam)
   if (!entry) {
@@ -54,7 +67,12 @@ export function colorFor(key: string): string {
   const layer = idx % 5
   const light = 0.68 - layer * 0.09 // 0.68/0.59/0.50/0.41/0.32
   const sat = idx >= 5 ? 0.5 : 0.66
-  return hsl(entry.hue, sat, light)
+  return { h: entry.hue, s: sat, l: light }
+}
+
+/** 系列实际用色:显式 color 优先（分项深浅),否则按 key 稳定取色。 */
+function seriesColor(s: { key: string; color?: string }): string {
+  return s.color ?? colorFor(s.key)
 }
 
 // 双组图固定语义色:in=蓝 out=绿 credit=玫红——玫红与 tokens 合计曲线（红/粉族）
@@ -69,6 +87,8 @@ export interface SeriesSpec {
   key: string
   label: string
   values: number[]
+  /** 覆盖按 key 取的稳定色（单模型分项视图用同色深浅）。 */
+  color?: string
 }
 
 /** 数值格式化钩子（缺省 = token 口径:hover 千分位、轴 / 环紧凑）。
@@ -202,7 +222,7 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   const MORE_H = 16
   const HEAD_H = 32 // 卡片 padding+border+标题行固定开销
   const allRows = series
-    .map((s) => ({ label: s.label, value: s.values[i] ?? 0, color: colorFor(s.key) }))
+    .map((s) => ({ label: s.label, value: s.values[i] ?? 0, color: seriesColor(s) }))
     .filter((r) => r.value > 0)
     .sort((a, b) => b.value - a.value)
   const availH = Math.max(HEAD_H + ROW_H, height - 10)
@@ -309,8 +329,8 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
         {/* id 带系列序号:项目路径含非 ASCII 字符时清洗后会撞名（渐变串色）*/}
         {series.map((s, si) => (
           <linearGradient key={s.key} id={`grad-${si}-${s.key.replace(/[^a-zA-Z0-9]/g, '_')}`} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={colorFor(s.key)} stopOpacity={0.22} />
-            <stop offset="100%" stopColor={colorFor(s.key)} stopOpacity={0.02} />
+            <stop offset="0%" stopColor={seriesColor(s)} stopOpacity={0.22} />
+            <stop offset="100%" stopColor={seriesColor(s)} stopOpacity={0.02} />
           </linearGradient>
         ))}
       </defs>
@@ -335,7 +355,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
         return (
           <g key={s.key}>
             <path d={area} fill={`url(#grad-${si}-${s.key.replace(/[^a-zA-Z0-9]/g, '_')})`} />
-            <path d={line} fill="none" stroke={colorFor(s.key)} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
+            <path d={line} fill="none" stroke={seriesColor(s)} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
           </g>
         )
       })}
@@ -344,7 +364,7 @@ export function LineChart({ series, buckets, height = 220, showYAxis = true, sho
           {series.map((s) => (
             <circle
               key={s.key} cx={xOf(hover.index)} cy={yOf(s.values[hover.index] ?? 0)} r={3}
-              fill={colorFor(s.key)} stroke="var(--panel)" strokeWidth={1.5}
+              fill={seriesColor(s)} stroke="var(--panel)" strokeWidth={1.5}
             />
           ))}
           <HoverCard
@@ -434,7 +454,7 @@ export function StackedBarChart({ series, buckets, height = 220, showYAxis = tru
                   d={isTop && r > 0
                     ? `M${x},${y + r} Q${x},${y} ${x + r},${y} L${x + barW - r},${y} Q${x + barW},${y} ${x + barW},${y + r} L${x + barW},${margin.top + plot.h} L${x},${margin.top + plot.h} Z`
                     : `M${x},${y} L${x + barW},${y} L${x + barW},${y + h} L${x},${y + h} Z`}
-                  fill={colorFor(s.key)}
+                  fill={seriesColor(s)}
                 />
               )
             })}
@@ -687,7 +707,7 @@ export function ComboChart({ series, buckets, height = 230 }: {
 // 超过每侧 6 项截断,余量并入「+N more」行（title 提示完整清单,不做 tooltip 卡）。
 
 export function DonutChart({ items, centerLabel, unitLabel, height = 190, formatValue = formatCompact, titleFor }: {
-  items: { key: string; label: string; value: number }[]
+  items: { key: string; label: string; value: number; color?: string }[]
   centerLabel: string
   unitLabel: string
   height?: number
@@ -735,7 +755,7 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190, format
 
   const legendRow = (a: (typeof arcs)[number]) => (
     <div key={a.key} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, lineHeight: '20px' }}>
-      <span style={{ width: 8, height: 8, borderRadius: 2, background: colorFor(a.key), flexShrink: 0 }} />
+      <span style={{ width: 8, height: 8, borderRadius: 2, background: seriesColor(a), flexShrink: 0 }} />
       <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }} title={titleFor ? titleFor(a.key, a.label) : a.label}>{a.label}</span>
       <span style={{ color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>{formatValue(a.value)}</span>
       <span style={{ color: 'var(--text-faint)', width: 38, textAlign: 'right', fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}>
@@ -756,7 +776,7 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190, format
       </div>
       <svg viewBox={`0 0 190 ${height}`} width={190} height={height} style={{ flexShrink: 0 }}>
         {arcs.map((a) => (
-          <path key={a.key} d={a.d} fill={colorFor(a.key)} stroke="var(--panel)" strokeWidth={1.5} />
+          <path key={a.key} d={a.d} fill={seriesColor(a)} stroke="var(--panel)" strokeWidth={1.5} />
         ))}
         <text x={cx} y={cy - 3} textAnchor="middle" fontSize={15} fontWeight={700} fill="var(--text)">
           {formatValue(total)}
