@@ -16,6 +16,11 @@
 //!
 //! 增量游标：单文件 JSON（非 JSONL）,offset 不适用——用「已处理 request 条数」：
 //! generation 不变跳过;count > len（重写/清空）→ 归零重读（已聚合不回滚）。
+//! 请求一发起就写进 `requests[]`（只有 `id / state:"running" / messages`）,`startedAt` 与
+//! `usage` 答完才补上——游标另记 `pending` = count 以内仍未落用量的 running 请求下标,
+//! 之后补上 usage 时再入账;canceled 等无 usage 的终态请求出列不计。卡死的 running 一直挂着无害。
+//! 旧游标（无 `pending` 字段）一次性补账：源里有 usage 但 `turn_raw` 没有该 turn_seq 的请求 = 当年被
+//! 越过的 running 请求,补入 daily_usage 与轮层（轮层与 daily_usage 同事务写入,缺轮即未入账）。
 //! 大体积 messages 由 serde derive 按字段跳过,不构建 Value 树。
 //!
 //! 模型归属（纯本地）：本地消息 `<会话>/messages/<id>.json` 的 `extra.modelId`（`extra` 是 JSON
@@ -233,7 +238,8 @@ impl CodebuddyAdapter {
     }
 }
 
-/// 游标（count = 已处理的 requests 条数;project = 轮层已落的 project_key,旧游标缺省 = unknown）。
+/// 游标（count = 已处理的 requests 条数;project = 轮层已落的 project_key,旧游标缺省 = unknown;
+/// pending = count 以内尚未落用量的 running 请求下标,None = 旧游标待补账）。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct IndexCursor {
     count: u64,
@@ -241,11 +247,13 @@ struct IndexCursor {
     mtime: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    #[serde(default)]
+    pending: Option<Vec<u64>>,
 }
 
 impl IndexCursor {
     fn fresh() -> Self {
-        IndexCursor { count: 0, size: 0, mtime: 0, project: None }
+        IndexCursor { count: 0, size: 0, mtime: 0, project: None, pending: Some(Vec::new()) }
     }
     fn up_to_date(&self, path: &Path) -> bool {
         jsonl::generation(path)
@@ -425,7 +433,7 @@ impl Adapter for CodebuddyAdapter {
             let landed = cursor.project.clone().unwrap_or_else(|| UNKNOWN_PROJECT.to_string());
             let project = if landed != UNKNOWN_PROJECT { landed.clone() } else { resolved };
             let reattribute = project != landed;
-            if cursor.up_to_date(&path) && !reattribute {
+            if cursor.up_to_date(&path) && !reattribute && cursor.pending.is_some() {
                 continue;
             }
             // 截断/重写：count 超过实际条数 → 归零重读（已聚合不回滚）
@@ -438,31 +446,49 @@ impl Adapter for CodebuddyAdapter {
             };
             if (cursor.count as usize) > file.requests.len() {
                 cursor.count = 0;
+                cursor.pending = Some(Vec::new());
             }
-            // 用量只加新请求;重归属时轮层从第 0 条整会话重发（已入账的 daily_usage 不动）。
+            // 用量只加新请求 + 挂起后补上 usage 的请求;重归属时轮层从第 0 条整会话重发（已入账的 daily_usage 不动）。
             let usage_from = cursor.count as usize;
             let turns_from = if reattribute { 0 } else { usage_from };
+            let pending: BTreeSet<usize> = cursor.pending.iter().flatten().map(|&i| i as usize).collect();
+            // 旧游标补账：count 以内缺轮的请求当年未入账（会话 id 为空时无轮层可凭,不补）。
+            let legacy_turns = (cursor.pending.is_none() && usage_from > 0 && !session_id.is_empty())
+                .then(|| store.raw_turn_seqs(META.id, &session_id));
             let session_dir = path.parent().unwrap_or(Path::new(""));
             let target = TurnTarget { session_id: &session_id, project: &project, title: meta.and_then(|m| m.title.as_deref()) };
             if reattribute && !session_id.is_empty() {
                 batch.replace_session(META.id, &session_id);
             }
-            for (idx, r) in file.requests.iter().enumerate().skip(turns_from) {
-                if let Some((day, hour, tokens)) = parse_request(r) {
-                    let model = local_model(session_dir, r).unwrap_or_else(|| "unknown".into());
-                    if idx >= usage_from {
-                        batch.add_usage(&day, Some(hour), META.id, &model, tokens, 1);
-                        batch.add_credit(&day, META.id, &model, r.usage.as_ref().map_or(0.0, |u| u.credit));
-                        months.insert(day[..7].to_string());
+            let mut still_pending = Vec::new();
+            for (idx, r) in file.requests.iter().enumerate() {
+                let Some((day, hour, tokens)) = parse_request(r) else {
+                    if idx >= usage_from || pending.contains(&idx) {
+                        if r.state.is_empty() || r.state == "running" {
+                            still_pending.push(idx as u64);
+                        }
                     }
-                    if !session_id.is_empty() {
-                        push_request_turn(&mut batch, &target, idx, r, &day, &model, tokens);
-                    }
+                    continue;
+                };
+                let late = pending.contains(&idx) || legacy_turns.as_ref().is_some_and(|seqs| !seqs.contains(&(idx as i64 + 1)));
+                let count_usage = idx >= usage_from || late;
+                if !count_usage && idx < turns_from {
+                    continue;
+                }
+                let model = local_model(session_dir, r).unwrap_or_else(|| "unknown".into());
+                if count_usage {
+                    batch.add_usage(&day, Some(hour), META.id, &model, tokens, 1);
+                    batch.add_credit(&day, META.id, &model, r.usage.as_ref().map_or(0.0, |u| u.credit));
+                    months.insert(day[..7].to_string());
+                }
+                if !session_id.is_empty() {
+                    push_request_turn(&mut batch, &target, idx, r, &day, &model, tokens);
                 }
             }
             // 末条 request 现状（running = 在处理;complete = 答完在等用户;其余 = 失败 / 取消,
-            // 不亮起）。无结束时间 → 以文件 mtime（请求完成时 index.json 重写）作最近事件。
-            if let (false, Some(last)) = (session_id.is_empty(), file.requests.iter().rev().find(|r| r.started_at.is_some())) {
+            // 不亮起）。无结束时间 → 以文件 mtime（请求发起 / 完成时 index.json 都重写）作最近事件;
+            // 进行中的请求还没有 startedAt,用户输入时刻取 mtime（发起时写入）。
+            if let (false, Some(last)) = (session_id.is_empty(), file.requests.last()) {
                 let phase = match last.state.as_str() {
                     "running" => LivePhase::Busy,
                     "complete" => LivePhase::Done { exact: true },
@@ -479,12 +505,13 @@ impl Adapter for CodebuddyAdapter {
                         phase,
                         last_event: mtime.max(last.started_at.unwrap_or(0)),
                         // request 行 = 用户发起的一轮
-                        last_input: last.started_at,
+                        last_input: last.started_at.or((mtime > 0).then_some(mtime)),
                         watch: (mtime > 0).then(|| (path.display().to_string(), mtime)),
                     },
                 );
             }
             cursor.count = file.requests.len() as u64;
+            cursor.pending = Some(still_pending);
             cursor.project = Some(project);
             if let Some((size, mtime)) = jsonl::generation(&path) {
                 cursor.size = size;
@@ -581,6 +608,76 @@ mod tests {
         assert_eq!((turns[0].error_count, turns[1].error_count), (0, 1));
         assert_eq!(store.test_task_sessions(META.id), vec!["sess-1".to_string()]);
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
+    fn write_requests(sess: &Path, reqs: &[String]) {
+        std::fs::create_dir_all(sess).unwrap();
+        std::fs::write(sess.join("index.json"), format!(r#"{{"requests":[{}]}}"#, reqs.join(","))).unwrap();
+    }
+
+    fn running_json(id: &str) -> String {
+        format!(r#"{{"id":"{id}","type":"craft","state":"running","messages":["m"]}}"#)
+    }
+
+    fn done_json(id: &str, ts: i64, total: i64) -> String {
+        request_json(ts, &usage_json(total - 100, 100, total, 0, total - 100, 0)).replace(r#""id":"r1""#, &format!(r#""id":"{id}""#))
+    }
+
+    /// 请求发起即写入（running、无 usage）,答完才补 usage:游标越过它后仍要在补上时入账;
+    /// canceled 无 usage 出列不计;重复采集不重复入账。
+    #[test]
+    fn running_requests_counted_once_usage_arrives() {
+        let dir = std::env::temp_dir().join(format!("tc_cb_run_{}", std::process::id()));
+        let sess = dir.join("Data").join("p1").join("CodeBuddyIDE").join("p1").join("history").join("ws").join("s1");
+        let adapter = CodebuddyAdapter { data_dir: dir.join("Data"), meta_dbs: vec![] };
+        let mut store = Store::open_in_memory().unwrap();
+        let t0 = 1_788_602_400_000;
+
+        write_requests(&sess, &[done_json("a", t0, 1000), running_json("b")]);
+        let first = adapter.collect(&mut store).map(|o| o.events);
+        write_requests(&sess, &[done_json("a", t0, 1000), done_json("b", t0 + 60_000, 2000), r#"{"id":"c","state":"canceled","messages":[]}"#.into(), running_json("d")]);
+        let second = adapter.collect(&mut store).map(|o| o.events);
+        let third = adapter.collect(&mut store).map(|o| o.events);
+        write_requests(&sess, &[done_json("a", t0, 1000), done_json("b", t0 + 60_000, 2000), r#"{"id":"c","state":"canceled","messages":[]}"#.into(), done_json("d", t0 + 120_000, 4000)]);
+        let fourth = adapter.collect(&mut store).map(|o| o.events);
+        let turns = store.test_turns(META.id).iter().map(|t| t.turn_seq).collect::<Vec<_>>();
+        let conservation = store.test_project_conservation();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((first.ok(), second.ok(), third.ok(), fourth.ok()), (Some(1), Some(1), Some(0), Some(1)));
+        assert_eq!(turns.len(), 3, "canceled 不成轮");
+        assert!(conservation.is_empty(), "{conservation:?}");
+    }
+
+    /// 旧游标（无 pending）当年越过了 running 请求:源里已有 usage、轮层缺该轮 → 补入账;已入账的不重复。
+    #[test]
+    fn legacy_cursor_backfills_skipped_requests() {
+        let dir = std::env::temp_dir().join(format!("tc_cb_legacy_{}", std::process::id()));
+        let sess = dir.join("Data").join("p1").join("CodeBuddyIDE").join("p1").join("history").join("ws").join("s1");
+        let adapter = CodebuddyAdapter { data_dir: dir.join("Data"), meta_dbs: vec![] };
+        let mut store = Store::open_in_memory().unwrap();
+        let t0 = 1_788_602_400_000;
+
+        // 首条 canceled 让原始 turn_seq（下标 + 1）与物化轮的重编号错开,补账必须按原始层判
+        let canceled = r#"{"id":"c","state":"canceled","messages":[]}"#.to_string();
+        write_requests(&sess, &[canceled.clone(), done_json("a", t0, 1000), running_json("b")]);
+        let first = adapter.collect(&mut store).map(|o| o.events);
+        // 旧版游标:count 已越过 b,且无 pending 字段;文件随后补上 b 的 usage、不再变化
+        write_requests(&sess, &[canceled, done_json("a", t0, 1000), done_json("b", t0 + 60_000, 2000)]);
+        let path = sess.join("index.json");
+        let (size, mtime) = jsonl::generation(&path).unwrap();
+        let mut batch = Batch::default();
+        batch.cursors.push((path.display().to_string(), format!(r#"{{"count":3,"size":{size},"mtime":{mtime},"project":"unknown"}}"#)));
+        store.commit(META.id, &batch).unwrap();
+        let repaired = adapter.collect(&mut store).map(|o| o.events);
+        let again = adapter.collect(&mut store).map(|o| o.events);
+        let turns = store.test_turns(META.id).iter().map(|t| t.turn_seq).collect::<Vec<_>>();
+        let conservation = store.test_project_conservation();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((first.ok(), repaired.ok(), again.ok()), (Some(1), Some(1), Some(0)));
+        assert_eq!(turns.len(), 2);
+        assert!(conservation.is_empty(), "{conservation:?}");
     }
 
     /// 会话元数据库（ItemTable 同 VS Code 形态）;rows = (会话 id, JSON 值)。

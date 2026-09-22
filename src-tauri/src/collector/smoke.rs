@@ -316,3 +316,28 @@ fn title_upgrade_on_db_copy() {
     }
     println!("{out}");
 }
+
+/// CodeBuddy 补账:对安装版 collector.db 的**副本**（TC_CB_DB）跑真实 CodeBuddy 源两遍,
+/// 打印近 7 天 codebuddy 日用量前后对比;第二遍须 0 事件（不重复入账）且守恒。
+#[test]
+#[ignore]
+fn codebuddy_backfill_on_db_copy() {
+    let path = std::env::var_os("TC_CB_DB").expect("TC_CB_DB = collector.db 副本路径");
+    let mut store = Store::open(std::path::Path::new(&path)).expect("open copy");
+    let since = (chrono::Local::now().date_naive() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+    let days = |store: &Store| -> Vec<(String, String, i64, i64)> {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT day, model_key, total_tokens, request_count FROM daily_usage WHERE agent_key = 'codebuddy' AND day >= ?1 ORDER BY 1, 2")
+            .unwrap();
+        stmt.query_map([&since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().flatten().collect()
+    };
+    let mut out = format!("before {:#?}\n", days(&store));
+    let adapter = super::codebuddy::CodebuddyAdapter::new();
+    let first = adapter.collect(&mut store).map(|o| o.events).ok();
+    let second = adapter.collect(&mut store).map(|o| o.events).ok();
+    out.push_str(&format!("after  {:#?}\nevents first={first:?} second={second:?}\n", days(&store)));
+    println!("{out}");
+    assert_eq!(second, Some(0), "第二遍不应再入账");
+    assert!(store.test_project_conservation().iter().all(|l| !l.contains("codebuddy")), "{:?}", store.test_project_conservation());
+}

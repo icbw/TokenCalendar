@@ -893,6 +893,18 @@ impl Store {
         out
     }
 
+    /// 某会话已落库的原始轮序号（`turn_raw`,保留源给的 turn_seq;物化 `turn` 会重编号,不可用）。
+    /// CodeBuddy 旧游标补账用：轮与用量同事务写入,缺轮 = 未入账。
+    pub fn raw_turn_seqs(&self, agent: &str, session: &str) -> std::collections::HashSet<i64> {
+        let mut out = std::collections::HashSet::new();
+        if let Ok(mut stmt) = self.conn.prepare_cached("SELECT turn_seq FROM turn_raw WHERE agent_key = ?1 AND session_id = ?2") {
+            if let Ok(rows) = stmt.query_map([agent, session], |r| r.get::<_, i64>(0)) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    }
+
     /// 副本文件 sessionId → 根会话（无别名 = 自己就是根）。
     pub fn session_root_alias(&self, agent: &str, alias: &str) -> Option<String> {
         self.conn
