@@ -92,7 +92,7 @@ SOFTWARE.
 | 组件 | 许可 | 说明 |
 | --- | --- | --- |
 | Tauri NSIS 模板 | MIT 或 Apache-2.0（Tauri Apps） | `src-tauri/nsis/installer.nsi` 基于 Tauri 官方 NSIS 模板修改，文件内保留了上游出处链接 |
-| Tauri / tauri-build / tauri-plugin-dialog / tauri-plugin-single-instance | MIT 或 Apache-2.0 | 桌面框架与插件 |
+| Tauri / tauri-build / tauri-plugin-dialog / tauri-plugin-single-instance / tauri-plugin-updater / tauri-plugin-autostart / tauri-plugin-notification | MIT 或 Apache-2.0 | 桌面框架与插件 |
 
 ## 4. 运行时依赖
 
@@ -115,7 +115,7 @@ SOFTWARE.
 ### 前端（打进 bundle 产物）
 
 `react`、`react-dom`、`scheduler`、`react-colorful`（MIT）、
-`@tauri-apps/api`、`@tauri-apps/plugin-dialog`（Apache-2.0 OR MIT）。
+`@tauri-apps/api`、`@tauri-apps/plugin-dialog`、`@tauri-apps/plugin-updater`、`@tauri-apps/plugin-autostart`、`@tauri-apps/plugin-notification`（Apache-2.0 OR MIT）。
 
 构建期工具（`vite` / `rolldown` / `typescript` / `lightningcss` 等）不随产物分发；
 其中 `lightningcss` 为 MPL-2.0，同样以未修改形式作为构建工具使用。

@@ -14,7 +14,7 @@ import ProjectManagerModal from '../projects/ProjectManagerModal'
 import InsightsView from '../insights/InsightsView'
 import TasksView from '../tasks/TasksView'
 import type { GroupBy as MatrixGroupBy } from '../matrix/UsageMatrixView'
-import { events, updateService, windowService } from '../../services'
+import { events, updateService, windowService, type ReadyUpdate } from '../../services'
 import { getDesignPrefs } from '../settings/designPrefs'
 import { useShowOnLoad } from './useShowOnLoad'
 import { useMainThemeSync } from '../settings/mainTheme'
@@ -167,22 +167,21 @@ export default function FullWindow() {
     }
   }, [])
 
-  // 应用更新（设置·About 的自动更新开关，默认关）：安装版启动后延迟检查，
-  // 有新版直接下载并安装（签名校验在 updater 插件内完成；Windows 上应用会随
-  // 安装器退出）。dev 构建整段跳过——dev 的 identifier 与安装版不同，
-  // 在 dev 里执行安装会把正式版装进系统。
+  // 应用更新（设置·About 的自动检查开关）：安装版每次启动后延迟一次检查，有新版就在后台
+  // 预下载安装包并发系统通知;**不自动安装**——安装由用户在设置·About 点 Install。
+  // dev 构建整段跳过——dev 的 identifier 与安装版不同，在 dev 里执行安装会把正式版装进系统。
   useEffect(() => {
     if (import.meta.env.DEV) return
     const timer = window.setTimeout(() => {
-      void (async () => {
-        if (!getDesignPrefs().autoUpdate) return
-        const r = await updateService.checkForUpdate()
-        if (r.status !== 'available' || !r.canInstall) return
-        await r.install(() => {})
-      })().catch((e) => console.error('[update] auto update failed:', e))
+      if (!getDesignPrefs().autoUpdate) return
+      updateService.autoCheckAndDownload().catch((e) => console.error('[update] auto check failed:', e))
     }, 5000)
     return () => window.clearTimeout(timer)
   }, [])
+
+  // 新版本已预下载：Settings 按钮挂一个提示点,直到安装（安装即退出进程,点自然消失）
+  const [updateReady, setUpdateReady] = useState<ReadyUpdate | null>(updateService.getReadyUpdate)
+  useEffect(() => updateService.subscribeReadyUpdate(setUpdateReady), [])
 
   const toggleWidget = useCallback(() => {
     windowService.toggleWidget().catch(console.error)
@@ -250,10 +249,15 @@ export default function FullWindow() {
           </button>
           <button
             className={`seg titlebar-view${view === 'settings' ? ' is-active' : ''}`}
-            onClick={() => setView((v) => (v === 'settings' ? 'matrix' : 'settings'))}
-            title="Settings"
+            onClick={() => {
+              // 有新版待安装时,从别处进设置直接落到 About（Install 按钮所在）
+              if (updateReady && view !== 'settings') setSettingsTab('about')
+              setView((v) => (v === 'settings' ? 'matrix' : 'settings'))
+            }}
+            title={updateReady ? `Settings — TokenCalendar ${updateReady.version} is ready to install` : 'Settings'}
           >
             Settings
+            {updateReady && <span className="titlebar-update-dot" aria-label="Update ready" />}
           </button>
           <div className="titlebar-sep" />
           <button className="titlebar-btn" onClick={minimize} title="Minimize" aria-label="Minimize">

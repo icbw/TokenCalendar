@@ -121,10 +121,9 @@ export interface DesignPrefs {
    * 按平台 id 记（绑定集合变化时下标会错位）;该平台未绑定 → 回落第一个已绑定平台,
    * 键保持不动直到用户再切换。undefined = 第一个。 */
   orbPlatform?: SubscriptionPlatform
-  /** 应用更新：启动后自动检查并安装新版本（**默认关**——联网自动装包属显式
-   * 授权行为,由用户在设置·About 主动开启）。关闭时主窗口加载不自动检查,
-   * 仅「Check for updates」手动触发。更新源与签名校验
-   * services/updateService.ts（仅安装版生效）。 */
+  /** 应用更新：每次启动后自动检查,有新版就在后台预下载并发系统通知;**从不自动安装**,
+   * 安装由用户在设置·About 点 Install。默认关（启动即联网属显式授权行为）。关闭时
+   * 仅「Check for updates」手动触发。更新源与签名校验见 services/updateService.ts（仅安装版生效）。 */
   autoUpdate: boolean
   /** 离开阈值（分钟,1〜1440;undefined = 30）:轮间空档 ≤ 阈值才计入「人工时间」。
    * **写入方是 Rust `set_idle_threshold`**（合并写 prefs.json 并同步重算 daily_project）;

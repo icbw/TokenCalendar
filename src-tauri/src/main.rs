@@ -111,9 +111,11 @@ fn main() {
         }))
         // 目录选择器（设置·Data tab 的迁移/备份/恢复路径选择）
         .plugin(tauri_plugin_dialog::init())
-        // 应用更新（设置·About：检查更新 / 自动更新）——更新源与公钥在
+        // 应用更新（设置·About：检查更新 / 启动时自动检查并预下载）——更新源与公钥在
         // tauri.conf.json 的 plugins.updater；安装包签名校验由插件执行。
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 系统通知：启动时预下载好新版后发一条「新版本已就绪」提示（安装仍由用户点按钮）。
+        .plugin(tauri_plugin_notification::init())
         // 开机自启（设置·General「Launch at login」）：系统启动项是唯一事实源，
         // 插件按 productName 读写 HKCU Run 键（与 NSIS 卸载清理的 ${PRODUCTNAME}
         // 同名，卸载即清干净）；不传附加参数——启动后落点由 window-state.json 决定。

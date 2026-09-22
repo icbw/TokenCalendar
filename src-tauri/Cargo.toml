@@ -1,6 +1,6 @@
 [package]
 name = "tokencalendar"
-version = "0.7.7"
+version = "0.7.8"
 description = "TokenCalendar — desktop widget for AI agent token usage"
 license = "MIT"
 edition = "2021"
@@ -25,6 +25,7 @@ tauri-plugin-updater = "2"
 # 不引入 tokio 运行时;rustls 纯 Rust TLS,无 OpenSSL 依赖。
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
 
 [target.'cfg(windows)'.dependencies]
 # UI_Shell：SetWindowSubclass/DefSubclassProc（comctl32 子类化,snap.rs / orb_dock.rs）。

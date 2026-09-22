@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from 'react'
 // react-colorful 自注入样式（运行时 <style> 注入，无独立 CSS 文件可 import）。
 import { HexColorPicker, HexColorInput } from 'react-colorful'
-import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type EstimatorState, type ExportResult, type DataInfo, type SubscriptionSnapshot, type UpdateCheck, type UpdateProgress } from '../../services'
+import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type EstimatorState, type ExportResult, type DataInfo, type SubscriptionSnapshot, type ReadyUpdate, type UpdateCheck, type UpdateProgress } from '../../services'
 import { currentMonth } from '../../lib/time'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
@@ -1412,7 +1412,8 @@ function SubscriptionsTab() {
 
 /* ---------------- About：版本与更新（更新源 = 公开仓 Release） ---------------- */
 
-/** 版本与更新：检查更新（签名校验）/ 自动更新开关 / 版本号按钮跳 Releases。
+/** 版本与更新：检查更新（签名校验）/ 启动自动检查开关 / 版本号按钮跳 Releases。
+ * 启动时自动检查只预下载安装包,安装永远由这里的按钮触发。
  * 状态不写 prefs：检查结果属会话态，重开面板重新检查即可。 */
 function AboutTab() {
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
@@ -1423,6 +1424,9 @@ function AboutTab() {
   const [result, setResult] = useState<UpdateCheck | null>(null)
   const [progress, setProgress] = useState<UpdateProgress | null>(null)
   const [note, setNote] = useState<string | null>(null)
+  // 启动时自动检查预下载好的新版（进程内共享,不用重新检查就能直接装）
+  const [ready, setReady] = useState<ReadyUpdate | null>(updateService.getReadyUpdate)
+  useEffect(() => updateService.subscribeReadyUpdate(setReady), [])
 
   useEffect(() => {
     updateService.currentVersion().then((v) => v && setVersion(v)).catch(console.error)
@@ -1438,6 +1442,7 @@ function AboutTab() {
   }
 
   const doInstall = async (install: (cb: (p: UpdateProgress) => void) => Promise<void>) => {
+    if (installing) return
     setInstalling(true)
     setNote(null)
     try {
@@ -1457,6 +1462,10 @@ function AboutTab() {
       const pct = Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
       return progress.finished ? 'Download complete — starting the installer…' : `Downloading update… ${pct}%`
     }
+    // 已预下载的版本不比检查结果旧时,以「可直接安装」为准
+    if (ready && (result?.status !== 'available' || result.version === ready.version)) {
+      return `Version ${ready.version} has been downloaded and is ready to install${version ? ` — current v${version}` : ''}.`
+    }
     if (!result) return 'Updates are served from the public repository releases page.'
     switch (result.status) {
       case 'unavailable':
@@ -1474,6 +1483,13 @@ function AboutTab() {
 
   // 闭包内不做窄化：先取出可安装结果（available 且非 dev 构建）。
   const installable = result?.status === 'available' && result.canInstall ? result : null
+  // 安装入口：检查出的新版优先（它可能比预下载的更新）;否则装预下载好的那份
+  const installAction: ((cb: (p: UpdateProgress) => void) => Promise<void>) | null = installable
+    ? installable.install
+    : ready
+      ? () => updateService.installReadyUpdate()
+      : null
+  const installDownloaded = ready !== null && (installable === null || installable.version === ready.version)
 
   return (
     <>
@@ -1503,25 +1519,33 @@ function AboutTab() {
           >
             Check for updates
           </button>
-          {installable ? (
+          {installAction ? (
             <button
               className="setting-btn is-active"
               disabled={installing}
               onClick={() => {
-                doInstall(installable.install).catch(console.error)
+                doInstall(installAction).catch(console.error)
               }}
-              title="Download, verify the signature and run the installer"
+              title={
+                installDownloaded
+                  ? 'Run the installer for the downloaded, signature-verified update'
+                  : 'Download, verify the signature and run the installer'
+              }
             >
-              Download &amp; install
+              {installDownloaded ? 'Install' : <>Download &amp; install</>}
             </button>
           ) : null}
         </div>
-        {result?.status === 'available' && result.notes ? <div className="setting-note">{result.notes}</div> : null}
+        {result?.status === 'available' && result.notes ? (
+          <div className="setting-note">{result.notes}</div>
+        ) : ready?.notes && result?.status !== 'available' ? (
+          <div className="setting-note">{ready.notes}</div>
+        ) : null}
         {note ? <div className="setting-note">{note}</div> : null}
 
         <ToggleRow
-          label="Auto update"
-          title="Check and install new versions at startup"
+          label="Check for updates at startup"
+          title="At every launch, check for a new version and download it in the background, then show a notification. Nothing is installed until you click Install."
           checked={design.autoUpdate}
           onChange={(v) => setDesignPrefs({ autoUpdate: v })}
         />

@@ -496,6 +496,49 @@ Function TcalSetDefaultInstDir
   done:
 FunctionEnd
 
+; 安装器单实例：同一时刻只允许一个 TokenCalendar 安装器运行。
+; 两个安装器并行时,先完成的那个会按 /R 拉起新版应用,后一个再去覆盖正在运行的
+; tokencalendar.exe,弹「Error opening file for writing」。命名互斥体随进程退出自动释放。
+; 静默 / 被动（应用内更新）模式直接退出,交互模式先提示再退出。
+Function TcalSingleInstaller
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "TokenCalendarSetup-${BUNDLEID}") p .r0 ?e'
+  Pop $1
+  ${If} $1 = 183 ; ERROR_ALREADY_EXISTS
+    IfSilent quit 0
+    ${IfThen} $PassiveMode = 1 ${|} Goto quit ${|}
+    MessageBox MB_OK|MB_ICONINFORMATION "Another ${PRODUCTNAME} setup is already running."
+    quit:
+    Quit
+  ${EndIf}
+FunctionEnd
+
+; 等主程序文件可写：CheckIfAppIsRunning 结束进程后只固定等 500ms,进程慢退或
+; 新实例恰好被拉起时文件仍被占用,直接 File 会弹「Error opening file for writing」。
+; 这里每 250ms 试开一次（写方式打开、不写入）,仍被占用则再结束一次进程,最多约 10 秒;
+; 超时照常往下走,由 File 的原生重试框兜底。
+Function TcalWaitMainBinaryWritable
+  StrCpy $R9 0
+  loop:
+    IfFileExists "$INSTDIR\${MAINBINARYNAME}.exe" 0 done
+    ClearErrors
+    FileOpen $R8 "$INSTDIR\${MAINBINARYNAME}.exe" a
+    ${IfNot} ${Errors}
+      FileClose $R8
+      Goto done
+    ${EndIf}
+    IntOp $R9 $R9 + 1
+    IntCmp $R9 40 done 0 done
+    !if "${INSTALLMODE}" == "currentUser"
+      nsis_tauri_utils::KillProcessCurrentUser "${MAINBINARYNAME}.exe"
+    !else
+      nsis_tauri_utils::KillProcess "${MAINBINARYNAME}.exe"
+    !endif
+    Pop $R8
+    Sleep 250
+    Goto loop
+  done:
+FunctionEnd
+
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
@@ -511,6 +554,8 @@ Function .onInit
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
   ${EndIf}
+
+  Call TcalSingleInstaller
 
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
     !insertmacro MUI_LANGDLL_DISPLAY
@@ -667,6 +712,7 @@ Section Install
   !endif
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  Call TcalWaitMainBinaryWritable
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"

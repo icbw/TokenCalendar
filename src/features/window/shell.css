@@ -121,6 +121,17 @@
   box-shadow: var(--shadow-1);
 }
 
+/* 新版本已下载待安装：Settings 按钮文字右上角的提示点 */
+.titlebar-update-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  vertical-align: super;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 /* Widget 显隐分段钮（标题栏内） */
 .titlebar-widget {
   margin-right: 4px;
