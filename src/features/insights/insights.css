@@ -661,3 +661,60 @@
 .price-seg-row td.price-col-model {
   padding-left: 22px;
 }
+
+/* 价目表可排序表头（与 Tasks 表头同款：按钮铺满表头文字,激活列加深 + 三角） */
+.price-th {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.price-th:hover,
+.price-th.is-active {
+  color: var(--text);
+}
+
+.price-th-arrow {
+  display: inline-block;
+  width: 8px;
+  font-size: 8px;
+}
+
+/* 单价变动箭头：涨 = 红↑,降 = 绿↓;无变动留同宽空位,让各行数字右端对齐 */
+.price-change {
+  display: inline-block;
+  width: 12px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  line-height: 1;
+  text-align: center;
+}
+
+button.price-change {
+  cursor: pointer;
+}
+
+.price-change.is-up,
+.price-delta.is-up {
+  color: var(--danger);
+}
+
+.price-change.is-down,
+.price-delta.is-down {
+  color: var(--success);
+}
+
+.price-delta {
+  margin-right: 6px;
+  font-weight: 600;
+}

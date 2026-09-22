@@ -1,9 +1,11 @@
-// Insights 价格面板,三件事一张卡一件：
+// Insights 价格面板,两件事一张卡一件：
 //
 //   1) 美元当量 + 用量 × 价格 —— 这段时间的 token 若按官方 API 单价计费值多少钱,
 //      分模型列出,每个模型按它自己的价目生效段切开;
-//   2) 价格梯度 —— 分模型 × 生效期的单价阶梯图（同一模型一条线,降价处是台阶）;
-//   3) 官方价目对照表 —— 四项单价 + 出处,它解释了前两块的数字是怎么来的。
+//   2) 官方价目对照表 —— 四项单价 + 出处,它解释了第一块的数字是怎么来的。
+//      可按列排序（默认 Since 降序,新上架 / 刚改价的在上）;某项单价相对该模型
+//      上一段生效期有变动时格内标箭头（涨 = 红↑,降 = 绿↓）,点箭头展开变动量。
+//      原先的「价格梯度」阶梯图已删:官方极少改价,整张图几乎全是平线,参考价值低。
 //
 // **口径红线（文案里一个字都不能松）**：
 // - 美元当量**不是账单**。用户付的是固定订阅月费,这个数衡量的是等价价值 /
@@ -12,12 +14,12 @@
 // - 缓存写按**常用档**估算（部分平台按 TTL 分档,采集层只有一个桶）。
 //
 // 取数全部经 subscriptionService 的五条只读命令,零网络、不唤醒取数轮。
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { events, subscriptionService } from '../../services'
 import type { SubscriptionPlatform } from '../../services'
 import type { ModelUsageResult, PriceModelRow } from '../../services/subscriptionService'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
-import { StepChart, colorFor, type StepSeries } from './charts'
+import { colorFor } from './charts'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import { formatSpan } from './range'
@@ -43,6 +45,22 @@ const usd = (v: number): string => `$${v.toLocaleString('en-US', { minimumFracti
 /** 单价口径：跨 $0.005〜$180,固定位数会把小的印成 $0.00 —— 走有效数字。 */
 const price = (v: number): string => (v <= 0 ? '—' : `$${Number(v.toPrecision(3)).toLocaleString('en-US')}`)
 const day = (t: number): string => new Date(t * 1000).toLocaleDateString('en-CA')
+/** 单价变动量：带符号 + 百分比,如 `+$1.25 （+25%)`。 */
+const deltaText = (prev: number, cur: number): string => {
+  const d = cur - prev
+  const sign = d > 0 ? '+' : '−'
+  const abs = Number(Math.abs(d).toPrecision(3)).toLocaleString('en-US')
+  const pct = Number(((Math.abs(d) / prev) * 100).toPrecision(3))
+  return `${sign}$${abs} (${sign}${pct}%)`
+}
+
+type SortKey = 'model' | Unit | 'since'
+interface Sort {
+  key: SortKey
+  desc: boolean
+}
+/** 默认 Since 降序：最新上架 / 最近改价的模型排在最上。 */
+const DEFAULT_SORT: Sort = { key: 'since', desc: true }
 
 export default function PricingBlock() {
   const [platform, setPlatform] = useState<SubscriptionPlatform>('codex')
@@ -50,8 +68,9 @@ export default function PricingBlock() {
   // 用 ref 不用 state：它一翻转就会把下面那条取数 effect 整个重跑一遍。
   const platformPicked = useRef(false)
   const [refreshTick, setRefreshTick] = useState(0)
-  const [unit, setUnit] = useState<Unit>('input')
-  const [focus, setFocus] = useState('') // 梯度图图例筛选:空串 = 全部
+  const [sort, setSort] = useState<Sort>(DEFAULT_SORT)
+  /** 已展开变动量的格子：`${match_key}:${unit}`。 */
+  const [revealed, setRevealed] = useState<ReadonlySet<string>>(new Set())
   const [usage, setUsage] = useState<Partial<Record<SubscriptionPlatform, ModelUsageResult | null>>>({})
   const [prices, setPrices] = useState<PriceModelRow[] | null>(null)
   const [now, setNow] = useState<{ at: number; rows: PriceModelRow[] } | null>(null)
@@ -145,40 +164,62 @@ export default function PricingBlock() {
   const totalTurns = cur === null ? 0 : cur.rows.reduce((s, r) => s + r.requests, 0)
   const totalTokens = cur === null ? 0 : cur.rows.reduce((s, r) => s + r.total_tokens, 0)
 
-  // 梯度图:一个 match_key 一条线,点 = 它的各段生效期。所选单价为 0 的模型整条剔掉
-  // ——对数轴上 0 无处可放,而「官方没有这一项」与「这一项免费」是两回事,不能画成 0。
-  const gradient = useMemo(() => {
-    const byKey = new Map<string, PriceModelRow[]>()
-    for (const r of prices ?? []) {
-      const list = byKey.get(r.match_key)
-      if (list) list.push(r)
-      else byKey.set(r.match_key, [r])
-    }
-    const series: StepSeries[] = []
-    const missing: string[] = []
-    for (const [key, rowsRaw] of byKey) {
-      const rows = [...rowsRaw].sort((a, b) => a.effective_from - b.effective_from)
-      const label = rows[rows.length - 1].display_name
-      if (rows.every((r) => unitPrice(r, unit) <= 0)) {
-        missing.push(label)
-        continue
+  // 每个现行价目行的「上一段」：同一 match_key 里生效期早于它的最近一行。
+  // 两段都公布了该项单价（> 0）且不相等才算变动——「从没公布到公布」不是涨价。
+  const prevOf = useMemo(() => {
+    const out = new Map<string, PriceModelRow>()
+    if (now === null) return out
+    for (const r of now.rows) {
+      let best: PriceModelRow | undefined
+      for (const p of prices ?? []) {
+        if (p.match_key !== r.match_key || p.effective_from >= r.effective_from) continue
+        if (!best || p.effective_from > best.effective_from) best = p
       }
-      series.push({ key, label, points: rows.map((r) => ({ t: r.effective_from, v: unitPrice(r, unit) })) })
+      if (best) out.set(r.match_key, best)
     }
-    series.sort((a, b) => b.points[b.points.length - 1].v - a.points[a.points.length - 1].v)
-    return { series, missing }
-  }, [prices, unit])
+    return out
+  }, [now, prices])
 
-  const shown = focus ? gradient.series.filter((s) => s.key === focus) : gradient.series
-  const t0 = useMemo(
-    () => (gradient.series.length === 0 ? 0 : Math.min(...gradient.series.map((s) => s.points[0].t))),
-    [gradient.series],
-  )
-  const tNow = Math.floor(Date.now() / 1000)
-  /** 有第二段生效期的模型 = 被官方降过价的,梯度图上的台阶就是它们。 */
-  const stepped = gradient.series.filter((s) => s.points.length > 1).length
+  const listRows = useMemo(() => {
+    if (now === null) return []
+    const dir = sort.desc ? -1 : 1
+    const { key } = sort
+    return [...now.rows].sort((a, b) => {
+      let c = 0
+      if (key === 'model') c = a.display_name.localeCompare(b.display_name, 'en', { numeric: true }) * dir
+      else if (key === 'since') c = (a.effective_from - b.effective_from) * dir
+      else {
+        const va = unitPrice(a, key)
+        const vb = unitPrice(b, key)
+        // 未公布（—）的一律沉底,不随升降序翻到顶上
+        if (va <= 0 || vb <= 0) c = va <= 0 && vb <= 0 ? 0 : va <= 0 ? 1 : -1
+        else c = (va - vb) * dir
+      }
+      return c || b.usd_input - a.usd_input || a.match_key.localeCompare(b.match_key)
+    })
+  }, [now, sort])
 
-  const pickFocus = useCallback((k: string) => setFocus((prev) => (prev === k ? '' : k)), [])
+  // 同列再点翻转方向;换列时价格 / 日期先降序（贵的、新的在上）,名称先升序
+  const pickSort = (key: SortKey) =>
+    setSort((prev) => (prev.key === key ? { key, desc: !prev.desc } : { key, desc: key !== 'model' }))
+  const toggleReveal = (id: string) =>
+    setRevealed((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  const sortHeader = (key: SortKey, label: string, className?: string) => {
+    const active = sort.key === key
+    return (
+      <th key={key} className={className} aria-sort={active ? (sort.desc ? 'descending' : 'ascending') : undefined}>
+        <button className={`price-th${active ? ' is-active' : ''}`} title="Click to sort" onClick={() => pickSort(key)}>
+          {label}
+          <span className="price-th-arrow">{active ? (sort.desc ? '▼' : '▲') : ''}</span>
+        </button>
+      </th>
+    )
+  }
 
   return (
     <>
@@ -199,7 +240,7 @@ export default function PricingBlock() {
         <RangeControl selection={selection} noun="Usage" />
       </div>
 
-      {/* ---- 1) 美元当量 + 用量 × 价格 ---- */}
+      {/* ---- 1) 美元当量 + 用量 × 价格 ----*/}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">Equivalent API value · {PLATFORM_LABEL[platform]}</span>
@@ -285,7 +326,7 @@ export default function PricingBlock() {
                         <span className="legend-swatch" style={{ background: colorFor(r.model_key) }} />
                         {/* 价目不可信时印 collector 的原始模型键,**不印折价目标的名字**：
                             codex-auto-review 折的是 gpt-5.6-luna,印成「GPT-5.6 Luna」就会与
-                            真正的 Luna 并排出现两行同名,谁也分不出哪行是哪行。 */}
+                            真正的 Luna 并排出现两行同名,谁也分不出哪行是哪行。*/}
                         {r.known ? r.display_name : r.model_key}
                         {!r.known && <span className="price-unknown-mark"> ≈</span>}
                       </td>
@@ -338,66 +379,7 @@ export default function PricingBlock() {
         )}
       </section>
 
-      {/* ---- 2) 价格梯度 ---- */}
-      <section className="insight-card">
-        <header className="insight-card-header">
-          <span className="insight-card-title">Price gradient · {UNIT_LABEL[unit]}</span>
-          <span
-            className="insight-card-sub"
-            title="Log scale: the published input prices span $0.05 to $30 per Mtok, and a linear axis flattens everything below the top few."
-          >
-            USD / Mtok, log scale
-          </span>
-          <Seg
-            value={unit}
-            options={UNITS.map((u) => ({ v: u, label: UNIT_LABEL[u], hint: `${UNIT_LABEL[u]} price per million tokens` }))}
-            onChange={setUnit}
-          />
-        </header>
-        {gradient.series.length === 0 ? (
-          <div className="insight-empty">
-            No published {UNIT_LABEL[unit].toLowerCase()} price for any {PLATFORM_LABEL[platform]} model
-          </div>
-        ) : (
-          <>
-            <div className="series-legend">
-              {gradient.series.map((s) => (
-                <button
-                  key={s.key}
-                  className={`legend-item${focus === s.key ? ' is-active' : ''}`}
-                  onClick={() => pickFocus(s.key)}
-                  title={focus === s.key ? 'Click to show every model' : `Only ${s.label}`}
-                >
-                  <span className="legend-swatch" style={{ background: colorFor(s.key) }} />
-                  {s.label}
-                </button>
-              ))}
-            </div>
-            <StepChart
-              series={shown}
-              t0={t0}
-              t1={tNow}
-              log
-              formatValue={price}
-              titleFor={(s) => `${s.label}\n${s.points.map((p) => `${day(p.t)} · ${price(p.v)} / Mtok`).join('\n')}`}
-            />
-            <p className="price-note">
-              {stepped === 0
-                ? 'No price change on record yet — each line starts the day its model was first listed and runs at one price. A published price cut shows up here as a step, and usage stays valued at the price of its own day.'
-                : `${stepped} ${stepped === 1 ? 'model has' : 'models have'} more than one price period; each step is a published price change, and usage is always valued at the price in effect on its own day.`}
-              {gradient.missing.length > 0 && (
-                <span title={gradient.missing.join(', ')}>
-                  {' '}
-                  {gradient.missing.length} {gradient.missing.length === 1 ? 'model publishes' : 'models publish'} no{' '}
-                  {UNIT_LABEL[unit].toLowerCase()} price and {gradient.missing.length === 1 ? 'is' : 'are'} left out.
-                </span>
-              )}
-            </p>
-          </>
-        )}
-      </section>
-
-      {/* ---- 3) 官方价目对照表 ---- */}
+      {/* ---- 2) 官方价目对照表 ----*/}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">Official price list · {PLATFORM_LABEL[platform]}</span>
@@ -410,36 +392,57 @@ export default function PricingBlock() {
             <table className="price-table">
               <thead>
                 <tr>
-                  <th className="price-col-model">Model</th>
-                  {UNITS.map((u) => (
-                    <th key={u}>{UNIT_LABEL[u]}</th>
-                  ))}
-                  <th>Since</th>
+                  {sortHeader('model', 'Model', 'price-col-model')}
+                  {UNITS.map((u) => sortHeader(u, UNIT_LABEL[u]))}
+                  {sortHeader('since', 'Since')}
                 </tr>
               </thead>
               <tbody>
-                {[...now.rows]
-                  .sort((a, b) => b.usd_input - a.usd_input || a.match_key.localeCompare(b.match_key))
-                  .map((r) => (
+                {listRows.map((r) => {
+                  const prev = prevOf.get(r.match_key)
+                  return (
                     <tr key={r.match_key}>
                       <td className="price-col-model" title={`${r.match_key}\n${r.source_note}`}>
                         <span className="legend-swatch" style={{ background: colorFor(r.match_key) }} />
                         {r.display_name}
                       </td>
-                      {UNITS.map((u) => (
-                        <td key={u} title={unitPrice(r, u) > 0 ? '' : 'Not published for this model'}>
-                          {price(unitPrice(r, u))}
-                        </td>
-                      ))}
+                      {UNITS.map((u) => {
+                        const v = unitPrice(r, u)
+                        const pv = prev === undefined ? 0 : unitPrice(prev, u)
+                        const changed = v > 0 && pv > 0 && Math.abs(v - pv) > 1e-9
+                        const dir = v > pv ? 'is-up' : 'is-down'
+                        const id = `${r.match_key}:${u}`
+                        const open = revealed.has(id)
+                        return (
+                          <td key={u} title={v > 0 ? '' : 'Not published for this model'}>
+                            {changed && open && <span className={`price-delta ${dir}`}>{deltaText(pv, v)}</span>}
+                            {price(v)}
+                            {changed ? (
+                              <button
+                                className={`price-change ${dir}`}
+                                title={`${v > pv ? 'Raised' : 'Cut'} on ${day(r.effective_from)}: ${price(pv)} → ${price(v)} · click to ${open ? 'hide' : 'show'} the change`}
+                                onClick={() => toggleReveal(id)}
+                              >
+                                {v > pv ? '↑' : '↓'}
+                              </button>
+                            ) : (
+                              <span className="price-change" aria-hidden />
+                            )}
+                          </td>
+                        )
+                      })}
                       <td title={`Effective from ${new Date(r.effective_from * 1000).toLocaleString()}`}>
                         {day(r.effective_from)}
                       </td>
                     </tr>
-                  ))}
+                  )
+                })}
               </tbody>
             </table>
             <p className="price-note">
               Official API list prices, shipped with the app and updated with it — hover a model for the source entry.
+              An arrow marks a price changed from the model's previous period (red up, green down) — click it for the
+              amount.
               Cache-write prices are the common tier: some platforms price it by retention, and local collection keeps a
               single cache-write bucket.
             </p>

@@ -50,6 +50,7 @@
   --accent: #2563eb;
   --accent-weak: rgba(37, 99, 235, 0.12);
   --danger: #dc2626;
+  --success: #16a34a;
   --warn: #d97706;
 
   --zero-bg: #e2e8f0;
@@ -89,6 +90,7 @@
     --accent: #3b82f6;
     --accent-weak: rgba(59, 130, 246, 0.16);
     --danger: #ef4444;
+    --success: #22c55e;
     --warn: #f59e0b;
 --zero-bg: #334155; /* slate-700 中性灰：深色主题下无用量格不偏蓝 */
   --future-bg: transparent;
