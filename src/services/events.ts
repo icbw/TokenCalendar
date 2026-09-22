@@ -1,7 +1,7 @@
 // 事件订阅封装：非 Tauri 环境（纯浏览器布局调试）下返回空退订函数。
 
 import { inTauri } from './tauri'
-import type { ChangedKeys } from './contract'
+import type { ChangedKeys, CollectStatusContract } from './contract'
 
 export type Unlisten = () => void
 
@@ -13,6 +13,11 @@ async function listen<T>(event: string, cb: (payload: T) => void): Promise<Unlis
 
 export function onUsageChanged(cb: () => void): Promise<Unlisten> {
   return listen<ChangedKeys>('usage:changed', () => cb())
+}
+
+// 采集轮进度（Rust 采集线程切源 / 收轮时发），载荷同 get_collect_status。
+export function onCollectStatus(cb: (status: CollectStatusContract) => void): Promise<Unlisten> {
+  return listen<CollectStatusContract>('collector:status', (s) => cb(s))
 }
 
 // 挂件可见性广播（Rust visibility.rs 单一源），载荷为 bool。

@@ -53,6 +53,14 @@ export interface SourceSummaryContract {
   stale: boolean
 }
 
+/** get_collect_status 返回 / `collector:status` 事件载荷（采集轮进度）。 */
+export interface CollectStatusContract {
+  source: string | null
+  round_started_at: number | null
+  first_round_done: boolean
+  last_round_at: number | null
+}
+
 export interface ExportResultContract {
   path: string
   rows: number

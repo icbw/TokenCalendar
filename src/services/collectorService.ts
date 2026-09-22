@@ -1,6 +1,6 @@
 // Collector 命令封装：来源健康面板、暂停开关、采集频率、挂件网格吸附开关。
 
-import type { SourceSummaryContract } from './contract'
+import type { CollectStatusContract, SourceSummaryContract } from './contract'
 import type { SourceSummary } from './types'
 import { tryInvoke } from './tauri'
 
@@ -25,6 +25,23 @@ function toInternal(s: SourceSummaryContract): SourceSummary {
 export async function listSources(): Promise<SourceSummary[] | null> {
   const res = await tryInvoke<SourceSummaryContract[]>('list_sources')
   return res ? res.map(toInternal) : null
+}
+
+/** 采集轮进度：source = 正在采集的源 id（null = 空闲）;firstRoundDone = 本次启动后已跑完一轮。 */
+export interface CollectStatus {
+  source: string | null
+  roundStartedAt: number | null
+  firstRoundDone: boolean
+  lastRoundAt: number | null
+}
+
+export function toCollectStatus(s: CollectStatusContract): CollectStatus {
+  return { source: s.source, roundStartedAt: s.round_started_at, firstRoundDone: s.first_round_done, lastRoundAt: s.last_round_at }
+}
+
+export async function getCollectStatus(): Promise<CollectStatus | null> {
+  const res = await tryInvoke<CollectStatusContract>('get_collect_status')
+  return res ? toCollectStatus(res) : null
 }
 
 export async function getPaused(): Promise<boolean | null> {

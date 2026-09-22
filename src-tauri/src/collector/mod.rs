@@ -367,6 +367,7 @@ fn run(app: AppHandle, mut store: Store) {
         if !paused {
             for adapter in &adapters {
                 let meta = adapter.meta();
+                set_round_source(&app, Some(meta.id));
                 match adapter.collect(&mut store) {
                     Ok(outcome) => {
                         store.record_success(meta.id, adapter.probe().fingerprint.as_deref());
@@ -411,6 +412,7 @@ fn run(app: AppHandle, mut store: Store) {
                 }
             }
             first_pass = false;
+            set_round_source(&app, None);
         }
         // 暂停采集时也照常派生（等待超时 / 过期剔除只依赖时间）
         tick_attention(&app, &mut store);
@@ -516,6 +518,57 @@ pub fn notify_attention(app: &AppHandle) {
     persist_acks(app);
     if let Err(e) = app.emit("timeline:attention", true) {
         crate::dev_log!("[collector] emit timeline:attention failed: {}", e);
+    }
+}
+
+/// 采集轮进度：页脚据此区分「正在采集」与「已追上」——`source_state` 是上次运行留下的健康记录,
+/// 启动后首轮跑完前它说的是过去,不代表热力图已含最新数据。
+#[derive(Clone, Default, Serialize)]
+pub struct CollectStatus {
+    /// 正在采集的源 id（None = 两轮之间空闲）。
+    pub source: Option<String>,
+    /// 开始时刻（毫秒;空闲时为 None）。
+    pub round_started_at: Option<i64>,
+    /// 本次启动后已完整跑完至少一轮。
+    pub first_round_done: bool,
+    /// 最近一轮跑完的时刻（毫秒）。
+    pub last_round_at: Option<i64>,
+}
+
+static STATUS: std::sync::Mutex<CollectStatus> =
+    std::sync::Mutex::new(CollectStatus { source: None, round_started_at: None, first_round_done: false, last_round_at: None });
+
+pub fn collect_status() -> CollectStatus {
+    STATUS.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// 切到某源（Some,一轮的第一个源即开轮）或收轮（None）→ 广播 `collector:status`。
+fn set_round_source(app: &AppHandle, source: Option<&str>) {
+    let snapshot = {
+        let Ok(mut st) = STATUS.lock() else { return };
+        let now = store::now_millis();
+        match source {
+            Some(id) => {
+                if st.source.is_none() {
+                    st.round_started_at = Some(now);
+                }
+                st.source = Some(id.to_string());
+            }
+            None => {
+                if !st.first_round_done {
+                    let took = st.round_started_at.map_or(0, |t| now - t);
+                    crate::dev_log!("[collector] first round since launch done in {} ms", took);
+                }
+                st.source = None;
+                st.round_started_at = None;
+                st.first_round_done = true;
+                st.last_round_at = Some(now);
+            }
+        }
+        st.clone()
+    };
+    if let Err(e) = app.emit("collector:status", snapshot) {
+        crate::dev_log!("[collector] emit collector:status failed: {}", e);
     }
 }
 

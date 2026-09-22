@@ -166,6 +166,7 @@ fn main() {
             commands::get_idle_threshold,
             commands::set_idle_threshold,
             commands::list_sources,
+            commands::get_collect_status,
             commands::get_paused,
             commands::set_paused,
             commands::export_month_csv,

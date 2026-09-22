@@ -805,6 +805,12 @@ pub fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceSummary>, St
     Ok(summaries)
 }
 
+/// 采集轮进度（页脚「正在采集 / 已追上」;变化时另有 `collector:status` 事件推送同一结构）。
+#[tauri::command]
+pub fn get_collect_status() -> collector::CollectStatus {
+    collector::collect_status()
+}
+
 #[tauri::command]
 pub fn get_paused(state: State<'_, AppState>) -> bool {
     state.paused.load(Ordering::SeqCst)
