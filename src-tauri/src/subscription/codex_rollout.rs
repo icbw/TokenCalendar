@@ -53,6 +53,23 @@
 //! 这个文件时兜底——rollout 的 mtime 在 Windows 上停在创建时刻,拿它判正在写的文件
 //! 会漏掉整个当前会话（见 `rollout_files`）。
 //!
+//! ## 取数时机：rollout 在跑的时候,只在「本地还看不见的扣费」上发请求
+//!
+//! **服务端按一次模型调用记账,调用结束时一次性扣**;而 `rate_limits` 记的是调用
+//! **开始**时的值、调用**结束**才写入 ⇒ 本地读数恒落后**一次调用**。活跃期调用密
+//! （中位 18 秒一次,每次 exec 还会拉起 guardian 审核调用）,下一次调用一写就追平,
+//! 这时发 API 请求至多早一次调用,不值得。本地追不上的只有两处:
+//!
+//! - **一轮的最后一次调用**:之后没有下一次调用替它写数,用户一停手本地就停在扣费前;
+//!   ⇒ 该轮 `task_complete` 之后若还有未反映的代价（≥ `MIN_PENDING_PCT`）,取一次;
+//! - **一次大调用之后长时间没有下一次调用**:未反映的代价 ≥ 取数阈值,且
+//!   `LONG_CALL_GRACE_SECS` 内没有新读数追平 ⇒ 取一次。
+//!
+//! 「未反映」= 结束时刻晚于**最新被反映时刻**的调用:每条读数反映的是它那次调用开始前
+//! 已结束的全部调用（含 guardian 子代理）,API 读数反映的是请求时刻之前的全部调用;
+//! 两者取最晚。决策见 `plan_fetch`,排程与退避在 demand.rs。rollout 没有 5h 读数
+//! （老版 CLI / API key 登录）时这一路不生效,退回按预计消耗取数。
+//!
 //! 读数照常收割进 `desktop_sample` 永久留着（rollout 会被 Codex 归档 / 被用户清掉 /
 //! `CODEX_HOME` 改指向,源没了历史也不能跟着丢）。
 
@@ -109,6 +126,18 @@ const WINDOW_7D_MINUTES: i64 = 10080;
 /// 扫描下界因此要比建样本的下界再往前一个窗长（见 `ingest`）。
 const WINDOW_SECS: i64 = 5 * 3_600;
 
+/// 一轮结束后,未反映的代价至少这么多（百分点）才值得取一次:显示是整数百分比,
+/// 半个点以下取回来多半还是同一个数。
+const MIN_PENDING_PCT: f64 = 0.5;
+
+/// 一轮结束（`task_complete`）后等这么久再取:服务端记账与 rollout 落盘之间差一两秒,
+/// 太早取可能正好读到扣费前的值。
+const TURN_END_DELAY_SECS: i64 = 5;
+
+/// 一次大调用结束后给「下一次调用写数追平」留的时间（秒）:活跃期调用中位 18 秒一次,
+/// 90 分位约 100 秒;等一分钟还没追平就取。
+const LONG_CALL_GRACE_SECS: i64 = 60;
+
 /// 拿不到模型名时的占位（匹配不上任何价目键 ⇒ 走回落价并标 unknown,与采集器同名）。
 const UNKNOWN_MODEL: &str = "unknown";
 
@@ -152,6 +181,90 @@ pub struct Scan {
     /// 有 `rate_limits` 但**不含 5h 窗口**的读数条数（老版 CLI 只回报周窗;
     /// 它们进不了标定——`Pair` 的两端是 5h 已用百分比——但这件事要在日志里看得）。
     pub weekly_only: usize,
+    /// 读过的每个文件各自的取数时机线索（键 = 路径）。`scan` 只重读变长的文件,
+    /// 所以取数计划要跨轮合并（见 `MARKS`）,不能只看这一轮读到的那几个。
+    pub marks: BTreeMap<String, Marks>,
+}
+
+/// 一个 rollout 文件里与取数时机有关的线索（口径见模块头「取数时机」）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Marks {
+    /// 每条 5h 读数所在那次调用的**开始**时刻（同文件里上一条 `token_count` 或
+    /// `task_started`）:这条读数反映的是此刻之前已结束的全部调用。
+    pub reflects: Vec<i64>,
+    /// 这个文件里的调用（结束时刻 + token）。
+    pub calls: Vec<Call>,
+    /// 主会话（非子代理）的轮生命周期:`（时刻, 是否为结束)`。
+    /// 子代理（guardian 审核等）每次审核都自成一轮,算进来会把每次 exec 都当成「一轮结束」。
+    pub turn_marks: Vec<(i64, bool)>,
+    /// 最新一条 5h 读数的时刻。
+    pub latest_reading: Option<i64>,
+}
+
+impl Marks {
+    fn absorb(&mut self, other: &Marks) {
+        self.reflects.extend_from_slice(&other.reflects);
+        self.calls.extend_from_slice(&other.calls);
+        self.turn_marks.extend_from_slice(&other.turn_marks);
+        self.latest_reading = self.latest_reading.max(other.latest_reading);
+    }
+}
+
+/// 各文件最近一次读到的线索（跨扫描合并用;进程内,重启后随文件变长逐个补回）。
+static MARKS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Marks>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+/// 把读过的文件并进缓存（整份替换:`scan_file` 每次都从头读）,删掉已不存在的文件,
+/// 返回全部文件合并后的线索。
+fn merge_marks(scan: &Scan) -> Marks {
+    let mut cache = MARKS.lock().unwrap_or_else(|e| e.into_inner());
+    for (k, m) in &scan.marks {
+        cache.insert(k.clone(), m.clone());
+    }
+    cache.retain(|k, _| scan.seen.contains_key(k));
+    let mut all = Marks::default();
+    for m in cache.values() {
+        all.absorb(m);
+    }
+    all
+}
+
+/// 取数计划（`plan_fetch` 的产出）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchPlan {
+    /// 应取时刻（None = 本地读数追得上,不必发请求）。
+    pub due: Option<i64>,
+    /// 未反映到任何读数里的预计消耗（百分点）。
+    pub pending_pct: f64,
+    /// 最新一条 5h 读数的时刻（demand 据此判这一路还「活着」）。
+    pub latest_reading: i64,
+    /// 日志用:turn-end / long-call / none。
+    pub reason: &'static str,
+}
+
+/// 取数计划（纯函数,单测直接覆盖;口径见模块头「取数时机」）。
+/// `api_at` = 快照里最近一次 **API** 读数的时刻;`scale` = 百分点 / 美元当量;
+/// `threshold` = 当前取数阈值（已含低余量收紧）。rollout 没有 5h 读数 → None。
+pub fn plan_fetch(marks: &Marks, api_at: Option<i64>, scale: f64, threshold: f64) -> Option<FetchPlan> {
+    let latest_reading = marks.latest_reading?;
+    let reflected = marks.reflects.iter().copied().max()?.max(api_at.unwrap_or(0));
+    let mut pending_usd = 0.0;
+    let mut last_call = None::<i64>;
+    for c in marks.calls.iter().filter(|c| c.t > reflected) {
+        let tokens = cost::Tokens { input: c.tokens[0], output: c.tokens[1], cache_read: c.tokens[2], cache_write: c.tokens[3] };
+        pending_usd += cost::cost_of(Platform::Codex, &c.model, &tokens, c.t).0;
+        last_call = Some(last_call.map_or(c.t, |x| x.max(c.t)));
+    }
+    let pending_pct = pending_usd * scale;
+    let plan = |due, reason| Some(FetchPlan { due, pending_pct, latest_reading, reason });
+    let Some(last_call) = last_call else { return plan(None, "none") };
+    // 主会话最后一个生命周期事件是「结束」且不早于最后一次未反映的调用 = 这一轮收工了
+    let turn_end = marks.turn_marks.iter().max_by_key(|m| m.0).filter(|m| m.1 && m.0 >= last_call).map(|m| m.0);
+    match turn_end {
+        Some(end) if pending_pct >= MIN_PENDING_PCT => plan(Some(end + TURN_END_DELAY_SECS), "turn-end"),
+        _ if pending_pct >= threshold => plan(Some(last_call + LONG_CALL_GRACE_SECS), "long-call"),
+        _ => plan(None, "none"),
+    }
 }
 
 /// Codex 家目录（`CODEX_HOME` 覆盖;与 `collector:codex` 同一套发现规则）。
@@ -227,7 +340,12 @@ pub(super) fn scan(since: i64, mtime_floor: i64, seen: &BTreeMap<String, u64>) -
         }
         out.files_read += 1;
         out.bytes_read += size;
-        scan_file(&path, since, &mut out);
+        let (r0, c0) = (out.readings.len(), out.calls.len());
+        let mut marks = Marks::default();
+        scan_file(&path, since, &mut out, &mut marks);
+        marks.calls = out.calls[c0..].to_vec();
+        marks.latest_reading = out.readings[r0..].iter().map(|r| r.t).max();
+        out.marks.insert(key.clone(), marks);
         out.seen.insert(key, size);
     }
     out.readings.sort_by_key(|r| r.t);
@@ -253,12 +371,16 @@ fn needs_read(known: Option<u64>, size: u64, mtime: i64, mtime_floor: i64) -> bo
 ///
 /// 预筛不是微优化：rollout 的字节数绝大部分是 `session_meta` 的 base_instructions 与
 /// 消息正文,单个文件可达几十 MB,逐行 serde 解析它们纯属浪费。
-fn scan_file(path: &Path, since: i64, out: &mut Scan) {
+fn scan_file(path: &Path, since: i64, out: &mut Scan, marks: &mut Marks) {
     let Ok(file) = std::fs::File::open(path) else { return };
     let mut reader = std::io::BufReader::new(file);
     // 模型在 `turn_context` 行的 `payload.model`（轮级设置,token_count 行不带)——
     // 与 collector:codex 同一判据。逐行推进,token_count 取当时最近的那个值。
     let mut model = String::new();
+    // 调用边界:上一条 token_count / task_started 的时刻（下一次调用从这里开始）
+    let mut boundary: Option<i64> = None;
+    // 子代理会话（guardian 审核等）:`session_meta.payload.source.subagent` 存在
+    let mut subagent = false;
     let mut buf: Vec<u8> = vec![];
     loop {
         buf.clear();
@@ -272,11 +394,29 @@ fn scan_file(path: &Path, since: i64, out: &mut Scan) {
         let line = String::from_utf8_lossy(&buf);
         let is_ctx = line.contains("\"turn_context\"");
         let is_tok = line.contains("\"token_count\"");
-        if !is_ctx && !is_tok {
+        let is_meta = line.contains("\"session_meta\"") && line.contains("\"subagent\"");
+        let is_turn = line.contains("\"task_started\"") || line.contains("\"task_complete\"") || line.contains("\"turn_aborted\"");
+        if !is_ctx && !is_tok && !is_meta && !is_turn {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
         let Some(payload) = v.get("payload") else { continue };
+        if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
+            subagent = payload.get("source").and_then(|s| s.get("subagent")).is_some();
+            continue;
+        }
+        let kind = payload.get("type").and_then(|x| x.as_str());
+        if matches!(kind, Some("task_started" | "task_complete" | "turn_aborted")) {
+            let Some(t) = payload_time(&v) else { continue };
+            let end = kind != Some("task_started");
+            if !end {
+                boundary = Some(t);
+            }
+            if !subagent && t >= since {
+                marks.turn_marks.push((t, end));
+            }
+            continue;
+        }
         // 精确键名：token_count 行有 `model_context_window` 而没有 `model`,不会误命中
         if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
             model = m.to_string();
@@ -285,6 +425,7 @@ fn scan_file(path: &Path, since: i64, out: &mut Scan) {
             continue;
         }
         let Some(t) = payload_time(&v) else { continue };
+        let started = boundary.replace(t).unwrap_or(t);
         if t < since {
             continue;
         }
@@ -292,7 +433,10 @@ fn scan_file(path: &Path, since: i64, out: &mut Scan) {
             out.calls.push(call);
         }
         match parse_reading(payload, t) {
-            Some(r) => out.readings.push(r),
+            Some(r) => {
+                out.readings.push(r);
+                marks.reflects.push(started);
+            }
             None if payload.get("rate_limits").is_some_and(|r| !r.is_null()) => {
                 out.weekly_only += 1;
             }
@@ -443,6 +587,15 @@ pub fn build_pairs(
     out
 }
 
+/// 窗尾在同一个窗口内逐条会抖几秒（服务端按请求时刻换算）;换号 / 窗口到期重开时差的是小时。
+const WINDOW_JITTER_SECS: i64 = 120;
+
+/// 两条读数是否属于同一个配额窗口：套餐相同,且两端窗尾都已知、相差不超过抖动容差。
+/// 任一端没有窗尾 = 判不了 ⇒ 按「不同窗」处理（照搬新读数,即改动前的行为）。
+fn same_window(a: Option<i64>, b: Option<i64>, plan_a: &str, plan_b: &str) -> bool {
+    plan_a == plan_b && matches!((a, b), (Some(a), Some(b)) if (a - b).abs() <= WINDOW_JITTER_SECS)
+}
+
 /// 用最新的 rollout 读数推进 Codex 快照（**零网络**;返回是否真的改了）。
 ///
 /// 这一步的价值不在省请求,在**时效**：`rate_limits` 是 Codex 在每次响应里带回来的
@@ -450,28 +603,60 @@ pub fn build_pairs(
 /// 十几二十个百分点,而取数是按预计消耗触发的——触发判据本身要等采集器先看见那些
 /// token。读数在文件里已经是真值了,没有理由还让球上显示上一次取数的旧数。
 ///
-/// 两条约束：
+/// 三条约束：
 /// - **必须比上次读数新**（`t > prev.fetched_at`）。旧样本不能冒充进展,否则
 ///   `advanced` 会误判、账目被错误清零。
-/// - **上下都改**。Claude 那条 `apply_flat_sample` 只下,因为它处理的是「兜底轮没涨」
-///   那个特殊情形;这里是一条**完整的、更新的**读数,两个方向都该照搬。
+/// - **换窗 / 换号时上下都改**。窗尾变了（窗口到期重开、换账号）或源没给窗尾,
+///   这是一条**完整的、更新的**读数,两个方向都照搬。
+/// - **同一窗口内只升不降**。`rate_limits` 是这次模型调用**开始**时服务端回的数,却在
+///   调用**结束**时才写进文件:主会话一次长调用（几十秒到几分钟）写下的数,可能比期间
+///   guardian 审核子代理（每次 exec 工具调用自动拉起,`codex-auto-review`）刚写的更旧。
+///   按写入先后取「最后一条」会让球上的数倒退。
+///   服务端同一窗口的用量只增不减（同窗相邻 API 读数 201 对,下降 0 次）⇒ 同窗取最大。
 fn update_snapshot(store: &SubStore, readings: &[Reading], now: i64) -> bool {
-    let Some(r) = readings.last() else { return false };
     let prev = store.load_snapshot(Platform::Codex);
-    if prev.as_ref().and_then(|p| p.fetched_at).is_some_and(|t0| r.t <= t0) {
-        return false; // 不比手上的新,什么都证明不了
+    let t0 = prev.as_ref().and_then(|p| p.fetched_at);
+    // 比手上新的读数;一条都没有 = 什么都证明不了
+    let fresh: Vec<&Reading> = readings.iter().filter(|r| t0.is_none_or(|t0| r.t > t0)).collect();
+    let Some(r) = fresh.last().copied() else { return false };
+    let prev_plan = prev.as_ref().map(|p| p.plan_type.as_str()).unwrap_or("");
+    let plan_of = |x: &Reading| if x.plan.is_empty() { prev_plan.to_string() } else { x.plan.clone() };
+    let plan = plan_of(r);
+    // 一个窗口的取值:本批里与最新一条同窗的读数取最大,再与快照里同窗的值取最大
+    let settle = |kind: &str, used: fn(&Reading) -> f64, resets: fn(&Reading) -> Option<i64>| -> f64 {
+        let mut v = used(r);
+        for x in &fresh {
+            if same_window(resets(x), resets(r), &plan_of(x), &plan) {
+                v = v.max(used(x));
+            }
+        }
+        if let Some(w) = prev.as_ref().and_then(|p| p.windows.iter().find(|w| w.kind == kind)) {
+            if same_window(w.resets_at, resets(r), prev_plan, &plan) {
+                v = v.max(w.used_percent);
+            }
+        }
+        v
+    };
+    let used5 = settle("5h", |x| x.used5, |x| x.resets5);
+    let used7 = settle("7d", |x| x.used7, |x| x.resets7);
+    // 同窗取大之后与快照一模一样 = 这批读数只是迟到的旧数,不是进展:不写、不清账目
+    // （清了会把「距上次读数」的消耗记漏,取数被推迟）。
+    if let Some(p) = prev.as_ref() {
+        let same = |kind: &str, v: f64| p.windows.iter().any(|w| w.kind == kind && w.used_percent == v);
+        if p.status == FetchStatus::Ok && p.plan_type == plan && same("5h", used5) && same("7d", used7) {
+            let resets_same = p.windows.iter().any(|w| w.kind == "5h" && same_window(w.resets_at, r.resets5, &p.plan_type, &plan));
+            if resets_same {
+                return false;
+            }
+        }
     }
     let snap = SubscriptionSnapshot {
         platform: Platform::Codex,
         // 读数自带套餐;缺省时沿用上一条快照的,别把已知的 plan 退化成 unknown
-        plan_type: if r.plan.is_empty() {
-            prev.as_ref().map(|p| p.plan_type.clone()).unwrap_or_else(|| "unknown".into())
-        } else {
-            r.plan.clone()
-        },
+        plan_type: if plan.is_empty() { "unknown".into() } else { plan.clone() },
         windows: vec![
-            QuotaWindow { kind: "5h".into(), used_percent: r.used5, resets_at: r.resets5 },
-            QuotaWindow { kind: "7d".into(), used_percent: r.used7, resets_at: r.resets7 },
+            QuotaWindow { kind: "5h".into(), used_percent: used5, resets_at: r.resets5 },
+            QuotaWindow { kind: "7d".into(), used_percent: used7, resets_at: r.resets7 },
         ],
         // 取读数时刻而非时刻：它就是那次 API 调用发生的时刻
         fetched_at: Some(r.t.min(now)),
@@ -492,8 +677,8 @@ fn update_snapshot(store: &SubStore, readings: &[Reading], now: i64) -> bool {
     let dropped = super::demand::take_account(Platform::Codex, now);
     crate::dev_log!(
         "[subscription] codex snapshot from rollout: 5h={:.0}% 7d={:.0}% plan={} age={}s          (no request, est {:.2}% cleared)",
-        r.used5,
-        r.used7,
+        used5,
+        used7,
         snap.plan_type,
         now - r.t,
         dropped.cost * calib::scale(Platform::Codex)
@@ -629,6 +814,29 @@ pub fn ingest(store: &SubStore, now: i64) -> (usize, usize, bool) {
     // 快照推进排在最后：它只依赖读数,与建样本互不影响,放这儿保证即使建样本
     // 一条都没建出来（比如全是 Δ=0 的区间）,球上的数照样是最新的。
     let snapshot_changed = update_snapshot(store, &scan.readings, now);
+
+    // 取数计划:本地追不上的扣费才排请求（见模块头「取数时机」）。排在快照推进之后:
+    // 阈值的低余量收紧要看刚推进的 5h 余量。
+    let snap = store.load_snapshot(Platform::Codex);
+    // API 读数反映请求之前结束的全部调用:取快照（若还是 API 来源）与 demand 记下的最近一次,较晚者
+    let api_at = snap
+        .as_ref()
+        .filter(|s| s.source == SnapshotSource::Api)
+        .and_then(|s| s.fetched_at)
+        .unwrap_or(0)
+        .max(super::demand::last_api_reading(Platform::Codex));
+    let api_at = (api_at > 0).then_some(api_at);
+    let remaining = snap.as_ref().and_then(|s| s.windows.iter().find(|w| w.kind == "5h")).map(|w| 100.0 - w.used_percent);
+    let threshold = super::demand::effective_threshold(remaining);
+    if let Some(plan) = plan_fetch(&merge_marks(&scan), api_at, calib::scale(Platform::Codex), threshold) {
+        super::demand::set_rollout_plan(Platform::Codex, plan.due, plan.latest_reading);
+        crate::dev_log!(
+            "[subscription] codex rollout plan: pending {:.2}% → {} ({})",
+            plan.pending_pct,
+            plan.due.map_or("no fetch".to_string(), |d| format!("fetch in {}s", (d - now).max(0))),
+            plan.reason
+        );
+    }
     (harvested, pairs, snapshot_changed)
 }
 
@@ -786,7 +994,7 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         let mut out = Scan::default();
-        scan_file(&path, 0, &mut out);
+        scan_file(&path, 0, &mut out, &mut Marks::default());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.calls.len(), 2);
         assert_eq!(out.calls[0].model, "gpt-5.6-sol");
@@ -852,6 +1060,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 同一窗口内快照只升不降:主会话长调用迟写的旧数（调用开始时的服务端值）
+    /// 不能把 guardian 子代理刚写的新数压回去;换窗 / 换号照常回落。
+    #[test]
+    fn snapshot_never_regresses_within_one_window() {
+        let dir = std::env::temp_dir().join(format!("tc_cxroll_mono_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SubStore::open(&dir.join("subscriptions.db")).unwrap();
+        let rd = |t: i64, u5: f64, r5: i64, plan: &str| Reading {
+            t,
+            used5: u5,
+            used7: 36.0,
+            plan: plan.into(),
+            resets5: Some(r5),
+            resets7: Some(500_000),
+        };
+        let used5 = |s: &SubStore| s.load_snapshot(Platform::Codex).unwrap().windows[0].used_percent;
+
+        // ① 同一批里:guardian 先写 95,主会话后写迟到的 91 → 取 95（窗尾抖几秒仍算同窗）
+        assert!(update_snapshot(&store, &[rd(1_000, 95.0, 20_000, "plus"), rd(1_001, 91.0, 20_003, "plus")], 1_010));
+        assert_eq!(used5(&store), 95.0);
+        let snap = store.load_snapshot(Platform::Codex).unwrap();
+        assert_eq!(snap.fetched_at, Some(1_001), "时刻仍取最新写入那条");
+
+        // ② 下一批只有迟到的更低读数 → 不是进展:不写、不广播
+        assert!(!update_snapshot(&store, &[rd(1_050, 93.0, 19_998, "plus")], 1_060));
+        assert_eq!(used5(&store), 95.0);
+        assert_eq!(store.load_snapshot(Platform::Codex).unwrap().fetched_at, Some(1_001), "不推进时刻 = 不清账目");
+
+        // ③ 同窗更高的照常上修
+        assert!(update_snapshot(&store, &[rd(1_100, 97.0, 20_001, "plus")], 1_110));
+        assert_eq!(used5(&store), 97.0);
+
+        // ④ 换号（套餐不同,窗尾差几小时）→ 从 0 起,允许回落
+        assert!(update_snapshot(&store, &[rd(1_200, 0.0, 38_000, "edu")], 1_210));
+        assert_eq!(used5(&store), 0.0);
+
+        // ⑤ 同套餐但窗尾差得远（窗口到期重开 / 同档第二个账号）→ 同样允许回落
+        assert!(update_snapshot(&store, &[rd(1_300, 40.0, 38_010, "edu")], 1_310));
+        assert!(update_snapshot(&store, &[rd(1_400, 2.0, 60_000, "edu")], 1_410));
+        assert_eq!(used5(&store), 2.0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取数计划:本地读数追得上就不发请求;一轮收工 / 大调用后久无下一次调用才排。
+    /// scale 取极大 / 极小值,让「有没有未反映代价」与具体价目解耦。
+    #[test]
+    fn fetch_plan_only_covers_charges_local_readings_cannot_see() {
+        const BIG: f64 = 1e9; // 任何非零代价都远超阈值
+        const TINY: f64 = 1e-12; // 任何代价都不到半个点
+        let marks = |reflects: Vec<i64>, calls: Vec<Call>, turn: Vec<(i64, bool)>| Marks {
+            reflects,
+            calls,
+            turn_marks: turn,
+            latest_reading: Some(1_000),
+        };
+        let c = |t| call(t, "gpt-5", 1_000);
+
+        // ① 一轮收工:最后一次调用（t=1000,它的读数反映的是 990 之前）→ 收工 5 秒后取
+        let m = marks(vec![990], vec![c(980), c(1_000)], vec![(900, false), (1_001, true)]);
+        let p = plan_fetch(&m, None, BIG, 5.0).unwrap();
+        assert_eq!((p.due, p.reason), (Some(1_006), "turn-end"));
+        assert!(p.pending_pct > 0.0);
+
+        // ② guardian 子代理的读数在主会话调用结束之后开始 ⇒ 已反映,不必取
+        let m = marks(vec![990, 1_002], vec![c(1_000)], vec![(900, false), (1_001, true)]);
+        assert_eq!(plan_fetch(&m, None, BIG, 5.0).unwrap().due, None);
+
+        // ③ API 读数晚于最后一次调用 ⇒ 已反映
+        let m = marks(vec![990], vec![c(1_000)], vec![(1_001, true)]);
+        assert_eq!(plan_fetch(&m, Some(1_003), BIG, 5.0).unwrap().due, None);
+
+        // ④ 轮还没收工、未反映代价 ≥ 阈值 ⇒ 给下一次调用 60 秒追平,追不上再取
+        let m = marks(vec![990], vec![c(1_000)], vec![(900, false)]);
+        assert_eq!(plan_fetch(&m, None, BIG, 5.0).unwrap(), FetchPlan { due: Some(1_060), pending_pct: plan_fetch(&m, None, BIG, 5.0).unwrap().pending_pct, latest_reading: 1_000, reason: "long-call" });
+
+        // ⑤ 轮没收工、代价不到阈值 ⇒ 等下一次调用写数,不取
+        assert_eq!(plan_fetch(&m, None, TINY, 5.0).unwrap().due, None);
+
+        // ⑥ 收工了但代价不到半个点 ⇒ 取回来多半还是同一个整数,不取
+        let m = marks(vec![990], vec![c(1_000)], vec![(1_001, true)]);
+        assert_eq!(plan_fetch(&m, None, TINY, 5.0).unwrap().due, None);
+
+        // ⑦ 新一轮已开始（最后一个生命周期事件是开始）⇒ 不按收工处理
+        let m = marks(vec![990], vec![c(1_000)], vec![(1_001, true), (1_010, false)]);
+        assert_eq!(plan_fetch(&m, None, BIG, 5.0).unwrap().reason, "long-call");
+
+        // ⑧ 没有 5h 读数（老版 CLI / API key）⇒ 这一路不生效,交还预计消耗
+        assert!(plan_fetch(&Marks::default(), None, BIG, 5.0).is_none());
+    }
+
+    /// 扫描时的线索:读数所在调用的开始 = 同文件上一条 token_count / task_started;
+    /// 子代理文件的轮事件不进 turn_marks（每次 exec 审核都会自成一轮）。
+    #[test]
+    fn scan_marks_call_starts_and_skips_subagent_turns() {
+        let dir = std::env::temp_dir().join(format!("tc_cxroll_marks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rl = r#""rate_limits":{"plan_type":"plus","primary":{"used_percent":5.0,"window_minutes":300,"resets_at":99999},"secondary":null}"#;
+        let tc = |ts: &str| format!(r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":10,"output_tokens":5}}}},{rl}}}}}"#);
+        let ev = |ts: &str, kind: &str| format!(r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"{kind}"}}}}"#);
+        let main = [
+            ev("2026-09-22T21:00:00Z", "task_started"),
+            tc("2026-09-22T21:00:20Z"),
+            tc("2026-09-22T21:01:00Z"),
+            ev("2026-09-22T21:01:01Z", "task_complete"),
+        ]
+        .join("
+");
+        let main_path = dir.join("main.jsonl");
+        std::fs::write(&main_path, main + "
+").unwrap();
+        let sub = [
+            r#"{"timestamp":"2026-09-22T21:00:30Z","type":"session_meta","payload":{"source":{"subagent":{"other":"guardian"}}}}"#.to_string(),
+            ev("2026-09-22T21:00:30Z", "task_started"),
+            tc("2026-09-22T21:00:33Z"),
+            ev("2026-09-22T21:00:33Z", "task_complete"),
+        ]
+        .join("
+");
+        let sub_path = dir.join("sub.jsonl");
+        std::fs::write(&sub_path, sub + "
+").unwrap();
+
+        let t = |s: &str| crate::collector::rfc3339_to_millis(s).unwrap() / 1000;
+        let mut out = Scan::default();
+        let mut m = Marks::default();
+        scan_file(&main_path, 0, &mut out, &mut m);
+        assert_eq!(m.reflects, vec![t("2026-09-22T21:00:00Z"), t("2026-09-22T21:00:20Z")], "开始 = task_started / 上一条 token_count");
+        assert_eq!(m.turn_marks, vec![(t("2026-09-22T21:00:00Z"), false), (t("2026-09-22T21:01:01Z"), true)]);
+        let mut s = Marks::default();
+        scan_file(&sub_path, 0, &mut out, &mut s);
+        assert_eq!(s.reflects, vec![t("2026-09-22T21:00:30Z")], "子代理读数照样算反映时刻");
+        assert!(s.turn_marks.is_empty(), "子代理的轮不算一轮收工");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 一个非法 UTF-8 字节（写到一半 / 磁盘问题）不许把整个文件的剩余部分吃掉。
     #[test]
     fn a_broken_byte_does_not_truncate_the_rest_of_the_file() {
@@ -867,7 +1213,7 @@ mod tests {
         bytes.push(b'\n');
         std::fs::write(&path, &bytes).unwrap();
         let mut out = Scan::default();
-        scan_file(&path, 0, &mut out);
+        scan_file(&path, 0, &mut out, &mut Marks::default());
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.readings.len(), 1, "坏字节之后的行必须照常读到");
         assert_eq!(out.calls.len(), 1);

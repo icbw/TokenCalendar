@@ -50,6 +50,11 @@ const MAX_POLL_SECS: u64 = 1800;
 /// 的读数正（`apply_flat_sample`）最多滞后这么久。mtime 没变时这一轮只花一次 stat。
 const HARVEST_SECS: u64 = 300;
 
+/// Codex 本地 token 最近这么多秒内出现过 = 活跃期（见主轮询的睡眠时长）。
+const CODEX_ACTIVE_SECS: i64 = 180;
+/// 活跃期主轮询最长睡这么久（秒）:一轮收工后最多这么久就能排上那次取数。
+const CODEX_ACTIVE_POLL_SECS: u64 = 15;
+
 /// 手动刷新的最小间隔（秒）。手动刷新走 `wake` 推进代际,一轮进行期间的连点会被代际
 /// 吸收成一轮,但「一轮结束后再点」不受约束——Claude 的 usage 端点按 User-Agent 分限流桶,
 /// 连打最容易把自己打进 429 冷却。被挡下的那次仍然退待机 + 广播,前端刷新动画照常落地。
@@ -97,7 +102,10 @@ pub fn note_local_tokens(
     // 余量决定阈值（开「低余量收紧」时 5h 剩余 ≤ 20% 阈值减半）
     let remaining = remaining_5h(app, platform);
     if let Some(due) = demand::note_tokens(platform, usage, now, remaining) {
-        if idle::pull_forward(platform, due) {
+        // Codex 不提前兜底轮:它的取数时机在收割之后才定（rollout 活着 → rollout 计划;
+        // 不活 → 预计消耗,经 `demand:next_due` 进睡眠时长）。提前兜底轮会绕过计划,
+        // 本地读数刚追平也照样打一次请求。
+        if platform != Platform::Codex && idle::pull_forward(platform, due) {
             reschedule();
         }
         crate::dev_log!(
@@ -109,10 +117,9 @@ pub fn note_local_tokens(
         );
     }
     // Codex 的 rate_limits 与这批 token 写在同一份 rollout 里 ⇒ 读数此刻已在本地文件上。
-    // 让主轮询醒来零请求收割一次,快照跟着每批 token 走,不必等预计消耗攒到阈值
-    // （阈值那一路只决定**要不要发请求**）。`reschedule` 不推进代际 = 不触发全量取数轮;
-    // 收割有 rollout 世代闸门,文件没长就只是一次 stat。排在 `note_tokens` 之后:
-    // 收割推进快照会清掉刚记进去的这批账目,不会重复计。
+    // 让主轮询醒来零请求收割一次:快照跟着每批 token 走,取数计划随之重算
+    // （`codex_rollout:plan_fetch`）。`reschedule` 不推进代际 = 不触发全量取数轮;
+    // 收割有 rollout 世代闸门,文件没长就只是一次 stat。
     if platform == Platform::Codex {
         reschedule();
     }
@@ -579,6 +586,8 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     Platform::Claude => adapters.claude.is_dead(*platform),
                 };
                 let prev = write_store.load_snapshot(*platform);
+                // 是否真的发了网络请求（只有它占取数最小间隔,见 demand.rs）
+                let mut networked = false;
                 // 快照
                 let snap = if dead && !changed {
                     // 判死零网络,但桌面端采样是本地文件,照读（Claude 专属回落）
@@ -606,6 +615,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     // 防两处同时进入 fetch_one（冷却检查与 429 冷却写入之间无
                     // 原子性,各发一请求会加速触限）。
                     let _lease = adapters.lock_fetch(*platform);
+                    networked = true;
                     let snap = fetch_one(&adapters, *platform, via);
                     drop(_lease);
                     // 响应顶层的 `account_id` 是最权威的一路——服务端把这次用量记在谁
@@ -630,9 +640,10 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                 if advanced {
                     record_pair(&write_store, *platform, prev.as_ref(), &snap, done_at);
                 }
-                // 尝试记进账目：最小间隔从**尝试**时刻起算,没进展则把应检时刻
-                // 按退避推后（否则故障期间每个采集轮都会重试一次,见 demand.rs）。
-                demand::note_attempt(*platform, done_at, advanced);
+                // 尝试记进账目：最小间隔从**发了请求的尝试**时刻起算（本地零成本的
+                // 探测 / 判死跳过不占间隔）;没进展则把应检时刻按退避推后
+                // （否则故障期间每个采集轮都会重试一次,见 demand.rs）。
+                demand::note_attempt(*platform, done_at, advanced, networked);
                 // 兜底应检时刻按设置档顺延（待机不改变取数频次）
                 idle::schedule_next(*platform, base, done_at);
                 // 广播按**落库后真的变了**判（失败轮只推进 status、安静轮原样保留,
@@ -661,7 +672,16 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         let gen_before = *guard;
         // 收割节律参与封顶（零网络,见 HARVEST_SECS）：兜底档再长也不至于让
         // 桌面端样本在库外压半小时。无绑定时同样照睡 HARVEST_SECS——收割不看绑定。
-        let wait = idle::next_wait_secs(now, poll_secs()).min(HARVEST_SECS);
+        let mut wait = idle::next_wait_secs(now, poll_secs()).min(HARVEST_SECS);
+        // Codex 的应检时刻不走兜底表（见 note_local_tokens）,单独并进睡眠时长
+        if let Some(due) = demand::next_due(Platform::Codex, now) {
+            wait = wait.min((due - now).max(1) as u64);
+        }
+        // Codex 活跃期缩短睡眠:一轮收工的 `task_complete` 不带 token,采集线程不会为它
+        // 报信,只能靠这里按世代闸门看见（零网络,文件没长只是 stat）。
+        if demand::active_within(Platform::Codex, now, CODEX_ACTIVE_SECS) {
+            wait = wait.min(CODEX_ACTIVE_POLL_SECS);
+        }
         let (guard, _) = WAKE
             .1
             .wait_timeout(guard, Duration::from_secs(wait))

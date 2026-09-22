@@ -11,7 +11,15 @@
 //! - **达阈即取**：预计消耗 ≥ 阈值（开「余量低时收紧」后,5h 剩余 ≤ `LOW_REMAINING_PCT`
 //!   时阈值减半）。
 //! - **最小间隔**：两次取数**尝试**之间至少 `MIN_GAP_SECS`。起点是尝试时刻而非上次成功时刻,
-//!   否则取数连续失败时间隔判据永远成立,每个采集轮都会再打一次。
+//!   否则取数连续失败时间隔判据永远成立,每个采集轮都会再打一次。**只有真发了网络请求的
+//!   尝试才算起点**:本地零成本的读取（Claude 桌面端采样证明没涨 / 判死轮跳过 / Codex rollout
+//!   收割）不占这个间隔——间隔保护的是限流预算,本地读取不花它。
+//!
+//! **Codex 另有一路**:rollout 里每次调用都带着服务端读数,只要这一路「活着」（最近
+//! `ROLLOUT_LIVE_SECS` 内有 5h 读数）,取数时机改由 `codex_rollout:plan_fetch` 决定
+//! ——只在本地读数追不上的扣费上排请求（一轮收工 / 大调用后久无下一次调用）,
+//! 预计消耗达阈值不再单独触发（账目照记,API 读数对的标定样本仍要它）。这一路同样
+//! 受最小间隔与退避约束;不活时自动退回按预计消耗取数。
 //!
 //! 账目在取到**新读数**时才清零（失败轮不清）;清零前的累计代价与分模型明细交给 calib.rs
 //! 落一条标定样本。没进展的轮（取数失败 / 判死 / 读数没推进）把应检时刻按 `backoff_secs`
@@ -27,6 +35,10 @@ use super::model::Platform;
 
 /// 两次取数**尝试**的最小间隔（秒）。
 pub const MIN_GAP_SECS: i64 = 60;
+
+/// rollout 读数这么久（秒）没有新的 5h 读数,就不再算「活着」,退回按预计消耗取数。
+/// 取兜底档封顶:再久本地也没有任何可比的信号了。
+const ROLLOUT_LIVE_SECS: i64 = 1800;
 
 /// 没进展时的退避封顶（秒;= 兜底档封顶,再久也没有意义——兜底轮会兜住）。
 const MAX_BACKOFF_SECS: i64 = 1800;
@@ -106,6 +118,12 @@ struct Track {
     fail_streak: u32,
     /// 已排定但尚未执行的应检时刻（0 = 无）。
     due: i64,
+    /// rollout 取数计划给出的应检时刻（0 = 本地读数追得上,不必取;仅 Codex）。
+    rollout_due: i64,
+    /// rollout 这一路「活着」的截止时刻（最新 5h 读数 + `ROLLOUT_LIVE_SECS`）。
+    rollout_live_until: i64,
+    /// 最近一次发了请求且取到新读数的时刻（0 = 本进程还没有）。
+    last_api_at: i64,
 }
 
 static TRACKS: LazyLock<Mutex<HashMap<Platform, Track>>> =
@@ -182,9 +200,55 @@ pub fn note_tokens(
     plan(t, platform, usage, now, threshold, scale)
 }
 
-/// 该平台是否有已到期的取数需求（主轮询每轮问一次）。
+/// 该平台是否有已到期的取数需求（主轮询每轮问一次）。rollout 活着时只认 rollout 计划。
 pub fn due_now(platform: Platform, now: i64) -> bool {
-    tracks().get(&platform).is_some_and(|t| t.due > 0 && now >= t.due)
+    tracks().get(&platform).is_some_and(|t| {
+        let due = if now < t.rollout_live_until { t.rollout_due } else { t.due };
+        due > 0 && now >= due
+    })
+}
+
+/// 该平台下一个应检时刻（主轮询算睡眠时长用;无 → None）。
+pub fn next_due(platform: Platform, now: i64) -> Option<i64> {
+    tracks().get(&platform).and_then(|t| {
+        let due = if now < t.rollout_live_until { t.rollout_due } else { t.due };
+        (due > 0).then_some(due)
+    })
+}
+
+/// 最近一次**取到新读数的 API 请求**的时刻（0 = 本进程还没有）。它反映请求之前
+/// 已结束的全部调用——rollout 取数计划的「最新被反映时刻」要把它算进去。
+pub fn last_api_reading(platform: Platform) -> i64 {
+    tracks().get(&platform).map_or(0, |t| t.last_api_at)
+}
+
+/// 最近 `secs` 秒内是否收到过该平台的本地 token（主轮询据此在活跃期缩短睡眠,
+/// 及时看见一轮收工的 `task_complete`——它不带 token,采集线程不会为它报信）。
+pub fn active_within(platform: Platform, now: i64, secs: i64) -> bool {
+    tracks().get(&platform).is_some_and(|t| t.last_token_at > 0 && now - t.last_token_at <= secs)
+}
+
+/// 下一次**网络**取数最早什么时候可以发:上次发请求的时刻 + 最小间隔（没进展时按退避）。
+fn earliest_retry(t: &Track) -> i64 {
+    if t.last_attempt_at == 0 {
+        return 0;
+    }
+    let gap = if t.fail_streak > 0 { backoff_secs(t.fail_streak) } else { MIN_GAP_SECS };
+    t.last_attempt_at + gap
+}
+
+/// 纯逻辑：落一份 rollout 取数计划（见 `set_rollout_plan`）。
+fn apply_rollout_plan(t: &mut Track, due: Option<i64>, latest_reading: i64) {
+    t.rollout_live_until = latest_reading + ROLLOUT_LIVE_SECS;
+    t.rollout_due = due.map_or(0, |d| d.max(earliest_retry(t)));
+}
+
+/// rollout 收割算出的取数计划（`codex_rollout:ingest` 每次收割后调用）:
+/// `due` = 应取时刻（None = 本地追得上）,`latest_reading` = 最新 5h 读数时刻。
+/// 应取时刻不早于最小间隔 / 退避允许的时刻——收割再频繁也不会绕过它们。
+pub fn set_rollout_plan(platform: Platform, due: Option<i64>, latest_reading: i64) {
+    let mut g = tracks();
+    apply_rollout_plan(g.entry(platform).or_default(), due, latest_reading);
 }
 
 /// 距上次读数的预计消耗。
@@ -194,18 +258,35 @@ pub fn estimated_pct(platform: Platform) -> f64 {
 }
 
 /// 纯逻辑：记一轮取数尝试（见 `note_attempt`）。
-fn record_attempt(t: &mut Track, now: i64, advanced: bool) {
-    t.last_attempt_at = now;
+/// `networked` = 真的发了网络请求;只有它推进最小间隔的起点。
+fn record_attempt(t: &mut Track, now: i64, advanced: bool, networked: bool) {
+    if networked {
+        t.last_attempt_at = now;
+    }
     if advanced {
         t.fail_streak = 0;
+        if networked {
+            t.last_api_at = now;
+        }
+        // 取到了新读数:这份计划要等下次收割按新的「最新被反映时刻」重算
+        t.rollout_due = 0;
         return;
     }
     // 需求仍挂着（账目不清,下轮照样该取）,只是把重试推后。
     // 只推**已到期**的需求：兜底轮 / 手动刷新轮与尚未到期的 token 需求无关,
     // 拿失败去改它会把一个更晚的应检时刻提前（backoff 反而成了提前量）。
-    if t.due > 0 && now >= t.due {
+    // rollout 计划同理（它与 t.due 是同一个需求的两种来源,退避计数共用、只计一次）。
+    let due_hit = t.due > 0 && now >= t.due;
+    let rollout_hit = t.rollout_due > 0 && now >= t.rollout_due;
+    if due_hit || rollout_hit {
         t.fail_streak = t.fail_streak.saturating_add(1);
-        t.due = now + backoff_secs(t.fail_streak);
+        let next = now + backoff_secs(t.fail_streak);
+        if due_hit {
+            t.due = next;
+        }
+        if rollout_hit {
+            t.rollout_due = next;
+        }
     }
 }
 
@@ -213,9 +294,9 @@ fn record_attempt(t: &mut Track, now: i64, advanced: bool) {
 /// `advanced` = 拿到了**更新的读数**。没进展就把应检时刻按退避推后——
 /// 否则应检时刻永远停在过去,故障期间每个采集轮都会重试一次,而且触发来源会被
 /// 恒判成 token（兜底轮的零请求探测因此永久失效）。
-pub fn note_attempt(platform: Platform, now: i64, advanced: bool) {
+pub fn note_attempt(platform: Platform, now: i64, advanced: bool, networked: bool) {
     let mut g = tracks();
-    record_attempt(g.entry(platform).or_default(), now, advanced);
+    record_attempt(g.entry(platform).or_default(), now, advanced, networked);
 }
 
 /// 成功取到新读数：取走账目（供落标定样本）并清零,记下新的账目起点。
@@ -228,6 +309,7 @@ pub fn take_account(platform: Platform, now: i64) -> Account {
     t.unknown_cost = 0.0;
     t.breakdown.clear();
     t.due = 0;
+    t.rollout_due = 0;
     t.since = now;
     acc
 }
@@ -327,7 +409,7 @@ mod tests {
             Some(5_000)
         );
         // 第一次没进展:应检时刻退到 +60,需求与账目都还在
-        record_attempt(&mut t, 5_000, false);
+        record_attempt(&mut t, 5_000, false, true);
         assert_eq!(t.due, 5_060);
         assert!(t.cost > 0.0, "失败轮不清账");
         // 退避期内又来一笔 token → 不能把重试拉回当下
@@ -337,10 +419,10 @@ mod tests {
             "退避时刻不被新 token 抹掉"
         );
         // 连续没进展 → 指数推后
-        record_attempt(&mut t, 5_060, false);
+        record_attempt(&mut t, 5_060, false, true);
         assert_eq!(t.due, 5_060 + 120);
         // 拿到新读数 → 退避计数清零
-        record_attempt(&mut t, 9_000, true);
+        record_attempt(&mut t, 9_000, true, true);
         assert_eq!(t.fail_streak, 0);
         assert_eq!(t.last_attempt_at, 9_000);
     }
@@ -349,7 +431,7 @@ mod tests {
     fn a_stalled_round_never_pulls_an_unripe_due_earlier() {
         // 兜底轮失败时,尚未到期的 token 需求（+500 秒）不该被改成 +60 秒
         let mut t = Track { since: 1_000, last_token_at: 1_000, last_attempt_at: 1_000, due: 5_500, ..Default::default() };
-        record_attempt(&mut t, 5_000, false);
+        record_attempt(&mut t, 5_000, false, true);
         assert_eq!(t.due, 5_500, "未到期的需求不受本轮失败影响");
         assert_eq!(t.fail_streak, 0);
     }
@@ -358,7 +440,7 @@ mod tests {
     fn a_stalled_fallback_round_schedules_nothing() {
         // 没有挂起需求的轮（纯兜底轮）没取到数 → 只推进尝试时刻,不凭空排程
         let mut t = Track { since: 1_000, last_token_at: 1_000, last_attempt_at: 1_000, ..Default::default() };
-        record_attempt(&mut t, 4_000, false);
+        record_attempt(&mut t, 4_000, false, true);
         assert_eq!(t.due, 0);
         assert_eq!(t.fail_streak, 0);
         assert_eq!(t.last_attempt_at, 4_000);
@@ -398,6 +480,46 @@ mod tests {
         set_policy(99.0, true);
         assert_eq!(threshold_pct(), MAX_THRESHOLD_PCT, "越界钳制");
         set_policy(DEFAULT_THRESHOLD_PCT, true);
+    }
+
+    /// rollout 计划:活着时只认它（预计消耗的 due 不单独触发）,且受最小间隔与退避约束;
+    /// 不活时退回预计消耗。
+    #[test]
+    fn rollout_plan_takes_over_timing_while_live() {
+        let mut t = Track { due: 1_000, last_attempt_at: 950, ..Track::default() };
+        // 活着 + 本地追得上 → 预计消耗的 due 不作数
+        apply_rollout_plan(&mut t, None, 1_000);
+        let due = |t: &Track, now: i64| {
+            let d = if now < t.rollout_live_until { t.rollout_due } else { t.due };
+            d > 0 && now >= d
+        };
+        assert!(!due(&t, 1_005), "rollout 活着且追得上:不因预计消耗取数");
+        // 计划要取,但离上次发请求不满最小间隔 → 推到间隔之后
+        apply_rollout_plan(&mut t, Some(980), 1_000);
+        assert_eq!(t.rollout_due, 950 + MIN_GAP_SECS);
+        // 取失败 → 按退避推后;下一次收割重算也不许把它拉回来
+        record_attempt(&mut t, 1_010, false, true);
+        assert_eq!((t.fail_streak, t.rollout_due), (1, 1_010 + backoff_secs(1)));
+        apply_rollout_plan(&mut t, Some(1_011), 1_020);
+        assert_eq!(t.rollout_due, 1_010 + backoff_secs(1));
+        // 取到新读数 → 计划清空,记下 API 读数时刻
+        record_attempt(&mut t, 1_100, true, true);
+        assert_eq!((t.rollout_due, t.last_api_at, t.fail_streak), (0, 1_100, 0));
+        // 最新 5h 读数超过 ROLLOUT_LIVE_SECS → 不再活着,退回预计消耗
+        t.due = 3_000;
+        assert!(due(&t, 1_020 + ROLLOUT_LIVE_SECS + 1_000), "不活时按预计消耗的 due");
+    }
+
+    /// 本地零成本读取（桌面端探测 / 判死跳过）不占最小间隔:紧随其后的真实需求照常立即排。
+    #[test]
+    fn local_only_attempts_do_not_start_the_min_gap() {
+        let mut t = Track::default();
+        record_attempt(&mut t, 5_000, true, false);
+        assert_eq!(t.last_attempt_at, 0, "零网络的轮不推进间隔起点");
+        record_attempt(&mut t, 5_000, true, true);
+        assert_eq!(t.last_attempt_at, 5_000);
+        record_attempt(&mut t, 5_030, true, false);
+        assert_eq!(t.last_attempt_at, 5_000, "之后的本地读取也不挪动它");
     }
 
     #[test]
