@@ -22,6 +22,7 @@
 //! 旧游标（无 `pending` 字段）一次性补账：源里有 usage 但 `turn_raw` 没有该 turn_seq 的请求 = 当年被
 //! 越过的 running 请求,补入 daily_usage 与轮层（轮层与 daily_usage 同事务写入,缺轮即未入账）。
 //! 大体积 messages 由 serde derive 按字段跳过,不构建 Value 树。
+//! 读文件一律整读进内存再解析、句柄即关（源以「临时文件 + rename 覆盖」保存,读者占着句柄会让它保存失败）。
 //!
 //! 模型归属（纯本地）：本地消息 `<会话>/messages/<id>.json` 的 `extra.modelId`（`extra` 是 JSON
 //! 字符串;按 `requests[].messages` 顺序取首条非 helper、requestId 相符的消息,通常下标 0 的 user
@@ -217,6 +218,11 @@ impl CodebuddyAdapter {
             })
             .unwrap_or_default();
         CodebuddyAdapter { data_dir, meta_dbs }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(data_dir: PathBuf) -> Self {
+        CodebuddyAdapter { data_dir, meta_dbs: vec![] }
     }
 
     /// 全部 history 根：Data/<profile>/CodeBuddyIDE/<sub>/history（层数固定但
@@ -437,9 +443,12 @@ impl Adapter for CodebuddyAdapter {
                 continue;
             }
             // 截断/重写：count 超过实际条数 → 归零重读（已聚合不回滚）
-            let file: IndexFile = match std::fs::File::open(&path)
+            // 先整文件读进内存再解析：CodeBuddy 保存 = 写临时文件再 rename 覆盖 index.json,Windows 上
+            // 目标只要被任何进程打开着 rename 就 EPERM（它提示「无法保存消息」）。从未缓冲的 File 直接
+            // from_reader 是逐字节读,85KB 的文件句柄要占 ~0.66s;fs:read 读完即关,约 0.1ms。
+            let file: IndexFile = match std::fs::read(&path)
                 .map_err(|e| e.to_string())
-                .and_then(|f| serde_json::from_reader(f).map_err(|e| e.to_string()))
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
             {
                 Ok(f) => f,
                 Err(_) => continue, // 文件此刻不可读/坏行,下轮重试

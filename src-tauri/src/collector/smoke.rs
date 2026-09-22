@@ -341,3 +341,29 @@ fn codebuddy_backfill_on_db_copy() {
     assert_eq!(second, Some(0), "第二遍不应再入账");
     assert!(store.test_project_conservation().iter().all(|l| !l.contains("codebuddy")), "{:?}", store.test_project_conservation());
 }
+
+/// 临时测量：真实 CodeBuddy 适配器反复采集时,外部「写临时文件 + rename 覆盖 index.json」的失败率。
+/// TC_CB_HOLD_SRC = 一份真实 index.json;TC_CB_WRITER = writer.js 路径。
+#[test]
+#[ignore]
+fn codebuddy_collect_vs_rename() {
+    let src = std::env::var("TC_CB_HOLD_SRC").expect("TC_CB_HOLD_SRC");
+    let writer = std::env::var("TC_CB_WRITER").expect("TC_CB_WRITER");
+    let dir = std::env::temp_dir().join(format!("tc_cb_hold_{}", std::process::id()));
+    let sess = dir.join("Data").join("p1").join("CodeBuddyIDE").join("p1").join("history").join("ws").join("s1");
+    std::fs::create_dir_all(&sess).unwrap();
+    let target = sess.join("index.json");
+    std::fs::copy(&src, &target).unwrap();
+    let child = std::process::Command::new("node").arg(&writer).arg(&target).arg("5000").stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let adapter = super::codebuddy::CodebuddyAdapter::for_test(dir.join("Data"));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut rounds = 0;
+    while std::time::Instant::now() < end {
+        let mut store = Store::open_in_memory().unwrap();
+        let _ = adapter.collect(&mut store);
+        rounds += 1;
+    }
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("collect rounds={rounds}; writer: {}", String::from_utf8_lossy(&out.stdout).trim());
+}
