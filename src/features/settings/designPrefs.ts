@@ -138,6 +138,9 @@ export interface DesignPrefs {
   /** 选定单个项目时,Tasks / Insights 的范围自动切到该项目生命周期（undefined = 开）。
    * 用户在项目生命周期模式下手改范围即写 false;范围控件的「Project span」按钮写回 true。 */
   projectAutoRange?: boolean
+  /** 项目固定配色:project_key → 色板槽位（projectColors.ts 的 PROJECT_PALETTE 下标）。
+   * 首次出图时分配、此后不变,跨会话 / 跨范围 / 跨视图同色;由 projectColors.ts 写入。 */
+  projectColors?: Record<string, number>
   /** 项目自动折叠规则（设置·Projects）:根会话数 < scratchMinSessions 且总轮数 < scratchMinTurns 的
    * 目录折叠进内置 Scratch 项目;scratchUnknown = 无目录源（unknown）归 Scratch。undefined = 开 / 2 / 5 / 开。
    * **写入方是 Rust `set_scratch_rule`**（合并写 prefs.json 并下发运行时值）;前端改规则时须同时 setDesignPrefs
@@ -267,6 +270,18 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.projectAutoRange !== undefined && typeof p.projectAutoRange !== 'boolean') {
     delete p.projectAutoRange
   }
+  if (p.projectColors !== undefined) {
+    const ok = typeof p.projectColors === 'object' && p.projectColors !== null && !Array.isArray(p.projectColors)
+    if (!ok) {
+      delete p.projectColors
+    } else {
+      const clean: Record<string, number> = {}
+      for (const [k, v] of Object.entries(p.projectColors)) {
+        if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 64) clean[k] = v
+      }
+      p.projectColors = clean
+    }
+  }
   // 自动折叠规则:布尔 + 整数域（与 Rust project_meta:SCRATCH_*_BOUNDS 同域）。
   for (const k of ['scratchRuleEnabled', 'scratchUnknown'] as const) {
     if (p[k] !== undefined && typeof p[k] !== 'boolean') delete p[k]
@@ -377,7 +392,14 @@ async function bootstrap(): Promise<void> {
     loaded = await migrateLegacyLocalStorage()
   }
   prefs = { ...DEFAULTS, ...(loaded ?? {}) }
+  ready = true
   for (const fn of listeners) fn(prefs)
+}
+
+/** prefs.json 已载入（此前的快照只来自 localStorage 桥,不宜由非用户操作触发写盘）。 */
+let ready = false
+export function designPrefsReady(): boolean {
+  return ready
 }
 
 /** 写盘节流（滑条高频 setDesignPrefs;600ms 静默窗口合并写）。

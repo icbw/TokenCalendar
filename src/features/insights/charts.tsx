@@ -20,7 +20,7 @@ function familyOf(key: string): string {
 }
 
 /** 家族 → 色相绑定池（协调紫蓝系,饱和度/明度统一在图表友好区）。 */
-const FAMILY_HUES = [
+export const FAMILY_HUES = [
   262, // 紫（主品牌族）
   217, // 蓝
   190, // 青

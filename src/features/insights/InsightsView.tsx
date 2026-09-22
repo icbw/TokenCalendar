@@ -16,6 +16,7 @@ import PricingBlock from './PricingBlock'
 import { HOUR_BUCKET_MAX_DAYS, rangeShortLabel, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
 import { openProjectManager } from '../projects/projectManagerStore'
+import { projectColor } from './projectColors'
 import '../projects/projects.css'
 import './insights.css'
 
@@ -50,6 +51,8 @@ function useTrendBlock() {
   const [kind, setKind] = useState<ChartKind>('line')
   const [filterKey, setFilterKey] = useState<string>('') // '' = 全部
   const [data, setData] = useState<RangeSeriesResult | null>(null)
+  /** data 所属的展示维:切维后新数据到达前 data 仍是旧维的系列,不能按新维着色（否则模型键会占掉项目色板槽位）。 */
+  const [dataDim, setDataDim] = useState<Dimension>(dimension)
   /** 单模型分项:TOKEN_PARTS 顺序的四条序列（仅 partsMode 时拉取）。 */
   const [parts, setParts] = useState<(RangeSeriesResult | null)[] | null>(null)
   const [loading, setLoading] = useState(false)
@@ -127,6 +130,7 @@ function useTrendBlock() {
     void Promise.all([req, partsReq]).then(([res, partRes]) => {
       if (cancelled) return
       setData(res)
+      setDataDim(dimension)
       setParts(partRes)
       setLoading(false)
     })
@@ -139,8 +143,14 @@ function useTrendBlock() {
   const series: SeriesSpec[] = useMemo(() => {
     if (!data) return []
     if (partsMode && parts && data.seriesKeys.length > 0) return partSeries(data, parts, filterKey)
-    return data.seriesKeys.map((k, i) => ({ key: k, label: seriesLabel(k, data.seriesLabels[i]), values: data.points.map((p) => p.values[i] ?? 0) }))
-  }, [data, parts, partsMode, filterKey, seriesLabel])
+    return data.seriesKeys.map((k, i) => ({
+      key: k,
+      label: seriesLabel(k, data.seriesLabels[i]),
+      values: data.points.map((p) => p.values[i] ?? 0),
+      // 项目维:项目固定配色（projectColors.ts）;其余维按 key 稳定取色
+      color: dataDim === 'project' ? projectColor(k) : undefined,
+    }))
+  }, [data, parts, partsMode, filterKey, seriesLabel, dataDim])
   const timeFmt = isTimeMetric(metric) ? formatDuration : undefined
   const buckets = data?.points.map((p) => p.bucket) ?? []
 
@@ -259,7 +269,7 @@ function useTrendBlock() {
                 onClick={() => pickFilter(o.key)}
                 title={filterKey === o.key ? 'Click to clear filter' : `Only ${dimension === 'project' ? projectTooltip(o.key) : o.label}`}
               >
-                <span className="legend-swatch" style={{ background: colorFor(o.key) }} />
+                <span className="legend-swatch" style={{ background: dataDim === 'project' ? projectColor(o.key) : colorFor(o.key) }} />
                 {o.label}
               </button>
             ))}

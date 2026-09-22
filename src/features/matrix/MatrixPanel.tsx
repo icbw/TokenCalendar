@@ -12,6 +12,7 @@ import { events, usageService } from '../../services'
 import type { BreakdownDay } from '../../services'
 import { LineChart, StackedBarChart, type CellColumns, type SeriesSpec } from '../insights/charts'
 import { projectDisplayName } from '../insights/analytics'
+import { projectColor } from '../insights/projectColors'
 import type { GroupBy } from './UsageMatrixView'
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
@@ -156,6 +157,7 @@ export default function MatrixPanel({
             key: k,
             label: k === '__total__' ? 'All sources' : groupBy === 'project' ? projectDisplayName(k) : res.seriesLabels[i] ?? k,
             values: res.points.map((p) => p.values[i] ?? 0),
+            color: groupBy === 'project' && k !== '__total__' ? projectColor(k) : undefined,
           })),
         )
       })
