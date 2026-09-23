@@ -260,9 +260,13 @@ export async function getModelUsage(
   })
 }
 
+/** 「一条消息多大」取自哪批消息（三级口径）：recent_own = 这个模型自己最近 14 天的消息（≥20 条）；
+ * history_own = 它自己近 30 天的消息（≥5 条）；all_messages = 你最近的全部消息按它的价格估。 */
+export type SizeBasis = 'recent_own' | 'history_own' | 'all_messages'
+
 /** 一个模型的每条消息额度代价（Rust query:MessageCostRow）。
- * 口径：你最近 14 天的全部消息，每条换成这个模型的官方标价，取**均值**；再乘这个模型自己
- * 的额度系数（样本不够回落平台系数）。模型之间的差别只来自价格与额度计价。 */
+ * 口径：一条消息的平均大小（取自哪批消息见 basis），按这个模型的官方标价估价，**取均值**；
+ * 再乘这个模型自己的额度系数（样本不够回落平台系数）。 */
 export interface MessageCostRow {
   /** collector 里的模型键，原样。 */
   model_key: string
@@ -270,8 +274,12 @@ export interface MessageCostRow {
   display_name: string
   /** 近 30 天以它为主的用户轮数（选主力模型、设置页候选用；不是估计的样本）。 */
   turns: number
-  /** 你最近的一条消息换成这个模型发，平均值多少美元当量（官方 API 标价）。 */
+  /** 一条消息平均值多少美元当量（官方 API 标价）。 */
   usd_per_turn: number
+  /** 「一条多大」取自哪批消息。 */
+  basis: SizeBasis
+  /** 那批消息的条数。 */
+  basis_n: number
   /** 这个模型的额度系数（百分点 / 美元当量，5h）。 */
   quota_factor: number
   /** quota_factor 是它自己的（false = 样本不够，回落平台系数）。 */

@@ -469,12 +469,16 @@ export default function PricingBlock() {
                 })}
               </tbody>
             </table>
-            <p className="price-note">
-              Official API list prices, shipped with the app and updated with it — hover a model for the source entry.
-              An arrow marks a price changed from the model's previous period (red up, green down) — click it for the
-              amount.
-              Cache-write prices are the common tier: some platforms price it by retention, and local collection keeps a
-              single cache-write bucket.
+            {/* 缓存写按常用档是文案红线,常驻可;其余说明放 hover*/}
+            <p
+              className="price-note"
+              title={
+                'Shipped with the app and updated with it — hover a model for the source entry.\n' +
+                'An arrow marks a price changed from the model\'s previous period (red up, green down); click it for the amount.\n' +
+                'Cache write uses the common tier: some platforms price it by retention, and local collection keeps a single cache-write bucket.'
+              }
+            >
+              Official API list prices; arrows mark a price change (click for the amount). Cache write uses the common tier.
             </p>
           </>
         )}

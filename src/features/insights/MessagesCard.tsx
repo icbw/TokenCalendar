@@ -5,15 +5,16 @@
 //
 // 口径（与悬浮球 hover 同源,见 get_message_budget）：
 // - 「消息」= 用户发起的一次对话（request_count 口径）,不是模型调用 / 工具调用;
-// - 一条消息多大 = 你最近 14 天全部消息的**均值**,每条按各模型的官方标价估价（同一批消息,
-//   模型之间的差别只来自价格）× 子会话开销 × 该模型的额度系数（不够样本回落平台系数）;
+// - 一条消息多大 = 三级取样的**均值**（最近常用的模型看它自己最近 14 天的消息;最近没怎么用的看它
+//   自己近 30 天的;自己的太少才拿全部消息按它的价格估）× 子会话开销 × 该模型的额度系数
+//   （不够样本回落平台系数）;
 //   周份额 = 5h 份额 × 周窗 / 5h 窗的大小之比;
 // - 剩余 % 取**当前快照**,在这里除——与悬浮球表盘同一时刻;窗口已过期的按 100% 算;
 // - 周窗口**不一定正好 7 天**（平台会主动提前重置）,起点来自读数里的重置痕迹,不从窗尾倒推。
 import { useEffect, useState } from 'react'
 import { events, subscriptionService } from '../../services'
 import type { SubscriptionPlatform, SubscriptionSnapshot } from '../../services'
-import type { MessageBudget } from '../../services/subscriptionService'
+import type { MessageBudget, MessageCostRow } from '../../services/subscriptionService'
 import type { DayRange } from '../../services/types'
 import { abbrevCount, shortModelName } from '../orb/messageBudget'
 import { colorFor } from './charts'
@@ -32,6 +33,14 @@ function remainOf(snap: SubscriptionSnapshot | undefined, kind: string, nowSec: 
   if (!w) return null
   if (w.resets_at !== null && w.resets_at <= nowSec) return 100
   return Math.max(0, Math.min(100, 100 - w.used_percent))
+}
+
+/** 这一行的「一条多大」取自哪批消息（悬停说明）。 */
+function basisText(r: MessageCostRow): string {
+  const name = shortModelName(r.model_key)
+  if (r.basis === 'recent_own') return `Sized on your last ${r.basis_n} ${name} messages (last 14 days)`
+  if (r.basis === 'history_own') return `Sized on your ${r.basis_n} ${name} messages from the last 30 days (little recent use)`
+  return `Sized on all your ${r.basis_n} recent messages, priced for ${name} (too few of its own)`
 }
 
 /** 「~剩 / 满」一格;每条代价未知 → —。 */
@@ -158,7 +167,8 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                   <td
                     className="price-col-model"
                     title={
-                      `${r.model_key}\nYour average message ≈ $${r.usd_per_turn.toFixed(2)} at this model's list price` +
+                      `${r.model_key}\n${basisText(r)}` +
+                      `\nAverage message ≈ $${r.usd_per_turn.toFixed(2)} at this model's list price` +
                       `\nA full 5-hour window ≈ $${(100 / r.quota_factor).toFixed(0)} of this model at list price ` +
                       (r.factor_measured ? '(measured on your readings)' : '(platform average — not enough readings on this model yet)')
                     }
@@ -184,16 +194,20 @@ export default function MessagesCard({ platform, range, refreshTick }: {
               ))}
             </tbody>
           </table>
-          <p className="price-note">
-            Estimates. A message is one prompt you send. Every model is priced on the same messages — the average of
-            your last {budget.sample} messages{budget.sample_from ? ` since ${stamp(budget.sample_from)}` : ''}, big tasks
-            included, with subagent and auto-review overhead spread in — so differences between models come from price.
-            Each model then uses its own measured share of the quota per dollar, because the platforms do not charge
-            every model against the quota exactly at list price.
-            {week && week.scale === null && ' Weekly columns need more quota readings on this plan before they can be estimated.'}
-            {' '}The weekly window follows the platform's own resets and is not always 7 days — it can reset early. Resets
-            are read from quota readings: two accounts on the same plan cannot be told apart, and switching between them
-            can look like a reset.
+          {/* 说明只留一行：完整口径放 hover,避免卡片底部堆成一段*/}
+          <p
+            className="price-note"
+            title={
+              'A message is one prompt you send, averaged with big tasks included and subagent and auto-review overhead spread in.\n' +
+              'A model you use a lot is sized on its own recent messages; one you have not used lately on its own last 30 days; ' +
+              'one you have barely used on all your recent messages, priced for it.\n' +
+              'Each model uses its own measured share of the quota per dollar — platforms do not charge every model at list price.\n' +
+              'The weekly window follows the platform\'s own resets and can reset early. Two accounts on the same plan cannot be told apart, and switching between them can look like a reset.'
+            }
+          >
+            Estimates from your own messages and each model's measured quota use; weekly window follows actual resets.
+            Hover a model or this line for details.
+            {week && week.scale === null && ' Weekly columns need more readings on this plan.'}
           </p>
         </>
       )}

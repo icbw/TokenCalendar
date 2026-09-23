@@ -2605,10 +2605,12 @@ fn message_budget_on_real_db() {
         }
         for r in &b.rows {
             println!(
-                "  {:<22} {:<24} {:>4} 轮  均值 ${:>7.4}  系数 {:>5.2}{}  一条 {:>6.3}%  满窗 ≈{:>6.0} 条  周满窗 ≈{:>6.0} 条",
+                "  {:<22} {:<24} {:>4} 轮  {:?}({})  均值 ${:>7.4}  系数 {:>5.2}{}  一条 {:>6.3}%  满窗 ≈{:>6.0} 条  周满窗 ≈{:>6.0} 条",
                 r.model_key,
                 r.display_name,
                 r.turns,
+                r.basis,
+                r.basis_n,
                 r.usd_per_turn,
                 r.quota_factor,
                 if r.factor_measured { "实测" } else { "平台" },

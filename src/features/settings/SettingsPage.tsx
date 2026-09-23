@@ -1426,8 +1426,8 @@ function SubscriptionsTab() {
             <div className="setting-note">
               Shown when hovering the orb's 5-hour dial as messages left / messages in a full window, e.g. “GPT-6 Astra:
               ~3/30”. A message is one prompt you send. Estimated from the average size of
-              your messages over the last 14 days, priced for each model, and from how much of the quota each model has
-              actually used per dollar of list price — so it moves with how you work. Models you used in the last 30 days
+              your messages on each model — its recent ones if you use it a lot, otherwise its last 30 days — and from how
+              much of the quota each model has actually used per dollar of list price, so it moves with how you work. Models you used in the last 30 days
               appear. Auto shows only the model you used most in the last 7 days.
             </div>
           </div>

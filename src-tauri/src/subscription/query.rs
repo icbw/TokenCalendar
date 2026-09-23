@@ -285,6 +285,22 @@ const BUDGET_LOOKBACK_DAYS: i64 = 30;
 const SAMPLE_DAYS: i64 = 14;
 /// 近 `SAMPLE_DAYS` 天的消息不到这么多条时,放宽到整个回看窗口。
 pub(super) const BUDGET_MIN_TURNS: usize = 5;
+/// 一个模型最近 `SAMPLE_DAYS` 天自己的消息有这么多条,就按它自己的消息算「一条多大」。
+const OWN_RECENT_MIN: usize = 20;
+/// 最近用得少,但回看窗口里自己的消息有这么多条,就按它自己的历史消息算。
+const OWN_HISTORY_MIN: usize = 5;
+
+/// 「一条消息多大」取自哪批消息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeBasis {
+    /// 最近常用：这个模型自己最近 14 天的消息（≥ 20 条）。
+    RecentOwn,
+    /// 最近没怎么用：这个模型自己在回看窗口（30 天）里的消息（≥ 5 条）。
+    HistoryOwn,
+    /// 自己的消息太少：你最近的全部消息,按这个模型的价格估。
+    AllMessages,
+}
 /// 「主力模型」看最近这么多天谁的轮最多（没有就退回整个取样窗口）。
 const MAIN_MODEL_DAYS: i64 = 7;
 /// 周窗口的名义长度。实际窗口可能更短（平台会主动提前重置）,所以它只当上界用。
@@ -299,12 +315,16 @@ pub struct MessageCostRow {
     pub display_name: String,
     /// 回看窗口里以它为主的用户轮数（选主力模型、设置页候选用;**不是**估计的样本）。
     pub turns: usize,
-    /// 你最近的一条消息**换成这个模型发**,平均值多少美元当量（官方 API 标价）。
+    /// 一条消息平均值多少美元当量（官方 API 标价;取自哪批消息见 `basis`）。
     pub usd_per_turn: f64,
     /// 这个模型的额度系数（百分点 / 美元当量,5h）。
     pub quota_factor: f64,
     /// `quota_factor` 是这个模型自己的（false = 样本不够,回落平台系数）。
     pub factor_measured: bool,
+    /// 「一条多大」取自哪批消息。
+    pub basis: SizeBasis,
+    /// 那批消息有多少条。
+    pub basis_n: usize,
     /// 一条消息吃掉 5h 窗口的百分点 = `usd_per_turn` × `overhead` × `quota_factor`。
     /// 展示层用它去除自己显示的剩余 %,得到还能发几条;100 ÷ 它 = 一个满窗口多少条。
     pub pct_per_turn: f64,
@@ -382,9 +402,11 @@ pub struct WeekForecast {
 /// 分模型的每条消息额度代价（悬浮球 hover、设置页模型选择、Insights 消息数表的数据源）。
 ///
 /// 口径：
-/// - **同一批消息给所有模型估价**：你最近 14 天发的全部消息,每条按它的 token 换成各模型的
-///   官方标价——回答的是「这条消息改用 X 发要多少」,模型之间的差别只来自价格,不再混进
-///   「你拿哪个模型干了多大的活」;
+/// - **「一条多大」三级取样**：最近常用的模型用它自己最近 14 天的
+///   消息;最近没怎么用的用它自己的历史消息;自己的消息太少才用你最近的全部消息按它的价格估。
+///   （第一次是「所有模型同一批消息」——排序只看价格,但把长任务模型的活算到短问答模型头上,
+///   本机 Claude Fable 5.1 因此少估三四成);
+/// - 每条都按模型**此刻的官方标价**估价;
 /// - **取均值,不取中位数**：一个窗口装几条 = 100% ÷ 每条平均吃掉的份额。消息体量极不均匀
 ///   （短问答几美分,长任务几十次调用几美元）,而恰恰是大消息把窗口吃满——中位数把它们
 ///   忽略掉,会把条数高估好几倍;
@@ -532,6 +554,22 @@ pub(super) fn message_budget(
     let enough = sample.len() >= BUDGET_MIN_TURNS;
     let now = now_ms.div_euclid(1000);
 
+    // 「一条多大」三级口径：最近常用的模型看它自己最近的消息;最近没怎么用的看它
+    // 自己的历史消息;自己的消息太少才拿全部消息按它的价格估。各模型的用法差别很大（同一平台上
+    // 一个模型专跑长任务、另一个多是短问答）,拿别的模型的活去估它会偏出三四成。
+    let mean_at = |priced: &cost::Priced, list: &[&RootTurn]| {
+        list.iter()
+            .map(|t| {
+                priced.usd_of(&cost::Tokens {
+                    input: t.tokens[0],
+                    output: t.tokens[1],
+                    cache_read: t.tokens[2],
+                    cache_write: t.tokens[3],
+                })
+            })
+            .sum::<f64>()
+            / list.len().max(1) as f64
+    };
     let mut rows: Vec<(MessageCostRow, usize)> = if !enough {
         vec![]
     } else {
@@ -540,18 +578,17 @@ pub(super) fn message_budget(
             .map(|(model, (n, recent))| {
                 // 此刻发的消息按此刻的价目算
                 let priced = cost::priced_at(platform, model, now);
-                let usd = sample
-                    .iter()
-                    .map(|t| {
-                        priced.usd_of(&cost::Tokens {
-                            input: t.tokens[0],
-                            output: t.tokens[1],
-                            cache_read: t.tokens[2],
-                            cache_write: t.tokens[3],
-                        })
-                    })
-                    .sum::<f64>()
-                    / sample.len() as f64;
+                let own: Vec<&RootTurn> = turns.iter().filter(|t| t.model == model).collect();
+                let own_recent: Vec<&RootTurn> =
+                    own.iter().copied().filter(|t| t.started_at >= sample_since).collect();
+                let (basis, list) = if own_recent.len() >= OWN_RECENT_MIN {
+                    (SizeBasis::RecentOwn, own_recent)
+                } else if own.len() >= OWN_HISTORY_MIN {
+                    (SizeBasis::HistoryOwn, own)
+                } else {
+                    (SizeBasis::AllMessages, sample.clone())
+                };
+                let usd = mean_at(&priced, &list);
                 let (quota_factor, factor_measured) =
                     factors.get(model).map_or((scale, false), |(k, _)| (*k, true));
                 (
@@ -562,6 +599,8 @@ pub(super) fn message_budget(
                         usd_per_turn: usd,
                         quota_factor,
                         factor_measured,
+                        basis,
+                        basis_n: list.len(),
                         pct_per_turn: usd * overhead * quota_factor,
                         pct_per_turn_week: None,
                     },
@@ -1099,17 +1138,19 @@ mod tests {
         assert!(few.rows.is_empty(), "4 条消息不够估");
     }
 
-    /// 同一批消息给所有模型估价：谁贵只看价格,与「平时拿哪个模型干多大的活」无关;
+    /// 三级口径 ①③：最近常用（≥20 条）的模型按它自己最近的消息;自己的消息太少的模型拿全部消息按它的价格估。
     /// 模型有自己的额度系数就用它的;子会话开销照摊。
     #[test]
-    fn every_model_is_priced_on_the_same_messages() {
+    fn recent_models_use_their_own_messages_rare_ones_use_all() {
         const NOW: i64 = 1_800_000_000_000;
         let mut parts = Vec::new();
-        // steady($3) 跑的是大任务,widget($10,夹具里此刻是旧价段) 只回答短问题
-        for i in 0..5 {
+        // steady($3) 最近跑了 20 条长任务;widget($10,夹具里此刻是旧价段)只回答过 2 个短问题
+        for i in 0..20 {
             parts.push(part("big", i, true, "claude-steady-1", 9_000_000, NOW));
-            parts.push(part("small", i, true, "claude-widget-1", 1_000_000, NOW));
             parts.push(part("sub", i, false, "claude-steady-1", 1_000_000, NOW)); // 子代理
+        }
+        for i in 0..2 {
+            parts.push(part("small", i, true, "claude-widget-1", 1_000_000, NOW));
         }
         let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
         let mut factors = no_factors();
@@ -1119,14 +1160,37 @@ mod tests {
         });
         let pick = |k: &str| got.rows.iter().find(|r| r.model_key == k).unwrap();
         let (steady, widget) = (pick("claude-steady-1"), pick("claude-widget-1"));
-        // 10 条消息,平均 5Mtok
-        assert!((steady.usd_per_turn - 15.0).abs() < 1e-9, "{}", steady.usd_per_turn);
-        assert!((widget.usd_per_turn - 50.0).abs() < 1e-9, "同一批消息,贵的模型就是贵");
-        let overhead = (9.0 * 3.0 * 5.0 + 1.0 * 10.0 * 5.0 + 1.0 * 3.0 * 5.0) / (9.0 * 3.0 * 5.0 + 1.0 * 10.0 * 5.0);
+        assert_eq!((steady.basis, steady.basis_n), (SizeBasis::RecentOwn, 20));
+        assert!((steady.usd_per_turn - 27.0).abs() < 1e-9, "它自己的长任务：9Mtok × $3,{}", steady.usd_per_turn);
+        assert_eq!((widget.basis, widget.basis_n), (SizeBasis::AllMessages, 22));
+        let mean_tok = (20.0 * 9.0 + 2.0 * 1.0) / 22.0;
+        assert!((widget.usd_per_turn - mean_tok * 10.0).abs() < 1e-9, "全部 22 条按 $10 估,{}", widget.usd_per_turn);
+        let overhead = (20.0 * 27.0 + 20.0 * 3.0 + 2.0 * 10.0) / (20.0 * 27.0 + 2.0 * 10.0);
         assert!((got.overhead - overhead).abs() < 1e-9);
         assert!(widget.factor_measured && (widget.quota_factor - 0.2).abs() < 1e-12);
-        assert!((widget.pct_per_turn - 50.0 * overhead * 0.2).abs() < 1e-9, "用它自己的系数");
-        assert!((steady.pct_per_turn - 15.0 * overhead * 1.0).abs() < 1e-9, "没有自己的系数就回落平台系数");
+        assert!((widget.pct_per_turn - widget.usd_per_turn * overhead * 0.2).abs() < 1e-9, "用它自己的系数");
+        assert!((steady.pct_per_turn - 27.0 * overhead * 1.0).abs() < 1e-9, "没有自己的系数就回落平台系数");
+    }
+
+    /// 三级口径 ②：最近没怎么用、但回看窗口里自己有 ≥5 条的模型,按它自己的历史消息算。
+    #[test]
+    fn models_not_used_lately_fall_back_to_their_own_history() {
+        const NOW: i64 = 1_800_000_000_000;
+        const OLD: i64 = NOW - 20 * 86_400_000;
+        let mut parts: Vec<TurnModelPart> =
+            (0..6).map(|i| part("old", i, true, "claude-widget-1", 2_000_000, OLD)).collect();
+        parts.extend((0..6).map(|i| part("new", i, true, "claude-steady-1", 1_000_000, NOW)));
+        let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
+        let got = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true, &no_factors())
+        });
+        let pick = |k: &str| got.rows.iter().find(|r| r.model_key == k).unwrap();
+        let widget = pick("claude-widget-1");
+        assert_eq!((widget.basis, widget.basis_n), (SizeBasis::HistoryOwn, 6), "20 天前的 6 条是它自己的历史");
+        assert!((widget.usd_per_turn - 20.0).abs() < 1e-9, "2Mtok × 此刻的 $10,{}", widget.usd_per_turn);
+        let steady = pick("claude-steady-1");
+        assert_eq!(steady.basis, SizeBasis::HistoryOwn, "最近只有 6 条,不到 20 条也按它自己的");
+        assert!((steady.usd_per_turn - 3.0).abs() < 1e-9);
     }
 
     /// 价目不可信的模型不出行;零 token 的轮照算进平均（它也是一条消息）。
