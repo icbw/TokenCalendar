@@ -1425,9 +1425,10 @@ function SubscriptionsTab() {
             ))}
             <div className="setting-note">
               Shown when hovering the orb's 5-hour dial as messages left / messages in a full window, e.g. “GPT-6 Astra:
-              ~3/30”. A message is one prompt you send. Estimated from your own median
-              cost per message over the last 30 days, so it moves with how you work; models need at least 5 messages
-              in that time to appear. Auto shows only the model you used most in the last 7 days.
+              ~3/30”. A message is one prompt you send. Estimated from the average size of
+              your messages over the last 14 days, priced for each model, and from how much of the quota each model has
+              actually used per dollar of list price — so it moves with how you work. Models you used in the last 30 days
+              appear. Auto shows only the model you used most in the last 7 days.
             </div>
           </div>
         </>
@@ -1482,7 +1483,7 @@ function MessageModelsRow({ platform, value }: {
   const perMsg = (key: string) => {
     const r = budget?.rows.find((x) => x.model_key === key)
     return r
-      ? `${r.display_name} · about ${Math.round(100 / r.pct_per_turn)} messages per full 5-hour window (median of ${r.turns} messages)`
+      ? `${r.display_name} · about ${Math.round(100 / r.pct_per_turn)} messages per full 5-hour window`
       : 'Not enough messages in the last 30 days to estimate'
   }
   return (

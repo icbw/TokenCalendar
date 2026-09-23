@@ -260,19 +260,25 @@ export async function getModelUsage(
   })
 }
 
-/** 一个模型的每轮额度代价（Rust query:MessageCostRow）。 */
+/** 一个模型的每条消息额度代价（Rust query:MessageCostRow）。
+ * 口径：你最近 14 天的全部消息，每条换成这个模型的官方标价，取**均值**；再乘这个模型自己
+ * 的额度系数（样本不够回落平台系数）。模型之间的差别只来自价格与额度计价。 */
 export interface MessageCostRow {
   /** collector 里的模型键，原样。 */
   model_key: string
   /** 命中价目行的展示名（可能是区间名，如「Claude Opus 4.5〜5」；短名见 messageBudget.ts）。 */
   display_name: string
-  /** 取样窗口里以它为主的用户轮数（= 中位数的样本数）。 */
+  /** 近 30 天以它为主的用户轮数（选主力模型、设置页候选用；不是估计的样本）。 */
   turns: number
-  /** 每轮代价的中位数（美元当量）。 */
-  median_usd: number
-  /** 一轮吃掉 5h 窗口的百分点。剩余条数 = 剩余 % ÷ 它；满窗口条数 = 100 ÷ 它。 */
+  /** 你最近的一条消息换成这个模型发，平均值多少美元当量（官方 API 标价）。 */
+  usd_per_turn: number
+  /** 这个模型的额度系数（百分点 / 美元当量，5h）。 */
+  quota_factor: number
+  /** quota_factor 是它自己的（false = 样本不够，回落平台系数）。 */
+  factor_measured: boolean
+  /** 一条消息吃掉 5h 窗口的百分点。剩余条数 = 剩余 % ÷ 它；满窗口条数 = 100 ÷ 它。 */
   pct_per_turn: number
-  /** 一轮吃掉周窗口的百分点（周系数样本不够 / 没带 week 查询 → null）。 */
+  /** 一条消息吃掉周窗口的百分点（周系数样本不够 / 没带 week 查询 → null）。 */
   pct_per_turn_week: number | null
 }
 
@@ -315,7 +321,11 @@ export interface MessageBudget {
   calibrated: boolean
   /** 子会话（子代理 / 自动审查）开销倍率，已乘进 pct_per_turn。 */
   overhead: number
-  /** 最近 7 天用户轮最多的模型（null = 没有够样本的模型）。 */
+  /** 「一条消息多大」取自多少条消息（0 = 不够估）。 */
+  sample: number
+  /** 这批消息的起点（unix 秒）。 */
+  sample_from: number
+  /** 最近 7 天用户轮最多的模型（null = 没有可估的模型）。 */
   main_model: string | null
   /** 够样本（≥5 轮）的模型，按轮数降序。 */
   rows: MessageCostRow[]

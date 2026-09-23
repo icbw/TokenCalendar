@@ -5,7 +5,9 @@
 //
 // 口径（与悬浮球 hover 同源,见 get_message_budget）：
 // - 「消息」= 用户发起的一次对话（request_count 口径）,不是模型调用 / 工具调用;
-// - 每条代价 = 该模型近 30 天的中位数 × 子会话开销;5h 与周各用各自的标定系数换成百分点;
+// - 一条消息多大 = 你最近 14 天全部消息的**均值**,每条按各模型的官方标价估价（同一批消息,
+//   模型之间的差别只来自价格）× 子会话开销 × 该模型的额度系数（不够样本回落平台系数）;
+//   周份额 = 5h 份额 × 周窗 / 5h 窗的大小之比;
 // - 剩余 % 取**当前快照**,在这里除——与悬浮球表盘同一时刻;窗口已过期的按 100% 算;
 // - 周窗口**不一定正好 7 天**（平台会主动提前重置）,起点来自读数里的重置痕迹,不从窗尾倒推。
 import { useEffect, useState } from 'react'
@@ -155,7 +157,11 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                 <tr key={r.model_key}>
                   <td
                     className="price-col-model"
-                    title={`${r.model_key}\nMedian ≈ $${r.median_usd.toFixed(2)} of API-equivalent usage per message, from ${r.turns} messages in the last 30 days`}
+                    title={
+                      `${r.model_key}\nYour average message ≈ $${r.usd_per_turn.toFixed(2)} at this model's list price` +
+                      `\nA full 5-hour window ≈ $${(100 / r.quota_factor).toFixed(0)} of this model at list price ` +
+                      (r.factor_measured ? '(measured on your readings)' : '(platform average — not enough readings on this model yet)')
+                    }
                   >
                     <span className="legend-swatch" style={{ background: colorFor(r.model_key) }} />
                     {shortModelName(r.model_key)}
@@ -179,8 +185,11 @@ export default function MessagesCard({ platform, range, refreshTick }: {
             </tbody>
           </table>
           <p className="price-note">
-            Estimates. A message is one prompt you send; its cost is your own median on that model over the last 30 days,
-            with subagent and auto-review overhead spread in, so the numbers move with how you work.
+            Estimates. A message is one prompt you send. Every model is priced on the same messages — the average of
+            your last {budget.sample} messages{budget.sample_from ? ` since ${stamp(budget.sample_from)}` : ''}, big tasks
+            included, with subagent and auto-review overhead spread in — so differences between models come from price.
+            Each model then uses its own measured share of the quota per dollar, because the platforms do not charge
+            every model against the quota exactly at list price.
             {week && week.scale === null && ' Weekly columns need more quota readings on this plan before they can be estimated.'}
             {' '}The weekly window follows the platform's own resets and is not always 7 days — it can reset early. Resets
             are read from quota readings: two accounts on the same plan cannot be told apart, and switching between them

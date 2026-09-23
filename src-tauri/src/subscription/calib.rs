@@ -378,6 +378,62 @@ pub fn week_scale_from_store(store: &super::store::SubStore, platform: Platform)
     fit_week(&store.week_pairs_for_fit(platform, &plan))
 }
 
+/// 分模型额度系数至少要这么多条「以它为主」的可用样本。
+pub const MODEL_MIN_PAIRS: u32 = 30;
+/// 且这些样本的 5h 涨幅合计至少这么多个百分点。
+const MODEL_MIN_GAIN_PCT: f64 = 10.0;
+/// 一条样本的代价里某个模型占到这么多,才把这条样本记到它名下。
+const MODEL_DOMINANT_SHARE: f64 = 0.8;
+
+/// **分模型额度系数**（百分点 / 美元当量,5h 窗口）：`Σ Δ5h ÷ Σ 有效代价`,只用以该模型为主的样本。
+///
+/// 平台级 `scale` 的前提是「额度按官方 API 价值计」,而各模型并不一样——本机 Codex:
+/// GPT-5.6 Sol 每美元当量只吃 ≈ 7.3 个点,Astra / Terra / Luna 在 10〜11 个点。也就是说平台
+/// 对 Sol 的额度计价比它的 API 标价便宜约三分之一（窗口的总量固定,换哪个模型都一样）。
+/// 剩余消息数按模型给,就得用各模型自己的系数;**价目表不动**——它回答的是「官方 API 标价」,
+/// 另一个问题。
+///
+/// 样本准入与平台级拟合同一套判据（[`Pair:usable`]）;样本不够的模型不出（调用方回落平台系数）。
+pub fn fit_models(
+    platform: Platform,
+    rows: &[(Pair, String)],
+    center: f64,
+) -> HashMap<String, (f64, u32)> {
+    let mut acc: HashMap<String, (f64, f64, u32)> = HashMap::new();
+    for (pair, breakdown) in rows {
+        if !pair.usable(center) {
+            continue;
+        }
+        let models = super::cost::parse_breakdown(breakdown);
+        let costs: Vec<(&String, f64)> = models
+            .iter()
+            .map(|(m, v)| {
+                let t = super::cost::Tokens { input: v[0], output: v[1], cache_read: v[2], cache_write: v[3] };
+                (m, super::cost::cost_of(platform, m, &t, pair.t1).0)
+            })
+            .collect();
+        let total: f64 = costs.iter().map(|(_, c)| c).sum();
+        let Some((model, c)) = costs.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)) else { continue };
+        if total <= 0.0 || c / total < MODEL_DOMINANT_SHARE {
+            continue;
+        }
+        let e = acc.entry(model.clone()).or_default();
+        e.0 += pair.delta();
+        e.1 += pair.effective_cost();
+        e.2 += 1;
+    }
+    acc.into_iter()
+        .filter(|(_, (d, c, n))| *n >= MODEL_MIN_PAIRS && *d >= MODEL_MIN_GAIN_PCT && *c > 0.0)
+        .map(|(m, (d, c, n))| (m, (d / c, n)))
+        .collect()
+}
+
+/// 当前套餐同一倍率类的分模型额度系数（查询面用;只读,一次查询一次拟合）。
+pub fn model_scales_from_store(store: &super::store::SubStore, platform: Platform) -> HashMap<String, (f64, u32)> {
+    let plan = store.load_snapshot(platform).map(|s| s.plan_type).unwrap_or_default();
+    fit_models(platform, &store.pairs_with_breakdown(platform, &plan), scale(platform))
+}
+
 /// 用库里**当前世代**的样本重算并缓存（启动装载与每落一条新样本后的唯一入口）。
 /// 世代 = 当前权重表版本 + 当前套餐,筛选口径见 `store:pairs_for_fit`;
 /// 被筛掉的样本留在库里当档案,只是不参与这一版系数的推断。
@@ -654,5 +710,41 @@ mod tests {
         let mut w = v.clone();
         w.push(p(30.0, 0.1));
         assert_eq!(fit_week(&w).unwrap().1, 30);
+    }
+
+    /// 分模型额度系数：样本记到占代价 ≥80% 的那个模型名下,各自和之比;样本不够的模型不出。
+    #[test]
+    fn model_factors_follow_the_dominant_model() {
+        // 夹具价目：Codex gpt-5.6-sol $4/Mtok 输入;gpt-5.6-terra $2/Mtok 输入（出厂种子）
+        let pair = |t0: i64, d: f64, cost: f64| Pair {
+            t0,
+            t1: t0 + 600,
+            used5_0: 10.0,
+            used5_1: 10.0 + d,
+            resets5_0: None,
+            resets5_1: None,
+            cost,
+            unknown_cost: 0.0,
+            aged_cost: 0.0,
+        };
+        let at = 1_790_000_000;
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            // sol:每条 0.25Mtok 输入 = $1,涨 7 个点;terra:每条 0.5Mtok = $1,涨 10 个点
+            rows.push((pair(at + i * 1000, 7.0, 1.0), r#"{"gpt-5.6-sol":[250000,0,0,0]}"#.to_string()));
+            rows.push((pair(at + i * 1000 + 500, 10.0, 1.0), r#"{"gpt-5.6-terra":[500000,0,0,0]}"#.to_string()));
+        }
+        // 混用的样本（谁都不到 80%）不记
+        rows.push((pair(at, 50.0, 2.0), r#"{"gpt-5.6-sol":[250000,0,0,0],"gpt-5.6-terra":[500000,0,0,0]}"#.to_string()));
+        // luna 只有 3 条,不够
+        for i in 0..3 {
+            rows.push((pair(at + i, 1.0, 0.04), r#"{"gpt-5.6-luna":[200000,0,0,0]}"#.to_string()));
+        }
+        let got = fit_models(Platform::Codex, &rows, 8.0);
+        let (sol, n) = got["gpt-5.6-sol"];
+        assert_eq!(n, 40);
+        assert!((sol - 7.0).abs() < 1e-9, "{sol}");
+        assert!((got["gpt-5.6-terra"].0 - 10.0).abs() < 1e-9);
+        assert!(!got.contains_key("gpt-5.6-luna"), "样本不够不出");
     }
 }

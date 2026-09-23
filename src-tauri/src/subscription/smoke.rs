@@ -2567,13 +2567,15 @@ fn message_budget_on_real_db() {
             now_ms,
             super::calib::scale(p),
             pairs >= super::calib::CALIBRATED_PAIRS,
+            &super::calib::model_scales_from_store(&s, p),
         );
         let readings = s.quota_readings(p, "7d", i64::MIN / 2, i64::MAX / 2);
         b.attach_week(p, &parts, &readings, super::calib::week_scale_from_store(&s, p), now_ms);
         println!(
-            "--- {} --- 切片 {} 条  scale {:.4} %/$（{} 样本）  开销 ×{:.3}  主力 {:?}",
+            "--- {} --- 切片 {} 条  样本 {} 条消息  scale {:.4} %/$（{} 样本）  开销 ×{:.3}  主力 {:?}",
             p.as_str(),
             parts.len(),
+            b.sample,
             b.scale,
             pairs,
             b.overhead,
@@ -2603,11 +2605,13 @@ fn message_budget_on_real_db() {
         }
         for r in &b.rows {
             println!(
-                "  {:<22} {:<24} {:>4} 轮  中位 ${:>7.4}  一轮 {:>6.3}%  满窗 ≈{:>6.0} 条  周满窗 ≈{:>6.0} 条",
+                "  {:<22} {:<24} {:>4} 轮  均值 ${:>7.4}  系数 {:>5.2}{}  一条 {:>6.3}%  满窗 ≈{:>6.0} 条  周满窗 ≈{:>6.0} 条",
                 r.model_key,
                 r.display_name,
                 r.turns,
-                r.median_usd,
+                r.usd_per_turn,
+                r.quota_factor,
+                if r.factor_measured { "实测" } else { "平台" },
                 r.pct_per_turn,
                 100.0 / r.pct_per_turn,
                 r.pct_per_turn_week.map_or(f64::NAN, |w| 100.0 / w)

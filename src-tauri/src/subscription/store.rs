@@ -977,6 +977,39 @@ impl SubStore {
         (filter, allow.unwrap_or_default())
     }
 
+    /// 分模型额度系数的原料：与 `pairs_for_fit` 同一批样本（同一套餐倍率类、排除存疑行）,
+    /// 附上各自的分模型 token 明细（`breakdown` 原文）。
+    pub fn pairs_with_breakdown(&self, platform: Platform, plan_type: &str) -> Vec<(super::calib::Pair, String)> {
+        let (filter, allow) = self.plan_class_filter(platform, plan_type);
+        let Ok(mut stmt) = self.conn.prepare(&format!(
+            "SELECT t0, t1, used5_0, used5_1, cost, unknown_cost, resets5_0, resets5_1, aged_cost, breakdown
+               FROM usage_pair
+              WHERE platform = ? AND weight_ver <> 0{filter}"
+        )) else {
+            return vec![];
+        };
+        let mut params: Vec<String> = vec![platform.as_str().to_string()];
+        params.extend(allow);
+        stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((
+                super::calib::Pair {
+                    t0: r.get(0)?,
+                    t1: r.get(1)?,
+                    used5_0: r.get(2)?,
+                    used5_1: r.get(3)?,
+                    cost: r.get(4)?,
+                    unknown_cost: r.get(5)?,
+                    resets5_0: r.get(6)?,
+                    resets5_1: r.get(7)?,
+                    aged_cost: r.get(8)?,
+                },
+                r.get::<_, String>(9)?,
+            ))
+        })
+        .map(|rs| rs.flatten().collect())
+        .unwrap_or_default()
+    }
+
     /// 周窗口标定的原料：与当前套餐同一倍率类的样本的 （Δ周用量, 代价, 不可信代价, 末端周用量)。
     ///
     /// 与 5h 共用同一批样本（`usage_pair` 两端本来就存着周读数）,只是看另一对列。

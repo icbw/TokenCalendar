@@ -1,7 +1,7 @@
 {
   "name": "tokencalendar",
   "private": true,
-  "version": "0.8.9",
+  "version": "0.9.1",
   "license": "MIT",
   "type": "module",
   "scripts": {
