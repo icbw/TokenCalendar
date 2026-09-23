@@ -285,6 +285,8 @@ const BUDGET_LOOKBACK_DAYS: i64 = 30;
 pub(super) const BUDGET_MIN_TURNS: usize = 5;
 /// 「主力模型」看最近这么多天谁的轮最多（没有就退回整个取样窗口）。
 const MAIN_MODEL_DAYS: i64 = 7;
+/// 周窗口的名义长度。实际窗口可能更短（平台会主动提前重置）,所以它只当上界用。
+const WEEK_SECS: i64 = 7 * 86_400;
 
 /// 一个模型的每轮代价。
 #[derive(Debug, Serialize)]
@@ -300,12 +302,14 @@ pub struct MessageCostRow {
     /// 一轮吃掉 5h 窗口的百分点 = 中位代价 × `overhead` × `scale`。
     /// 展示层用它去除自己显示的剩余 %,得到还能发几条;100 ÷ 它 = 一个满窗口多少条。
     pub pct_per_turn: f64,
+    /// 一轮吃掉**周**窗口的百分点（周系数样本不够时 `None`,且只在带 `week` 查询时给）。
+    pub pct_per_turn_week: Option<f64>,
 }
 
-/// `get_message_budget` 的出口：分模型的「每轮吃掉多少 5h 额度」。
+/// `get_message_budget` 的出口：分模型的「每轮吃掉多少额度」。
 ///
 /// **只给每轮代价,不给剩余条数**——剩余 % 以展示层手里的快照为准,在那边除,
-/// 免得 hover 里的条数与表盘上的百分比来自两个不同时刻。
+/// 免得条数与表盘上的百分比来自两个不同时刻。
 #[derive(Debug, Serialize)]
 pub struct MessageBudget {
     pub platform: Platform,
@@ -322,16 +326,60 @@ pub struct MessageBudget {
     pub main_model: Option<String>,
     /// 够样本的模型,按轮数降序。
     pub rows: Vec<MessageCostRow>,
+    /// 周窗口那一半（只在 `week = true` 时给;悬浮球不要它）。
+    pub week: Option<WeekForecast>,
 }
 
-/// 分模型的每轮额度代价（悬浮球 hover 与设置页模型选择的数据源）。
+/// 一次周重置。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WeekReset {
+    /// 新窗口的起点（unix 秒;读数稀疏时是「最晚不早于它」的估计,见 [`week_window`]）。
+    pub t: i64,
+    /// 提前重置：发生在上一个窗口申报的重置时刻之前（平台主动重置）。
+    pub early: bool,
+}
+
+/// 当前周窗口里某个模型已经发了多少条。
+#[derive(Debug, Serialize)]
+pub struct WeekTurns {
+    pub model_key: String,
+    pub display_name: String,
+    pub turns: usize,
+}
+
+/// 周窗口：系数、当前窗口的起止、重置历史、窗口内已发条数。
+#[derive(Debug, Serialize)]
+pub struct WeekForecast {
+    /// 周系数（百分点 / 美元当量;样本不够 = `None`,展示层不出周剩余那一列）。
+    pub scale: Option<f64>,
+    /// 参与周系数拟合的样本数。
+    pub pairs: u32,
+    /// 当前账号（= 最近一条周读数的套餐名;空 = 不知道）。一台机器可能轮换几个账号,
+    /// 周窗口是**按账号**的,下面几项都只看这个账号。
+    pub account: String,
+    /// 当前窗口起点（`None` = 没有任何周读数）。
+    pub start: Option<i64>,
+    /// 当前窗口申报的重置时刻（`None` = 来源没给,或窗口已过期、新窗尾还没读到）。
+    pub resets_at: Option<i64>,
+    /// 这个账号在读数历史里的全部重置,按时间升序（区间筛选交给展示层）。
+    pub resets: Vec<WeekReset>,
+    /// 当前窗口里的用户轮,按模型（代价最大者）,按条数降序。
+    pub turns: Vec<WeekTurns>,
+    /// 当前窗口里的用户轮合计。
+    pub total_turns: usize,
+}
+
+/// 分模型的每轮额度代价（悬浮球 hover、设置页模型选择、Insights 消息数表的数据源）。
 ///
 /// 「消息」= 用户发起的对话轮次（`request_count` 口径）。每轮代价取**中位数**：
 /// 轮体量分布重尾,均值会被少数巨型轮带偏。一轮用了几个模型时归给代价最大的那个。
+/// `week = true` 时另附周窗口那一半（读数历史 + 周系数,悬浮球不需要）。
 #[tauri::command]
 pub fn get_message_budget(
     platform: String,
+    week: Option<bool>,
     state: State<'_, AppState>,
+    sub: State<'_, SubscriptionReader>,
 ) -> Result<MessageBudget, String> {
     let platform = platform_of(&platform)?;
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -343,32 +391,49 @@ pub fn get_message_budget(
         Ok(store.turn_model_parts(platform.collector_source(), &from))
     })?;
     let pairs = super::calib::sample_count(platform);
-    Ok(message_budget(
+    let mut budget = message_budget(
         platform,
         from,
         &parts,
         now_ms,
         super::calib::scale(platform),
         pairs >= super::calib::CALIBRATED_PAIRS,
-    ))
+    );
+    if week.unwrap_or(false) {
+        let (fit, readings) = {
+            let store = sub.0.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                super::calib::week_scale_from_store(&store, platform),
+                store.quota_readings(platform, "7d", i64::MIN / 2, i64::MAX / 2),
+            )
+        };
+        budget.attach_week(platform, &parts, &readings, fit, now_ms);
+    }
+    Ok(budget)
 }
 
-/// [`get_message_budget`] 的本体（纯函数,测试直接喂切片）。
-pub(super) fn message_budget(
+/// 一条用户轮（根会话的轮）：起点、代价最大的模型、该模型价目是否可信、整轮代价。
+struct RootTurn<'a> {
+    started_at: i64,
+    model: &'a str,
+    known: bool,
+    usd: f64,
+}
+
+/// 模型键 → 展示名。
+type Names<'a> = std::collections::HashMap<&'a str, String>;
+
+/// 切片折价 → 用户轮列表 + 子会话开销倍率 + 模型展示名。
+fn root_turns(
     platform: Platform,
-    from: String,
     parts: &[crate::collector::store::TurnModelPart],
-    now_ms: i64,
-    scale: f64,
-    calibrated: bool,
-) -> MessageBudget {
+) -> (Vec<RootTurn<'_>>, f64, Names<'_>) {
     use std::collections::{BTreeMap, HashMap};
 
-    //  切片折价;根会话的切片按轮归拢,子会话的只进开销
     let (mut all_usd, mut root_usd) = (0.0_f64, 0.0_f64);
     // （会话, 轮) → （轮起点, 模型 → （代价, 价目可信))
     let mut turns: BTreeMap<(&str, i64), (i64, HashMap<&str, (f64, bool)>)> = BTreeMap::new();
-    let mut names: HashMap<&str, String> = HashMap::new();
+    let mut names: Names = HashMap::new();
     for p in parts {
         let priced = cost::priced_at(platform, &p.model_key, p.started_at.div_euclid(1000));
         let usd = priced.usd_of(&cost::Tokens {
@@ -390,32 +455,45 @@ pub(super) fn message_budget(
         e.0 += usd;
     }
     let overhead = if root_usd > 0.0 { (all_usd / root_usd).max(1.0) } else { 1.0 };
+    let list = turns
+        .into_values()
+        .filter_map(|(started_at, models)| {
+            let usd: f64 = models.values().map(|(u, _)| u).sum();
+            let (model, (_, known)) = models
+                .into_iter()
+                .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(b.0.cmp(a.0)))?;
+            Some(RootTurn { started_at, model, known, usd })
+        })
+        .collect();
+    (list, overhead, names)
+}
 
-    //  每轮归给代价最大的模型;主模型价目不可信（回落 / 路由标签）的轮不进样本
+/// [`get_message_budget`] 的本体（纯函数,测试直接喂切片）。
+pub(super) fn message_budget(
+    platform: Platform,
+    from: String,
+    parts: &[crate::collector::store::TurnModelPart],
+    now_ms: i64,
+    scale: f64,
+    calibrated: bool,
+) -> MessageBudget {
+    use std::collections::BTreeMap;
+
+    let (turns, overhead, names) = root_turns(platform, parts);
+
+    // 零 token 的轮（秒中止 / 纯本地命令）不是「一条消息的代价」;主模型价目不可信
+    // （回落 / 路由标签）的轮不进样本
     let recent_ms = now_ms - MAIN_MODEL_DAYS * 86_400_000;
     let mut per_model: BTreeMap<&str, (Vec<f64>, usize)> = BTreeMap::new();
-    for (started_at, models) in turns.values() {
-        let cost: f64 = models.values().map(|(u, _)| u).sum();
-        if cost <= 0.0 {
-            continue; // 零 token 的轮（秒中止 / 纯本地命令）不是「一条消息的代价」
-        }
-        let Some((model, (_, known))) = models
-            .iter()
-            .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(b.0.cmp(a.0)))
-        else {
-            continue;
-        };
-        if !known {
-            continue;
-        }
-        let e = per_model.entry(model).or_default();
-        e.0.push(cost);
-        if *started_at >= recent_ms {
+    for t in turns.iter().filter(|t| t.usd > 0.0 && t.known) {
+        let e = per_model.entry(t.model).or_default();
+        e.0.push(t.usd);
+        if t.started_at >= recent_ms {
             e.1 += 1;
         }
     }
 
-    //  够样本的模型出中位数
+    // 够样本的模型出中位数
     let mut rows: Vec<(MessageCostRow, usize)> = per_model
         .into_iter()
         .filter(|(_, (v, _))| v.len() >= BUDGET_MIN_TURNS)
@@ -430,6 +508,7 @@ pub(super) fn message_budget(
                     turns: n,
                     median_usd: median,
                     pct_per_turn: median * overhead * scale,
+                    pct_per_turn_week: None,
                 },
                 recent,
             )
@@ -449,7 +528,209 @@ pub(super) fn message_budget(
         overhead,
         main_model,
         rows: rows.into_iter().map(|(r, _)| r).collect(),
+        week: None,
     }
+}
+
+impl MessageBudget {
+    /// 挂上周窗口那一半：周系数换算每行的周代价,读数历史切出当前账号的窗口与重置,
+    /// 再数窗口里这个账号发了多少条。
+    pub(super) fn attach_week(
+        &mut self,
+        platform: Platform,
+        parts: &[crate::collector::store::TurnModelPart],
+        readings: &[super::model::QuotaReading],
+        fit: Option<(f64, u32)>,
+        now_ms: i64,
+    ) {
+        use std::collections::HashMap;
+
+        let (scale, pairs) = fit.map_or((None, 0), |(s, n)| (Some(s), n));
+        for r in &mut self.rows {
+            r.pct_per_turn_week = scale.map(|s| r.median_usd * self.overhead * s);
+        }
+        let w = week_window(readings, now_ms.div_euclid(1000));
+        let (turns, _, names) = root_turns(platform, parts);
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        if let Some(start) = w.start {
+            for t in &turns {
+                let at = t.started_at.div_euclid(1000);
+                if at >= start && w.account_at(at) == w.account {
+                    *counts.entry(t.model).or_default() += 1;
+                }
+            }
+        }
+        let mut list: Vec<WeekTurns> = counts
+            .into_iter()
+            .map(|(m, n)| WeekTurns {
+                model_key: m.to_string(),
+                display_name: names.get(m).cloned().unwrap_or_else(|| m.to_string()),
+                turns: n,
+            })
+            .collect();
+        list.sort_by(|a, b| b.turns.cmp(&a.turns).then(a.model_key.cmp(&b.model_key)));
+        self.week = Some(WeekForecast {
+            scale,
+            pairs,
+            total_turns: list.iter().map(|t| t.turns).sum(),
+            turns: list,
+            account: w.account,
+            start: w.start,
+            resets_at: w.resets_at,
+            resets: w.resets,
+        });
+    }
+}
+
+/// 从周读数历史里切出的当前账号窗口。
+pub(super) struct WeekWindow {
+    pub account: String,
+    pub start: Option<i64>,
+    pub resets_at: Option<i64>,
+    pub resets: Vec<WeekReset>,
+    /// （时刻, 账号) 升序——把一条用户轮归给当时在用的账号。
+    timeline: Vec<(i64, String)>,
+}
+
+impl WeekWindow {
+    /// 时刻 `t` 在用的账号：该时刻及之前最近一条读数的账号;更早没有读数就取第一条。
+    fn account_at(&self, t: i64) -> &str {
+        let i = self.timeline.partition_point(|(at, _)| *at <= t);
+        self.timeline.get(i.saturating_sub(1)).map_or("", |(_, a)| a.as_str())
+    }
+}
+
+/// 读数掉回这么低才算「清零」（整数刻度 + 重置后几分钟里可能已经用掉一两格）。
+const RESET_FLOOR_PCT: f64 = 5.0;
+/// 且至少掉了这么多——从 3% 掉到 0% 分不清是重置还是噪声。
+const RESET_DROP_PCT: f64 = 5.0;
+/// 清零后这段时间内又回到原水位 = 不是重置,是读数倒退（Codex rollout 里并发调用
+/// 交错写入会出现一次「旧值」,见的 rollout 驱动取数）。
+const RESET_BOUNCE_SECS: i64 = 3600;
+/// 窗尾前移超过这么多 = 进了新窗口（同一窗口内窗尾只会有几分钟的抖动）。
+const RESET_TAIL_JUMP_SECS: i64 = 86_400;
+/// 重置早于上一窗口申报时刻超过这么多才算「提前重置」（读数时刻本身有几分钟的粒度）。
+const EARLY_SLACK_SECS: i64 = 3600;
+
+/// 周读数 → 当前账号的窗口与重置历史（纯函数）。
+///
+/// **周窗口不一定正好 7 天**：平台会主动提前重置。所以窗口起点不从窗尾倒推 7 天了事,
+/// 而是看读数里的重置痕迹：
+/// - 窗尾（`resets_at`）前移超过一天,或
+/// - 读数从 ≥ 5 点掉回 ≤ 5%,且之后一小时内没有弹回原水位。
+///
+/// 重置时刻取「上一条读数 → 这一条」之间最可信的那一点：上一窗口申报的窗尾若落在
+/// 两条读数之间就取它（按期重置,精确）;否则取 `max（上一条读数, 新窗尾 − 7 天)`
+/// （提前重置时新窗尾 − 7 天就是重置那一刻;读数稀疏时退回上一条读数,即「最晚不早于」）。
+/// 当前窗口起点另外不早于「当前窗尾 − 7 天」。窗尾已过而新窗口还没读到时,窗尾本身
+/// 记作一次按期重置,窗口从那里起算。
+///
+/// 账号 = 读数的套餐名（空名沿用前一条的）。同名套餐的两个账号交替使用时,读数带窗尾的
+/// 能认出来：候选重置之后若旧窗尾（还没到期）又被申报,旧窗口就还活着;或者「新」窗尾
+/// 早先就被申报过,那个窗口本来就在——两种都是换账号,不算重置。
+/// **没有窗尾的读数认不出**——那一段里来回跳仍可能被看成重置。
+pub(super) fn week_window(readings: &[super::model::QuotaReading], now: i64) -> WeekWindow {
+    let mut rs: Vec<&super::model::QuotaReading> = readings.iter().collect();
+    rs.sort_by_key(|r| r.t);
+    // 账号：空名沿用前一条;开头的空名取第一个有名字的
+    let mut last = rs
+        .iter()
+        .find(|r| !r.plan_type.is_empty())
+        .map(|r| r.plan_type.clone())
+        .unwrap_or_default();
+    let timeline: Vec<(i64, String)> = rs
+        .iter()
+        .map(|r| {
+            if !r.plan_type.is_empty() {
+                last = r.plan_type.clone();
+            }
+            (r.t, last.clone())
+        })
+        .collect();
+    let Some(account) = timeline.last().map(|(_, a)| a.clone()) else {
+        return WeekWindow { account: String::new(), start: None, resets_at: None, resets: vec![], timeline };
+    };
+    let mine: Vec<&super::model::QuotaReading> = rs
+        .iter()
+        .zip(&timeline)
+        .filter(|(_, (_, a))| *a == account)
+        .map(|(r, _)| *r)
+        .collect();
+
+    let mut resets: Vec<WeekReset> = Vec::new();
+    let mut end: Option<i64> = None; // 当前窗口最新申报的窗尾
+    // 最近一次重置之后的第一条读数时刻（新窗尾第一次读到时回头校准重置时刻用）
+    let mut after_reset: Option<i64> = None;
+    for (i, r) in mine.iter().enumerate() {
+        if i > 0 {
+            let prev = mine[i - 1];
+            let tail_jump = matches!((r.resets_at, end), (Some(a), Some(b)) if a - b > RESET_TAIL_JUMP_SECS);
+            // 新窗尾 − 7 天比上一条读数还晚 ⇒ 上一条在更早的窗口里（账号隔了几天才又用,
+            // 回来时读数不一定掉到底——新窗口里可能已经用了一截）
+            let stale_prev = r.resets_at.is_some_and(|a| prev.t < a - WEEK_SECS);
+            let dropped = prev.used_percent >= RESET_DROP_PCT
+                && r.used_percent <= RESET_FLOOR_PCT
+                && prev.used_percent - r.used_percent >= RESET_DROP_PCT
+                && !mine[i + 1..]
+                    .iter()
+                    .take_while(|x| x.t <= r.t + RESET_BOUNCE_SECS)
+                    .any(|x| x.used_percent >= prev.used_percent - 1.0);
+            // 旧窗口后来又出现了（之后某条读数申报的窗尾仍是旧窗尾,且旧窗尾还没到）
+            // ⇒ 旧窗口没被重置,这是同名套餐的另一个账号插了进来
+            let old_alive = end.is_some_and(|e| {
+                mine[i + 1..]
+                    .iter()
+                    .take_while(|x| x.t < e)
+                    .any(|x| x.resets_at.is_some_and(|a| (a - e).abs() <= EARLY_SLACK_SECS))
+            });
+            // 「新」窗尾早就被申报过 ⇒ 那个窗口本来就在,是切回了另一个账号
+            let seen_before = r.resets_at.is_some_and(|a| {
+                mine[..i - 1]
+                    .iter()
+                    .any(|x| x.resets_at.is_some_and(|b| (a - b).abs() <= EARLY_SLACK_SECS))
+            });
+            if (tail_jump || stale_prev || dropped) && !old_alive && !seen_before {
+                let t = match end {
+                    Some(e) if e > prev.t && e <= r.t => e,
+                    _ => r.resets_at.map_or(prev.t, |a| prev.t.max(a - WEEK_SECS)),
+                };
+                // 「提前」只在有申报窗尾可比时判：没有窗尾时,同名套餐的两个账号来回切
+                // 与真的提前重置在读数上长得一样,硬判只会造出假的「提前」
+                let early = end.is_some_and(|e| t < e - EARLY_SLACK_SECS);
+                resets.push(WeekReset { t, early });
+                after_reset = Some(r.t);
+                end = None;
+            }
+        }
+        if let Some(a) = r.resets_at {
+            // 重置之后第一次读到新窗尾：重置时刻不早于「新窗尾 − 7 天」,也不晚于重置后的
+            // 第一条读数——读数稀疏时,这一步把「最晚不早于上一条读数」收紧到真实时刻附近
+            if end.is_none() {
+                if let (Some(last), Some(first)) = (resets.last_mut(), after_reset) {
+                    last.t = last.t.max(a - WEEK_SECS).min(first);
+                }
+            }
+            end = Some(a);
+        }
+    }
+    // 起点：最近一次重置,但不早于「当前窗尾 − 7 天」;读数里没有重置痕迹时窗口
+    // 早在第一条读数之前就开始了 ⇒ 有窗尾就取窗尾 − 7 天,没有才退回第一条读数
+    let mut start = match (resets.last(), end) {
+        (Some(l), Some(e)) => Some(l.t.max(e - WEEK_SECS)),
+        (Some(l), None) => Some(l.t),
+        (None, Some(e)) => Some(e - WEEK_SECS),
+        (None, None) => mine.first().map(|r| r.t),
+    };
+    let mut resets_at = end;
+    // 窗尾已过、新窗口还没读到：窗尾就是一次按期重置
+    if let Some(e) = end {
+        if now >= e {
+            resets.push(WeekReset { t: e, early: false });
+            start = Some(e);
+            resets_at = None;
+        }
+    }
+    WeekWindow { account, start, resets_at, resets, timeline }
 }
 
 // ---------- 读数 ----------
@@ -805,5 +1086,150 @@ mod tests {
         });
         assert_eq!(got.rows[0].model_key, "claude-widget-1", "行按总轮数排");
         assert_eq!(got.main_model.as_deref(), Some("claude-steady-1"), "主力看最近一周");
+    }
+
+    // ---------- 周窗口 ----------
+
+    use crate::subscription::model::SnapshotSource;
+
+    const H: i64 = 3600;
+    const D: i64 = 86_400;
+
+    fn rd(t: i64, used: f64, resets_at: Option<i64>, plan: &str) -> QuotaReading {
+        QuotaReading {
+            t,
+            kind: "7d".into(),
+            used_percent: used,
+            resets_at,
+            plan_type: plan.into(),
+            source: SnapshotSource::Api,
+        }
+    }
+
+    /// 按期重置：上一窗尾落在两条读数之间 ⇒ 重置时刻就是那个窗尾,不算提前。
+    #[test]
+    fn a_scheduled_reset_lands_on_the_announced_tail() {
+        const T0: i64 = 1_800_000_000;
+        let end1 = T0 + 2 * D;
+        let v = vec![
+            rd(T0, 40.0, Some(end1), "max"),
+            rd(T0 + D, 60.0, Some(end1), "max"),
+            rd(end1 + 2 * H, 1.0, Some(end1 + 7 * D), "max"),
+        ];
+        let w = week_window(&v, end1 + 3 * H);
+        assert_eq!(w.resets, vec![WeekReset { t: end1, early: false }]);
+        assert_eq!(w.start, Some(end1));
+        assert_eq!(w.resets_at, Some(end1 + 7 * D));
+    }
+
+    /// 提前重置：窗尾还没到读数就清零了,新窗尾 = 重置那刻 + 7 天 ⇒ 起点与「提前」都认得出。
+    #[test]
+    fn an_early_reset_is_flagged_and_starts_the_window() {
+        const T0: i64 = 1_800_000_000;
+        let end1 = T0 + 3 * D;
+        let reset = T0 + D + 30 * 60;
+        let v = vec![
+            rd(T0, 40.0, Some(end1), "max"),
+            rd(T0 + D, 55.0, Some(end1), "max"),
+            rd(T0 + D + H, 0.0, Some(reset + 7 * D), "max"),
+        ];
+        let w = week_window(&v, T0 + D + 2 * H);
+        assert_eq!(w.resets.len(), 1);
+        assert!(w.resets[0].early, "早于申报窗尾两天 = 提前重置");
+        assert_eq!(w.resets[0].t, reset, "新窗尾 − 7 天");
+        assert_eq!(w.start, Some(reset));
+    }
+
+    /// 读数倒退一次又弹回（rollout 并发交错写入）不算重置;没有窗尾的来源也能靠清零认出重置。
+    #[test]
+    fn a_bounce_is_not_a_reset_but_a_sustained_drop_is() {
+        const T0: i64 = 1_800_000_000;
+        let v = vec![
+            rd(T0, 30.0, None, "plus"),
+            rd(T0 + 60, 0.0, None, "plus"),
+            rd(T0 + 120, 31.0, None, "plus"),
+            rd(T0 + 5 * D, 70.0, None, "plus"),
+            rd(T0 + 5 * D + 600, 0.0, None, "plus"),
+            rd(T0 + 5 * D + 2 * H, 2.0, None, "plus"),
+        ];
+        let w = week_window(&v, T0 + 6 * D);
+        assert_eq!(w.resets.len(), 1, "只有持续的那次清零");
+        assert_eq!(w.resets[0].t, T0 + 5 * D, "没有窗尾可用 ⇒ 最晚不早于上一条读数");
+        assert!(!w.resets[0].early, "隔得太远没法判提前");
+        assert_eq!(w.start, Some(T0 + 5 * D));
+    }
+
+    /// 换账号：窗口、重置只看当前账号;用户轮按当时在用的账号归属。
+    #[test]
+    fn accounts_are_kept_apart() {
+        const T0: i64 = 1_800_000_000;
+        let v = vec![
+            rd(T0, 50.0, Some(T0 + 6 * D), "edu"),
+            rd(T0 + H, 10.0, Some(T0 + 4 * D), "plus"), // 换到 plus:读数掉了,但不是重置
+            rd(T0 + 2 * H, 55.0, Some(T0 + 6 * D), "edu"),
+            rd(T0 + 3 * H, 12.0, Some(T0 + 4 * D), "plus"),
+        ];
+        let w = week_window(&v, T0 + 4 * H);
+        assert_eq!(w.account, "plus");
+        assert!(w.resets.is_empty(), "账号来回切不是重置");
+        assert_eq!(w.start, Some(T0 + 4 * D - 7 * D), "没有重置痕迹 ⇒ 窗尾 − 7 天（窗口早于第一条读数就开始了）");
+        assert_eq!(w.account_at(T0 + 30 * 60), "edu");
+        assert_eq!(w.account_at(T0 + H + 1), "plus");
+        assert_eq!(w.account_at(T0 - D), "edu", "更早没有读数就取第一条");
+    }
+
+    /// 同名套餐的两个账号交替：各自申报各自的窗尾,旧窗尾之后又出现 ⇒ 不是重置。
+    #[test]
+    fn two_accounts_on_one_plan_are_not_resets() {
+        const T0: i64 = 1_800_000_000;
+        let (ea, eb) = (T0 + 5 * D, T0 + 2 * D);
+        let v = vec![
+            rd(T0, 40.0, Some(ea), "plus"),
+            rd(T0 + H, 3.0, Some(eb), "plus"),
+            rd(T0 + 2 * H, 41.0, Some(ea), "plus"),
+            rd(T0 + 3 * H, 4.0, Some(eb), "plus"),
+            rd(T0 + 4 * H, 42.0, Some(ea), "plus"),
+        ];
+        let w = week_window(&v, T0 + 5 * H);
+        assert!(w.resets.is_empty(), "{:?}", w.resets);
+        assert_eq!(w.resets_at, Some(ea));
+    }
+
+    /// 窗尾已过、新窗口还没读到：窗尾记一次按期重置,窗口从那里起算,窗尾未知。
+    #[test]
+    fn an_expired_window_resets_at_its_tail() {
+        const T0: i64 = 1_800_000_000;
+        let v = vec![rd(T0, 80.0, Some(T0 + D), "max")];
+        let w = week_window(&v, T0 + 2 * D);
+        assert_eq!(w.resets, vec![WeekReset { t: T0 + D, early: false }]);
+        assert_eq!(w.start, Some(T0 + D));
+        assert_eq!(w.resets_at, None);
+    }
+
+    /// 周那一半：每行周代价 = 中位 × 开销 × 周系数;窗口里的轮按模型数,窗口外的不算。
+    #[test]
+    fn attach_week_counts_turns_since_the_window_start() {
+        const NOW: i64 = 1_800_000_000_000;
+        let start = NOW / 1000 - D;
+        let mut parts: Vec<TurnModelPart> =
+            (0..5).map(|i| part("a", i, true, "claude-steady-1", 1_000_000, NOW - 1000)).collect();
+        parts.extend((5..8).map(|i| part("a", i, true, "claude-steady-1", 1_000_000, (start - H) * 1000)));
+        let rows = price::two_segment_fixture(NOW / 1000 + D);
+        let mut b = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true)
+        });
+        let readings = vec![rd(start + 60, 3.0, Some(start + 7 * D), "max")];
+        price::with_rows(&rows, || b.attach_week(Platform::Claude, &parts, &readings, Some((0.1, 30)), NOW));
+        let w = b.week.as_ref().unwrap();
+        assert_eq!(w.start, Some(start));
+        assert_eq!(w.total_turns, 5, "窗口起点之前的 3 轮不算");
+        assert_eq!(w.turns[0].model_key, "claude-steady-1");
+        assert!((b.rows[0].pct_per_turn_week.unwrap() - 3.0 * 0.1).abs() < 1e-9);
+        // 周系数样本不够 ⇒ 周那一列不给
+        let mut b2 = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true)
+        });
+        price::with_rows(&rows, || b2.attach_week(Platform::Claude, &parts, &readings, None, NOW));
+        assert_eq!(b2.rows[0].pct_per_turn_week, None);
     }
 }

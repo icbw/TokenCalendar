@@ -560,6 +560,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 大数后面的小字补充（如周重置次数里的「（1 early)」） */
+.price-total-aside {
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
 /* 口径说明行（等价价值 ≠ 账单）:常驻,不是 hover 才出现的免责声明 */
 .price-note {
   margin: 8px 0 0;

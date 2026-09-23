@@ -918,6 +918,38 @@ impl SubStore {
     /// 被筛掉的行**留在库里**：它们是档案（将来回看套餐差异 / 价格变更前后的对比）,
     /// 只是不参与当前这一版系数的推断。
     pub fn pairs_for_fit(&self, platform: Platform, plan_type: &str) -> Vec<super::calib::Pair> {
+        let (filter, allow) = self.plan_class_filter(platform, plan_type);
+        let Ok(mut stmt) = self.conn.prepare(&format!(
+            "SELECT t0, t1, used5_0, used5_1, cost, unknown_cost, resets5_0, resets5_1, aged_cost
+               FROM usage_pair
+              WHERE platform = ? AND weight_ver <> 0{filter}"
+        )) else {
+            return vec![];
+        };
+        let mut params: Vec<String> = vec![platform.as_str().to_string()];
+        params.extend(allow);
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params),
+            |r| {
+            Ok(super::calib::Pair {
+                t0: r.get(0)?,
+                t1: r.get(1)?,
+                used5_0: r.get(2)?,
+                used5_1: r.get(3)?,
+                cost: r.get(4)?,
+                unknown_cost: r.get(5)?,
+                resets5_0: r.get(6)?,
+                resets5_1: r.get(7)?,
+                aged_cost: r.get(8)?,
+            })
+        },
+        );
+        rows.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
+    /// 「与当前套餐同一倍率类」的 SQL 片段与绑定值（`pairs_for_fit` / `week_pairs_for_fit` 共用）。
+    /// 当前套餐未知 → 空片段（不按套餐筛）。
+    fn plan_class_filter(&self, platform: Platform, plan_type: &str) -> (String, Vec<String>) {
         // 倍率类是 Rust 侧的判断（子串匹配 + 倍率相等）,SQL 表达不了 ⇒ 先把库里出现过的
         // 套餐名取出来判一遍,再把同类的那几个绑进 IN。库里的 distinct 套餐名至多几个。
         let allow: Option<Vec<String>> = match plan_type.trim() {
@@ -942,32 +974,34 @@ impl SubStore {
                 std::iter::repeat("?").take(list.len()).collect::<Vec<_>>().join(",")
             ),
         };
+        (filter, allow.unwrap_or_default())
+    }
+
+    /// 周窗口标定的原料：与当前套餐同一倍率类的样本的 （Δ周用量, 代价, 不可信代价, 末端周用量)。
+    ///
+    /// 与 5h 共用同一批样本（`usage_pair` 两端本来就存着周读数）,只是看另一对列。
+    /// 周窗口是**固定窗口**（到点整体清零,不滚动）,所以不存在 5h 那种「老化量」正。
+    pub fn week_pairs_for_fit(&self, platform: Platform, plan_type: &str) -> Vec<super::calib::WeekPair> {
+        let (filter, allow) = self.plan_class_filter(platform, plan_type);
         let Ok(mut stmt) = self.conn.prepare(&format!(
-            "SELECT t0, t1, used5_0, used5_1, cost, unknown_cost, resets5_0, resets5_1, aged_cost
+            "SELECT used7_1 - used7_0, cost, unknown_cost, used7_1
                FROM usage_pair
               WHERE platform = ? AND weight_ver <> 0{filter}"
         )) else {
             return vec![];
         };
         let mut params: Vec<String> = vec![platform.as_str().to_string()];
-        params.extend(allow.unwrap_or_default());
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params),
-            |r| {
-            Ok(super::calib::Pair {
-                t0: r.get(0)?,
-                t1: r.get(1)?,
-                used5_0: r.get(2)?,
-                used5_1: r.get(3)?,
-                cost: r.get(4)?,
-                unknown_cost: r.get(5)?,
-                resets5_0: r.get(6)?,
-                resets5_1: r.get(7)?,
-                aged_cost: r.get(8)?,
+        params.extend(allow);
+        stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            Ok(super::calib::WeekPair {
+                delta7: r.get(0)?,
+                cost: r.get(1)?,
+                unknown_cost: r.get(2)?,
+                used7_1: r.get(3)?,
             })
-        },
-        );
-        rows.map(|rs| rs.flatten().collect()).unwrap_or_default()
+        })
+        .map(|rs| rs.flatten().collect())
+        .unwrap_or_default()
     }
 
     /// 库里这个平台出现过的套餐名（含空串;至多几个）。

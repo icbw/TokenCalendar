@@ -272,6 +272,34 @@ export interface MessageCostRow {
   median_usd: number
   /** 一轮吃掉 5h 窗口的百分点。剩余条数 = 剩余 % ÷ 它；满窗口条数 = 100 ÷ 它。 */
   pct_per_turn: number
+  /** 一轮吃掉周窗口的百分点（周系数样本不够 / 没带 week 查询 → null）。 */
+  pct_per_turn_week: number | null
+}
+
+/** 一次周重置（Rust query:WeekReset）。 */
+export interface WeekReset {
+  /** 新窗口起点（unix 秒；读数稀疏时是「最晚不早于它」的估计）。 */
+  t: number
+  /** 提前重置：早于上一窗口申报的重置时刻（平台主动重置）。 */
+  early: boolean
+}
+
+/** 周窗口那一半（Rust query:WeekForecast;只在 getMessageBudget（p, true) 时有）。 */
+export interface WeekForecast {
+  /** 周系数（百分点 / 美元当量；样本不够 = null → 不出周剩余）。 */
+  scale: number | null
+  pairs: number
+  /** 当前账号 = 最近一条周读数的套餐名。周窗口按账号，下面几项只看这个账号。 */
+  account: string
+  /** 当前窗口起点（unix 秒；null = 没有周读数）。周窗口**不一定正好 7 天**（会提前重置）。 */
+  start: number | null
+  /** 当前窗口申报的重置时刻（null = 来源没给 / 已过期还没读到新窗尾）。 */
+  resets_at: number | null
+  /** 这个账号读数历史里的全部重置，升序（区间筛选在展示层）。 */
+  resets: WeekReset[]
+  /** 当前窗口里已发的用户轮，按模型，降序。 */
+  turns: { model_key: string; display_name: string; turns: number }[]
+  total_turns: number
 }
 
 /** 分模型的「一轮吃掉多少 5h 额度」（Rust query:MessageBudget）。
@@ -291,11 +319,13 @@ export interface MessageBudget {
   main_model: string | null
   /** 够样本（≥5 轮）的模型，按轮数降序。 */
   rows: MessageCostRow[]
+  /** 周窗口那一半（week = true 时才有）。 */
+  week: WeekForecast | null
 }
 
 /** 分模型每轮额度代价（剩余消息数的分母）。「消息」= 用户发起的对话轮次。 */
-export async function getMessageBudget(platform: SubscriptionPlatform): Promise<MessageBudget | null> {
-  return tryInvoke<MessageBudget>('get_message_budget', { platform })
+export async function getMessageBudget(platform: SubscriptionPlatform, week = false): Promise<MessageBudget | null> {
+  return tryInvoke<MessageBudget>('get_message_budget', { platform, week })
 }
 
 /** 归一化读数序列的一行（Rust model:QuotaReading）。 */

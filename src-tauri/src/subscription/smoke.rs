@@ -2560,7 +2560,7 @@ fn message_budget_on_real_db() {
         super::calib::refit_from_store(&s, p);
         let parts = store.turn_model_parts(p.collector_source(), &from);
         let pairs = super::calib::sample_count(p);
-        let b = super::query::message_budget(
+        let mut b = super::query::message_budget(
             p,
             from.clone(),
             &parts,
@@ -2568,6 +2568,8 @@ fn message_budget_on_real_db() {
             super::calib::scale(p),
             pairs >= super::calib::CALIBRATED_PAIRS,
         );
+        let readings = s.quota_readings(p, "7d", i64::MIN / 2, i64::MAX / 2);
+        b.attach_week(p, &parts, &readings, super::calib::week_scale_from_store(&s, p), now_ms);
         println!(
             "--- {} --- 切片 {} 条  scale {:.4} %/$（{} 样本）  开销 ×{:.3}  主力 {:?}",
             p.as_str(),
@@ -2577,15 +2579,38 @@ fn message_budget_on_real_db() {
             b.overhead,
             b.main_model
         );
+        let w = b.week.as_ref().expect("带了周");
+        let ts = |t: Option<i64>| {
+            t.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "—".into())
+        };
+        println!(
+            "  周：系数 {:?}（{} 样本）  账号 {:?}  窗口 {} → {}  窗内 {} 条  重置 {} 次",
+            w.scale.map(|v| (v * 1e4).round() / 1e4),
+            w.pairs,
+            w.account,
+            ts(w.start),
+            ts(w.resets_at),
+            w.total_turns,
+            w.resets.len()
+        );
+        for r in &w.resets {
+            println!("    重置 {}{}", ts(Some(r.t)), if r.early { "（提前）" } else { "" });
+        }
+        for t in &w.turns {
+            println!("    窗内 {:<22} {:>4} 条", t.model_key, t.turns);
+        }
         for r in &b.rows {
             println!(
-                "  {:<22} {:<24} {:>4} 轮  中位 ${:>7.4}  一轮 {:>6.3}%  满窗 ≈{:>6.0} 条",
+                "  {:<22} {:<24} {:>4} 轮  中位 ${:>7.4}  一轮 {:>6.3}%  满窗 ≈{:>6.0} 条  周满窗 ≈{:>6.0} 条",
                 r.model_key,
                 r.display_name,
                 r.turns,
                 r.median_usd,
                 r.pct_per_turn,
-                100.0 / r.pct_per_turn
+                100.0 / r.pct_per_turn,
+                r.pct_per_turn_week.map_or(f64::NAN, |w| 100.0 / w)
             );
             assert!(r.turns >= super::query::BUDGET_MIN_TURNS);
             assert!(r.pct_per_turn > 0.0);

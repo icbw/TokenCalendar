@@ -321,6 +321,63 @@ pub fn sample_count(platform: Platform) -> u32 {
     slot().get(&platform).map_or(0, |(_, n)| *n)
 }
 
+/// 周窗口标定的一条样本（与 5h 同一条 `usage_pair`,看的是周读数那一对列）。
+#[derive(Debug, Clone, Copy)]
+pub struct WeekPair {
+    /// 两端周用量之差（百分点）。
+    pub delta7: f64,
+    pub cost: f64,
+    pub unknown_cost: f64,
+    /// 末端周用量（贴顶判据用）。
+    pub used7_1: f64,
+}
+
+/// 周窗口系数至少要这么多条可用样本才给——少了宁可不出周那两列。
+pub const WEEK_MIN_PAIRS: u32 = 20;
+/// 且可用样本的周用量涨幅合计至少这么多个百分点（周读数一格很粗,涨得太少就全是量化噪声）。
+const WEEK_MIN_GAIN_PCT: f64 = 5.0;
+
+/// **周窗口系数**（百分点 / 美元当量）：`Σ Δ周用量 ÷ Σ 代价`,与 5h 的 `scale` 同一个量纲。
+///
+/// 只用于**剩余消息数的周那一列**,不进取数时机。与 5h 的拟合相比少两件事、多一件事：
+/// - 不扣老化量：周窗口是**固定窗口**（到点整体清零）,区间里不会有旧用量过期;
+/// - 不做出厂预设混合：没有周的出厂值,样本不够就直接不给（`None`）;
+/// - 丢 `Δ < 0`（跨了周重置,或换了账号）与贴顶样本;Δ = 0 照收（整数刻度,理由同 5h）;
+///   价目不可信过半的样本丢;涨幅大得本地代价解释不了的（> 参照 × `RATIO_MAX_FACTOR`,
+///   多是同类账号之间切换）丢,参照取第一遍的和之比。
+pub fn fit_week(pairs: &[WeekPair]) -> Option<(f64, u32)> {
+    let base: Vec<&WeekPair> = pairs
+        .iter()
+        .filter(|p| {
+            p.delta7 >= 0.0
+                && p.used7_1 < SATURATED_PCT
+                && p.cost > 0.0
+                && p.unknown_cost <= p.cost * 0.5
+        })
+        .collect();
+    let ratio = |v: &[&WeekPair]| {
+        let c: f64 = v.iter().map(|p| p.cost).sum();
+        (c > 0.0).then(|| v.iter().map(|p| p.delta7).sum::<f64>() / c)
+    };
+    let first = ratio(&base)?;
+    let kept: Vec<&WeekPair> = base
+        .into_iter()
+        .filter(|p| p.delta7 <= READING_STEP_PCT * ZERO_DELTA_SLACK || p.delta7 <= p.cost * first * RATIO_MAX_FACTOR)
+        .collect();
+    let gain: f64 = kept.iter().map(|p| p.delta7).sum();
+    let n = kept.len() as u32;
+    if n < WEEK_MIN_PAIRS || gain < WEEK_MIN_GAIN_PCT {
+        return None;
+    }
+    ratio(&kept).filter(|s| *s > 0.0).map(|s| (s, n))
+}
+
+/// 当前套餐同一倍率类的周窗口系数（查询面用;只读,不缓存——一次查询一次拟合,几千行的和）。
+pub fn week_scale_from_store(store: &super::store::SubStore, platform: Platform) -> Option<(f64, u32)> {
+    let plan = store.load_snapshot(platform).map(|s| s.plan_type).unwrap_or_default();
+    fit_week(&store.week_pairs_for_fit(platform, &plan))
+}
+
 /// 用库里**当前世代**的样本重算并缓存（启动装载与每落一条新样本后的唯一入口）。
 /// 世代 = 当前权重表版本 + 当前套餐,筛选口径见 `store:pairs_for_fit`;
 /// 被筛掉的样本留在库里当档案,只是不参与这一版系数的推断。
@@ -580,5 +637,22 @@ mod tests {
         // 取不到老化量的来源填 0 ⇒ 等同未修正的 cost,逐位不变
         p.aged_cost = 0.0;
         assert_eq!(p.effective_cost(), p.cost);
+    }
+
+    /// 周系数 = 和之比;跨重置（Δ<0）与贴顶样本不进,样本不够不给。
+    #[test]
+    fn week_fit_is_a_ratio_of_sums_and_needs_enough_samples() {
+        let p = |delta7: f64, cost: f64| WeekPair { delta7, cost, unknown_cost: 0.0, used7_1: 50.0 };
+        let mut v: Vec<WeekPair> = (0..30).map(|i| p(if i % 3 == 0 { 1.0 } else { 0.0 }, 1.0)).collect();
+        v.push(p(-40.0, 5.0)); // 跨了周重置
+        v.push(WeekPair { used7_1: 100.0, ..p(0.0, 50.0) }); // 贴顶
+        let (s, n) = fit_week(&v).expect("够样本");
+        assert_eq!(n, 30);
+        assert!((s - 10.0 / 30.0).abs() < 1e-9, "{s}");
+        assert!(fit_week(&v[..10]).is_none(), "10 条不够");
+        // 换同类账号造成的大跳：本地代价解释不了 → 不进
+        let mut w = v.clone();
+        w.push(p(30.0, 0.1));
+        assert_eq!(fit_week(&w).unwrap().1, 30);
     }
 }
