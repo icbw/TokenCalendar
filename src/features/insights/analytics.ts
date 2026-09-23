@@ -31,13 +31,14 @@ export function projectTooltip(key: string): string {
   return name && name !== key && !key.endsWith(`/${name}`) ? `${name}\n${key}` : key
 }
 
-/** token 分项（互斥,相加 = Tokens 总量）。工具栏顺序:Tokens → Input → Cache write → Cache read → Output。
- * input = 未命中缓存的输入;cache_write = 写入提示缓存的输入（价格面板「缓存写」);
- * cache_read = 命中缓存、从缓存读出的输入（价格面板「缓存读」）。 */
-export type TokenPart = 'input' | 'cache_write' | 'cache_read' | 'output'
-export const TOKEN_PARTS: TokenPart[] = ['input', 'cache_write', 'cache_read', 'output']
+/** 展示用 token 分项（互斥,相加 = Tokens 总量）。工具栏顺序:Token → 输入 → 缓存读取 → 输出。
+ * 总输入 = 未命中输入 + 缓存读取,各平台同口径:
+ * uncached = 未命中缓存读的输入（Claude = input + cache_write;OpenAI 系 = input_tokens − cached_input_tokens）;
+ * cache_read = 命中缓存、从缓存读出的输入。缓存写只在价格面板按单价单列。 */
+export type TokenPart = 'uncached' | 'cache_read' | 'output'
+export const TOKEN_PARTS: TokenPart[] = ['uncached', 'cache_read', 'output']
 /** 分项的价格顺序（单价从高到低）:图表色阶由深到浅、堆叠自下而上、图例与 tooltip 行都按此序。 */
-export const PART_PRICE_ORDER: TokenPart[] = ['output', 'input', 'cache_write', 'cache_read']
+export const PART_PRICE_ORDER: TokenPart[] = ['output', 'uncached', 'cache_read']
 
 type MetricText = { label: string; short: string; hint: string; unit: string }
 type K = MessageKey<'insights'>
@@ -53,9 +54,11 @@ function metricText(label: K, short: K, hint: K, unit: K): MetricText {
   }
 }
 
-/** label = 图表 / 图例全名;short = 工具栏按钮（Insights 工具栏单行不换行,默认 1120 宽窗口下放得下）。 */
+/** input / cache_write 是存储分项,只在价格面板（单价口径）出现,不进工具栏与图表。
+ * label = 图表 / 图例全名;short = 工具栏按钮（Insights 工具栏单行不换行,默认 1120 宽窗口下放得下）。 */
 export const TOKEN_METRIC_LABELS: Record<TokenMetric, MetricText> = {
   total: metricText('mTotal', 'mTotal', 'mTotalHint', 'mTotalUnit'),
+  uncached: metricText('mUncached', 'mUncachedShort', 'mUncachedHint', 'mUncachedUnit'),
   input: metricText('mInput', 'mInput', 'mInputHint', 'mInputUnit'),
   cache_write: metricText('mCacheWrite', 'mCacheWriteShort', 'mCacheWriteHint', 'mCacheWriteUnit'),
   cache_read: metricText('mCacheRead', 'mCacheReadShort', 'mCacheReadHint', 'mCacheReadUnit'),

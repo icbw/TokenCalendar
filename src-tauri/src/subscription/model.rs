@@ -165,6 +165,63 @@ pub struct SubscriptionSnapshot {
     pub source: SnapshotSource,
 }
 
+/// Codex 滚动窗尾的容差（秒）：未开始的窗口，窗尾 = 读数时刻 + 窗口长度。真库 api 读数偏
+/// −1〜+9 秒；rollout 读数偏 −23〜−6 秒（读数取调用开始时刻）。取 120，留足余量。
+const ROLLING_RESET_TOLERANCE_SECS: i64 = 120;
+
+/// 窗口是否**已开始计时**（与「已用是否为 0」是两件事）。
+///
+/// 读数是整数百分比，窗口开始后用量不到 1% 时 `used_percent` 仍是 0，所以不能拿 0 当作
+/// 「没开始」（[调查]（../../../)）。
+/// 各平台在服务端各有一个信号：
+/// - Claude：没开始时 `resets_at = null`，开始后才给窗尾；
+/// - Codex：没开始时给**滚动窗尾**（读数时刻 + 窗口长度，每次取数都往后漂），开始后窗尾固定。
+///
+/// 两个平台都要求窗尾仍在未来：桌面端零请求路会保留上一份快照的窗尾，那个窗口可能已经过期。
+/// 桌面端读数本身不带窗尾，在这里自然落到 `used > 0` 这条判据上。
+pub fn window_started(platform: Platform, w: &QuotaWindow, fetched_at: Option<i64>, now: i64) -> bool {
+    if w.used_percent > 0.0 {
+        return true;
+    }
+    let Some(reset) = w.resets_at.filter(|&r| r > now) else {
+        return false;
+    };
+    match platform {
+        Platform::Claude => true,
+        Platform::Codex => {
+            let len = match w.kind.as_str() {
+                "5h" => 5 * 3600,
+                "7d" => 7 * 86_400,
+                // 未知窗口没有长度可比；窗尾在未来就当作已开始（与 Claude 同判）
+                _ => return true,
+            };
+            fetched_at.is_some_and(|t| reset - t < len - ROLLING_RESET_TOLERANCE_SECS)
+        }
+    }
+}
+
+/// 前端读口的快照形状：快照原样展开，另附**派生的**「已开始的窗口」列表。
+/// 只在命令面现算，不落库——`resets_at` 与读数时刻都在库里，随时能重新算出来。
+#[derive(Debug, Clone, Serialize)]
+pub struct FrontendSnapshot {
+    #[serde(flatten)]
+    pub snap: SubscriptionSnapshot,
+    /// 已开始计时的窗口 kind（见 [`window_started`]）。
+    pub started_windows: Vec<String>,
+}
+
+impl FrontendSnapshot {
+    pub fn from_snapshot(snap: SubscriptionSnapshot, now: i64) -> Self {
+        let started_windows = snap
+            .windows
+            .iter()
+            .filter(|w| window_started(snap.platform, w, snap.fetched_at, now))
+            .map(|w| w.kind.clone())
+            .collect();
+        Self { snap, started_windows }
+    }
+}
+
 /// 归一化读数序列的一行（落库形状见 `store` 的 `quota_reading` 建表注释）。
 ///
 /// 一行 = **一个窗口在某一时刻的一次读数**。与 `SubscriptionSnapshot` 的区别是维度：
@@ -224,4 +281,82 @@ pub struct CredentialInfo {
     pub parseable: bool,
     /// 账号掩码（如 JWT payload 取 id / 邮箱前 3 位 + ***;无则 None）。
     pub account_hint: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(kind: &str, used: f64, resets_at: Option<i64>) -> QuotaWindow {
+        QuotaWindow { kind: kind.into(), used_percent: used, resets_at }
+    }
+
+    /// 2026-09-23 真库：21:02:54 那次 Claude API 读数，5h 已用 0、窗尾 01:49:59。
+    const T: i64 = 1_790_190_174;
+
+    #[test]
+    fn claude_zero_with_reset_is_started() {
+        assert!(window_started(Platform::Claude, &w("5h", 0.0, Some(1_790_207_399)), Some(T), T));
+        assert!(window_started(Platform::Claude, &w("7d", 0.0, Some(1_790_780_399)), Some(T), T));
+        assert!(window_started(Platform::Claude, &w("7d_fable", 0.0, Some(1_790_780_400)), Some(T), T));
+    }
+
+    #[test]
+    fn claude_zero_without_reset_is_not_started() {
+        assert!(!window_started(Platform::Claude, &w("5h", 0.0, None), Some(T), T));
+    }
+
+    #[test]
+    fn expired_reset_is_not_started() {
+        // 桌面端零请求路保留下来的旧窗尾，已经过期
+        assert!(!window_started(Platform::Claude, &w("5h", 0.0, Some(T - 1)), Some(T - 9_000), T));
+        assert!(!window_started(Platform::Codex, &w("5h", 0.0, Some(T - 1)), Some(T - 9_000), T));
+    }
+
+    #[test]
+    fn used_above_zero_is_always_started() {
+        // 桌面端读数不带窗尾；Claude scoped 窗口也见过有用量、窗尾为 null
+        assert!(window_started(Platform::Claude, &w("5h", 3.0, None), Some(T), T));
+        assert!(window_started(Platform::Codex, &w("5h", 1.0, Some(T + 18_000)), Some(T), T));
+    }
+
+    #[test]
+    fn codex_rolling_reset_is_not_started() {
+        // 真库极值：api 5h −1〜+9 秒、rollout 5h 最低 17,977、rollout 7d 604,785
+        for d in [17_977, 17_999, 18_009] {
+            assert!(!window_started(Platform::Codex, &w("5h", 0.0, Some(T + d)), Some(T), T), "{d}");
+        }
+        assert!(!window_started(Platform::Codex, &w("7d", 0.0, Some(T + 604_785)), Some(T), T));
+    }
+
+    #[test]
+    fn codex_fixed_reset_is_started() {
+        // 窗口开始了 10 分钟：窗尾固定，距读数时刻不足一个窗口长
+        assert!(window_started(Platform::Codex, &w("5h", 0.0, Some(T + 18_000 - 600)), Some(T), T));
+        // 快照不是刚取的也照样判：比的是读数时刻，不是现在
+        assert!(window_started(Platform::Codex, &w("5h", 0.0, Some(T + 17_400)), Some(T), T + 300));
+    }
+
+    #[test]
+    fn codex_without_fetched_at_is_not_started() {
+        assert!(!window_started(Platform::Codex, &w("5h", 0.0, Some(T + 9_000)), None, T));
+    }
+
+    #[test]
+    fn frontend_snapshot_lists_started_kinds_and_flattens() {
+        let snap = SubscriptionSnapshot {
+            platform: Platform::Claude,
+            plan_type: "max".into(),
+            windows: vec![w("5h", 0.0, None), w("7d", 0.0, Some(T + 86_400))],
+            fetched_at: Some(T),
+            status: FetchStatus::Ok,
+            source: SnapshotSource::Api,
+        };
+        let f = FrontendSnapshot::from_snapshot(snap, T);
+        assert_eq!(f.started_windows, vec!["7d".to_string()]);
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["platform"], "claude");
+        assert_eq!(v["windows"][1]["kind"], "7d");
+        assert_eq!(v["started_windows"][0], "7d");
+    }
 }

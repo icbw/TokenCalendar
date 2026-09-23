@@ -1,9 +1,11 @@
 // 线上契约形状：与 src-tauri/src/commands.rs 的 serde 定义严格对齐（snake_case）。
 // 装配层消费的驼峰形状见 types.ts，由各 service 做一次映射。
 
-/** token 指标:四个分项互斥,total = input + cache_write + cache_read + output（collector v16 口径;
- * Codex 少量源事件只报 total、无分项,这部分不归属任何分项）。input = 未命中缓存的输入。 */
-export type TokenMetric = 'total' | 'input' | 'cache_write' | 'cache_read' | 'output'
+/** token 指标:四个存储分项互斥,total = input + cache_write + cache_read + output（collector v16 口径;
+ * Codex 少量源事件只报 total、无分项,这部分不归属任何分项）。
+ * 展示口径 uncached = 未命中输入 = input + cache_write,
+ * 总输入 = uncached + cache_read。input / cache_write 单列只供价格面板按单价拆账。 */
+export type TokenMetric = 'total' | 'uncached' | 'input' | 'cache_write' | 'cache_read' | 'output'
 
 export interface MatrixQuery {
   month: string

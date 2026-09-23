@@ -61,6 +61,9 @@ struct Snapshot {
     input: i64,
     output: i64,
     cached: i64,
+    /// `cache_write_input_tokens`（2026-07 起出现,至今恒 0）。按 OpenAI 惯例视为 `input_tokens` 的子集
+    /// （同 cached;`total_tokens = input + output` 不含它）,入库时从未命中输入里拆出。
+    cache_write: i64,
     reason: i64,
     total: i64,
 }
@@ -72,6 +75,7 @@ fn read_snapshot(usage: &Value) -> Snapshot {
         output: get("output_tokens"),
         // 两个字段名并存：新格式 cached_input_tokens / 旧 cache_read_input_tokens
         cached: get("cached_input_tokens").max(get("cache_read_input_tokens")),
+        cache_write: get("cache_write_input_tokens"),
         reason: get("reasoning_output_tokens"),
         total: get("total_tokens"),
     }
@@ -361,10 +365,12 @@ impl Adapter for CodexAdapter {
                     Parsed::ToolCall { .. } | Parsed::ToolOutput { .. } => continue,
                 };
 
-                let (input, output, total_tokens, cached) = if let Some(last) = last {
-                    // 单次值路径（新格式）：无差分、无回退风险
+                let (input, output, total_tokens, cached, cache_write) = if let Some(last) = last {
+                    // 单次值路径（新格式）：无差分、无回退风险。
+                    // input_tokens = 总输入 ⊇ 缓存读 + 缓存写;入库 input = 其余未命中部分
                     let cached = last.cached.min(last.input);
-                    let input = (last.input - cached).max(0);
+                    let cache_write = last.cache_write.min(last.input - cached);
+                    let input = (last.input - cached - cache_write).max(0);
                     let output = last.output;
                     let t = if last.total > 0 { last.total } else { last.input + last.output };
                     // 基线同步到累积快照，保证文件内后续纯累积行差分仍正确
@@ -375,7 +381,7 @@ impl Adapter for CodexAdapter {
                         cursor.base_reason = tot.reason;
                         cursor.base_total = tot.total;
                     }
-                    (input, output, t, cached)
+                    (input, output, t, cached, cache_write)
                 } else {
                     // 差分路径（旧格式纯累积快照）：任一分量回退 → 丢弃整行且不更新基线
                     let tot = total.expect("last 与 total 至少存在其一");
@@ -399,11 +405,12 @@ impl Adapter for CodexAdapter {
                     let input = d_in - cached;
                     let output = d_out;
                     let t = if d_total > 0 { d_total } else { d_in + d_out };
-                    (input, output, t, cached)
+                    // 纯累积旧格式早于 cache_write_input_tokens 字段,不做差分
+                    (input, output, t, cached, 0)
                 };
 
-                // cache_read = cached_input_tokens（Codex 无 cache 写入分项）
-                let tokens = Tokens { input, output, total: total_tokens, cache_read: cached, cache_write: 0 };
+                // cache_read = cached_input_tokens;cache_write = cache_write_input_tokens（原样存,目前恒 0）
+                let tokens = Tokens { input, output, total: total_tokens, cache_read: cached, cache_write };
                 let mark = cursor.pending_turn as i64;
                 if cursor.turn.response(&mut batch, META.id, ts, Some(hour), &model, tokens, None, mark) == 1 {
                     cursor.pending_turn = false;
@@ -672,6 +679,34 @@ mod tests {
         let rows = store.month_rows("2026-09", "agent", "total", chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()).unwrap();
         assert_eq!(rows[0].message_counts.iter().sum::<i64>(), 1, "中止轮不计 request_count");
         assert!(store.test_project_conservation().is_empty(), "{:?}", store.test_project_conservation());
+    }
+
+    /// `cache_write_input_tokens` 原样入 cache_write,且视为 input_tokens 的子集:
+    /// 四分项守恒,未命中输入（uncached）= input_tokens − cached_input_tokens 不变。
+    #[test]
+    fn cache_write_field_is_stored_as_subset_of_input() {
+        let usage = r#"{"input_tokens":1000,"cached_input_tokens":700,"cache_write_input_tokens":200,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}"#;
+        let lines = vec![
+            ev("2026-09-05T09:59:00.000Z", "session_meta", r#"{"id":"cw","session_id":"cw","cwd":"E:\\Work\\Demo","source":"vscode"}"#),
+            turn_context_line("gpt-5.6"),
+            ev("2026-09-05T10:00:00.100Z", "event_msg", r#"{"type":"task_started","turn_id":"t1"}"#),
+            format!(r#"{{"timestamp":"2026-09-05T10:00:05.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{usage},"last_token_usage":{usage}}}}}}}"#),
+        ];
+        let dir = std::env::temp_dir().join(format!("tc_codex_cw_{}", std::process::id()));
+        let day_dir = dir.join("sessions").join("2026").join("09").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("rollout-cw.jsonl"), lines.join("\n") + "\n").unwrap();
+        let adapter = CodexAdapter { sessions_dir: dir.join("sessions"), archived_dir: dir.join("archived"), state_db: None };
+        let mut store = Store::open_in_memory().unwrap();
+        let ok = adapter.collect(&mut store).is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let got = |metric: &str| store.month_rows("2026-09", "agent", metric, today).unwrap()[0].month_total;
+        assert_eq!(
+            (got("input"), got("cache_write"), got("cache_read"), got("output"), got("uncached"), got("total")),
+            (100, 200, 700, 50, 300, 1050)
+        );
     }
 
     /// 会话行的项目 = Codex `threads.cwd`（用户在应用里把线程切到别的工作区）;轮仍按各自 turn_context 归属;

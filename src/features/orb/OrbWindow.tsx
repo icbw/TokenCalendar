@@ -21,7 +21,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
 import { events, subscriptionService, windowService, type OrbDockState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
 import { getDesignPrefs, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
-import type { MessageBudget } from '../../services/subscriptionService'
+import type { MessageBudget, QuotaWindow } from '../../services/subscriptionService'
 import { budgetLine, pickBudgetRows, remainOfWindow, weekBudgetLine } from './messageBudget'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
@@ -149,12 +149,19 @@ function windowOf(snap: SubscriptionSnapshot | undefined, kind: string) {
   return snap?.windows.find((w) => w.kind === kind)
 }
 
-/** 窗口「未使用」统一判据：窗口存在但零消耗。两平台对「还没开始用」的表示不一致——
- * Codex 给「当前 + 窗口长度」的滚动 resets_at（每次取数都往后漂的假窗口尾）,
- * Claude 给 resets_at = null。判据只取 used_percent（与 resets_at 无关）⇒ 表盘 / 周行 /
- * 提示统一切到 idle 读数,首次消耗后自动回到真实读数。 */
-function windowIdle(w: { used_percent: number } | undefined): boolean {
-  return w != null && w.used_percent <= 0
+/** 窗口「未使用」= 窗口存在但**还没开始计时**（表盘 / 周行 / 提示统一切到 idle 读数）。
+ * 「开始没有」由 Rust 按平台判好随快照送来（`started_windows`,见 model.rs `window_started`）:
+ * 读数是整数百分比,开始后用量不到 1% 时 used 仍是 0,不能拿 0 当「没开始」。
+ * 快照缺这个字段（旧后端）时退回旧判据 used ≤ 0。 */
+function windowIdle(snap: SubscriptionSnapshot | undefined, w: QuotaWindow | undefined): boolean {
+  if (w == null) return false
+  const started = snap?.started_windows
+  return started ? !started.includes(w.kind) : w.used_percent <= 0
+}
+
+/** 已开始、但整数读数还是 0（用量不到 1%）。 */
+function windowUnderOne(w: QuotaWindow | undefined, idle: boolean): boolean {
+  return w != null && !idle && w.used_percent <= 0
 }
 
 /** 状态文案（auth_failed 与 plan_inactive 语义勿混）：
@@ -481,8 +488,8 @@ export default function OrbWindow() {
   const remain7d = w7d ? Math.max(0, Math.min(100, 100 - w7d.used_percent)) : null
   const remain5h = w5h ? Math.max(0, Math.min(100, 100 - w5h.used_percent)) : null
   // 未使用态（5h 表盘 / 7d 周行）：判据与显示口径见 windowIdle。
-  const fiveIdle = windowIdle(w5h)
-  const weekIdle = windowIdle(w7d)
+  const fiveIdle = windowIdle(snap, w5h)
+  const weekIdle = windowIdle(snap, w7d)
   const hint = statusHint(snap?.status ?? 'idle')
   // 竖条外轮廓水位线（从顶部往下、两侧一起退）：周额度剩余 ↦ 遮罩矩形的纵向位移——
   // 100% → 线抬到 −FADE（整圈含顶边全亮）,0% → 落在 SPAN（连淡出段一起沉到轮廓下方 = 全灭）。
@@ -839,7 +846,7 @@ export default function OrbWindow() {
       ? {
           label: t('tipWeeklyQuota'),
           lines: [
-            t('tipLeft', { pct: pctText(remain7d) }),
+            windowUnderOne(w7d, weekIdle) ? t('tipUnderOne') : t('tipLeft', { pct: pctText(remain7d) }),
             ...(weekReset ? [t('tipResetsIn', { t: weekReset })] : []),
             ...scopedLines,
             ...weekBudgetLines,
@@ -852,7 +859,7 @@ export default function OrbWindow() {
       ? {
           label: t('tipFiveHourQuota'),
           lines: [
-            t('tipLeft', { pct: pctText(remain5h) }),
+            windowUnderOne(w5h, fiveIdle) ? t('tipUnderOne') : t('tipLeft', { pct: pctText(remain5h) }),
             ...(reset5h ? [t('tipResetsAt', { t: reset5h })] : []),
             ...fiveBudgetLines(remain5h),
           ],

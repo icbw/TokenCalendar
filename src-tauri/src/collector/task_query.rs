@@ -30,10 +30,13 @@ use super::store::{
 };
 use super::project_meta::{project_labels, resolve_cte, ScratchRule, HIDDEN_SLICE_KEY};
 
-/// 项目维 metric → daily_project 列（白名单;SQL 只拼这里的常量）。
+/// 项目维 metric → daily_project 列或列表达式（白名单;SQL 只拼这里的常量）。
+/// 列名不带表前缀:调用处与之 JOIN 的 pmap 只有 raw_key / eff_key,不会歧义。
+/// `uncached` 口径见 `store:token_metric_col`。
 pub fn project_metric_col(metric: &str) -> Option<&'static str> {
     Some(match metric {
         "total" => "total_tokens",
+        "uncached" => "(input_tokens + cache_write_tokens)",
         "input" => "input_tokens",
         "output" => "output_tokens",
         "cache_read" => "cache_read_tokens",
@@ -391,7 +394,7 @@ impl Store {
         let key_col = dim_col(group_by)?;
         let sql = if group_by == "project" {
             format!(
-                "WITH {} SELECT p.eff_key AS k, substr(d.day, 9) AS dd, SUM(d.{metric_col}) AS v, SUM(d.turns) AS rc
+                "WITH {} SELECT p.eff_key AS k, substr(d.day, 9) AS dd, SUM({metric_col}) AS v, SUM(d.turns) AS rc
                  FROM daily_project d JOIN pmap p ON p.raw_key = d.project_key WHERE d.day LIKE ?1 GROUP BY k, dd",
                 resolve_cte(rule)
             )
@@ -531,7 +534,7 @@ impl Store {
             (String::new(), "")
         };
         let mut sql = format!(
-            "{with}SELECT {key_col} AS k, d.day AS day, SUM(d.{metric_col}) AS v FROM daily_project d{join}
+            "{with}SELECT {key_col} AS k, d.day AS day, SUM({metric_col}) AS v FROM daily_project d{join}
              WHERE d.day >= ?1 AND d.day <= ?2"
         );
         let mut params = vec![start_day.to_string(), end_day.to_string()];

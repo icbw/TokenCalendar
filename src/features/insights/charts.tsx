@@ -87,7 +87,7 @@ function seriesColor(s: { key: string; color?: string }): string {
 
 // 双组图合计模式:tokens 四分项取蓝色阶（Output 最深 → Cache read 最浅）,credit = 玫红——
 // 玫红与紫蓝系协调,琥珀等暖黄不协调;credit 曲线与主图同用 smoothPath。
-export const COMBO_PART_SHADES = shadeLadder(217, 0.72, 0.45, 4)
+export const COMBO_PART_SHADES = shadeLadder(217, 0.72, 0.45, 3)
 export const COMBO_CREDIT = hsl(348, 0.78, 0.58)
 
 // ---- 公共几何 ----

@@ -295,7 +295,7 @@ function useTrendBlock() {
   }
 }
 
-/** 单模型的 token 分项序列:按价格从高到低（Output → Input → Cache write → Cache read）固定排列,
+/** 单模型的 token 分项序列:按价格从高到低（Output → Uncached input → Cache read）固定排列,
  * 依次取该模型本色由深到浅——最深的 Output 与该模型总量同色,堆叠柱自下而上同序。
  * 源里只报总量、无分项的余量（Codex）另列 Unitemized（中性灰,不在价格色阶内）。
  * 全零分项不出现（颜色仍按固定档位,不因缺项而顺移）;每个桶的分项和恒等于总量。 */
@@ -540,7 +540,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   bucket: 'day' | 'hour'
 }) {
   const t = useT('insights')
-  // [total, ...PART_PRICE_ORDER] 五条序列（total 用来算只报总量的余量）
+  // [total, ...PART_PRICE_ORDER] 四条序列（total 用来算只报总量的余量）
   const [tok, setTok] = useState<(RangeSeriesResult | null)[] | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const modelBars = byModel && bucket === 'day'
@@ -595,7 +595,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
       const idx = r.seriesKeys.indexOf(key)
       return idx < 0 ? 0 : r.points[point]?.values[idx] ?? 0
     }
-    // 一个桶（或小时点）的分项:价格顺序四项 + 余量（total − 四项和,仅 Codex 只报总量的调用会有）
+    // 一个桶（或小时点）的分项:价格顺序三项 + 余量（total − 三项和,仅 Codex 只报总量的调用会有）
     const partVals = (key: string, point: number) => {
       const vals = PART_PRICE_ORDER.map((_, j) => at(res[j + 1], key, point))
       const rest = Math.max(0, at(res[0], key, point) - vals.reduce((a, b) => a + b, 0))

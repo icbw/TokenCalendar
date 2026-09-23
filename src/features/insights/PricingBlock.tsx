@@ -57,6 +57,22 @@ const deltaText = (prev: number, cur: number): string => {
   return `${sign}$${abs} (${sign}${pct}%)`
 }
 
+/** 用量表四格:与价目表同列同序（输入 / 输出 / 缓存写入 / 缓存读取）,取原始分项——每格 × 同名单价即该项美元当量。 */
+function UsageCells({ u }: { u: { input_tokens: number; output_tokens: number; cache_write_tokens: number; cache_read_tokens: number } }) {
+  return (
+    <>
+      {UNITS.map((k) => {
+        const v = u[`${k}_tokens`]
+        return (
+          <td key={k} title={formatFull(v)}>
+            {formatCompact(v)}
+          </td>
+        )
+      })}
+    </>
+  )
+}
+
 type SortKey = 'model' | Unit | 'since'
 interface Sort {
   key: SortKey
@@ -320,10 +336,9 @@ export default function PricingBlock() {
                 <tr>
                   <th className="price-col-model">{t('colModel')}</th>
                   <th>{t('turns')}</th>
-                  <th>{t('mInput')}</th>
-                  <th>{t('mOutput')}</th>
-                  <th>{t('mCacheWrite')}</th>
-                  <th>{t('mCacheRead')}</th>
+                  {UNITS.map((u) => (
+                    <th key={u}>{TOKEN_METRIC_LABELS[u].label}</th>
+                  ))}
                   <th className="price-col-usd">{t('colEquivalent')}</th>
                 </tr>
               </thead>
@@ -359,10 +374,7 @@ export default function PricingBlock() {
                       <td title={t('turnsCellHint')}>
                         {formatFull(r.requests)}
                       </td>
-                      <td title={formatFull(r.input_tokens)}>{formatCompact(r.input_tokens)}</td>
-                      <td title={formatFull(r.output_tokens)}>{formatCompact(r.output_tokens)}</td>
-                      <td title={formatFull(r.cache_write_tokens)}>{formatCompact(r.cache_write_tokens)}</td>
-                      <td title={formatFull(r.cache_read_tokens)}>{formatCompact(r.cache_read_tokens)}</td>
+                      <UsageCells u={r} />
                       <td className="price-col-usd">
                         <span className="price-share-track">
                           <span
@@ -389,10 +401,7 @@ export default function PricingBlock() {
                             })}
                           </td>
                           <td title={t('segTurnsHint')}>—</td>
-                          <td title={formatFull(s.input_tokens)}>{formatCompact(s.input_tokens)}</td>
-                          <td title={formatFull(s.output_tokens)}>{formatCompact(s.output_tokens)}</td>
-                          <td title={formatFull(s.cache_write_tokens)}>{formatCompact(s.cache_write_tokens)}</td>
-                          <td title={formatFull(s.cache_read_tokens)}>{formatCompact(s.cache_read_tokens)}</td>
+                          <UsageCells u={s} />
                           <td className="price-col-usd">
                             <span className="price-usd-value">{usd(s.usd)}</span>
                           </td>

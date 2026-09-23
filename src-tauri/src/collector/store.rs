@@ -534,10 +534,13 @@ CREATE TABLE IF NOT EXISTS session_alias (
 );";
 
 
-/// token 指标 → 聚合表列。四个分项互斥,`total = input + output + cache_read + cache_write`
+/// token 指标 → 聚合表列（或列表达式）。四个存储分项互斥,`total = input + output + cache_read + cache_write`
 /// （COLLECTOR_GUIDE Codex 少量只报 total 的源事件除外）。未知指标回落 total。
+/// 展示口径 `uncached` = 未命中输入 = input + cache_write（缓存写本身就是未命中缓存读、现写入的部分;
+/// 与 OpenAI 系 `input_tokens − cached_input_tokens` 同义）,总输入 = uncached + cache_read。
 pub fn token_metric_col(metric: &str) -> &'static str {
     match metric {
+        "uncached" => "(input_tokens + cache_write_tokens)",
         "input" => "input_tokens",
         "output" => "output_tokens",
         "cache_read" => "cache_read_tokens",
@@ -547,7 +550,7 @@ pub fn token_metric_col(metric: &str) -> &'static str {
 }
 
 /// 命令层校验用:受支持的 token 指标。
-pub const TOKEN_METRICS: &[&str] = &["total", "input", "output", "cache_read", "cache_write"];
+pub const TOKEN_METRICS: &[&str] = &["total", "uncached", "input", "output", "cache_read", "cache_write"];
 
 pub fn days_in_month(y: i32, m: u32) -> u32 {
     let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
@@ -1804,6 +1807,15 @@ mod tests {
             let rows = s.month_rows("2026-09", "agent", metric, TODAY).unwrap();
             assert_eq!(rows[0].values[0], Some(expect), "metric={}", metric);
         }
+        // 未命中输入 = input + cache_write;range_series 与月矩阵同口径
+        let mut batch = Batch::default();
+        batch.add_usage("2026-09-02", Some(3), "claude-code", "c", Tokens { input: 2, output: 5, total: 107, cache_read: 80, cache_write: 20 }, 1);
+        s.commit("test", &batch).unwrap();
+        let rows = s.month_rows("2026-09", "agent", "uncached", TODAY).unwrap();
+        let cc = rows.iter().find(|r| r.key == "claude-code").unwrap();
+        assert_eq!(cc.values[1], Some(22));
+        let hours = s.range_series("2026-09-02", "2026-09-02", "hour", "total", "uncached", None).unwrap();
+        assert_eq!(hours.points.iter().map(|p| p.values[0]).sum::<i64>(), 22);
     }
 
     #[test]

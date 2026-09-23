@@ -14,7 +14,7 @@ use crate::{AppState, collector};
 // ---------- 契约类型 ----------
 
 // bucket/metric：bucket 仅支持 day（week/cumulative 由前端聚合）；
-// metric 支持 total/input/output/cache_read/cache_write（聚合表列直供,见 store:token_metric_col）。
+// metric 支持 total/uncached/input/output/cache_read/cache_write（聚合表列直供,见 store:token_metric_col）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MatrixQuery {
@@ -308,7 +308,7 @@ fn parse_month_ym(month: &str) -> (i32, u32) {
 
 /// 时间范围序列：后端按 bucket 聚合的连续序列 + 维度系列。
 /// bucket: day|hour（hour 轴 = day+HH 本地时）;dimension: agent|model|total;
-/// metric: total|input|output|cache_read|cache_write;filter_dimension/filter_key 可选收窄。
+/// metric: total|uncached|input|output|cache_read|cache_write;filter_dimension/filter_key 可选收窄。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RangeSeriesQuery {
@@ -415,7 +415,7 @@ fn range_millis(range: &DayRange) -> Result<(i64, i64), String> {
 }
 
 /// 项目维月度矩阵（形状 = get_monthly_matrix）。group_by: project | agent | model;
-/// metric: total | input | output | cache_read | cache_write | turns | model_calls | tool_calls | wait（Σ wall_ms）| human（Σ idle_ms）。
+/// metric: total | uncached | input | output | cache_read | cache_write | turns | model_calls | tool_calls | wait（Σ wall_ms）| human（Σ idle_ms）。
 /// message_counts = 该格对话轮次（Σ turns）。
 #[tauri::command(rename_all = "snake_case")]
 pub fn get_project_month_rows(month: String, group_by: String, metric: String, state: State<'_, AppState>) -> Result<MatrixResult, String> {

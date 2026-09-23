@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 
-use model::{CredentialInfo, FetchStatus, Platform, SnapshotSource, SubscriptionSnapshot};
+use model::{CredentialInfo, FetchStatus, FrontendSnapshot, Platform, SnapshotSource, SubscriptionSnapshot};
 use store::SubStore;
 
 /// 默认**兜底**取数间隔（设置页 5/10/15/30 分钟可调）。
@@ -740,12 +740,18 @@ pub fn spawn(app: AppHandle) -> Result<(), String> {
 // ---------- 命令面 ----------
 
 /// 两平台归一化快照（前端唯一读口;未绑定平台 = idle 占位）。
+/// 每份快照附带派生的 `started_windows`（窗口是否已开始计时,见 `model:window_started`）。
 #[tauri::command]
 pub fn get_subscription_snapshots(
     state: tauri::State<'_, SubscriptionReader>,
-) -> Result<Vec<SubscriptionSnapshot>, String> {
+) -> Result<Vec<FrontendSnapshot>, String> {
     let store = state.0.lock().unwrap();
-    Ok(store.snapshots_for_frontend())
+    let now = chrono::Utc::now().timestamp();
+    Ok(store
+        .snapshots_for_frontend()
+        .into_iter()
+        .map(|s| FrontendSnapshot::from_snapshot(s, now))
+        .collect())
 }
 
 /// 扫描本机凭据文件（设置页发现列表;**只含存在性/可解析性/掩码,绝无 token 值**）。

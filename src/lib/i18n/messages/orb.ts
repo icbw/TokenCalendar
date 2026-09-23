@@ -27,6 +27,8 @@ export default {
   // hover 提示：读数行
   tipIdle: ['idle — updates after first use', '未使用——首次使用后更新'],
   tipLeft: ['{pct} / 100 left', '剩余 {pct} / 100'],
+  // 窗口已开始、整数读数仍为 0（服务端只报整数百分比）
+  tipUnderOne: ['over 99 / 100 left — under 1% used', '剩余 99 以上 / 100——已用不足 1%'],
   tipScopedLeft: ['{name} limit {pct} / 100 left', '{name} 限额剩余 {pct} / 100'],
   tipResetsIn: ['resets in {t}', '{t}后重置'],
   tipResetsAt: ['resets at {t}', '{t} 重置'],

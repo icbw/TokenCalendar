@@ -26,6 +26,9 @@ export interface SubscriptionSnapshot {
    * `rollout` = Codex 会话 rollout 里 token_count 事件带的 rate_limits
    * （与 api 是同一个服务端数字，只是走本地文件到手、不花请求）。 */
   source?: 'api' | 'desktop' | 'rollout'
+  /** 已开始计时的窗口 kind（Rust 按平台派生：Claude 看窗尾有无、Codex 看窗尾是否还在滚动）。
+   * 与「已用是否为 0」无关——读数是整数百分比,开始后不足 1% 时 used 仍是 0。 */
+  started_windows?: string[]
 }
 
 /** 凭据发现项（scan_subscription_credentials 出口；只含掩码）。 */

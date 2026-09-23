@@ -26,6 +26,7 @@ type ViewSort = Record<GroupBy, { byTotal: boolean; family: boolean }>
 /** 指标按钮的字典键（短名 / 悬停说明 / hover 读数单位）。只存键,文案在渲染时取。 */
 const METRIC_KEYS: Record<Metric, { short: MessageKey<'matrix'>; hint: MessageKey<'matrix'>; unit: MessageKey<'matrix'> }> = {
   total: { short: 'metricTokens', hint: 'metricTokensHint', unit: 'unitTokens' },
+  uncached: { short: 'metricUncached', hint: 'metricUncachedHint', unit: 'unitUncached' },
   input: { short: 'metricInput', hint: 'metricInputHint', unit: 'unitInput' },
   cache_write: { short: 'metricCacheW', hint: 'metricCacheWHint', unit: 'unitCacheW' },
   cache_read: { short: 'metricCacheR', hint: 'metricCacheRHint', unit: 'unitCacheR' },
