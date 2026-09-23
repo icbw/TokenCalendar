@@ -5,7 +5,7 @@
 //   · Pricing:价格面板（PricingBlock）;
 //   · Credit:tokens × 积分双组图——可选模块,设置里打开才出现（按钮与模块一起出现）。
 // 手写 SVG 图表见 charts.tsx。
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { events, usageService } from '../../services'
 import type { CreditSummary, RangeSeriesResult, TokenMetric } from '../../services'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
@@ -193,7 +193,6 @@ function useTrendBlock() {
     toolbar: (
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">{t('modTrend')}</span>
         <Seg
           value={kind}
           options={[
@@ -470,7 +469,6 @@ function CreditBlock() {
       {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不 auto 靠右;模块内 sticky*/}
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">{t('creditTitle')}</span>
         <Seg
           value={bucket}
           options={[
@@ -726,13 +724,44 @@ export default function InsightsView() {
     if (!showCredit && active === 'credit') setActive('trend')
   }, [showCredit, active])
 
-  // 切换行固定在滚动区外（flex-shrink:0）;模块工具栏在各自 section 内 sticky。
+  // 模块导航悬浮在滚动区右上角（零高度 sticky 停靠层内绝对定位）,不占行:
+  // 垂直居中于吸顶工具栏的第一行控件;工具栏首行按导航实宽绕开,放不下的控件折到导航下方。
+  // 两个尺寸随文本缩放 / 语言 / 折行。
+  const navRef = useRef<HTMLElement>(null)
+  const [navBox, setNavBox] = useState({ w: 0, barH: 0 })
+  useLayoutEffect(() => {
+    const nav = navRef.current
+    const bar = scrollRef.current?.querySelector<HTMLElement>('.insight-module-bar > .insight-toolbar')
+    if (!nav || !bar) return
+    const measure = () => {
+      // barH = 首行中心 × 2（工具栏折行后变高,导航仍对齐首行而非整条工具栏）
+      const first = bar.querySelector<HTMLElement>('.toolbar-group')
+      const b = bar.getBoundingClientRect()
+      const f = first?.getBoundingClientRect()
+      const barH = f ? Math.round((f.top - b.top + f.height / 2) * 2) : bar.offsetHeight
+      const next = { w: nav.offsetWidth, barH }
+      setNavBox((cur) => (cur.w === next.w && cur.barH === next.barH ? cur : next))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(nav)
+    ro.observe(bar)
+    return () => ro.disconnect()
+  }, [])
+
   return (
     <div className="insights-view">
-      <nav className="insight-toolbar insight-module-nav" aria-label={t('modulesAria')}>
-        <Seg value={active} options={modules.map((m) => ({ v: m.id, label: t(m.label), hint: t(m.hint) }))} onChange={jump} />
-      </nav>
-      <div className="insights-scroll insights-modules" ref={scrollRef} onScroll={spy}>
+      <div
+        className="insights-scroll insights-modules"
+        ref={scrollRef}
+        onScroll={spy}
+        style={{ '--module-nav-w': `${navBox.w}px`, '--module-bar-h': `${navBox.barH}px` } as CSSProperties}
+      >
+        <div className="insight-module-nav-dock">
+          <nav className="insight-module-nav" ref={navRef} aria-label={t('modulesAria')}>
+            <Seg value={active} options={modules.map((m) => ({ v: m.id, label: t(m.label), hint: t(m.hint) }))} onChange={jump} />
+          </nav>
+        </div>
         <section className="insight-module" data-module="trend">
           {trend.toolbar}
           {trend.card}

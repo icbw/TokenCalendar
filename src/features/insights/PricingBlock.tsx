@@ -255,7 +255,6 @@ export default function PricingBlock() {
     <>
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">{t('modPricing')}</span>
         <Seg
           value={platform}
           options={PLATFORMS.map((p) => ({

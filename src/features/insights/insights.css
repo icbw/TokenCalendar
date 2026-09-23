@@ -734,8 +734,10 @@ button.price-change {
 }
 
 /* ---- 三模块并列切换（Usage trend / Pricing / Credit） ----
-   顶部切换行固定在滚动区外;每个模块一个 section,模块工具栏（+ 范围条）在 section 内 sticky:
-   滚到哪个模块,哪个模块的工具栏就停在滚动区顶部,离开该模块时随 section 一起被推走。 */
+   每个模块一个 section,模块工具栏（+ 范围条）在 section 内 sticky:
+   滚到哪个模块,哪个模块的工具栏就停在滚动区顶部,离开该模块时随 section 一起被推走。
+   模块导航不占行:悬浮在滚动区右上角（高亮项即当前模块名,工具栏不再另写标题）,垂直居中于吸顶工具栏主行、右缘与工具栏内容区右缘对齐;
+   尺寸由 InsightsView 写入 --module-nav-w / --module-bar-h。 */
 .insights-modules {
   gap: 0;
 }
@@ -763,4 +765,78 @@ button.price-change {
   gap: 10px;
   padding-bottom: 2px;
   background: var(--panel);
+}
+
+/* 零高度 sticky 停靠层:作为滚动区首个子元素钉在顶部,不参与布局;宽度 = 内容区宽（不含滚动条） */
+.insight-module-nav-dock {
+  position: sticky;
+  top: 0;
+  height: 0;
+  z-index: 3;
+}
+
+.insight-module-nav {
+  position: absolute;
+  top: calc(var(--module-bar-h, 42px) / 2);
+  right: 8px;
+  transform: translateY(-50%);
+  padding: 3px;
+  border-radius: 999px;
+  /* 玻璃质感:低不透明底 + 背景模糊提饱和,顶缘一道内高光,外圈柔和投影托起 */
+  background: color-mix(in srgb, var(--panel) 52%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 30%, transparent),
+    0 2px 6px rgba(15, 23, 42, 0.08),
+    var(--shadow-2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.6);
+  backdrop-filter: blur(14px) saturate(1.6);
+  transition: box-shadow 0.18s ease, background-color 0.18s ease;
+}
+
+.insight-module-nav:hover {
+  background: color-mix(in srgb, var(--panel) 64%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 30%, transparent),
+    0 2px 6px rgba(15, 23, 42, 0.08),
+    var(--shadow-3);
+}
+
+.insight-module-nav .toolbar-group {
+  background: transparent;
+  padding: 0;
+  gap: 2px;
+  border-radius: 999px;
+}
+
+.insight-module-nav .seg {
+  padding: 5px 10px;
+  border-radius: 999px;
+}
+
+/* 三个工具栏主行:不再按导航宽度整行让位,工具栏占满整行、导航悬浮其上。
+   改成可折行的块级排布——首行用一个与导航等宽的右浮动占位绕开导航,
+   放不下的控件整组折到导航下方的下一行（取代原先的单行横向滚动）。
+   line-height:0 去掉行内 strut,行高只由控件决定;上下内距 5px + 控件外距 3px = 原 8px。 */
+.insights-modules .insight-module-bar > .insight-toolbar:first-child {
+  display: block;
+  overflow: visible;
+  white-space: normal;
+  line-height: 0;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+.insights-modules .insight-module-bar > .insight-toolbar:first-child::before {
+  content: '';
+  float: right;
+  width: calc(var(--module-nav-w, 0px) + 4px);
+  height: 1px;
+}
+
+.insights-modules .insight-module-bar > .insight-toolbar:first-child > * {
+  display: inline-flex;
+  vertical-align: middle;
+  margin: 3px 10px 3px 0;
+  line-height: normal;
 }

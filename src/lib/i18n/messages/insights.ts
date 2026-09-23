@@ -80,7 +80,7 @@ export default {
 
   // ---- 模块切换行 ----
   modulesAria: ['Insights modules', '洞察模块'],
-  modTrend: ['Usage trend', '用量趋势'],
+  modTrend: ['Usage', '用量'],
   modTrendHint: ['Token usage over time, share by series and anomaly days', 'Token 用量随时间的变化、各系列占比与异常日'],
   modPricing: ['Pricing', '定价'],
   modPricingHint: ['Equivalent API value and official list prices', 'API 等价价值与官方价目'],
@@ -124,7 +124,6 @@ export default {
   anomalyNoSamples: ['not enough samples', '样本不足'],
 
   // ---- 积分模块 ----
-  creditTitle: ['tokens × credit · CodeBuddy', 'Token × 积分 · CodeBuddy'],
   creditPickMonth: ['Pick month', '选择月份'],
   creditNoData: ['{month} has no credit data yet', '{month}暂无积分数据'],
   creditGuideBody: [
