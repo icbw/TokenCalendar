@@ -6,13 +6,15 @@
 // 取数层：Tauri invoke（services）。
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { events, inTauri, usageService, windowService } from '../../services'
-import { cellVisual } from './matrixScale'
+import { cellVisual, monthShort } from './matrixScale'
+import { fmt, useT } from '../../lib/i18n'
 import MatrixTooltip, { type TooltipContent } from './MatrixTooltip'
 import {
   getDesignPrefs,
   setDesignPrefs,
   subscribeDesignPrefs,
   SIZE_PRESETS,
+  weekStartOf,
   type DesignPrefs,
   type SizePreset,
   type WeekStart,
@@ -23,14 +25,13 @@ import './yearMatrix.css'
 
 type Granularity = 'daily' | 'weekly' | 'cumulative'
 
-const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-/** 粒度单钮循环顺序与显示名。 */
+/** 粒度单钮循环顺序与显示名字典键（文案在渲染时取）。 */
 const GRANULARITY_CYCLE: Granularity[] = ['daily', 'weekly', 'cumulative']
-const GRANULARITY_LABEL: Record<Granularity, string> = {
-  daily: 'Daily',
-  weekly: 'Weekly',
-  cumulative: 'Cumulative',
-}
+const GRANULARITY_LABEL = {
+  daily: 'granDaily',
+  weekly: 'granWeekly',
+  cumulative: 'granCumulative',
+} as const satisfies Record<Granularity, string>
 const GAP = 4
 const CELL_MIN = 3
 const CELL_MAX = 18
@@ -133,6 +134,7 @@ function demoValue(d: Date, rng: () => number): number {
 }
 
 export default function YearMatrix() {
+  const t = useT('matrix')
   const [granularity, setGranularity] = useState<Granularity>('daily')
   const [cells, setCells] = useState<Cell[][]>([]) // 53 columns x 7 rows
   const [loading, setLoading] = useState(true)
@@ -143,13 +145,13 @@ export default function YearMatrix() {
   // 抽屉只写 pref，这里监听变化调 set_widget_size）。
   const [sizePreset, setSizePreset] = useState<SizePreset>(() => getDesignPrefs().sizePreset)
   const [locked, setLocked] = useState(() => getDesignPrefs().locked)
-  const [weekStart, setWeekStart] = useState<WeekStart>(() => getDesignPrefs().weekStart ?? 'sunday')
+  const [weekStart, setWeekStart] = useState<WeekStart>(() => weekStartOf(getDesignPrefs()))
   useEffect(
     () =>
       subscribeDesignPrefs((p) => {
         setLocked(p.locked)
         setSizePreset(p.sizePreset)
-        setWeekStart(p.weekStart ?? 'sunday')
+        setWeekStart(weekStartOf(p))
       }),
     [],
   )
@@ -169,7 +171,7 @@ export default function YearMatrix() {
   // 周起始在 load 内即时读取 pref（单一来源）；切换经 weekStart state 触发本 effect 重载，
   // 行序与列边界随之整体平移。
   const load = useCallback(async (g: Granularity) => {
-    const weekStart = getDesignPrefs().weekStart ?? 'sunday'
+    const weekStart = weekStartOf(getDesignPrefs())
     const endDow = weekEndDow(weekStart)
     setLoading(true)
     const { start, end } = gridRange(weekStart)
@@ -291,8 +293,9 @@ export default function YearMatrix() {
   }, [])
 
   // Month labels: show under the column where a new month starts （GitHub style).
+  // 存月份下标（数据），文案在渲染时经 t 取——切换语言无需重建。
   const monthLabels = useMemo(() => {
-    const labels: (string | null)[] = []
+    const labels: (number | null)[] = []
     let prevMonth = -1
     for (const col of cells) {
       const d = col[0]?.date
@@ -303,7 +306,7 @@ export default function YearMatrix() {
       // 列首日进入新月份时在该列标注；月份从列中间开始时，标签落在下一列
       // （近似 GitHub 的锚定方式）。
       if (d.getMonth() !== prevMonth) {
-        labels.push(MONTH_SHORT[d.getMonth()])
+        labels.push(d.getMonth())
         prevMonth = d.getMonth()
       } else {
         labels.push(null)
@@ -418,17 +421,17 @@ export default function YearMatrix() {
       const cell = col?.[r]
       if (!cell) return
       // weekly/cumulative：一格 = 一周聚合，标题标注周起点避免与日期混淆
-      const dateLabel = granularity === 'daily' ? cell.iso : `Week of ${col[0].iso}`
+      const dateLabel = granularity === 'daily' ? cell.iso : t('weekOf', { date: col[0].iso })
       // 未来格与零值格同款灰色显示，hover 文案一致：No usage
       const valueLabel =
         cell.value === null || cell.value === 0
-          ? 'No usage'
-          : `Tokens: ${cell.value.toLocaleString('en-US')}`
+          ? t('noUsage')
+          : t('tokensValue', { n: fmt.number(cell.value) })
       // 挂件走紧凑单行（MatrixTooltip compact）：「日期 · 读数」，不带
       // 「Token activity」前缀——两行浮层在矮窗里会压住邻行。
       setTooltip({ anchor: el, content: { title: dateLabel, lines: [valueLabel] } })
     },
-    [cells, granularity],
+    [cells, granularity, t],
   )
 
   const dragAttr = locked ? undefined : true
@@ -462,7 +465,7 @@ export default function YearMatrix() {
                     background: vis ? vis.background : undefined,
                   }}
                   role="gridcell"
-                  aria-label={`${cell.iso}: ${cell.value === null ? 'N/A' : cell.value === 0 ? 'No usage' : cell.value.toLocaleString('en-US')}`}
+                  aria-label={`${cell.iso}: ${cell.value === null ? t('notAvailable') : cell.value === 0 ? t('noUsage') : fmt.number(cell.value)}`}
                   onMouseEnter={(e) => showCellTooltip(c, r, e.currentTarget)}
                 />
               )
@@ -471,7 +474,7 @@ export default function YearMatrix() {
         ))}
       </div>
     ),
-    [cells, cellSize, globalCap, showCellTooltip, dragAttr, hideTooltip],
+    [cells, cellSize, globalCap, showCellTooltip, dragAttr, hideTooltip, t],
   )
 
   return (
@@ -481,7 +484,7 @@ export default function YearMatrix() {
       data-tauri-drag-region={dragAttr}
     >
       <div className={`year-card${snapLanded ? ' snap-landed' : ''}`} data-tauri-drag-region={dragAttr}>
-        <div className="year-grid" role="grid" aria-label="Year token activity" data-tauri-drag-region={dragAttr}>
+        <div className="year-grid" role="grid" aria-label={t('yearGridAria')} data-tauri-drag-region={dragAttr}>
           {gridRows}
         </div>
 
@@ -491,7 +494,7 @@ export default function YearMatrix() {
           <div className="year-month-labels" style={{ gap: GAP }}>
             {monthLabels.map((label, i) => (
               <span key={i} className="year-month-label" style={{ width: cellSize }}>
-                {label ?? ''}
+                {label === null ? '' : monthShort(t, label)}
               </span>
             ))}
           </div>
@@ -506,23 +509,23 @@ export default function YearMatrix() {
               className="year-action"
               onClick={cycleGranularity}
               disabled={loading}
-              title={`${GRANULARITY_LABEL[granularity]} → ${GRANULARITY_LABEL[nextGranularity]}`}
-              aria-label={`View: ${GRANULARITY_LABEL[granularity]}, next ${GRANULARITY_LABEL[nextGranularity]}`}
+              title={`${t(GRANULARITY_LABEL[granularity])} → ${t(GRANULARITY_LABEL[nextGranularity])}`}
+              aria-label={t('viewAria', { cur: t(GRANULARITY_LABEL[granularity]), next: t(GRANULARITY_LABEL[nextGranularity]) })}
             >
               <SwitchViewIcon />
             </button>
             <button
               className={`year-action is-lock${locked ? ' is-active' : ''}`}
               onClick={toggleLock}
-              title={locked ? 'Unlock' : 'Lock'}
-              aria-label={locked ? 'Unlock widget' : 'Lock widget'}
+              title={locked ? t('unlock') : t('lock')}
+              aria-label={locked ? t('unlockWidget') : t('lockWidget')}
             >
               {locked ? <LockClosedIcon /> : <LockOpenIcon />}
             </button>
-            <button className="year-action" onClick={expandFull} title="Main window" aria-label="Open main window">
+            <button className="year-action" onClick={expandFull} title={t('mainWindow')} aria-label={t('openMainWindow')}>
               <ExpandIcon />
             </button>
-            <button className="year-action" onClick={resetSize} title="Reset size" aria-label="Reset size">
+            <button className="year-action" onClick={resetSize} title={t('resetSize')} aria-label={t('resetSize')}>
               <ResetIcon />
             </button>
           </div>

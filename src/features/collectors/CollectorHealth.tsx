@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react'
 import { collectorService, events, type SourceSummary } from '../../services'
 import { toCollectStatus, type CollectStatus } from '../../services/collectorService'
+import { useT, type Translator } from '../../lib/i18n'
 import './health.css'
 
 /** 已追上之后,单轮超过这么久才亮「Collecting…」（常规一轮毫秒级,避免每轮闪一下）。 */
@@ -21,16 +22,17 @@ function levelOf(s: SourceSummary): StatusLevel {
   return 'error'
 }
 
-function noteOf(s: SourceSummary): string | undefined {
+function noteOf(s: SourceSummary, t: Translator<'collectors'>): string | undefined {
   if (s.lastErrorMessage) return s.lastErrorMessage.slice(0, 60)
-  if (s.probeStatus === 'partial') return 'Partial'
-  if (s.probeStatus === 'unsupported_schema') return 'Schema unknown'
-  if (s.probeStatus === 'no_source') return 'No source'
-  if (s.stale) return 'Stale'
+  if (s.probeStatus === 'partial') return t('notePartial')
+  if (s.probeStatus === 'unsupported_schema') return t('noteSchemaUnknown')
+  if (s.probeStatus === 'no_source') return t('noteNoSource')
+  if (s.stale) return t('noteStale')
   return undefined
 }
 
 export default function CollectorHealth() {
+  const t = useT('collectors')
   const [sources, setSources] = useState<SourceSummary[]>([])
   const [loaded, setLoaded] = useState(false)
   const [status, setStatus] = useState<CollectStatus | null>(null)
@@ -90,12 +92,12 @@ export default function CollectorHealth() {
     return () => window.clearTimeout(timer)
   }, [roundStartedAt])
 
-  if (!loaded) return <footer className="health-footer"><span className="health-summary">Loading collectors…</span></footer>
+  if (!loaded) return <footer className="health-footer"><span className="health-summary">{t('loading')}</span></footer>
 
   if (paused) {
     return (
       <footer className="health-footer">
-        <span className="health-summary"><span className="health-dot is-attention" />Collection paused</span>
+        <span className="health-summary"><span className="health-dot is-attention" />{t('paused')}</span>
       </footer>
     )
   }
@@ -107,20 +109,20 @@ export default function CollectorHealth() {
       <footer className="health-footer">
         <span className="health-summary">
           <span className="health-dot is-collecting" />
-          Collecting…{name ? <span className="health-note">{name}</span> : null}
+          {t('collecting')}{name ? <span className="health-note">{name}</span> : null}
         </span>
       </footer>
     )
   }
 
-  const items = sources.map((s) => ({ ...s, level: levelOf(s), note: noteOf(s) }))
+  const items = sources.map((s) => ({ ...s, level: levelOf(s), note: noteOf(s, t) }))
   const ok = items.filter((s) => s.level === 'healthy').length
 
   return (
     <footer className="health-footer">
       <span className="health-summary">
         <span className={`health-dot ${ok === items.length && items.length > 0 ? 'is-healthy' : 'is-attention'}`} />
-        Collectors {ok}/{items.length} OK
+        {t('summary', { ok, total: items.length })}
       </span>
       {items.filter((s) => s.level !== 'healthy').map((s) => (
         <span key={s.id} className="health-item" title={s.id}>

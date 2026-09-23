@@ -6,70 +6,65 @@
 import type { TaskTurn } from '../../services'
 import { formatCompact } from '../matrix/matrixScale'
 import { formatDuration } from '../insights/analytics'
+import { useT, type Translator } from '../../lib/i18n'
+import { clockLabel } from './taskFormat'
 
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const pad2 = (n: number) => String(n).padStart(2, '0')
-
-function clock(ms: number): string {
-  const d = new Date(ms)
-  return `${MONTH_ABBR[d.getMonth()]} ${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
-}
-
-function turnHint(t: TaskTurn): string {
+function turnHint(tn: TaskTurn, t: Translator<'tasks'>): string {
   const parts = [
-    `Turn ${t.turnSeq} · ${clock(t.startedAt)}${t.aborted ? ' · aborted' : ''}`,
-    `Model ${t.model}`,
-    `Wait ${formatDuration(t.wallMs)} (model ${formatDuration(t.modelMs)} · tool ${formatDuration(t.toolMs)})`,
-    `${t.steps} steps · ${t.toolCalls} tools`,
+    `${t('turnHead', { seq: tn.turnSeq, time: clockLabel(tn.startedAt) })}${tn.aborted ? ` · ${t('turnAborted')}` : ''}`,
+    t('turnModel', { model: tn.model }),
+    t('turnWait', { wall: formatDuration(tn.wallMs), model: formatDuration(tn.modelMs), tool: formatDuration(tn.toolMs) }),
+    t('stepsTools', { steps: tn.steps, tools: tn.toolCalls }),
   ]
-  if (t.subagentCalls > 0) parts.push(`${t.subagentCount} subagents · ${t.subagentCalls} subagent calls`)
-  if (t.ttftMs !== null) parts.push(`First token ${(t.ttftMs / 1000).toFixed(1)}s`)
-  if (t.gapMs !== null) parts.push(`Gap before ${formatDuration(t.gapMs)}`)
-  parts.push(`${formatCompact(t.totalTokens)} tokens`)
-  if (t.errorCount > 0) parts.push(`Errors: ${t.errorCount}`)
-  if (t.retryCount > 0) parts.push(`Retries: ${t.retryCount}`)
+  if (tn.subagentCalls > 0) parts.push(t('turnSubagents', { n: tn.subagentCount, calls: tn.subagentCalls }))
+  if (tn.ttftMs !== null) parts.push(t('turnFirstToken', { s: (tn.ttftMs / 1000).toFixed(1) }))
+  if (tn.gapMs !== null) parts.push(t('turnGap', { d: formatDuration(tn.gapMs) }))
+  parts.push(t('turnTokens', { n: formatCompact(tn.totalTokens) }))
+  if (tn.errorCount > 0) parts.push(t('turnErrors', { n: tn.errorCount }))
+  if (tn.retryCount > 0) parts.push(t('turnRetries', { n: tn.retryCount }))
   return parts.join('\n')
 }
 
 export default function TaskTurns({ turns }: { turns: TaskTurn[] | null | undefined }) {
-  if (turns === undefined) return <div className="insight-empty">Loading turns…</div>
-  if (turns === null) return <div className="insight-empty">Turns unavailable (service not running)</div>
-  if (turns.length === 0) return <div className="insight-empty">No turns recorded for this task</div>
+  const t = useT('tasks')
+  if (turns === undefined) return <div className="insight-empty">{t('loadingTurns')}</div>
+  if (turns === null) return <div className="insight-empty">{t('turnsUnavailable')}</div>
+  if (turns.length === 0) return <div className="insight-empty">{t('noTurnsTask')}</div>
 
-  const maxWall = Math.max(1, ...turns.map((t) => t.wallMs ?? 0))
-  const anyTiming = turns.some((t) => t.wallMs !== null)
-  const aborted = turns.filter((t) => t.aborted).length
+  const maxWall = Math.max(1, ...turns.map((tn) => tn.wallMs ?? 0))
+  const anyTiming = turns.some((tn) => tn.wallMs !== null)
+  const aborted = turns.filter((tn) => tn.aborted).length
 
   return (
     <div className="turns">
       <div className="turns-head">
-        <span>{turns.length} turns{aborted > 0 ? ` · ${aborted} aborted` : ''}</span>
-        {anyTiming && <span>Longest {formatDuration(maxWall)}</span>}
+        <span>{t('turnsN', { n: turns.length })}{aborted > 0 ? ` · ${t('abortedN', { n: aborted })}` : ''}</span>
+        {anyTiming && <span>{t('longest', { d: formatDuration(maxWall) })}</span>}
         <span className="turns-legend">
-          <span className="legend-item"><span className="legend-swatch turn-seg-model" />Model</span>
-          <span className="legend-item"><span className="legend-swatch turn-seg-tool" />Tool</span>
-          <span className="legend-item"><span className="legend-swatch turn-seg-rest" />Other</span>
-          <span className="legend-item"><span className="legend-swatch turn-swatch-error" />Aborted</span>
+          <span className="legend-item"><span className="legend-swatch turn-seg-model" />{t('legendModel')}</span>
+          <span className="legend-item"><span className="legend-swatch turn-seg-tool" />{t('legendTool')}</span>
+          <span className="legend-item"><span className="legend-swatch turn-seg-rest" />{t('legendOther')}</span>
+          <span className="legend-item"><span className="legend-swatch turn-swatch-error" />{t('legendAborted')}</span>
         </span>
       </div>
       <div className="turns-list">
-        {turns.map((t) => {
-          const wall = t.wallMs
+        {turns.map((tn) => {
+          const wall = tn.wallMs
           let modelPct = 0
           let toolPct = 0
           if (wall !== null && wall > 0) {
-            const m = Math.max(0, t.modelMs ?? 0)
-            const tl = Math.max(0, t.toolMs ?? 0)
+            const m = Math.max(0, tn.modelMs ?? 0)
+            const tl = Math.max(0, tn.toolMs ?? 0)
             const scale = m + tl > wall ? wall / (m + tl) : 1
             modelPct = ((m * scale) / wall) * 100
             toolPct = ((tl * scale) / wall) * 100
           }
           return (
-            <div key={t.turnSeq} className={`turn-row${t.aborted ? ' is-aborted' : ''}`} title={turnHint(t)}>
-              <span className="turn-seq">#{t.turnSeq}</span>
+            <div key={tn.turnSeq} className={`turn-row${tn.aborted ? ' is-aborted' : ''}`} title={turnHint(tn, t)}>
+              <span className="turn-seq">#{tn.turnSeq}</span>
               <div className="turn-track">
                 {wall === null ? (
-                  <span className="turn-na">no timing</span>
+                  <span className="turn-na">{t('noTiming')}</span>
                 ) : (
                   <div className="turn-bar" style={{ width: `${Math.max(0.6, (wall / maxWall) * 100)}%` }}>
                     <span className="turn-seg-model" style={{ width: `${modelPct}%` }} />
@@ -78,8 +73,10 @@ export default function TaskTurns({ turns }: { turns: TaskTurn[] | null | undefi
                 )}
               </div>
               <span className="turn-meta">
-                {t.steps} steps · {t.toolCalls} tools
-                {t.errorCount > 0 && <span className="turn-errors"> · {t.errorCount} {t.errorCount === 1 ? 'error' : 'errors'}</span>}
+                {t('stepsTools', { steps: tn.steps, tools: tn.toolCalls })}
+                {tn.errorCount > 0 && (
+                  <span className="turn-errors"> · {t(tn.errorCount === 1 ? 'errorsN_one' : 'errorsN_other', { n: tn.errorCount })}</span>
+                )}
               </span>
               <span className="turn-wall">{formatDuration(wall)}</span>
             </div>

@@ -14,6 +14,7 @@ import { LineChart, StackedBarChart, type CellColumns, type SeriesSpec } from '.
 import { projectDisplayName } from '../insights/analytics'
 import { projectColor } from '../insights/projectColors'
 import type { GroupBy } from './UsageMatrixView'
+import { useT } from '../../lib/i18n'
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const ymd = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
@@ -40,6 +41,7 @@ export default function MatrixPanel({
   onToggleTotalOnly,
   onClearRow,
 }: MatrixPanelProps) {
+  const t = useT('matrix')
   const [kind, setKind] = useState<'line' | 'stack'>('line')
   const [series, setSeries] = useState<SeriesSpec[] | null>(null)
   const [buckets, setBuckets] = useState<string[]>([])
@@ -155,7 +157,8 @@ export default function MatrixPanel({
         setSeries(
           res.seriesKeys.map((k, i) => ({
             key: k,
-            label: k === '__total__' ? 'All sources' : groupBy === 'project' ? projectDisplayName(k) : res.seriesLabels[i] ?? k,
+            // __total__ 的显示名在渲染时由 shownSeries 替换（随语言切换）
+            label: k === '__total__' ? k : groupBy === 'project' ? projectDisplayName(k) : res.seriesLabels[i] ?? k,
             values: res.points.map((p) => p.values[i] ?? 0),
             color: groupBy === 'project' && k !== '__total__' ? projectColor(k) : undefined,
           })),
@@ -166,17 +169,23 @@ export default function MatrixPanel({
     }
   }, [groupBy, selectedRow, totalOnly, refreshTick])
 
+  // 合计系列的显示名在渲染时取（取数结果只存数据,切换语言即时生效）。
+  const shownSeries = useMemo(
+    () => series?.map((s) => (s.key === '__total__' ? { ...s, label: t('allSources') } : s)) ?? null,
+    [series, t],
+  )
+
   const title = useMemo(() => {
     if (selectedRow !== null) return groupBy === 'project' ? projectDisplayName(selectedRow) : selectedRow
-    if (totalOnly) return 'All · total'
-    return groupBy === 'model' ? 'All models' : groupBy === 'project' ? 'All projects' : 'All agents'
-  }, [selectedRow, totalOnly, groupBy])
+    if (totalOnly) return t('allTotal')
+    return groupBy === 'model' ? t('allModels') : groupBy === 'project' ? t('allProjects') : t('allAgents')
+  }, [selectedRow, totalOnly, groupBy, t])
 
   if (collapsed) {
     return (
       <section className="matrix-panel is-collapsed">
         {/* 折叠态:仅剩展开钮（▲),与展开态折叠钮（▾）同一坐标——右缘图标列正下方*/}
-        <button className="matrix-panel-collapse" onClick={onToggleCollapsed} title={`Expand chart — ${title}`}>
+        <button className="matrix-panel-collapse" onClick={onToggleCollapsed} title={t('expandChart', { title })}>
           <ChevronUpIcon />
         </button>
       </section>
@@ -191,14 +200,14 @@ export default function MatrixPanel({
         <button
           className={`matrix-panel-icon${kind === 'stack' ? ' is-active' : ''}`}
           onClick={() => setKind('stack')}
-          title="Stacked bars"
+          title={t('stackedBars')}
         >
           <StackIcon />
         </button>
         <button
           className={`matrix-panel-icon${kind === 'line' ? ' is-active' : ''}`}
           onClick={() => setKind('line')}
-          title="Lines"
+          title={t('lines')}
         >
           <LinesIcon />
         </button>
@@ -206,33 +215,33 @@ export default function MatrixPanel({
           <button
             className={`matrix-panel-icon${totalOnly ? ' is-active' : ''}`}
             onClick={onToggleTotalOnly}
-            title={totalOnly ? 'Show per-series curves' : 'Show all-source total only'}
+            title={totalOnly ? t('showPerSeries') : t('showTotalOnly')}
           >
             <TotalIcon />
           </button>
         ) : (
-          <button className="matrix-panel-icon" onClick={onClearRow} title="Back to all-series preset">
+          <button className="matrix-panel-icon" onClick={onClearRow} title={t('backToPreset')}>
             <CloseIcon />
           </button>
         )}
       </header>
 
       {/* 折叠/展开箭头固定右下角:折叠后也锚在同一坐标,两个状态一个位置,不跳动。*/}
-      <button className="matrix-panel-collapse" onClick={onToggleCollapsed} title="Collapse chart panel">
+      <button className="matrix-panel-collapse" onClick={onToggleCollapsed} title={t('collapseChart')}>
         <ChevronDownIcon />
       </button>
 
       <div className="matrix-panel-body" ref={bodyRef}>
-        {loading && series === null && <div className="insight-empty">Loading…</div>}
-        {!loading && unavailable && <div className="insight-empty">Data unavailable (service not running)</div>}
+        {loading && series === null && <div className="insight-empty">{t('loading')}</div>}
+        {!loading && unavailable && <div className="insight-empty">{t('dataUnavailable')}</div>}
         {!loading && !unavailable && (series === null || series.length === 0 || series.every((s) => s.values.every((v) => v === 0))) && (
-          <div className="insight-empty">No usage records in this window</div>
+          <div className="insight-empty">{t('noUsageInWindow')}</div>
         )}
-        {series !== null && series.length > 0 && !series.every((s) => s.values.every((v) => v === 0)) && (
+        {shownSeries !== null && shownSeries.length > 0 && !shownSeries.every((s) => s.values.every((v) => v === 0)) && (
           kind === 'line' ? (
-            <LineChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
+            <LineChart series={shownSeries} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
           ) : (
-            <StackedBarChart series={series} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
+            <StackedBarChart series={shownSeries} buckets={buckets} height={150} showYAxis={false} showGrid={false} showXAxis={false} columns={columns} />
           )
         )}
       </div>

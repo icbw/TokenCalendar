@@ -3,6 +3,7 @@
 // 统一 crosshair tooltip / 轴刻度 / 稳定配色（家族编码）。
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
+import { useT } from '../../lib/i18n'
 
 // ---- 配色 ----
 // 家族绑定 + 精选色板:手工挑选的 12 色环（紫→蓝→青→品红域,避开与整体不协调的
@@ -223,6 +224,7 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
   /** true = 行按系列原顺序（分项的价格顺序）,不按值降序。 */
   ordered?: boolean
 }) {
+  const t = useT('insights')
   const i = hover.index
   const total = series.reduce((s, sr) => s + (sr.values[i] ?? 0), 0)
   // 行数动态上限:图表高度放得下几行就列几行,余量并作「+N more」摘要行,
@@ -281,11 +283,11 @@ function HoverCard({ hover, plot, bucketLabels, series, height, margin, yMax, st
           ))}
           {restCount > 0 && (
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, lineHeight: '16px', color: 'var(--text-faint)' }}>
-              <span>+{restCount} more</span>
+              <span>{t('chartMore', { n: restCount })}</span>
               <span style={{ fontVariantNumeric: 'tabular-nums' }}>{fmt(restValue)}</span>
             </div>
           )}
-          {allRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No data</div>}
+          {allRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>{t('chartNoData')}</div>}
         </div>
       </foreignObject>
     </g>
@@ -522,6 +524,7 @@ export function ComboChart({ parts, groups, credits, buckets, height = 230 }: {
   buckets: string[]
   height?: number
 }) {
+  const t = useT('insights')
   const width = 760
   const [hover, setHover] = useState<HoverState | null>(null)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -620,7 +623,7 @@ export function ComboChart({ parts, groups, credits, buckets, height = 230 }: {
     for (const c of credits) {
       const v = c.values[i]
       if (v !== null && v !== undefined) {
-        tooltipRows.push({ key: `c:${c.key}`, label: credits.length > 1 ? `${c.label} · credit` : 'credit', value: v, color: c.color, credit: true })
+        tooltipRows.push({ key: `c:${c.key}`, label: credits.length > 1 ? t('chartModelCredit', { label: c.label }) : t('chartCredit'), value: v, color: c.color, credit: true })
       } else {
         uncovered = true
       }
@@ -716,9 +719,9 @@ export function ComboChart({ parts, groups, credits, buckets, height = 230 }: {
                   <span style={{ fontVariantNumeric: 'tabular-nums' }}>{r.credit ? r.value.toFixed(2) : formatFull(r.value)}</span>
                 </div>
               ))}
-              {tooltipRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No data</div>}
+              {tooltipRows.length === 0 && <div style={{ color: 'var(--text-faint)' }}>{t('chartNoData')}</div>}
               {tooltipRows.length > 0 && uncovered && (
-                <div style={{ color: 'var(--text-faint)', lineHeight: '16px' }}>credit not covered</div>
+                <div style={{ color: 'var(--text-faint)', lineHeight: '16px' }}>{t('chartCreditUncovered')}</div>
               )}
             </div>
           </foreignObject>
@@ -741,9 +744,10 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190, format
   /** 图例名 hover 提示（缺省 = label;项目维传完整路径）。 */
   titleFor?: (key: string, label: string) => string
 }) {
+  const t = useT('insights')
   const total = items.reduce((s, it) => s + it.value, 0)
   if (total <= 0 || items.length === 0) {
-    return <div className="insight-empty">No data</div>
+    return <div className="insight-empty">{t('chartNoData')}</div>
   }
   const cx = 95
   const cy = height / 2
@@ -796,7 +800,7 @@ export function DonutChart({ items, centerLabel, unitLabel, height = 190, format
         {leftItems.map(legendRow)}
         {overflowCount > 0 && (
           <div style={{ fontSize: 10, color: 'var(--text-faint)', lineHeight: '20px' }} title={arcs.map((a) => `${a.label} ${formatValue(a.value)}`).join('\n')}>
-            +{overflowCount} more ({formatValue(overflowValue)})
+            {t('chartMoreValue', { n: overflowCount, v: formatValue(overflowValue) })}
           </div>
         )}
       </div>

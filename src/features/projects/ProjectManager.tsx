@@ -12,57 +12,71 @@ import { events, projectService } from '../../services'
 import type { ProjectMetaList, ProjectMetaRow, ProjectStatus, ScratchRuleInfo, WriteResult } from '../../services'
 import { formatCompact, formatFull } from '../matrix/matrixScale'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
+import { localizeProjectLabel } from '../../services/projectLabels'
+import { fmt, getT, useT, type MessageKey } from '../../lib/i18n'
 import './projects.css'
 
 type StatusFilter = 'all' | 'pinned' | ProjectStatus
 type SortKey = 'recent' | 'sessions'
 
-const STATUS_FILTERS: { v: StatusFilter; label: string; hint: string }[] = [
-  { v: 'all', label: 'All', hint: 'Every folder seen in the data' },
-  { v: 'pinned', label: '', hint: 'Pinned: monitored on the Timeline window, listed first' },
-  { v: 'active', label: 'Active', hint: 'Shown as their own project' },
-  { v: 'hidden', label: 'Hidden', hint: 'Left out of analysis views and project lists' },
-  { v: 'merged', label: 'Merged', hint: 'Counted under another project' },
-  { v: 'scratch', label: 'Scratch', hint: 'Collapsed into Scratch by the rule below' },
+type ProjectsKey = MessageKey<'projects'>
+
+/** 筛选段:label / hint 存字典键,渲染时取文（模块顶层不拼文案）。pinned 段显示图标,无 label。 */
+const STATUS_FILTERS: { v: StatusFilter; label: ProjectsKey | null; hint: ProjectsKey }[] = [
+  { v: 'all', label: 'filterAll', hint: 'hintAll' },
+  { v: 'pinned', label: null, hint: 'hintPinned' },
+  { v: 'active', label: 'filterActive', hint: 'hintActive' },
+  { v: 'hidden', label: 'filterHidden', hint: 'hintHidden' },
+  { v: 'merged', label: 'filterMerged', hint: 'hintMerged' },
+  { v: 'scratch', label: 'scratch', hint: 'hintScratch' },
 ]
 
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
+/** 短日期（显示用,按当前语言）:`Sep 5` / `9月5日`;跨年补年份。 */
 function dayLabel(day: string | null): string {
   if (!day) return '—'
   const [y, m, d] = day.split('-').map(Number)
-  const year = y !== new Date().getFullYear() ? `, ${y}` : ''
-  return `${MONTH_ABBR[m - 1]} ${d}${year}`
+  const withYear = y !== new Date().getFullYear()
+  return fmt.date(new Date(y, m - 1, d), withYear ? { year: 'numeric', month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric' })
 }
 
 function statusText(r: ProjectMetaRow): string {
+  const t = getT('projects')
   switch (r.status) {
     case 'hidden':
-      return 'Hidden'
+      return t('filterHidden')
     case 'merged':
-      return `Merged → ${r.mergedLabel ?? r.mergedInto ?? ''}`
+      return t('statusMerged', { target: r.mergedLabel ? localizeProjectLabel(r.mergedInto ?? '', r.mergedLabel) : r.mergedInto ?? '' })
     case 'scratch':
-      return 'Scratch'
+      return t('scratch')
     default:
-      return 'Active'
+      return t('filterActive')
   }
 }
 
+/** 合并目标下拉项的状态后缀（非 active 才显示）。 */
+function optionStatus(status: ProjectStatus): string {
+  const t = getT('projects')
+  const word = status === 'hidden' ? t('optStatusHidden') : status === 'merged' ? t('optStatusMerged') : status === 'scratch' ? t('optStatusScratch') : status
+  return t('optStatusWrap', { status: word })
+}
+
 function statusHint(r: ProjectMetaRow, scratchHidden: boolean): string {
+  const t = getT('projects')
   const lines: string[] = []
-  if (r.status === 'merged' && r.mergedInto) lines.push(`Counted under ${r.mergedInto}`)
-  if (r.status === 'active') lines.push('Click to move into Scratch')
-  if (r.status === 'scratch') lines.push('Click to keep as its own project')
+  if (r.status === 'merged' && r.mergedInto) lines.push(t('hintCountedUnder', { key: r.mergedInto }))
+  if (r.status === 'active') lines.push(t('hintClickToScratch'))
+  if (r.status === 'scratch') lines.push(t('hintClickToKeep'))
   if (r.status === 'scratch') {
-    const how = r.mergedInto === projectService.SCRATCH_KEY ? 'Moved into Scratch by hand' : 'Collapsed into Scratch by the rule'
-    lines.push(scratchHidden ? `${how} (Scratch is hidden)` : how)
+    const how = r.mergedInto === projectService.SCRATCH_KEY ? t('hintMovedByHand') : t('hintCollapsedByRule')
+    lines.push(scratchHidden ? t('hintScratchHidden', { how }) : how)
   }
-  if (r.status !== 'hidden' && r.effectiveKey === null && r.status !== 'scratch') lines.push('Not visible: its target project is hidden')
-  if (r.managed && r.status === 'active') lines.push('Managed: the Scratch rule does not apply')
+  if (r.status !== 'hidden' && r.effectiveKey === null && r.status !== 'scratch') lines.push(t('hintNotVisible'))
+  if (r.managed && r.status === 'active') lines.push(t('hintManaged'))
   return lines.join('\n')
 }
 
 export default function ProjectManager({ active }: { active: boolean }) {
+  const t = useT('projects')
   const [list, setList] = useState<ProjectMetaList | null | undefined>(undefined)
   const [ruleInfo, setRuleInfo] = useState<ScratchRuleInfo | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
@@ -155,7 +169,8 @@ export default function ProjectManager({ active }: { active: boolean }) {
     return true
   }, [])
 
-  const rows = useMemo(() => list?.rows ?? [], [list])
+  // 内置伪项目的后端默认名（Unknown project）按当前语言显示;别名 / 目录名原样
+  const rows = useMemo(() => (list?.rows ?? []).map((r) => ({ ...r, label: localizeProjectLabel(r.key, r.label, t) })), [list, t])
   const byKey = useMemo(() => new Map(rows.map((r) => [r.key, r])), [rows])
   const counts = useMemo(() => {
     const c: Record<StatusFilter, number> = { all: rows.length, pinned: 0, active: 0, hidden: 0, merged: 0, scratch: 0 }
@@ -176,9 +191,9 @@ export default function ProjectManager({ active }: { active: boolean }) {
         (!q || r.key.toLowerCase().includes(q) || r.label.toLowerCase().includes(q) || (r.alias ?? '').toLowerCase().includes(q)),
     )
     if (sort === 'sessions') {
-      out.sort((a, b) => b.sessions - a.sessions || b.turns - a.turns || a.label.localeCompare(b.label))
+      out.sort((a, b) => b.sessions - a.sessions || b.turns - a.turns || fmt.compare(a.label, b.label))
     } else {
-      out.sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? '') || b.sessions - a.sessions || a.label.localeCompare(b.label))
+      out.sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? '') || b.sessions - a.sessions || fmt.compare(a.label, b.label))
     }
     // 置顶行额外提前,按置顶先后（= 时间轴列序）;其余保持上面的排序
     const pinRank = (r: ProjectMetaRow) => {
@@ -186,7 +201,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
       return i < 0 ? Number.MAX_SAFE_INTEGER : i
     }
     return out.map((r, i) => ({ r, i })).sort((a, b) => pinRank(a.r) - pinRank(b.r) || a.i - b.i).map((x) => x.r)
-  }, [rows, filter, sort, query, pins])
+  }, [rows, filter, sort, query, pins, t])
 
   const toggleSelect = (key: string) =>
     setSelected((prev) => {
@@ -241,8 +256,8 @@ export default function ProjectManager({ active }: { active: boolean }) {
   const mergeCandidates = useMemo(() => {
     if (!merging) return []
     const src = new Set(merging.sources)
-    return rows.filter((r) => !src.has(r.key) && r.mergedInto === null).sort((a, b) => a.label.localeCompare(b.label))
-  }, [merging, rows])
+    return rows.filter((r) => !src.has(r.key) && r.mergedInto === null).sort((a, b) => fmt.compare(a.label, b.label))
+  }, [merging, rows, t])
   const blockedSources = merging ? merging.sources.filter((k) => targets.has(k)) : []
 
   const confirmMerge = async () => {
@@ -280,7 +295,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
     const n = Number(draft)
     const reset = () => (field === 'minSessions' ? setSessionsDraft(String(ruleInfo.rule.minSessions)) : setTurnsDraft(String(ruleInfo.rule.minTurns)))
     if (!Number.isInteger(n) || n < lo || n > hi) {
-      setError(`${field === 'minSessions' ? 'Sessions' : 'Turns'} must be a whole number from ${lo} to ${hi}`)
+      setError(t(field === 'minSessions' ? 'sessionsMustBe' : 'turnsMustBe', { lo, hi }))
       reset()
       return
     }
@@ -296,23 +311,23 @@ export default function ProjectManager({ active }: { active: boolean }) {
 
   return (
     <div className="pm">
-      <div className="setting-section">Scratch rule</div>
+      <div className="setting-section">{t('scratchRule')}</div>
       <div className="setting-block">
         <Toggle
-          label="Collapse small folders into Scratch"
-          title="Folders with few sessions and few turns are shown as one Scratch project. Renamed, kept, hidden or merged folders are not affected."
+          label={t('collapseSmall')}
+          title={t('collapseSmallHint')}
           checked={rule?.enabled ?? true}
           disabled={!rule || busy}
           onChange={(v) => void applyRule({ enabled: v })}
         />
         <div className="setting-row">
-          <span title="A folder is collapsed only when both counts are below these numbers">Collapse when</span>
+          <span title={t('collapseWhenHint')}>{t('collapseWhen')}</span>
           <div className="pm-rule-nums">
-            <span className="setting-unit">fewer than</span>
+            <span className="setting-unit">{t('fewerThan')}</span>
             <input
               className="setting-num"
               type="number"
-              aria-label="Session threshold"
+              aria-label={t('sessionThreshold')}
               value={sessionsDraft}
               min={ruleInfo?.minSessionsBounds[0]}
               max={ruleInfo?.minSessionsBounds[1]}
@@ -321,11 +336,11 @@ export default function ProjectManager({ active }: { active: boolean }) {
               onBlur={() => commitNumber('minSessions', sessionsDraft)}
               onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
             />
-            <span className="setting-unit">sessions and fewer than</span>
+            <span className="setting-unit">{t('sessionsAndFewerThan')}</span>
             <input
               className="setting-num"
               type="number"
-              aria-label="Turn threshold"
+              aria-label={t('turnThreshold')}
               value={turnsDraft}
               min={ruleInfo?.minTurnsBounds[0]}
               max={ruleInfo?.minTurnsBounds[1]}
@@ -334,68 +349,68 @@ export default function ProjectManager({ active }: { active: boolean }) {
               onBlur={() => commitNumber('minTurns', turnsDraft)}
               onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
             />
-            <span className="setting-unit">turns</span>
+            <span className="setting-unit">{t('turnsUnit')}</span>
           </div>
         </div>
         <Toggle
-          label="Unknown project goes to Scratch"
-          title="Sessions without a working directory (for example CodeBuddy cloud workspaces)"
+          label={t('unknownToScratch')}
+          title={t('unknownToScratchHint')}
           checked={rule?.unknownAsScratch ?? true}
           disabled={!rule || busy}
           onChange={(v) => void applyRule({ unknownAsScratch: v })}
         />
         <Toggle
-          label="Hide Scratch"
-          title="Leave the Scratch project out of analysis views and project lists"
+          label={t('hideScratch')}
+          title={t('hideScratchHint')}
           checked={list?.scratchHidden ?? false}
           disabled={!list || busy}
           onChange={(v) => void toggleScratchHidden(v)}
         />
         {ruleInfo && (
           <div className="setting-note">
-            Default: collapse on, fewer than {ruleInfo.defaults.minSessions} sessions and fewer than {ruleInfo.defaults.minTurns} turns, Unknown goes to Scratch.
+            {t('ruleDefault', { sessions: ruleInfo.defaults.minSessions, turns: ruleInfo.defaults.minTurns })}
           </div>
         )}
       </div>
 
-      <div className="setting-section">Folders</div>
+      <div className="setting-section">{t('folders')}</div>
       <div className="setting-block pm-list-block">
         <div className="pm-toolbar">
-          <div className="setting-seg" role="group" aria-label="Status filter">
+          <div className="setting-seg" role="group" aria-label={t('statusFilterAria')}>
             {STATUS_FILTERS.map((f) => (
               <button
                 key={f.v}
                 type="button"
                 className={`setting-seg-btn${filter === f.v ? ' is-active' : ''}`}
-                title={f.hint}
+                title={t(f.hint)}
                 onClick={() => setFilter(f.v)}
               >
-                {f.v === 'pinned' ? <PinIcon /> : f.label} <span className="pm-count">{counts[f.v]}</span>
+                {f.label === null ? <PinIcon /> : t(f.label)} <span className="pm-count">{counts[f.v]}</span>
               </button>
             ))}
           </div>
-          <div className="setting-seg" role="group" aria-label="Sort">
-            <button type="button" className={`setting-seg-btn${sort === 'recent' ? ' is-active' : ''}`} title="Most recent activity first" onClick={() => setSort('recent')}>
-              Recent
+          <div className="setting-seg" role="group" aria-label={t('sortAria')}>
+            <button type="button" className={`setting-seg-btn${sort === 'recent' ? ' is-active' : ''}`} title={t('sortRecentHint')} onClick={() => setSort('recent')}>
+              {t('sortRecent')}
             </button>
-            <button type="button" className={`setting-seg-btn${sort === 'sessions' ? ' is-active' : ''}`} title="Most sessions first" onClick={() => setSort('sessions')}>
-              Sessions
+            <button type="button" className={`setting-seg-btn${sort === 'sessions' ? ' is-active' : ''}`} title={t('sortSessionsHint')} onClick={() => setSort('sessions')}>
+              {t('sortSessions')}
             </button>
           </div>
-          <input className="setting-input pm-search" type="search" placeholder="Filter by name or path" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input className="setting-input pm-search" type="search" placeholder={t('searchPlaceholder')} value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
 
         {selectedCount > 0 && !merging && (
           <div className="pm-batchbar">
-            <span>{selectedCount} selected</span>
-            <button className="setting-btn" disabled={busy} onClick={() => void batchHide()} title="Hide every selected folder">
-              Hide
+            <span>{t('selectedCount', { n: selectedCount })}</span>
+            <button className="setting-btn" disabled={busy} onClick={() => void batchHide()} title={t('hideSelectedHint')}>
+              {t('hide')}
             </button>
-            <button className="setting-btn" disabled={busy} onClick={() => setMerging({ sources: [...selected], target: '' })} title="Count the selected folders under one project">
-              Merge into…
+            <button className="setting-btn" disabled={busy} onClick={() => setMerging({ sources: [...selected], target: '' })} title={t('mergeSelectedHint')}>
+              {t('mergeInto')}
             </button>
             <button className="setting-btn" onClick={() => setSelected(new Set())}>
-              Clear
+              {t('clear')}
             </button>
           </div>
         )}
@@ -403,31 +418,33 @@ export default function ProjectManager({ active }: { active: boolean }) {
         {merging && (
           <div className="pm-batchbar pm-mergebar">
             <span>
-              Merge {merging.sources.length === 1 ? (byKey.get(merging.sources[0])?.label ?? merging.sources[0]) : `${merging.sources.length} folders`} into
+              {merging.sources.length === 1
+                ? t('mergeOneInto', { name: byKey.get(merging.sources[0])?.label ?? merging.sources[0] })
+                : t('mergeManyInto', { n: merging.sources.length })}
             </span>
             <select
               className="matrix-sort pm-target"
               value={merging.target}
-              aria-label="Merge target"
+              aria-label={t('mergeTarget')}
               onChange={(e) => setMerging({ ...merging, target: e.target.value })}
             >
-              <option value="">Choose a project…</option>
+              <option value="">{t('chooseProject')}</option>
               {mergeCandidates.map((r) => (
                 <option key={r.key} value={r.key} title={r.key}>
                   {r.label}
-                  {r.status !== 'active' ? ` (${r.status})` : ''}
+                  {r.status !== 'active' ? optionStatus(r.status) : ''}
                 </option>
               ))}
             </select>
             <button className="setting-btn is-active" disabled={busy || !merging.target || blockedSources.length > 0} onClick={() => void confirmMerge()}>
-              Merge
+              {t('merge')}
             </button>
             <button className="setting-btn" onClick={() => setMerging(null)}>
-              Cancel
+              {t('cancel')}
             </button>
             {blockedSources.length > 0 && (
               <span className="pm-error">
-                {blockedSources.map((k) => byKey.get(k)?.label ?? k).join(', ')} already {blockedSources.length === 1 ? 'has' : 'have'} merged folders; unmerge those first
+                {t(blockedSources.length === 1 ? 'blockedOne' : 'blockedMany', { names: blockedSources.map((k) => byKey.get(k)?.label ?? k).join(', ') })}
               </span>
             )}
           </div>
@@ -440,27 +457,27 @@ export default function ProjectManager({ active }: { active: boolean }) {
         )}
 
         {list === undefined ? (
-          <div className="setting-note">Loading…</div>
+          <div className="setting-note">{t('loading')}</div>
         ) : list === null ? (
-          <div className="setting-note">Data unavailable (service not running)</div>
+          <div className="setting-note">{t('dataUnavailable')}</div>
         ) : visible.length === 0 ? (
-          <div className="setting-note">{rows.length === 0 ? 'No project folders collected yet' : 'No folders match this filter'}</div>
+          <div className="setting-note">{rows.length === 0 ? t('noFoldersYet') : t('noFoldersMatch')}</div>
         ) : (
           <div className="pm-table-wrap">
             <table className="pm-table">
               <thead>
                 <tr>
                   <th className="pm-col-check">
-                    <input type="checkbox" aria-label="Select all shown" checked={allVisibleSelected} onChange={toggleSelectAll} />
+                    <input type="checkbox" aria-label={t('selectAllShown')} checked={allVisibleSelected} onChange={toggleSelectAll} />
                   </th>
-                  <th className="is-left">Name</th>
-                  <th className="is-left">Agents</th>
-                  <th title="Root sessions">Sessions</th>
-                  <th title="User turns">Turns</th>
-                  <th title="Total tokens">Tokens</th>
-                  <th className="is-left" title="First and last active day">Active</th>
-                  <th className="is-left">Status</th>
-                  <th className="is-left">Actions</th>
+                  <th className="is-left">{t('colName')}</th>
+                  <th className="is-left">{t('colAgents')}</th>
+                  <th title={t('colSessionsHint')}>{t('colSessions')}</th>
+                  <th title={t('colTurnsHint')}>{t('colTurns')}</th>
+                  <th title={t('colTokensHint')}>{t('colTokens')}</th>
+                  <th className="is-left" title={t('colActiveHint')}>{t('colActive')}</th>
+                  <th className="is-left">{t('colStatus')}</th>
+                  <th className="is-left">{t('colActions')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -470,7 +487,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
                   return (
                     <tr key={r.key} className={`pm-row is-${r.status}${selected.has(r.key) ? ' is-selected' : ''}`}>
                       <td className="pm-col-check">
-                        <input type="checkbox" aria-label={`Select ${r.label}`} checked={selected.has(r.key)} onChange={() => toggleSelect(r.key)} />
+                        <input type="checkbox" aria-label={t('selectRow', { label: r.label })} checked={selected.has(r.key)} onChange={() => toggleSelect(r.key)} />
                       </td>
                       <td className="is-left pm-name" title={r.alias ? `${r.alias}\n${r.key}` : r.key}>
                         {isRenaming ? (
@@ -493,7 +510,7 @@ export default function ProjectManager({ active }: { active: boolean }) {
                               <button
                                 type="button"
                                 className={`pm-pin-btn${pins.includes(r.key) ? ' is-active' : ''}`}
-                                title={pins.includes(r.key) ? 'Unpin: stop monitoring on the Timeline window' : 'Pin: monitor on the Timeline window and list first'}
+                                title={pins.includes(r.key) ? t('unpinHint') : t('pinHint')}
                                 aria-pressed={pins.includes(r.key)}
                                 onClick={() => togglePin(r.key)}
                               >
@@ -534,40 +551,40 @@ export default function ProjectManager({ active }: { active: boolean }) {
                       </td>
                       <td className="is-left">
                         <div className="pm-actions">
-                        <button className="pm-act" disabled={busy} title="Set a display name (empty = folder name)" onClick={() => setRenaming({ key: r.key, value: r.alias ?? '' })}>
-                          Rename
+                        <button className="pm-act" disabled={busy} title={t('renameHint')} onClick={() => setRenaming({ key: r.key, value: r.alias ?? '' })}>
+                          {t('rename')}
                         </button>
                         {r.hidden ? (
-                          <button className="pm-act" disabled={busy} title="Show this folder again" onClick={() => void setHidden(r, false)}>
-                            Unhide
+                          <button className="pm-act" disabled={busy} title={t('unhideHint')} onClick={() => void setHidden(r, false)}>
+                            {t('unhide')}
                           </button>
                         ) : (
-                          <button className="pm-act" disabled={busy} title="Leave out of analysis views and project lists (data is kept)" onClick={() => void setHidden(r, true)}>
-                            Hide
+                          <button className="pm-act" disabled={busy} title={t('hideHint')} onClick={() => void setHidden(r, true)}>
+                            {t('hide')}
                           </button>
                         )}
                         {r.mergedInto && r.mergedInto !== projectService.SCRATCH_KEY ? (
-                          <button className="pm-act" disabled={busy} title={`Stop counting under ${r.mergedLabel ?? r.mergedInto}`} onClick={() => void run(() => projectService.unmergeProjects([r.key]))}>
-                            Unmerge
+                          <button className="pm-act" disabled={busy} title={t('unmergeHint', { target: r.mergedLabel ?? r.mergedInto })} onClick={() => void run(() => projectService.unmergeProjects([r.key]))}>
+                            {t('unmerge')}
                           </button>
                         ) : (
                           <button
                             className="pm-act"
                             disabled={busy || targets.has(r.key)}
-                            title={targets.has(r.key) ? 'Other folders are merged into this one' : 'Count this folder under another project'}
+                            title={targets.has(r.key) ? t('mergeRowBlocked') : t('mergeRowHint')}
                             onClick={() => setMerging({ sources: [r.key], target: '' })}
                           >
-                            Merge…
+                            {t('mergeRow')}
                           </button>
                         )}
                         {r.folderExists && (
-                          <button className="pm-act" title="Open in File Explorer" onClick={() => void projectService.openProjectFolder(r.key).then((res) => !res.ok && setError(res.error))}>
-                            Open
+                          <button className="pm-act" title={t('openInExplorer')} onClick={() => void projectService.openProjectFolder(r.key).then((res) => !res.ok && setError(res.error))}>
+                            {t('open')}
                           </button>
                         )}
                         {r.managed && (
-                          <button className="pm-act is-muted" disabled={busy} title="Clear name, hidden and merge settings; the Scratch rule applies again" onClick={() => void run(() => projectService.resetProjectMeta(r.key))}>
-                            Reset
+                          <button className="pm-act is-muted" disabled={busy} title={t('resetHint')} onClick={() => void run(() => projectService.resetProjectMeta(r.key))}>
+                            {t('reset')}
                           </button>
                         )}
                         </div>
@@ -594,15 +611,16 @@ function PinIcon() {
 
 /** Off / On 两段开关（与设置页 ToggleRow 同一视觉语言;该组件未导出,这里按同一类名复刻）。 */
 function Toggle({ label, title, checked, disabled = false, onChange }: { label: string; title?: string; checked: boolean; disabled?: boolean; onChange(v: boolean): void }) {
+  const t = useT('projects')
   return (
     <div className="setting-row">
       <span title={title}>{label}</span>
       <div className="setting-seg" role="group" aria-label={label}>
         <button type="button" className={`setting-seg-btn${!checked ? ' is-active' : ''}`} disabled={disabled} aria-pressed={!checked} onClick={() => onChange(false)}>
-          Off
+          {t('off')}
         </button>
         <button type="button" className={`setting-seg-btn${checked ? ' is-active' : ''}`} disabled={disabled} aria-pressed={checked} onClick={() => onChange(true)}>
-          On
+          {t('on')}
         </button>
       </div>
     </div>

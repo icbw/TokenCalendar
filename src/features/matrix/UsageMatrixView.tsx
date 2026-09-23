@@ -9,7 +9,9 @@ import { events, usageService } from '../../services'
 import type { BreakdownDay, TokenMetric } from '../../services'
 import type { UsageRow } from '../../services/types'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
-import { TOKEN_METRICS, TOKEN_METRIC_LABELS, projectDisplayName, projectTooltip } from '../insights/analytics'
+import { TOKEN_METRICS, projectDisplayName, projectTooltip } from '../insights/analytics'
+import { fmt, useT, type MessageKey } from '../../lib/i18n'
+import { monthDayLabel, monthShort } from './matrixScale'
 import './matrixView.css'
 
 /** project 维走 get_project_month_rows / get_project_breakdown;agent / model 维走月矩阵命令。 */
@@ -21,7 +23,14 @@ type Metric = TokenMetric
  * byTotal（激活 = 按总量,未激活 = 按名称）;family（家族聚合,仅 model 视图生效）叠加在 byTotal 之上。 */
 type ViewSort = Record<GroupBy, { byTotal: boolean; family: boolean }>
 
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+/** 指标按钮的字典键（短名 / 悬停说明 / hover 读数单位）。只存键,文案在渲染时取。 */
+const METRIC_KEYS: Record<Metric, { short: MessageKey<'matrix'>; hint: MessageKey<'matrix'>; unit: MessageKey<'matrix'> }> = {
+  total: { short: 'metricTokens', hint: 'metricTokensHint', unit: 'unitTokens' },
+  input: { short: 'metricInput', hint: 'metricInputHint', unit: 'unitInput' },
+  cache_write: { short: 'metricCacheW', hint: 'metricCacheWHint', unit: 'unitCacheW' },
+  cache_read: { short: 'metricCacheR', hint: 'metricCacheRHint', unit: 'unitCacheR' },
+  output: { short: 'metricOutput', hint: 'metricOutputHint', unit: 'unitOutput' },
+}
 
 const NOW = new Date()
 /** 滚动窗口：31 列恒定，最右列 = 今天。 */
@@ -39,9 +48,6 @@ const WINDOW_MONTHS = [...new Set(WINDOW_DATES.map(ymd).map((s) => s.slice(0, 7)
 const CURRENT_MONTH_START = WINDOW_DATES.findIndex(
   (d) => d.getMonth() === NOW.getMonth() && d.getFullYear() === NOW.getFullYear(),
 )
-const RANGE_LABEL = `${MONTH_ABBR[WINDOW_DATES[0].getMonth()]} ${WINDOW_DATES[0].getDate()} – ${MONTH_ABBR[WINDOW_DATES[WINDOW_DAYS - 1].getMonth()]} ${WINDOW_DATES[WINDOW_DAYS - 1].getDate()}, ${WINDOW_DATES[WINDOW_DAYS - 1].getFullYear()}`
-
-const DAY_LABELS = WINDOW_DATES.map((d) => (d.getDate() === 1 ? MONTH_ABBR[d.getMonth()] : String(d.getDate())))
 
 function applyBucket(values: (number | null)[], bucket: Bucket): (number | null)[] {
   if (bucket === 'day') return values
@@ -123,6 +129,20 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
   /** 点行名上抛（null = 取消/恢复预设）。不传时内部内联展开。 */
   onRowSelect?: (rowKey: string | null) => void
 }) {
+  const t = useT('matrix')
+    // 区间标题与表头日标签依赖语言,渲染时生成（模块顶层不拼文案）。
+  const rangeLabel = useMemo(() => {
+    const last = WINDOW_DATES[WINDOW_DAYS - 1]
+    return t('rangeLabel', {
+      from: monthDayLabel(t, WINDOW_DATES[0]),
+      to: monthDayLabel(t, last),
+      year: last.getFullYear(),
+    })
+  }, [t])
+  const dayLabels = useMemo(
+    () => WINDOW_DATES.map((d) => (d.getDate() === 1 ? monthShort(t, d.getMonth()) : String(d.getDate()))),
+    [t],
+  )
   const [internalGroupBy, setInternalGroupBy] = useState<GroupBy>('agent')
   const effectiveGroupBy = groupBy ?? internalGroupBy
   const [bucket, setBucket] = useState<Bucket>('day')
@@ -332,18 +352,19 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
       rows.sort((a, b) => {
         const fa = familyOf(a.key, effectiveGroupBy)
         const fb = familyOf(b.key, effectiveGroupBy)
-        if (!byTotal) return fa.localeCompare(fb) || a.label.localeCompare(b.label)
+        if (!byTotal) return fmt.compare(fa, fb) || fmt.compare(a.label, b.label)
         return (
           (familyTotal.get(fb) ?? 0) - (familyTotal.get(fa) ?? 0) ||
           b.total - a.total ||
-          a.label.localeCompare(b.label)
+          fmt.compare(a.label, b.label)
         )
       })
     } else {
-      rows.sort((a, b) => (byTotal ? b.total - a.total : a.label.localeCompare(b.label)))
+      rows.sort((a, b) => (byTotal ? b.total - a.total : fmt.compare(a.label, b.label)))
     }
     return rows
-  }, [serverRows, bucket, effectiveGroupBy, byTotal, familySort])
+    // t：显示排序（fmt.compare）随语言变化,切换后重排
+  }, [serverRows, bucket, effectiveGroupBy, byTotal, familySort, t])
 
   // 行数上限截断（排序在前 = 保留 top N;超出行静默隐藏,上限在设置页调）。
   const visibleRows = useMemo(
@@ -399,17 +420,17 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
   return (
     <div className="matrix-view" ref={matrixRef}>
       <div className="matrix-toolbar">
-        <span className="matrix-month">{RANGE_LABEL}{useMock ? ' (demo)' : ''}</span>
+        <span className="matrix-month">{rangeLabel}{useMock ? t('demoSuffix') : ''}</span>
         <div className="toolbar-groups">
           <div className="toolbar-group">
             {TOKEN_METRICS.map((m) => (
               <button
                 key={m}
                 className={`seg${metric === m ? ' is-active' : ''}`}
-                title={TOKEN_METRIC_LABELS[m].hint}
+                title={t(METRIC_KEYS[m].hint)}
                 onClick={() => setMetric(m)}
               >
-                {TOKEN_METRIC_LABELS[m].short}
+                {t(METRIC_KEYS[m].short)}
               </button>
             ))}
           </div>
@@ -418,10 +439,10 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
               <button
                 key={g}
                 className={`seg${effectiveGroupBy === g ? ' is-active' : ''}`}
-                title={g === 'agent' ? 'One row per agent' : g === 'model' ? 'One row per model' : 'One row per project (working directory)'}
+                title={g === 'agent' ? t('groupAgentHint') : g === 'model' ? t('groupModelHint') : t('groupProjectHint')}
                 onClick={() => setGroupBy(g)}
               >
-                {g === 'agent' ? 'Agent' : g === 'model' ? 'Model' : 'Project'}
+                {g === 'agent' ? t('groupAgent') : g === 'model' ? t('groupModel') : t('groupProject')}
               </button>
             ))}
           </div>
@@ -430,14 +451,14 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
               <button
                 key={b}
                 className={`seg${bucket === b ? ' is-active' : ''}`}
-                title={b === 'day' ? 'Daily buckets' : b === 'week' ? 'Weekly buckets' : 'Cumulative running total'}
+                title={b === 'day' ? t('bucketDayHint') : b === 'week' ? t('bucketWeekHint') : t('bucketCumHint')}
                 onClick={() => setBucket(b)}
               >
-                {b === 'day' ? 'Daily' : b === 'week' ? 'Weekly' : 'Cum.'}
+                {b === 'day' ? t('granDaily') : b === 'week' ? t('granWeekly') : t('bucketCumShort')}
               </button>
             ))}
           </div>
-          {loading && <span className="matrix-loading">Loading…</span>}
+          {loading && <span className="matrix-loading">{t('loading')}</span>}
         </div>
       </div>
 
@@ -451,7 +472,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
           <button
             className={`matrix-panel-icon${scaleMode === 'perRow' ? ' is-active' : ''}`}
             onClick={() => setScaleMode((m) => (m === 'global' ? 'perRow' : 'global'))}
-            title={scaleMode === 'global' ? 'Color scale: global (click for per row)' : 'Color scale: per row (click for global)'}
+            title={scaleMode === 'global' ? t('scaleGlobal') : t('scalePerRow')}
             aria-pressed={scaleMode === 'perRow'}
           >
             <ScaleIcon />
@@ -459,7 +480,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
           <button
             className={`matrix-panel-icon${!byTotal ? ' is-active' : ''}`}
             onClick={() => toggleSort('byTotal')}
-            title={byTotal ? 'Sort by tokens (click to sort by name)' : 'Sort by name (click to sort by tokens)'}
+            title={byTotal ? t('sortByTokens') : t('sortByName')}
             aria-pressed={!byTotal}
           >
             <SortTotalIcon />
@@ -468,7 +489,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
             <button
               className={`matrix-panel-icon${viewSort.family ? ' is-active' : ''}`}
               onClick={() => toggleSort('family')}
-              title={viewSort.family ? 'Grouped by model family (click to ungroup)' : 'Group by model family'}
+              title={viewSort.family ? t('familyOn') : t('familyOff')}
               aria-pressed={viewSort.family}
             >
               <FamilyIcon />
@@ -478,7 +499,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
 
         <UsageMatrix
           rows={visibleRows}
-          dayLabels={DAY_LABELS}
+          dayLabels={dayLabels}
           dates={WINDOW_DATES}
           headerMutedFrom={CURRENT_MONTH_START}
           scaleMode={scaleMode}
@@ -491,7 +512,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
             )
           }
           onSelectRow={toggleExpand}
-          valueUnit={TOKEN_METRIC_LABELS[metric].unit}
+          valueUnit={t(METRIC_KEYS[metric].unit)}
         />
       </div>
 
@@ -502,7 +523,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
           kind={effectiveGroupBy}
           rowKey={effectiveExpanded}
           label={matrixRows.find((r) => r.key === effectiveExpanded)?.label ?? effectiveExpanded}
-          month={RANGE_LABEL}
+          month={rangeLabel}
           days={expandedData}
           onClose={() => {
             setInternalExpanded(null)

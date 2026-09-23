@@ -38,6 +38,8 @@
   color: var(--text-faint);
   text-align: center;
   line-height: 1;
+  /* 中文月标签「9月」在窄列里会在数字与「月」之间折行 */
+  white-space: nowrap;
 }
 
 /* 31 天滚动窗口：窗口内属于上月/更早的表头列淡化（月缩写列保持可读） */

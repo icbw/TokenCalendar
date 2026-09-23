@@ -1,4 +1,5 @@
 // 项目推进时间轴常量。
+import { fmt } from '../../lib/i18n'
 
 /** 时间窗默认值（可在设置中改：prefs timelinePastDays / timelineFutureDays,0〜30）。
  * 天数过多时每格只能放一个会话,默认 7 + 今天 + 7。 */
@@ -51,8 +52,6 @@ export const PEEK_DELAY_MS = 5000
 export const HOVER_DELAY_MS = 350
 export const HOVER_GRACE_MS = 140
 
-export const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
 /** 本地日历日 YYYY-MM-DD（与 Rust `Local:now.date_naive` 同口径,不拼时区）。 */
 export function localDay(d: Date = new Date()): string {
   const y = d.getFullYear()
@@ -79,12 +78,18 @@ export function dayParts(day: string): { y: number; m: number; d: number } {
   return { y, m, d }
 }
 
-/** 短日期:`Sep 5`（跨年补年份）。 */
+/** 本地日 YYYY-MM-DD → 当地零点 Date（仅供显示格式化）。 */
+export function dayDate(day: string): Date {
+  const { y, m, d } = dayParts(day)
+  return new Date(y, m - 1, d)
+}
+
+/** 短日期（显示用,按当前语言）:`Sep 5` / `9月5日`;跨年补年份（`Sep 5, 2025` / `2025年9月5日`）。 */
 export function shortDay(day: string | null): string {
   if (!day) return '—'
-  const { y, m, d } = dayParts(day)
-  const year = y !== new Date().getFullYear() ? `, ${y}` : ''
-  return `${MONTH_ABBR[m - 1]} ${d}${year}`
+  const date = dayDate(day)
+  const withYear = date.getFullYear() !== new Date().getFullYear()
+  return fmt.date(date, withYear ? { year: 'numeric', month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric' })
 }
 
 /** 时刻 HH:mm（标题为空时的回退标签,与 Tasks 视图同口径）。 */

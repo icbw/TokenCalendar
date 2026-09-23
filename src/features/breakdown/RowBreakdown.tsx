@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react'
 import type { BreakdownDay } from '../../services'
 import { LineChart, StackedBarChart, colorFor, type SeriesSpec } from '../insights/charts'
 import { formatCompact } from '../matrix/matrixScale'
+import { useT } from '../../lib/i18n'
 import './breakdown.css'
 
 interface RowBreakdownProps {
@@ -18,6 +19,7 @@ interface RowBreakdownProps {
 type ViewKind = 'line' | 'stack'
 
 export default function RowBreakdown({ kind, label, month, days, onClose }: RowBreakdownProps) {
+  const t = useT('matrix')
   const [viewKind, setViewKind] = useState<ViewKind>('line')
 
   const view = useMemo(() => {
@@ -49,26 +51,26 @@ export default function RowBreakdown({ kind, label, month, days, onClose }: RowB
     return { series, buckets, monthTotal }
   }, [days])
 
-  const title = kind === 'agent' ? 'Daily model breakdown' : 'Daily agent breakdown'
+  const title = kind === 'agent' ? t('dailyModelBreakdown') : t('dailyAgentBreakdown')
 
   return (
     <div className="breakdown">
       <div className="breakdown-header">
         <span className="breakdown-title">{label} · {month} · {title}</span>
-        {view && <span className="breakdown-month-total">Total {formatCompact(view.monthTotal)}</span>}
+        {view && <span className="breakdown-month-total">{t('totalValue', { n: formatCompact(view.monthTotal) })}</span>}
         <div className="toolbar-group breakdown-kind">
-          <button className={`seg${viewKind === 'line' ? ' is-active' : ''}`} title="Line chart" onClick={() => setViewKind('line')}>Lines</button>
-          <button className={`seg${viewKind === 'stack' ? ' is-active' : ''}`} title="Stacked chart" onClick={() => setViewKind('stack')}>Stack</button>
+          <button className={`seg${viewKind === 'line' ? ' is-active' : ''}`} title={t('lineChart')} onClick={() => setViewKind('line')}>{t('lines')}</button>
+          <button className={`seg${viewKind === 'stack' ? ' is-active' : ''}`} title={t('stackedChart')} onClick={() => setViewKind('stack')}>{t('stack')}</button>
         </div>
-        <button className="breakdown-close" onClick={onClose} title="Close breakdown" aria-label="Close breakdown">×</button>
+        <button className="breakdown-close" onClick={onClose} title={t('closeBreakdown')} aria-label={t('closeBreakdown')}>×</button>
       </div>
 
       {!view && (
-        <div className="breakdown-empty">Breakdown unavailable (demo mode or service not running)</div>
+        <div className="breakdown-empty">{t('breakdownUnavailable')}</div>
       )}
 
       {view && view.series.length === 0 && (
-        <div className="breakdown-empty">No breakdown data in this window</div>
+        <div className="breakdown-empty">{t('noBreakdownData')}</div>
       )}
 
       {view && view.series.length > 0 && (

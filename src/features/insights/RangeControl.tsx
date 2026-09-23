@@ -5,16 +5,18 @@ import { useEffect, useState } from 'react'
 import { Seg } from './Seg'
 import { formatSpan, todayYmd, validateCustom, type PresetDays } from './range'
 import type { RangeSelection } from './useRangeSelection'
+import { useT } from '../../lib/i18n'
 
 type SegKey = '7' | '30' | '90' | 'all' | 'custom'
 
 export default function RangeControl({ selection, noun, note }: {
   selection: RangeSelection
-  /** 预设按钮 hover 文案的主语（"Turns" / "Usage"）。 */
+  /** 预设按钮 hover 文案的主语（"Turns" / "Usage",调用方传已翻译的文字）。 */
   noun: string
   /** 范围条末尾的口径说明（同页多个口径并列时写明,不隐藏差异）。 */
   note?: string
 }) {
+  const t = useT('insights')
   const { sel, range, projectSpan, project, choose, applyProjectSpan } = selection
   const segValue: SegKey | '' = sel.kind === 'preset' ? (String(sel.days) as SegKey) : sel.kind === 'project' ? '' : sel.kind
 
@@ -39,9 +41,9 @@ export default function RangeControl({ selection, noun, note }: {
       <Seg<SegKey | ''>
         value={segValue}
         options={[
-          ...([7, 30, 90] as PresetDays[]).map((d) => ({ v: String(d) as SegKey, label: `${d}d`, hint: `${noun} in the last ${d} days` })),
-          { v: 'all' as SegKey, label: 'All', hint: `${noun} across all recorded days` },
-          { v: 'custom' as SegKey, label: 'Custom', hint: 'Pick start and end dates' },
+          ...([7, 30, 90] as PresetDays[]).map((d) => ({ v: String(d) as SegKey, label: t('rangePreset', { d }), hint: t('rangePresetHint', { noun, d }) })),
+          { v: 'all' as SegKey, label: t('rangeAll'), hint: t('rangeAllHint', { noun }) },
+          { v: 'custom' as SegKey, label: t('rangeCustom'), hint: t('rangeCustomHint') },
         ]}
         onChange={(v) => {
           if (v === 'all') choose({ kind: 'all' })
@@ -56,7 +58,7 @@ export default function RangeControl({ selection, noun, note }: {
             className="range-date"
             value={draft.startDay}
             max={today}
-            aria-label="Start date"
+            aria-label={t('rangeStartDate')}
             aria-invalid={Boolean(error) || undefined}
             onChange={(e) => editDraft({ startDay: e.target.value })}
           />
@@ -66,7 +68,7 @@ export default function RangeControl({ selection, noun, note }: {
             className="range-date"
             value={draft.endDay}
             max={today}
-            aria-label="End date"
+            aria-label={t('rangeEndDate')}
             aria-invalid={Boolean(error) || undefined}
             onChange={(e) => editDraft({ endDay: e.target.value })}
           />
@@ -75,17 +77,17 @@ export default function RangeControl({ selection, noun, note }: {
       {error ? (
         <span className="range-error">{error}</span>
       ) : (
-        <span className={`range-span${sel.kind === 'project' ? ' is-project' : ''}`} title={sel.kind === 'project' ? 'Lifecycle of the selected project: first to last active day. Change the range to stop following it.' : spanText}>
-          {sel.kind === 'project' ? `Project span · ${spanText}` : spanText}
+        <span className={`range-span${sel.kind === 'project' ? ' is-project' : ''}`} title={sel.kind === 'project' ? t('rangeProjectSpanActiveHint') : spanText}>
+          {sel.kind === 'project' ? t('rangeProjectSpanActive', { span: spanText }) : spanText}
         </span>
       )}
       {project && sel.kind !== 'project' && projectSpan && (
         <button
           className="seg range-project-btn"
-          title={`Use the selected project's lifecycle (${formatSpan({ startDay: projectSpan.firstDay, endDay: projectSpan.lastDay })}) and follow it when the project changes`}
+          title={t('rangeProjectSpanBtnHint', { span: formatSpan({ startDay: projectSpan.firstDay, endDay: projectSpan.lastDay }) })}
           onClick={applyProjectSpan}
         >
-          Project span
+          {t('rangeProjectSpan')}
         </button>
       )}
       {note && <span className="range-note">{note}</span>}

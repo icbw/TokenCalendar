@@ -13,6 +13,7 @@
 
 import type { Update } from '@tauri-apps/plugin-updater'
 import { inTauri, tryInvoke } from './tauri'
+import { getT } from '../lib/i18n'
 
 /** 公开仓 Releases 页（版本号按钮落点；手动下载走这里）。 */
 export const RELEASES_URL = 'https://github.com/icbw/TokenCalendar/releases'
@@ -60,15 +61,15 @@ function errText(e: unknown): string {
   const s = e instanceof Error ? e.message : String(e)
   // 常见首跑态：公开仓还没有带 latest.json 的 Release——给可读文案。
   if (/404|not found|Could not fetch|valid release json/i.test(s)) {
-    return 'No published release found.'
+    return getT('update')('errNoRelease')
   }
   if (/network|dns|connect|timed? ?out/i.test(s)) {
-    return 'Network error while checking for updates.'
+    return getT('update')('errNetwork')
   }
   // 安装包验签失败（如 tauri.conf.json 的 pubkey 与签名私钥不配套，下载到 100% 后在此抛错）：
   // 自动安装没有出路，文案直接指向手动下载。
   if (/signature|minisign|verification failed/i.test(s)) {
-    return 'The downloaded package failed signature verification. Download the installer from the releases page instead.'
+    return getT('update')('errSignature')
   }
   return s
 }
@@ -146,8 +147,8 @@ function installOnce(update: Update): Promise<void> {
 
 /** 安装已预下载的新版本（设置·About 的 Install 按钮）。 */
 export async function installReadyUpdate(): Promise<void> {
-  if (!ready) throw new Error('No downloaded update to install.')
-  if (IS_DEV) throw new Error('Dev build: install is disabled.')
+  if (!ready) throw new Error(getT('update')('errNoReady'))
+  if (IS_DEV) throw new Error(getT('update')('errDevInstall'))
   await installOnce(ready.update)
 }
 
@@ -184,9 +185,10 @@ async function notifyReady(info: ReadyUpdate): Promise<void> {
     const { isPermissionGranted, requestPermission, sendNotification } = await import('@tauri-apps/plugin-notification')
     const granted = (await isPermissionGranted()) || (await requestPermission()) === 'granted'
     if (!granted) return
+    const t = getT('update')
     sendNotification({
-      title: `TokenCalendar ${info.version} is ready`,
-      body: 'The update has been downloaded. Open Settings → About and click Install to update.',
+      title: t('notifyTitle', { version: info.version }),
+      body: t('notifyBody'),
     })
   } catch (e) {
     console.error('[update] notification failed:', e)

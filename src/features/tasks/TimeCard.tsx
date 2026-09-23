@@ -11,9 +11,9 @@ import { taskService } from '../../services'
 import type { DayRange, GapHistogram } from '../../services'
 import { Seg } from '../insights/Seg'
 import TimeSpentPanel from './TimeSpentPanel'
-import { formatFull } from '../matrix/matrixScale'
 import { formatDuration } from '../insights/analytics'
 import { getDesignPrefs, setDesignPrefs } from '../settings/designPrefs'
+import { fmt, useT, type MessageKey } from '../../lib/i18n'
 
 const FALLBACK = { minutes: 30, defaultMinutes: 30, minMinutes: 1, maxMinutes: 1440 }
 
@@ -32,6 +32,7 @@ function thresholdLabel(ms: number): string {
 }
 
 function GapChart({ hist }: { hist: GapHistogram }) {
+  const tr = useT('tasks')
   const width = 760
   const height = 150
   const margin = { top: 18, right: 12, bottom: 22, left: 40 }
@@ -60,9 +61,9 @@ function GapChart({ hist }: { hist: GapHistogram }) {
   const tx = xOfMs(t)
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', display: 'block' }} role="img" aria-label="Gap distribution">
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', display: 'block' }} role="img" aria-label={tr('gapChartAria')}>
       <line x1={margin.left} x2={margin.left + plot.w} y1={margin.top + plot.h} y2={margin.top + plot.h} stroke="var(--border)" />
-      <text x={margin.left - 6} y={margin.top + 4} textAnchor="end" fontSize={10} fill="var(--text-faint)">{formatFull(maxCount)}</text>
+      <text x={margin.left - 6} y={margin.top + 4} textAnchor="end" fontSize={10} fill="var(--text-faint)">{fmt.number(maxCount)}</text>
       <text x={margin.left - 6} y={margin.top + plot.h} textAnchor="end" fontSize={10} fill="var(--text-faint)">0</text>
       {hist.buckets.map((b, i) => {
         const h = (b.count / maxCount) * plot.h
@@ -83,7 +84,7 @@ function GapChart({ hist }: { hist: GapHistogram }) {
             />
             {/* 整桶透明命中区:矮柱 / 空桶也能 hover 出计数*/}
             <rect x={margin.left + i * slot} y={margin.top} width={slot} height={plot.h} fill="transparent">
-              <title>{`${range}: ${formatFull(b.count)} gaps`}</title>
+              <title>{tr('bucketTitle', { range, n: fmt.number(b.count) })}</title>
             </rect>
           </g>
         )
@@ -107,10 +108,13 @@ function GapChart({ hist }: { hist: GapHistogram }) {
 
 type TimeMode = 'gaps' | 'spent'
 
-const SUBTITLES: Record<TimeMode, string> = {
-  gaps: 'Gaps between turns up to the threshold count as human time; longer gaps count as away',
-  spent: 'Where the time in this range went: each turn counts on its own local day',
+const SUBTITLES: Record<TimeMode, MessageKey<'tasks'>> = {
+  gaps: 'subtitleGaps',
+  spent: 'subtitleSpent',
 }
+
+/** 状态行存数据不存文案,切换语言后随之重译。 */
+type ApplyStatus = { ok: false } | { ok: true; days: number; ms: number }
 
 export default function TimeCard({ range, agent, project, labelMode, agentLabel, refreshTick, onPickTask }: {
   range: DayRange
@@ -121,12 +125,13 @@ export default function TimeCard({ range, agent, project, labelMode, agentLabel,
   refreshTick: number
   onPickTask: (agent: string, sessionId: string) => boolean
 }) {
+  const t = useT('tasks')
   const [mode, setMode] = useState<TimeMode>(() => getDesignPrefs().taskTimeMode ?? 'gaps')
   const [info, setInfo] = useState(FALLBACK)
   const [input, setInput] = useState(() => String(getDesignPrefs().idleThresholdMin ?? FALLBACK.minutes))
   const [hist, setHist] = useState<GapHistogram | null | undefined>(undefined)
   const [applying, setApplying] = useState(false)
-  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null)
+  const [status, setStatus] = useState<ApplyStatus | null>(null)
   const [histTick, setHistTick] = useState(0)
 
   // 运行时阈值以 Rust 为准（prefs.json 载入值;designPrefs 仅作首帧占位）
@@ -173,14 +178,14 @@ export default function TimeCard({ range, agent, project, labelMode, agentLabel,
     const res = await taskService.setIdleThreshold(parsed)
     setApplying(false)
     if (!res) {
-      setStatus({ ok: false, text: 'Could not apply the threshold' })
+      setStatus({ ok: false })
       return
     }
     // 双写:Rust 已落 prefs.json,这里只同步内存快照（persist 会写回同值,无副作用）
     setDesignPrefs({ idleThresholdMin: res.minutes })
     setInfo((prev) => ({ ...prev, minutes: res.minutes }))
     setInput(String(res.minutes))
-    setStatus({ ok: true, text: `Applied · recomputed ${formatFull(res.recomputedDays)} agent-days in ${formatFull(res.elapsedMs)} ms` })
+    setStatus({ ok: true, days: res.recomputedDays, ms: res.elapsedMs })
     setHistTick((x) => x + 1)
   }
 
@@ -190,16 +195,16 @@ export default function TimeCard({ range, agent, project, labelMode, agentLabel,
         <Seg<TimeMode>
           value={mode}
           options={[
-            { v: 'gaps', label: 'Idle gaps', hint: 'Distribution of gaps between turns' },
-            { v: 'spent', label: 'Time spent', hint: 'Task and human time by project, task or day' },
+            { v: 'gaps', label: t('modeGaps'), hint: t('modeGapsHint') },
+            { v: 'spent', label: t('modeSpent'), hint: t('modeSpentHint') },
           ]}
           onChange={pickMode}
         />
-        <span className="insight-card-sub">{SUBTITLES[mode]}</span>
+        <span className="insight-card-sub">{t(SUBTITLES[mode])}</span>
       </header>
       <div className="gap-controls">
-        <label className="gap-threshold" title={`Idle threshold in minutes (${info.minMinutes}–${info.maxMinutes}, default ${info.defaultMinutes})`}>
-          Idle threshold
+        <label className="gap-threshold" title={t('thresholdTitle', { min: info.minMinutes, max: info.maxMinutes, def: info.defaultMinutes })}>
+          {t('idleThreshold')}
           <input
             type="number"
             min={info.minMinutes}
@@ -215,18 +220,22 @@ export default function TimeCard({ range, agent, project, labelMode, agentLabel,
             }}
             aria-invalid={!valid || undefined}
           />
-          min
+          {t('minUnit')}
         </label>
         <button
           className={`seg gap-apply${dirty && !applying ? ' is-active' : ''}${!dirty || applying ? ' is-disabled' : ''}`}
           aria-disabled={!dirty || applying || undefined}
-          title={!valid ? `Enter a whole number of minutes between ${info.minMinutes} and ${info.maxMinutes}` : dirty ? 'Recompute human time with this threshold' : 'Threshold unchanged'}
+          title={!valid ? t('thresholdInvalid', { min: info.minMinutes, max: info.maxMinutes }) : dirty ? t('thresholdRecompute') : t('thresholdUnchanged')}
           onClick={() => void apply()}
         >
-          {applying ? 'Applying…' : 'Apply'}
+          {applying ? t('applying') : t('apply')}
         </button>
-        {!valid && <span className="gap-status is-error">{info.minMinutes}–{info.maxMinutes} minutes</span>}
-        {valid && status && <span className={`gap-status${status.ok ? '' : ' is-error'}`}>{status.text}</span>}
+        {!valid && <span className="gap-status is-error">{t('minutesRange', { min: info.minMinutes, max: info.maxMinutes })}</span>}
+        {valid && status && (
+          <span className={`gap-status${status.ok ? '' : ' is-error'}`}>
+            {status.ok ? t('applied', { days: fmt.number(status.days), ms: fmt.number(status.ms) }) : t('applyFailed')}
+          </span>
+        )}
       </div>
 
       {mode === 'spent' ? (
@@ -240,28 +249,28 @@ export default function TimeCard({ range, agent, project, labelMode, agentLabel,
           onPickTask={onPickTask}
         />
       ) : hist === undefined ? (
-        <div className="insight-empty">Loading…</div>
+        <div className="insight-empty">{t('loading')}</div>
       ) : hist === null ? (
-        <div className="insight-empty">Data unavailable (service not running)</div>
+        <div className="insight-empty">{t('unavailable')}</div>
       ) : hist.total === 0 ? (
-        <div className="insight-empty">No gaps between turns in this range</div>
+        <div className="insight-empty">{t('noGaps')}</div>
       ) : (
         <>
           <GapChart hist={hist} />
           <div className="gap-stats">
             <div className="gap-stat">
               <span className="legend-swatch gap-swatch-within" />
-              <span className="gap-stat-label">≤ {thresholdLabel(hist.thresholdMs)} · human</span>
-              <span className="gap-stat-value">{formatFull(hist.withinCount)} gaps · {formatDuration(hist.withinMs)}</span>
+              <span className="gap-stat-label">{t('statHuman', { t: thresholdLabel(hist.thresholdMs) })}</span>
+              <span className="gap-stat-value">{t('gapsDur', { n: fmt.number(hist.withinCount), d: formatDuration(hist.withinMs) })}</span>
             </div>
             <div className="gap-stat">
               <span className="legend-swatch gap-swatch-beyond" />
-              <span className="gap-stat-label">&gt; {thresholdLabel(hist.thresholdMs)} · away</span>
-              <span className="gap-stat-value">{formatFull(hist.beyondCount)} gaps · {formatDuration(hist.beyondMs)}</span>
+              <span className="gap-stat-label">{t('statAway', { t: thresholdLabel(hist.thresholdMs) })}</span>
+              <span className="gap-stat-value">{t('gapsDur', { n: fmt.number(hist.beyondCount), d: formatDuration(hist.beyondMs) })}</span>
             </div>
             <div className="gap-stat">
-              <span className="gap-stat-label">Total</span>
-              <span className="gap-stat-value">{formatFull(hist.total)} gaps · {formatDuration(hist.withinMs + hist.beyondMs)}</span>
+              <span className="gap-stat-label">{t('total')}</span>
+              <span className="gap-stat-value">{t('gapsDur', { n: fmt.number(hist.total), d: formatDuration(hist.withinMs + hist.beyondMs) })}</span>
             </div>
           </div>
         </>

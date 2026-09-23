@@ -5,10 +5,12 @@
 import { useEffect, useState } from 'react'
 import ProjectManager from './ProjectManager'
 import { closeProjectManager, isProjectManagerOpen, subscribeProjectManager } from './projectManagerStore'
+import { useT } from '../../lib/i18n'
 import '../settings/settings.css'
 import './projects.css'
 
 export default function ProjectManagerModal() {
+  const t = useT('projects')
   const [open, setOpen] = useState(isProjectManagerOpen)
   useEffect(() => subscribeProjectManager(setOpen), [])
 
@@ -24,12 +26,12 @@ export default function ProjectManagerModal() {
   return (
     <div className={`pm-modal${open ? ' is-open' : ''}`} aria-hidden={!open}>
       <div className="pm-modal-backdrop" onClick={closeProjectManager} />
-      <section className="pm-modal-dialog" role="dialog" aria-modal="true" aria-label="Manage projects">
+      <section className="pm-modal-dialog" role="dialog" aria-modal="true" aria-label={t('manageProjects')}>
         <header className="pm-modal-header">
-          <span className="pm-modal-title">Manage projects</span>
-          <span className="pm-modal-sub">Also in Settings › Projects</span>
-          <button className="settings-back pm-modal-close" onClick={closeProjectManager} title="Close (Esc)" aria-label="Close">
-            Close
+          <span className="pm-modal-title">{t('manageProjects')}</span>
+          <span className="pm-modal-sub">{t('alsoInSettings')}</span>
+          <button className="settings-back pm-modal-close" onClick={closeProjectManager} title={t('closeTitle')} aria-label={t('close')}>
+            {t('close')}
           </button>
         </header>
         <div className="pm-modal-body">

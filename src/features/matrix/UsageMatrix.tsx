@@ -2,7 +2,8 @@
 // CSS Grid 布局：固定行头 + 31 列 + 行总量；P95+log1p 色阶（global/perRow）；
 // 状态视觉（future/zero/estimated/error/today/selected）；自写 tooltip；键盘导航
 import { useMemo, useRef, useState, useCallback } from 'react'
-import { p95Cap, cellVisual, formatCompact } from './matrixScale'
+import { p95Cap, cellVisual, formatCompact, fullDateLabel } from './matrixScale'
+import { fmt, useT } from '../../lib/i18n'
 import MatrixTooltip, { type TooltipContent } from './MatrixTooltip'
 import './monthMatrix.css'
 
@@ -40,8 +41,6 @@ interface TooltipState {
   content: TooltipContent | null
 }
 
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
 export default function UsageMatrix({
   rows,
   dayLabels,
@@ -52,8 +51,10 @@ export default function UsageMatrix({
   selectedRow,
   onSelectCell,
   onSelectRow,
-  valueUnit = 'tokens',
+  valueUnit: valueUnitProp,
 }: UsageMatrixProps) {
+  const t = useT('matrix')
+  const valueUnit = valueUnitProp ?? t('unitTokens')
   const gridRef = useRef<HTMLDivElement>(null)
   const [tooltip, setTooltip] = useState<TooltipState | null>(null)
   const [hover, setHover] = useState<{ rowKey: string; day: number } | null>(null)
@@ -86,18 +87,19 @@ export default function UsageMatrix({
     const lines: string[] = []
     const c = row.counts?.[day]
     if (v === 0 && (c ?? 0) === 0) {
-      lines.push('No usage')
+      lines.push(t('noUsage'))
     } else {
-      lines.push(`${formatCompact(v)} ${valueUnit}${c != null ? ` · ${c.toLocaleString('en-US')} messages` : ''}`)
+      lines.push(
+        t('valueWithUnit', { value: formatCompact(v), unit: valueUnit }) +
+          (c != null ? t('messagesPart', { n: fmt.number(c) }) : ''),
+      )
       const isEst = row.cellOpts?.(day)?.estimated
-      if (isEst) lines.push('Quality: estimated')
+      if (isEst) lines.push(t('qualityEstimated'))
     }
     const d = dates?.[day]
-    const title = d
-      ? `${MONTH_ABBR[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`
-      : `${row.label} · ${dayLabels[day]}`
+    const title = d ? fullDateLabel(t, d) : `${row.label} · ${dayLabels[day]}`
     setTooltip({ anchor: el, content: { title, lines } })
-  }, [rows, dayLabels, dates, valueUnit])
+  }, [rows, dayLabels, dates, valueUnit, t])
 
   const hideTooltip = useCallback(() => setTooltip(null), [])
 
@@ -137,7 +139,7 @@ export default function UsageMatrix({
       ref={gridRef}
       className="month-matrix"
       role="grid"
-      aria-label="Monthly usage matrix"
+      aria-label={t('monthGridAria')}
       tabIndex={0}
       onKeyDown={onKeyDown}
     >
@@ -155,7 +157,7 @@ export default function UsageMatrix({
             </div>
           ))}
         </div>
-        <div className="matrix-header-total">Total</div>
+        <div className="matrix-header-total">{t('total')}</div>
       </div>
 
       {rows.map((row) => {
@@ -170,7 +172,7 @@ export default function UsageMatrix({
             >
               <span className="matrix-row-name">{row.label}</span>
               {row.health && row.health !== 'healthy' && (
-                <span className={`matrix-row-health is-${row.health}`} title={`Collector status: ${row.health}`} />
+                <span className={`matrix-row-health is-${row.health}`} title={t('collectorStatus', { status: row.health === 'error' ? t('healthError') : t('healthAttention') })} />
               )}
             </button>
             <div className="matrix-row-cells">
@@ -188,7 +190,7 @@ export default function UsageMatrix({
                     ].filter(Boolean).join(' ')}
                     style={{ background: visual.background }}
                     role="gridcell"
-                    aria-label={`${row.label} ${dayLabels[day]}: ${v === null ? 'N/A' : v === 0 ? 'No usage' : v.toLocaleString('en-US')}`}
+                    aria-label={`${row.label} ${dayLabels[day]}: ${v === null ? t('notAvailable') : v === 0 ? t('noUsage') : fmt.number(v)}`}
                     tabIndex={-1}
                     onClick={() => onSelectCell(row.key, day)}
                     onMouseEnter={(e) => {

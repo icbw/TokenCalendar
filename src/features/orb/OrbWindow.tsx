@@ -26,6 +26,7 @@ import { budgetLine, pickBudgetRows, remainOfWindow, weekBudgetLine } from './me
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
+import { fmt, getT, useT } from '../../lib/i18n'
 import './orb.css'
 
 /** 挂件派生主题 → --orb-* 变量镜像（orb.css 消费 --orb-* 键,颜色变量按窗口拆分,
@@ -160,21 +161,22 @@ function windowIdle(w: { used_percent: number } | undefined): boolean {
  * auth_failed = 凭据失效,需要用户重新登录 agent CLI;
  * plan_inactive = 凭据仍有效但订阅过期/降级,续费后自动恢复,用户零操作。 */
 function statusHint(status: string): { text: string; level: 'ok' | 'warn' | 'error' | 'muted' } {
+  const t = getT('orb')
   switch (status) {
     case 'ok':
-      return { text: 'Active', level: 'ok' }
+      return { text: t('statusActive'), level: 'ok' }
     case 'plan_inactive':
-      return { text: 'Subscription inactive — resumes after renewal', level: 'warn' }
+      return { text: t('statusPlanInactive'), level: 'warn' }
     case 'auth_failed':
-      return { text: 'Credentials expired — run the agent CLI to refresh', level: 'error' }
+      return { text: t('statusAuthFailed'), level: 'error' }
     case 'rate_limited':
-      return { text: 'Rate limited — retrying automatically', level: 'warn' }
+      return { text: t('statusRateLimited'), level: 'warn' }
     case 'network_failed':
-      return { text: 'Network error — showing last known data', level: 'warn' }
+      return { text: t('statusNetworkFailed'), level: 'warn' }
     case 'parse_failed':
-      return { text: 'Upstream response unrecognized', level: 'warn' }
+      return { text: t('statusParseFailed'), level: 'warn' }
     default:
-      return { text: 'Not bound — manage in Settings', level: 'muted' }
+      return { text: t('statusNotBound'), level: 'muted' }
   }
 }
 
@@ -197,9 +199,10 @@ function countdownDetailed(resetsAt: number | null | undefined): string | null {
   const d = Math.floor(totalMin / 1440)
   const h = Math.floor((totalMin % 1440) / 60)
   const m = totalMin % 60
-  if (d > 0) return `${d}d ${h}h ${m}m`
-  if (h > 0) return `${h}h ${m}m`
-  return `${m}m`
+  const t = getT('orb')
+  if (d > 0) return t('countdownDHM', { d, h, m })
+  if (h > 0) return t('countdownHM', { h, m })
+  return t('countdownM', { m })
 }
 
 /** hover 提示内容：自绘玻璃浮层（不用原生 title——系统方角样式与玻璃族不搭,且与光标
@@ -216,12 +219,12 @@ interface TipContent {
 }
 
 /** 重置绝对时刻（周重置行 hover:可见文字是倒计时,提示补「几号几点」——
- * 与可见读数互补而非重复;固定 en-US 短格式,与全英文界面一致）。 */
+ * 与可见读数互补而非重复;短格式按当前界面语言）。 */
 function stampAt(resetsAt: number | null | undefined): string | null {
   if (!resetsAt) return null
   const t = resetsAt * 1000
   if (t <= Date.now()) return null
-  return new Date(t).toLocaleString('en-US', {
+  return fmt.dateTime(t, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
   })
 }
@@ -282,6 +285,7 @@ function placeTip(x: number, y: number, w: number, h: number): { left: number; t
 }
 
 export default function OrbWindow() {
+  const t = useT('orb')
   // 启动形态就位（get_orb_form 返回）前不请求显示——否则首帧可能是猜测形态
   const [formReady, setFormReady] = useState(false)
   useShowOnLoad(formReady)
@@ -795,7 +799,7 @@ export default function OrbWindow() {
 
   // plan 行 = 平台名 + 套餐名（codex 显示名映射为 GPT;大小写显式归一,上游曾
   // "codex Plus"）。
-  const planLabel = snap?.plan_type && snap.plan_type !== 'unknown' ? snap.plan_type : boundSnaps.length ? 'Subscription' : 'Not bound'
+  const planLabel = snap?.plan_type && snap.plan_type !== 'unknown' ? snap.plan_type : boundSnaps.length ? t('planSubscription') : t('planNotBound')
   const planTitle = snap?.platform
     ? `${platformLabel(snap.platform)} ${capitalize(planLabel)}`
     : capitalize(planLabel)
@@ -823,50 +827,50 @@ export default function OrbWindow() {
     .map((w) => {
       const r = remainOfWindow(snap?.windows, w.kind, nowSec)
       const name = w.kind.slice(3).replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
-      return r === null ? null : `${name} limit ${pctText(r)} / 100 left`
+      return r === null ? null : t('tipScopedLeft', { name, pct: pctText(r) })
     })
     .filter((l): l is string => l !== null)
   const weekBudgetLines = budgetRows
     .map((r) => weekBudgetLine(r, snap?.windows, nowSec))
     .filter((l): l is string => l !== null)
   const weeklyTip: TipContent = weekIdle
-    ? { label: 'Weekly quota', lines: ['idle — updates after first use'] }
+    ? { label: t('tipWeeklyQuota'), lines: [t('tipIdle')] }
     : w7d
       ? {
-          label: 'Weekly quota',
+          label: t('tipWeeklyQuota'),
           lines: [
-            `${pctText(remain7d)} / 100 left`,
-            ...(weekReset ? [`resets in ${weekReset}`] : []),
+            t('tipLeft', { pct: pctText(remain7d) }),
+            ...(weekReset ? [t('tipResetsIn', { t: weekReset })] : []),
             ...scopedLines,
             ...weekBudgetLines,
           ],
         }
       : statusTip
   const fiveTip: TipContent = fiveIdle
-    ? { label: '5-hour quota', lines: ['idle — updates after first use', ...fiveBudgetLines(100)] }
+    ? { label: t('tipFiveHourQuota'), lines: [t('tipIdle'), ...fiveBudgetLines(100)] }
     : w5h
       ? {
-          label: '5-hour quota',
+          label: t('tipFiveHourQuota'),
           lines: [
-            `${pctText(remain5h)} / 100 left`,
-            ...(reset5h ? [`resets at ${reset5h}`] : []),
+            t('tipLeft', { pct: pctText(remain5h) }),
+            ...(reset5h ? [t('tipResetsAt', { t: reset5h })] : []),
             ...fiveBudgetLines(remain5h),
           ],
         }
       : statusTip
   const resetTip: TipContent = weekIdle
-    ? { label: 'Weekly reset', lines: ['idle — updates after first use'] }
+    ? { label: t('tipWeeklyReset'), lines: [t('tipIdle')] }
     : weekStamp
-      ? { label: 'Weekly reset', lines: [weekStamp] }
+      ? { label: t('tipWeeklyReset'), lines: [weekStamp] }
       : statusTip
   // 提示动作（悬挂按钮：锚按钮中心,16px 小钮上跟光标会抖）
-  const btnSettingsTip: TipContent = { lines: ['Subscription settings'] }
-  const btnRefreshTip: TipContent = { lines: ['Refresh now'] }
-  const btnCollapseTip: TipContent = { lines: ['Collapse to strip'] }
+  const btnSettingsTip: TipContent = { lines: [t('btnSettings')] }
+  const btnRefreshTip: TipContent = { lines: [t('btnRefresh')] }
+  const btnCollapseTip: TipContent = { lines: [t('btnCollapseTip')] }
   const btnSwitchTip: TipContent =
     boundSnaps.length > 1
-      ? { label: 'Subscriptions', lines: [`Switch · ${activePlatform + 1} / ${boundSnaps.length}`] }
-      : { lines: ['Only one subscription bound'] }
+      ? { label: t('tipSubscriptions'), lines: [t('tipSwitch', { i: activePlatform + 1, n: boundSnaps.length })] }
+      : { lines: [t('tipOnlyOne')] }
 
   // 表盘区域判定：环与中央表盘各有提示,用几何判定而非 DOM 命中——
   // 表盘 SVG 与 gauge 都是 pointer-events:none,鼠标事件一律落在容器上;底部
@@ -1075,7 +1079,7 @@ export default function OrbWindow() {
               hoverTip('reset', resetTip, e.clientX, e.clientY)
             }}
           >
-            {weekIdle ? '7d idle' : weekReset ?? '—'}
+            {weekIdle ? t('weekIdle') : weekReset ?? '—'}
           </div>
         </div>
 
@@ -1087,7 +1091,7 @@ export default function OrbWindow() {
             onClick={() => windowService.openMainAtView('settings', 'subscriptions').catch(console.error)}
             onMouseEnter={hangTip('btn:settings', btnSettingsTip)}
             onMouseLeave={leaveTip}
-            aria-label="Subscription settings"
+            aria-label={t('btnSettings')}
           >
             <SettingsIcon />
           </button>
@@ -1096,7 +1100,7 @@ export default function OrbWindow() {
             onClick={refreshNow}
             onMouseEnter={hangTip('btn:refresh', btnRefreshTip)}
             onMouseLeave={leaveTip}
-            aria-label="Refresh now"
+            aria-label={t('btnRefresh')}
           >
             <RefreshIcon spinning={refreshing} />
           </button>
@@ -1105,7 +1109,7 @@ export default function OrbWindow() {
             onClick={collapse}
             onMouseEnter={hangTip('btn:collapse', btnCollapseTip)}
             onMouseLeave={leaveTip}
-            aria-label="Collapse"
+            aria-label={t('btnCollapse')}
           >
             <CollapseIcon />
           </button>
@@ -1115,7 +1119,7 @@ export default function OrbWindow() {
             disabled={boundSnaps.length <= 1}
             onMouseEnter={hangTip('btn:switch', btnSwitchTip)}
             onMouseLeave={leaveTip}
-            aria-label="Switch subscription"
+            aria-label={t('btnSwitch')}
           >
             <SwitchIcon />
           </button>
@@ -1150,7 +1154,7 @@ export default function OrbWindow() {
         className={`orb-menu${menu ? '' : ' is-hidden'}`}
         style={menuStyle}
       >
-        <button onClick={menuHide}>Hide orb</button>
+        <button onClick={menuHide}>{t('menuHide')}</button>
       </div>
     </div>
   )
@@ -1161,6 +1165,7 @@ export default function OrbWindow() {
  * 窗口存在但零消耗（idle）→ 主读数「5h」+ 副行「idle」（满环不变）,两平台「未使用」
  * 的读数形态由此统一。 */
 function FiveGauge({ pct, resetAt, idle }: { pct: number | null; resetAt: string | null; idle: boolean }) {
+  const t = useT('orb')
   const r = 46 // viewBox 100 固定半径,外层 CSS 缩放到 60px
   const circ = 2 * Math.PI * r
   const valid = pct !== null
@@ -1197,7 +1202,7 @@ function FiveGauge({ pct, resetAt, idle }: { pct: number | null; resetAt: string
       </svg>
       <div className="orb-gauge-center">
         <span className="orb-gauge-num">{idle ? '5h' : valid ? Math.round(shown) : '—'}</span>
-        <span className="orb-gauge-reset">{idle ? 'idle' : resetAt ?? '—'}</span>
+        <span className="orb-gauge-reset">{idle ? t('gaugeIdle') : resetAt ?? '—'}</span>
       </div>
     </div>
   )

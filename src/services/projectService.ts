@@ -10,6 +10,7 @@ import type {
   ScratchRuleInfoContract,
 } from './contract'
 import { inTauri, tryInvoke } from './tauri'
+import { getT } from '../lib/i18n'
 
 export type { ProjectStatus }
 
@@ -62,7 +63,7 @@ export const SCRATCH_KEY = '__scratch'
 export type WriteResult<T> = { ok: true; value: T } | { ok: false; error: string }
 
 async function invokeWrite<T>(cmd: string, args: Record<string, unknown>): Promise<WriteResult<T>> {
-  if (!inTauri) return { ok: false, error: 'Service not running' }
+  if (!inTauri) return { ok: false, error: getT('projects')('serviceNotRunning') }
   try {
     const { invoke } = await import('@tauri-apps/api/core')
     return { ok: true, value: await invoke<T>(cmd, args) }

@@ -19,17 +19,17 @@ import { HOUR_BUCKET_MAX_DAYS, rangeShortLabel, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
 import { openProjectManager } from '../projects/projectManagerStore'
 import { projectColor } from './projectColors'
+import { fmt, useT, type MessageKey } from '../../lib/i18n'
 import '../projects/projects.css'
 import './insights.css'
-
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 const ymd = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
 
+/** 'YYYY-MM' → en "Sep 2026" / zh "2026年9月"（显示用,按当前语言）。 */
 const fullMonthLabel = (m: string) => {
-  const [y, mo] = m.split('-')
-  return `${MONTH_ABBR[Number(mo) - 1]} ${y}`
+  const [y, mo] = m.split('-').map(Number)
+  return fmt.date(new Date(y, mo - 1, 1), { year: 'numeric', month: 'short' })
 }
 
 // ---- 口径控件（分段控件,样式复用 .seg） ----
@@ -46,6 +46,7 @@ type ChartKind = 'line' | 'stack'
 // 自定义 hook 形态:工具栏与卡片拆成两个返回件,由 InsightsView 装配:
 // 工具栏固定在滚动区外,卡片随内容滚动。
 function useTrendBlock() {
+  const t = useT('insights')
   const [bucket, setBucket] = useState<Bucket>('day')
   const [dimension, setDimension] = useState<Dimension>('model')
   const [metric, setMetric] = useState<Metric>('total')
@@ -84,11 +85,11 @@ function useTrendBlock() {
   const hourTooLong = spanDays(selection.range) > HOUR_BUCKET_MAX_DAYS
   const effectiveBucket: Bucket = hourTooLong || useEffort ? 'day' : bucket
 
-  // 系列展示名:合计系列统一英文名;project 维取路径末段（完整路径走 hover）
+  // 系列展示名:合计系列统一名;project 维取路径末段（完整路径走 hover）。t 进依赖:切换语言即重算
   const seriesLabel = useCallback(
     (key: string, label: string | undefined) =>
-      key === '__total__' ? 'All sources' : dimension === 'project' ? projectDisplayName(key) : label ?? key,
-    [dimension],
+      key === '__total__' ? t('allSources') : dimension === 'project' ? projectDisplayName(key) : label ?? key,
+    [dimension, t],
   )
 
   const filterOptions = useMemo(() => {
@@ -143,7 +144,7 @@ function useTrendBlock() {
   const partsView = partsMode && parts !== null
   const series: SeriesSpec[] = useMemo(() => {
     if (!data) return []
-    if (partsMode && parts && data.seriesKeys.length > 0) return partSeries(data, parts, filterKey)
+    if (partsMode && parts && data.seriesKeys.length > 0) return partSeries(data, parts, filterKey, t('unitemized'))
     return data.seriesKeys.map((k, i) => ({
       key: k,
       label: seriesLabel(k, data.seriesLabels[i]),
@@ -151,7 +152,7 @@ function useTrendBlock() {
       // 项目维:项目固定配色（projectColors.ts）;其余维按 key 稳定取色
       color: dataDim === 'project' ? projectColor(k) : undefined,
     }))
-  }, [data, parts, partsMode, filterKey, seriesLabel, dataDim])
+  }, [data, parts, partsMode, filterKey, seriesLabel, dataDim, t])
   const buckets = data?.points.map((p) => p.bucket) ?? []
 
   // 占比环数据:主图范围内各系列合计
@@ -192,27 +193,27 @@ function useTrendBlock() {
     toolbar: (
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">Usage trend</span>
+        <span className="insight-card-title">{t('modTrend')}</span>
         <Seg
           value={kind}
           options={[
-            { v: 'line' as ChartKind, label: 'Lines', hint: 'Line chart' },
-            { v: 'stack' as ChartKind, label: 'Stack', hint: 'Stacked chart' },
+            { v: 'line' as ChartKind, label: t('kindLines'), hint: t('kindLinesHint') },
+            { v: 'stack' as ChartKind, label: t('kindStack'), hint: t('kindStackHint') },
           ]}
           onChange={setKind}
         />
         <Seg
           value={effectiveBucket}
           options={[
-            { v: 'day' as Bucket, label: 'Day', hint: 'Group by day' },
+            { v: 'day' as Bucket, label: t('bucketDay'), hint: t('bucketDayHint') },
             {
               v: 'hour' as Bucket,
-              label: 'Hour',
+              label: t('bucketHour'),
               hint: useEffort
-                ? 'Hourly buckets are not available for projects'
+                ? t('bucketHourNoProjects')
                 : hourTooLong
-                  ? `Hourly buckets need a range of ${HOUR_BUCKET_MAX_DAYS} days or less`
-                  : 'Group by hour',
+                  ? t('bucketHourTooLong', { n: HOUR_BUCKET_MAX_DAYS })
+                  : t('bucketHourHint'),
               disabled: useEffort || hourTooLong,
             },
           ]}
@@ -221,10 +222,10 @@ function useTrendBlock() {
         <Seg
           value={dimension}
           options={[
-            { v: 'model' as Dimension, label: 'Model', hint: 'One series per model' },
-            { v: 'agent' as Dimension, label: 'Agent', hint: 'One series per agent' },
-            { v: 'project' as Dimension, label: 'Project', hint: 'One series per project (working directory)' },
-            { v: 'total' as Dimension, label: 'Total', hint: 'Single all-source series' },
+            { v: 'model' as Dimension, label: t('dimModel'), hint: t('dimModelHint') },
+            { v: 'agent' as Dimension, label: t('dimAgent'), hint: t('dimAgentHint') },
+            { v: 'project' as Dimension, label: t('dimProject'), hint: t('dimProjectHint') },
+            { v: 'total' as Dimension, label: t('dimTotal'), hint: t('dimTotalHint') },
           ]}
           onChange={(v) => {
             setDimension(v)
@@ -236,10 +237,10 @@ function useTrendBlock() {
           options={TOKEN_METRICS.map((m) => ({ v: m as Metric, label: TOKEN_METRIC_LABELS[m].short, hint: TOKEN_METRIC_LABELS[m].hint }))}
           onChange={setMetric}
         />
-        {loading && <span className="matrix-loading">Loading…</span>}
+        {loading && <span className="matrix-loading">{t('loading')}</span>}
       </header>
       <div className="insight-rangebar">
-        <RangeControl selection={rangeSelection} noun="Usage" />
+        <RangeControl selection={rangeSelection} noun={t('nounUsage')} />
       </div>
       </div>
     ),
@@ -253,7 +254,7 @@ function useTrendBlock() {
                 key={o.key}
                 className={`legend-item${filterKey === o.key ? ' is-active' : ''}`}
                 onClick={() => pickFilter(o.key)}
-                title={filterKey === o.key ? 'Click to clear filter' : `Only ${dimension === 'project' ? projectTooltip(o.key) : o.label}`}
+                title={filterKey === o.key ? t('legendClear') : t('legendOnly', { name: dimension === 'project' ? projectTooltip(o.key) : o.label })}
               >
                 <span className="legend-swatch" style={{ background: dataDim === 'project' ? projectColor(o.key) : colorFor(o.key) }} />
                 {o.label}
@@ -261,17 +262,17 @@ function useTrendBlock() {
             ))}
             {/* 项目维图例即项目选择器,末尾放管理入口（打开主窗口内弹出层,不改筛选）*/}
             {dimension === 'project' && (
-              <button className="legend-item pm-manage-link" onClick={openProjectManager} title="Rename, hide or merge projects">
-                Manage projects…
+              <button className="legend-item pm-manage-link" onClick={openProjectManager} title={t('manageProjectsHint')}>
+                {t('manageProjects')}
               </button>
             )}
           </div>
         )}
 
         {data === null ? (
-          <div className="insight-empty">Data unavailable (service not running)</div>
+          <div className="insight-empty">{t('dataUnavailable')}</div>
         ) : series.length === 0 || series.every((s) => s.values.every((v) => v === 0)) ? (
-          <div className="insight-empty">No usage records in this range</div>
+          <div className="insight-empty">{t('noUsageInRange')}</div>
         ) : kind === 'line' ? (
           <LineChart series={series} buckets={buckets} ordered={partsView} />
         ) : (
@@ -298,7 +299,7 @@ function useTrendBlock() {
  * 依次取该模型本色由深到浅——最深的 Output 与该模型总量同色,堆叠柱自下而上同序。
  * 源里只报总量、无分项的余量（Codex）另列 Unitemized（中性灰,不在价格色阶内）。
  * 全零分项不出现（颜色仍按固定档位,不因缺项而顺移）;每个桶的分项和恒等于总量。 */
-function partSeries(total: RangeSeriesResult, parts: (RangeSeriesResult | null)[], modelKey: string): SeriesSpec[] {
+function partSeries(total: RangeSeriesResult, parts: (RangeSeriesResult | null)[], modelKey: string, unitemizedLabel: string): SeriesSpec[] {
   const totals = total.points.map((p) => p.values[0] ?? 0)
   const valuesOf = (m: TokenMetric) => {
     const r = parts[TOKEN_PARTS.indexOf(m as (typeof TOKEN_PARTS)[number])]
@@ -312,7 +313,7 @@ function partSeries(total: RangeSeriesResult, parts: (RangeSeriesResult | null)[
     color: shades[k],
   }))
   const rest = totals.map((t, i) => Math.max(0, t - specs.reduce((a, s) => a + s.values[i], 0)))
-  specs.push({ key: `${modelKey}::unitemized`, label: 'Unitemized', values: rest, color: UNITEMIZED_COLOR })
+  specs.push({ key: `${modelKey}::unitemized`, label: unitemizedLabel, values: rest, color: UNITEMIZED_COLOR })
   return specs.filter((s) => s.values.some((v) => v > 0))
 }
 
@@ -325,6 +326,7 @@ interface OutlierDay {
 }
 
 function AnomalyBlock() {
+  const t = useT('insights')
   const [days, setDays] = useState<{ ymd: string; total: number }[] | null>(null)
   const [unavailable, setUnavailable] = useState(false)
   const [refreshTick, setRefreshTick] = useState(0)
@@ -382,17 +384,17 @@ function AnomalyBlock() {
   return (
     <section className="insight-card">
       <header className="insight-card-header">
-        <span className="insight-card-title">Anomaly days · last 31 days</span>
-        <span className="insight-card-sub" title="Daily totals beyond mean ± 2 std-dev; rightmost = today">|z| ≥ 2 outliers</span>
+        <span className="insight-card-title">{t('anomalyTitle')}</span>
+        <span className="insight-card-sub" title={t('anomalySubHint')}>{t('anomalySub')}</span>
       </header>
       {days === null || unavailable ? (
-        <div className="insight-empty">Data unavailable (service not running)</div>
+        <div className="insight-empty">{t('dataUnavailable')}</div>
       ) : (
         <div className="anomaly-heatmap">
           {/* 单行 31 格热力条:最右 = 今日（与主矩阵窗口语义一致）;
               异常日按 |z| 强度上色（z≥2 深红 / ≤-2 深蓝,更强更深）,非异常日有数据
               中性灰、无数据更浅。行首保留一段文字说明。*/}
-          <span className="anomaly-heatmap-label">Outliers</span>
+          <span className="anomaly-heatmap-label">{t('anomalyOutliers')}</span>
           <div className="anomaly-strip">
             {days.map((d) => {
               const z = zByDay.get(d.ymd)
@@ -400,20 +402,20 @@ function AnomalyBlock() {
               // |z| 强度落档:2~3 浅 / 3~4 中 / ≥4 深
               const zLevel = z === undefined ? '' : ` z${Math.min(4, Math.max(2, Math.floor(Math.abs(z))))}`
               const cls = isOut ? (z! > 0 ? ' is-high' : ' is-low') + zLevel : d.total > 0 ? ' is-flat' : ' is-zero'
-              const zTxt = z === undefined ? 'not enough samples' : `${z > 0 ? '+' : ''}${z.toFixed(1)}σ`
+              const zTxt = z === undefined ? t('anomalyNoSamples') : `${z > 0 ? '+' : ''}${z.toFixed(1)}σ`
               return (
                 <div
                   key={d.ymd}
                   className={`anomaly-cell${cls}`}
-                  title={`${d.ymd} · ${formatFull(d.total)} tokens · ${zTxt}${isOut ? ' · outlier' : ''}`}
+                  title={t('anomalyCell', { day: d.ymd, n: formatFull(d.total), z: zTxt }) + (isOut ? t('anomalyCellOutlier') : '')}
                 />
               )
             })}
           </div>
           {outliers.length === 0 ? (
-            <span className="anomaly-heatmap-none">None</span>
+            <span className="anomaly-heatmap-none">{t('anomalyNone')}</span>
           ) : (
-            <span className="anomaly-heatmap-count">{outliers.length} days</span>
+            <span className="anomaly-heatmap-count">{t('anomalyDays', { n: outliers.length })}</span>
           )}
         </div>
       )}
@@ -424,6 +426,7 @@ function AnomalyBlock() {
 // ---- tokens × 积分（双组图;可选组件,默认关） ----
 
 function CreditBlock() {
+  const t = useT('insights')
   const [month, setMonth] = useState(() => {
     const now = new Date()
     return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}`
@@ -467,12 +470,12 @@ function CreditBlock() {
       {/* 工具行独立成行（参照矩阵视图）,月份选择跟在控件组后,不 auto 靠右;模块内 sticky*/}
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">tokens × credit · CodeBuddy</span>
+        <span className="insight-card-title">{t('creditTitle')}</span>
         <Seg
           value={bucket}
           options={[
-            { v: 'day' as const, label: 'Day', hint: 'Group by day' },
-            { v: 'hour' as const, label: 'Hour', hint: 'Group by hour' },
+            { v: 'day' as const, label: t('bucketDay'), hint: t('bucketDayHint') },
+            { v: 'hour' as const, label: t('bucketHour'), hint: t('bucketHourHint') },
           ]}
           onChange={setBucket}
         />
@@ -482,40 +485,37 @@ function CreditBlock() {
           value={month}
           max={`${new Date().getFullYear()}-${pad2(new Date().getMonth() + 1)}`}
           onChange={(e) => e.target.value && setMonth(e.target.value)}
-          aria-label="Pick month"
+          aria-label={t('creditPickMonth')}
         />
-        {loading && <span className="matrix-loading">Loading…</span>}
+        {loading && <span className="matrix-loading">{t('loading')}</span>}
       </header>
       </div>
 
       <section className="insight-card">
         {summary === null ? (
-        <div className="insight-empty">{loading ? 'Loading…' : 'Data unavailable (service not running)'}</div>
+        <div className="insight-empty">{loading ? t('loading') : t('dataUnavailable')}</div>
       ) : !summary.hasData ? (
         <div className="credit-guide">
-          <p className="credit-guide-title">{fullMonthLabel(month)} has no credit data yet</p>
-          <p className="credit-guide-body">
-            Credits are read from local CodeBuddy / WorkBuddy session data (shared credit pool);
-            this month has no request with credits yet.
-          </p>
+          <p className="credit-guide-title">{t('creditNoData', { month: fullMonthLabel(month) })}</p>
+          <p className="credit-guide-body">{t('creditGuideBody')}</p>
         </div>
       ) : (
         <div className="credit-body">
           <div className="credit-totals">
             <div className="credit-total-item">
-              <span className="credit-total-label">Total credit</span>
+              <span className="credit-total-label">{t('creditTotal')}</span>
               <span className="credit-total-value">{formatFull(Math.round(summary.totalCredit * 100) / 100)}</span>
             </div>
             <div className="credit-total-item">
-              <span className="credit-total-label">Requests</span>
+              <span className="credit-total-label">{t('creditRequests')}</span>
               <span className="credit-total-value">{formatFull(summary.totalRequests)}</span>
             </div>
             <div className="credit-total-item credit-total-note">
-              <span className="credit-total-label">Local session credits · may run slightly below the official bill</span>
+              <span className="credit-total-label">{t('creditNote')}</span>
             </div>
-            <label className="credit-mode-toggle" title="One bar per model side by side in the same chart, with one credit curve per model">
+            <label className="credit-mode-toggle" title={t('creditByModelHint')}>
               <input type="checkbox" checked={byModel} onChange={(e) => setByModel(e.target.checked)} />
-              By model
+              {t('creditByModel')}
             </label>
           </div>
           <ComboBlock month={month} summary={summary} byModel={byModel} bucket={bucket} />
@@ -539,6 +539,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   byModel: boolean
   bucket: 'day' | 'hour'
 }) {
+  const t = useT('insights')
   // [total, ...PART_PRICE_ORDER] 五条序列（total 用来算只报总量的余量）
   const [tok, setTok] = useState<(RangeSeriesResult | null)[] | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
@@ -584,7 +585,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
   const buckets = summary.byDay.map((d) => d.day)
   const parts: ComboPart[] = [
     ...PART_PRICE_ORDER.map((m) => ({ key: m, label: TOKEN_METRIC_LABELS[m].label })),
-    { key: 'unitemized', label: 'Unitemized' },
+    { key: 'unitemized', label: t('unitemized') },
   ]
 
   const view = useMemo(() => {
@@ -610,7 +611,7 @@ function ComboBlock({ month, summary, byModel, bucket }: {
       : [
           {
             key: '__total__',
-            label: 'All sources',
+            label: t('allSources'),
             colors: [...COMBO_PART_SHADES, UNITEMIZED_COLOR],
             values: buckets.map((_, bi) =>
               bucket === 'day'
@@ -628,14 +629,14 @@ function ComboBlock({ month, summary, byModel, bucket }: {
           const byDay = new Map(m.byDay.map((d) => [d.day, d.credit]))
           return { key: m.key, label: m.label, color: colorFor(m.key), values: buckets.map((day) => byDay.get(day) ?? null) }
         })
-      : [{ key: 'credit', label: 'credit', color: COMBO_CREDIT, values: buckets.map((day) => summary.byDay.find((d) => d.day === day)?.credit ?? null) }]
+      : [{ key: 'credit', label: t('chartCredit'), color: COMBO_CREDIT, values: buckets.map((day) => summary.byDay.find((d) => d.day === day)?.credit ?? null) }]
     const hasRest = groups.some((g) => g.values.some((v) => (v[PART_PRICE_ORDER.length] ?? 0) > 0))
     return { groups, credits, hasRest }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tok, buckets.join(','), summary, byModel, modelBars, bucket])
+  }, [tok, buckets.join(','), summary, byModel, modelBars, bucket, t])
 
   if (view === null) {
-    return <div className="insight-empty">Loading…</div>
+    return <div className="insight-empty">{t('loading')}</div>
   }
 
   // 按模型时图例:模型色（柱 = 该模型色阶,线 = 该模型 credit）+ 中性色阶说明分项深浅
@@ -658,15 +659,15 @@ function ComboBlock({ month, summary, byModel, bucket }: {
           </span>
         ))}
         {view.hasRest && (
-          <span className="legend-item" title="Tokens reported only as a total, without a breakdown">
+          <span className="legend-item" title={t('unitemizedHint')}>
             <span className="legend-swatch" style={{ background: UNITEMIZED_COLOR }} />
-            Unitemized
+            {t('unitemized')}
           </span>
         )}
         {!byModel && (
-          <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_CREDIT }} />credit (right axis)</span>
+          <span className="legend-item"><span className="legend-swatch" style={{ background: COMBO_CREDIT }} />{t('creditLegendLine')}</span>
         )}
-        {byModel && <span className="legend-item combo-legend-note">bars: tokens by model (dark → light = Output → Cache read) · lines: credit (right axis)</span>}
+        {byModel && <span className="legend-item combo-legend-note">{t('creditLegendNote')}</span>}
       </div>
     </div>
   )
@@ -674,13 +675,15 @@ function ComboBlock({ month, summary, byModel, bucket }: {
 
 type ModuleId = 'trend' | 'pricing' | 'credit'
 
-const MODULES: { id: ModuleId; label: string; hint: string }[] = [
-  { id: 'trend', label: 'Usage trend', hint: 'Token usage over time, share by series and anomaly days' },
-  { id: 'pricing', label: 'Pricing', hint: 'Equivalent API value and official list prices' },
-  { id: 'credit', label: 'Credit', hint: 'Tokens × credit (CodeBuddy / WorkBuddy)' },
+// label / hint 存字典键,渲染时取文案（切换语言即时生效）
+const MODULES: { id: ModuleId; label: MessageKey<'insights'>; hint: MessageKey<'insights'> }[] = [
+  { id: 'trend', label: 'modTrend', hint: 'modTrendHint' },
+  { id: 'pricing', label: 'modPricing', hint: 'modPricingHint' },
+  { id: 'credit', label: 'modCredit', hint: 'modCreditHint' },
 ]
 
 export default function InsightsView() {
+  const t = useT('insights')
   // CodeBuddy 积分卡是可选模块（设置·Data 打开,默认关）:没用过 CodeBuddy 的用户
   // 不应看到常驻空引导卡——关着时模块与切换按钮一起不出现。
   const [showCredit, setShowCredit] = useState(() => getDesignPrefs().insightsCredit)
@@ -726,8 +729,8 @@ export default function InsightsView() {
   // 切换行固定在滚动区外（flex-shrink:0）;模块工具栏在各自 section 内 sticky。
   return (
     <div className="insights-view">
-      <nav className="insight-toolbar insight-module-nav" aria-label="Insights modules">
-        <Seg value={active} options={modules.map((m) => ({ v: m.id, label: m.label, hint: m.hint }))} onChange={jump} />
+      <nav className="insight-toolbar insight-module-nav" aria-label={t('modulesAria')}>
+        <Seg value={active} options={modules.map((m) => ({ v: m.id, label: t(m.label), hint: t(m.hint) }))} onChange={jump} />
       </nav>
       <div className="insights-scroll insights-modules" ref={scrollRef} onScroll={spy}>
         <section className="insight-module" data-module="trend">

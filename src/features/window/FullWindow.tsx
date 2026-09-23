@@ -17,6 +17,7 @@ import type { GroupBy as MatrixGroupBy } from '../matrix/UsageMatrixView'
 import { events, updateService, windowService, type ReadyUpdate } from '../../services'
 import { getDesignPrefs } from '../settings/designPrefs'
 import { useShowOnLoad } from './useShowOnLoad'
+import { useT } from '../../lib/i18n'
 import { useMainThemeSync } from '../settings/mainTheme'
 import { useMaterialSync } from '../settings/materialTheme'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
@@ -27,6 +28,7 @@ import './shell.css'
 type MainView = 'matrix' | 'insights' | 'tasks' | 'settings'
 
 export default function FullWindow() {
+  const t = useT('window')
   useShowOnLoad()
   // 主界面主题（顶栏/主体/边框取色 + 顶栏 alpha）仅主窗口消费；
   // 挂件窗口不读这些变量，改主界面取色挂件外围零变化。
@@ -214,38 +216,38 @@ export default function FullWindow() {
           <button
             className={`seg titlebar-view titlebar-orb${orbVisible ? ' is-active' : ''}`}
             onClick={toggleOrb}
-            title={orbVisible ? 'Hide orbit orb' : 'Show orbit orb'}
+            title={orbVisible ? t('hideOrb') : t('showOrb')}
           >
-            Orbit
+            {t('orbit')}
           </button>
           <button
             className={`seg titlebar-widget${widgetVisible ? ' is-active' : ''}`}
             onClick={toggleWidget}
-            title={widgetVisible ? 'Hide widget window' : 'Show widget window'}
+            title={widgetVisible ? t('hideWidget') : t('showWidget')}
           >
-            Widget
+            {t('widget')}
           </button>
           {/* Matrix / Insights 文字 seg（与 Widget 同款组件形式）;三态互斥,再点活动按钮回 matrix。*/}
           <button
             className={`seg titlebar-view${view === 'matrix' ? ' is-active' : ''}`}
             onClick={() => setView('matrix')}
-            title="Matrix view"
+            title={t('matrixHint')}
           >
-            Matrix
+            {t('matrix')}
           </button>
           <button
             className={`seg titlebar-view${view === 'insights' ? ' is-active' : ''}`}
             onClick={() => setView('insights')}
-            title="Insights charts"
+            title={t('insightsHint')}
           >
-            Insights
+            {t('insights')}
           </button>
           <button
             className={`seg titlebar-view${view === 'tasks' ? ' is-active' : ''}`}
             onClick={() => setView('tasks')}
-            title="Tasks: per-session turns, steps and time"
+            title={t('tasksHint')}
           >
-            Tasks
+            {t('tasks')}
           </button>
           <button
             className={`seg titlebar-view${view === 'settings' ? ' is-active' : ''}`}
@@ -254,24 +256,24 @@ export default function FullWindow() {
               if (updateReady && view !== 'settings') setSettingsTab('about')
               setView((v) => (v === 'settings' ? 'matrix' : 'settings'))
             }}
-            title={updateReady ? `Settings — TokenCalendar ${updateReady.version} is ready to install` : 'Settings'}
+            title={updateReady ? t('settingsUpdateReady', { version: updateReady.version }) : t('settings')}
           >
-            Settings
-            {updateReady && <span className="titlebar-update-dot" aria-label="Update ready" />}
+            {t('settings')}
+            {updateReady && <span className="titlebar-update-dot" aria-label={t('updateReady')} />}
           </button>
           <div className="titlebar-sep" />
-          <button className="titlebar-btn" onClick={minimize} title="Minimize" aria-label="Minimize">
+          <button className="titlebar-btn" onClick={minimize} title={t('minimize')} aria-label={t('minimize')}>
             <MinimizeIcon />
           </button>
           <button
             className="titlebar-btn"
             onClick={toggleMaximize}
-            title={maximized ? 'Restore' : 'Maximize'}
-            aria-label={maximized ? 'Restore' : 'Maximize'}
+            title={maximized ? t('restore') : t('maximize')}
+            aria-label={maximized ? t('restore') : t('maximize')}
           >
             {maximized ? <RestoreIcon /> : <MaximizeIcon />}
           </button>
-          <button className="titlebar-btn is-close" onClick={close} title="Close" aria-label="Close">
+          <button className="titlebar-btn is-close" onClick={close} title={t('close')} aria-label={t('close')}>
             <CloseIcon />
           </button>
         </div>

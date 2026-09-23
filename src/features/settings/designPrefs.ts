@@ -10,6 +10,7 @@ export type SizePreset = 'large' | 'medium' | 'small'
 
 import type { SubscriptionPlatform } from '../../services/subscriptionService'
 import { setFetchPolicy } from '../../services/subscriptionService'
+import { systemLocale } from '../../lib/i18n/system'
 
 /** 「按预计消耗取数」阈值的合法域（与 Rust clamp 同源：0.5〜10.0，步进 0.5；
  * default = 距上次读数预计消耗这么多百分点就取一次）。设置页的 min/max/step 取这里。 */
@@ -193,6 +194,9 @@ export interface DesignPrefs {
   timelineHeat?: boolean
   timelineBarAlpha?: number
   timelineCellAlpha?: number
+  /** 界面语言（undefined = 跟随系统:中文系统 → zh-CN,其余 → en）。消费方一律经
+   * src/lib/i18n 的 effectiveLocale / useT;Rust 托盘启动读本键,运行时经 set_ui_locale 同步。 */
+  locale?: 'en' | 'zh-CN'
 }
 
 const KEY = 'tokencalendar.design'
@@ -388,6 +392,7 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.timelineAutoStripSecs !== undefined && !(typeof p.timelineAutoStripSecs === 'number' && Number.isInteger(p.timelineAutoStripSecs) && p.timelineAutoStripSecs >= 0 && p.timelineAutoStripSecs <= 3600)) {
     delete p.timelineAutoStripSecs
   }
+  if (p.locale !== undefined && p.locale !== 'en' && p.locale !== 'zh-CN') delete p.locale
   // 应用更新开关：非布尔值视为未设置（回落默认关）。
   if (p.autoUpdate !== undefined && typeof p.autoUpdate !== 'boolean') {
     delete p.autoUpdate
@@ -501,6 +506,11 @@ export function setDesignPrefs(patch: Partial<DesignPrefs>): void {
 export function subscribeDesignPrefs(fn: (p: DesignPrefs) => void): () => void {
   listeners.add(fn)
   return () => listeners.delete(fn)
+}
+
+/** designPrefs → 热力图周起始。未设置时按界面语言:中文默认周一（国内日历习惯）,英文默认周日（GitHub 式）。 */
+export function weekStartOf(p: DesignPrefs): WeekStart {
+  return p.weekStart ?? ((p.locale ?? systemLocale()) === 'zh-CN' ? 'monday' : 'sunday')
 }
 
 /** designPrefs → 待机开关（undefined = 开;与 Rust ENABLED 初值对齐）。 */

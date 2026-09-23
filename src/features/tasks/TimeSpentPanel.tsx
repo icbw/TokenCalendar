@@ -7,39 +7,34 @@
 import { useEffect, useMemo, useState } from 'react'
 import { taskService } from '../../services'
 import type { DayRange, TimeSpent, TimeSpentGroup, TimeSpentRow } from '../../services'
-import { formatFull } from '../matrix/matrixScale'
 import { formatDuration, projectDisplayName, projectTooltip } from '../insights/analytics'
 import { StackedBarChart, type SeriesSpec } from '../insights/charts'
 import { projectColor } from '../insights/projectColors'
 import { Seg } from '../insights/Seg'
 import { getDesignPrefs, setDesignPrefs } from '../settings/designPrefs'
+import { fmt, useT, type MessageKey, type Translator } from '../../lib/i18n'
+import { startedLabel } from './taskFormat'
 
 export type TimeMetric = 'total' | 'task' | 'human'
 
-/** 图内三量的名称与说明（任务列表的 Wait 列与 Task 为同一个量）。 */
-export const TIME_METRIC_LABELS: Record<TimeMetric, { label: string; hint: string }> = {
-  total: { label: 'Total', hint: 'Task + Human, stacked' },
-  task: { label: 'Task', hint: 'Task time: sum of turn wall-clock durations (the Wait column of the task list)' },
-  human: { label: 'Human', hint: 'Human time: gaps between turns up to the idle threshold' },
+type TasksKey = MessageKey<'tasks'>
+
+/** 图内三量的名称与说明（字典键;任务列表的 Wait 列与 Task 为同一个量）。 */
+export const TIME_METRIC_LABELS: Record<TimeMetric, { label: TasksKey; hint: TasksKey }> = {
+  total: { label: 'metricTotal', hint: 'metricTotalHint' },
+  task: { label: 'metricTask', hint: 'metricTaskHint' },
+  human: { label: 'metricHuman', hint: 'metricHumanHint' },
 }
 
-const GROUP_OPTIONS: { v: TimeSpentGroup; label: string; hint: string }[] = [
-  { v: 'project', label: 'Project', hint: 'Time per project (each turn counts toward its own project)' },
-  { v: 'task', label: 'Task', hint: 'Time per task, counting only the turns inside the range' },
-  { v: 'day', label: 'Day', hint: 'Time per local day of the turn' },
+const GROUP_OPTIONS: { v: TimeSpentGroup; label: TasksKey; hint: TasksKey }[] = [
+  { v: 'project', label: 'groupProject', hint: 'groupProjectHint' },
+  { v: 'task', label: 'groupTask', hint: 'groupTaskHint' },
+  { v: 'day', label: 'groupDay', hint: 'groupDayHint' },
 ]
 
 const TOP_N = 15
 const TASK_COLOR = 'var(--time-task)'
 const HUMAN_COLOR = 'var(--time-human)'
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const pad2 = (n: number) => String(n).padStart(2, '0')
-
-function startedLabel(ms: number): string {
-  const d = new Date(ms)
-  const year = d.getFullYear() !== new Date().getFullYear() ? `, ${d.getFullYear()}` : ''
-  return `${MONTH_ABBR[d.getMonth()]} ${d.getDate()}${year} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
-}
 
 /** 本地 0 点毫秒（范围起点,判定「started before range」）。 */
 function localMidnight(day: string): number {
@@ -63,8 +58,8 @@ interface BarItem {
 const valueOf = (it: { task: number; human: number }, metric: TimeMetric) =>
   metric === 'task' ? it.task : metric === 'human' ? it.human : it.task + it.human
 
-function triple(task: number, human: number): string {
-  return `Task ${formatDuration(task)} · Human ${formatDuration(human)} · Total ${formatDuration(task + human)}`
+function triple(t: Translator<'tasks'>, task: number, human: number): string {
+  return t('triple', { task: formatDuration(task), human: formatDuration(human), total: formatDuration(task + human) })
 }
 
 function HBars({ items, metric, onPick }: { items: BarItem[]; metric: TimeMetric; onPick?: (it: BarItem) => void }) {
@@ -112,6 +107,7 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
   /** Task 维点击:列表当前页有该任务 → 展开并滚到它,返回 true;否则返回 false（只提示,不改列表筛选）。 */
   onPickTask: (agent: string, sessionId: string) => boolean
 }) {
+  const t = useT('tasks')
   const [userGroup, setUserGroup] = useState<TimeSpentGroup>(() => getDesignPrefs().taskTimeGroup ?? 'project')
   const [metric, setMetric] = useState<TimeMetric>(() => getDesignPrefs().taskTimeMetric ?? 'total')
   // 用户在哪个项目下手选过维度（换项目即失效）:自动切 Task 只在没手选过的那次生效
@@ -119,7 +115,8 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
   const group: TimeSpentGroup = project && pickedFor !== project && userGroup === 'project' ? 'task' : userGroup
 
   const [data, setData] = useState<TimeSpent | null | undefined>(undefined)
-  const [notice, setNotice] = useState<string | null>(null)
+  // 只记「该任务不在当前页」这一事实,文案在渲染时取（切换语言即更新）
+  const [notOnPage, setNotOnPage] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -131,7 +128,7 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
     }
   }, [range, group, agent, project, refreshTick])
 
-  useEffect(() => setNotice(null), [range, group, agent, project])
+  useEffect(() => setNotOnPage(false), [range, group, agent, project])
 
   const pickGroup = (g: TimeSpentGroup) => {
     setUserGroup(g)
@@ -156,7 +153,7 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
           task: r.taskMs,
           human: r.humanMs,
           turns: r.turns,
-          tooltip: `${projectTooltip(r.key)}\n${triple(r.taskMs, r.humanMs)}\n${formatFull(r.turns)} turns`,
+          tooltip: `${projectTooltip(r.key)}\n${triple(t, r.taskMs, r.humanMs)}\n${t('turnsN', { n: fmt.number(r.turns) })}`,
         }
       }
       const started = r.startedAt !== undefined ? startedLabel(r.startedAt) : ''
@@ -167,11 +164,11 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
       const lines = [
         title ? `${title}\n${started}` : started,
         `${agentLabel(r.agent ?? '')}${r.project ? ` · ${projectDisplayName(r.project)}` : ''}`,
-        `In range: ${triple(r.taskMs, r.humanMs)} · ${formatFull(r.turns)} turns`,
-        `Whole task: ${triple(lifeTask, lifeHuman)}`,
+        t('inRange', { triple: triple(t, r.taskMs, r.humanMs), n: fmt.number(r.turns) }),
+        t('wholeTask', { triple: triple(t, lifeTask, lifeHuman) }),
       ]
-      if (before) lines.push('Started before the range: only its turns inside the range are counted')
-      lines.push('Click to open it in the task list')
+      if (before) lines.push(t('startedBefore'))
+      lines.push(t('clickToOpen'))
       return {
         key: r.key,
         label: title || started,
@@ -179,39 +176,40 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
         human: r.humanMs,
         turns: r.turns,
         tooltip: lines.join('\n'),
-        badge: before ? 'started before range' : undefined,
+        badge: before ? t('badgeBefore') : undefined,
         row: r,
       }
     })
     if (data.others) {
       const o = data.others
+      const n = fmt.number(o.count)
       list.push({
         key: '__others__',
-        label: `Others (${formatFull(o.count)})`,
+        label: t('others', { n }),
         swatch: group === 'project' ? 'var(--border-strong)' : undefined,
         task: o.taskMs,
         human: o.humanMs,
         turns: o.turns,
-        tooltip: `${formatFull(o.count)} more ${group === 'project' ? 'projects' : 'tasks'}\n${triple(o.taskMs, o.humanMs)}\n${formatFull(o.turns)} turns`,
+        tooltip: `${t(group === 'project' ? 'moreProjects' : 'moreTasks', { n })}\n${triple(t, o.taskMs, o.humanMs)}\n${t('turnsN', { n: fmt.number(o.turns) })}`,
         isOthers: true,
       })
     }
     // 按当前指标降序（Others 固定末尾）
     const head = list.filter((it) => !it.isOthers).sort((a, b) => valueOf(b, metric) - valueOf(a, metric))
     return [...head, ...list.filter((it) => it.isOthers)]
-  }, [data, group, labelMode, metric, rangeStartMs, agentLabel])
+  }, [data, group, labelMode, metric, rangeStartMs, agentLabel, t])
 
   const daySeries = useMemo<SeriesSpec[]>(() => {
     if (!data || group !== 'day') return []
-    const task: SeriesSpec = { key: 'task', label: 'Task', values: data.rows.map((r) => r.taskMs), color: TASK_COLOR }
-    const human: SeriesSpec = { key: 'human', label: 'Human', values: data.rows.map((r) => r.humanMs), color: HUMAN_COLOR }
+    const task: SeriesSpec = { key: 'task', label: t('metricTask'), values: data.rows.map((r) => r.taskMs), color: TASK_COLOR }
+    const human: SeriesSpec = { key: 'human', label: t('metricHuman'), values: data.rows.map((r) => r.humanMs), color: HUMAN_COLOR }
     return metric === 'task' ? [task] : metric === 'human' ? [human] : [task, human]
-  }, [data, group, metric])
+  }, [data, group, metric, t])
 
   const pick = (it: BarItem) => {
     const r = it.row
     if (!r?.agent || !r.sessionId) return
-    setNotice(onPickTask(r.agent, r.sessionId) ? null : 'This task is not on the current page of the task list (the list shows tasks started in the range)')
+    setNotOnPage(!onPickTask(r.agent, r.sessionId))
   }
 
   return (
@@ -220,38 +218,39 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
         <Seg<TimeSpentGroup>
           value={group}
           options={GROUP_OPTIONS.map((o) => ({
-            ...o,
-            hint: o.v === 'task' && group === 'task' && project && userGroup === 'project' ? 'Switched to tasks because a single project is selected' : o.hint,
+            v: o.v,
+            label: t(o.label),
+            hint: o.v === 'task' && group === 'task' && project && userGroup === 'project' ? t('groupTaskAuto') : t(o.hint),
           }))}
           onChange={pickGroup}
         />
         <Seg<TimeMetric>
           value={metric}
-          options={(['total', 'task', 'human'] as TimeMetric[]).map((m) => ({ v: m, label: TIME_METRIC_LABELS[m].label, hint: TIME_METRIC_LABELS[m].hint }))}
+          options={(['total', 'task', 'human'] as TimeMetric[]).map((m) => ({ v: m, label: t(TIME_METRIC_LABELS[m].label), hint: t(TIME_METRIC_LABELS[m].hint) }))}
           onChange={pickMetric}
         />
         <span className="tspent-legend">
           {metric !== 'human' && (
             <span className="gap-stat">
               <span className="legend-swatch" style={{ background: TASK_COLOR }} />
-              <span className="gap-stat-label">Task</span>
+              <span className="gap-stat-label">{t('metricTask')}</span>
             </span>
           )}
           {metric !== 'task' && (
             <span className="gap-stat">
               <span className="legend-swatch" style={{ background: HUMAN_COLOR }} />
-              <span className="gap-stat-label">Human</span>
+              <span className="gap-stat-label">{t('metricHuman')}</span>
             </span>
           )}
         </span>
       </div>
 
       {data === undefined ? (
-        <div className="insight-empty">Loading…</div>
+        <div className="insight-empty">{t('loading')}</div>
       ) : data === null ? (
-        <div className="insight-empty">Data unavailable (service not running)</div>
+        <div className="insight-empty">{t('unavailable')}</div>
       ) : data.total.turns === 0 ? (
-        <div className="insight-empty">No turns in this range</div>
+        <div className="insight-empty">{t('noTurnsRange')}</div>
       ) : (
         <>
           {group === 'day' ? (
@@ -259,20 +258,20 @@ export default function TimeSpentPanel({ range, agent, project, labelMode, agent
           ) : (
             <HBars items={items} metric={metric} onPick={group === 'task' ? pick : undefined} />
           )}
-          {notice && <div className="gap-status tspent-notice">{notice}</div>}
+          {notOnPage && <div className="gap-status tspent-notice">{t('notOnPage')}</div>}
           <div className="gap-stats">
             <div className="gap-stat">
-              <span className="gap-stat-label">Task</span>
+              <span className="gap-stat-label">{t('metricTask')}</span>
               <span className="gap-stat-value">{formatDuration(data.total.taskMs)}</span>
             </div>
             <div className="gap-stat">
-              <span className="gap-stat-label">Human</span>
+              <span className="gap-stat-label">{t('metricHuman')}</span>
               <span className="gap-stat-value">{formatDuration(data.total.humanMs)}</span>
             </div>
             <div className="gap-stat">
-              <span className="gap-stat-label">Total</span>
+              <span className="gap-stat-label">{t('total')}</span>
               <span className="gap-stat-value">
-                {formatDuration(data.total.taskMs + data.total.humanMs)} · {formatFull(data.total.turns)} turns
+                {t('durTurns', { d: formatDuration(data.total.taskMs + data.total.humanMs), n: fmt.number(data.total.turns) })}
               </span>
             </div>
           </div>

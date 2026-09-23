@@ -18,12 +18,13 @@ import type { MessageBudget, MessageCostRow } from '../../services/subscriptionS
 import type { DayRange } from '../../services/types'
 import { abbrevCount, shortModelName, weekCounts } from '../orb/messageBudget'
 import { colorFor } from './charts'
+import { fmt, getT, useT } from '../../lib/i18n'
 
 const PLATFORM_LABEL: Record<SubscriptionPlatform, string> = { codex: 'Codex', claude: 'Claude' }
 
-/** 时刻 → `Sep 21, 12:34`（en-US,与面板其余英文一致）。 */
+/** 时刻 → en `Sep 21, 12:34` / zh `9月21日 12:34`（显示用,按当前语言）。 */
 const stamp = (t: number): string =>
-  new Date(t * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+  fmt.dateTime(t * 1000, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 /** 时刻 → 本地日 `YYYY-MM-DD`（与区间的日口径对齐）。 */
 const localDay = (t: number): string => new Date(t * 1000).toLocaleDateString('en-CA')
 
@@ -37,10 +38,11 @@ function remainOf(snap: SubscriptionSnapshot | undefined, kind: string, nowSec: 
 
 /** 这一行的「一条多大」取自哪批消息（悬停说明）。 */
 function basisText(r: MessageCostRow): string {
+  const t = getT('insights')
   const name = shortModelName(r.model_key)
-  if (r.basis === 'recent_own') return `Sized on your last ${r.basis_n} ${name} messages (last 14 days)`
-  if (r.basis === 'history_own') return `Sized on your ${r.basis_n} ${name} messages from the last 30 days (little recent use)`
-  return `Sized on all your ${r.basis_n} recent messages, priced for ${name} (too few of its own)`
+  if (r.basis === 'recent_own') return t('basisRecent', { n: r.basis_n, name })
+  if (r.basis === 'history_own') return t('basisHistory', { n: r.basis_n, name })
+  return t('basisAll', { n: r.basis_n, name })
 }
 
 /** 周一格：全模型周限额与模型专属周限额（Claude Fable 那条）取紧的那条。 */
@@ -56,10 +58,9 @@ function weekTitle(r: MessageCostRow, windows: SubscriptionSnapshot['windows'] |
   const c = weekCounts(r, windows, nowSec)
   if (!c || !r.scoped_kind) return ''
   const name = r.scoped_kind.slice(3).replace(/_/g, ' ').replace(/^\w/, (ch) => ch.toUpperCase())
-  if (c.limitedBy === 'own') return `Limited by the separate ${name} weekly limit, which is tighter than the all-models one`
-  return r.pct_per_turn_scoped
-    ? `The all-models weekly limit is tighter than the separate ${name} one`
-    : `${name} also has its own weekly limit; too few ${name} messages this week to size it yet`
+  const t = getT('insights')
+  if (c.limitedBy === 'own') return t('limitedOwn', { name })
+  return r.pct_per_turn_scoped ? t('limitedAll', { name }) : t('limitedUnsized', { name })
 }
 
 /** 「~剩 / 满」一格;每条代价未知 → —。 */
@@ -74,6 +75,7 @@ export default function MessagesCard({ platform, range, refreshTick }: {
   range: DayRange
   refreshTick: number
 }) {
+  const t = useT('insights')
   const [budget, setBudget] = useState<MessageBudget | null>(null)
   const [snaps, setSnaps] = useState<SubscriptionSnapshot[]>([])
   const [subTick, setSubTick] = useState(0)
@@ -122,31 +124,35 @@ export default function MessagesCard({ platform, range, refreshTick }: {
     return d >= range.startDay && d <= range.endDay
   })
   const early = resetsInRange.filter((r) => r.early).length
-  const account = week?.account ? ` (${week.account.charAt(0).toUpperCase()}${week.account.slice(1)})` : ''
+  const account = week?.account ? t('msgAccount', { a: `${week.account.charAt(0).toUpperCase()}${week.account.slice(1)}` }) : ''
 
   return (
     <section className="insight-card">
       <header className="insight-card-header">
-        <span className="insight-card-title">Messages by model · {PLATFORM_LABEL[platform]}</span>
+        <span className="insight-card-title">{t('msgTitle', { p: PLATFORM_LABEL[platform] })}</span>
         <span className="insight-card-sub">
           {week?.start
-            ? `Weekly window${account}: ${stamp(week.start)} – ${week.resets_at ? stamp(week.resets_at) : 'reset time not reported'}`
+            ? t('msgWeekWindow', {
+                account,
+                start: stamp(week.start),
+                end: week.resets_at ? stamp(week.resets_at) : t('msgResetUnknown'),
+              })
             : ''}
         </span>
       </header>
       {budget === null ? (
-        <div className="insight-empty">Data unavailable (service not running)</div>
+        <div className="insight-empty">{t('dataUnavailable')}</div>
       ) : rows.length === 0 && extra.length === 0 ? (
-        <div className="insight-empty">Not enough {PLATFORM_LABEL[platform]} messages in the last 30 days to estimate</div>
+        <div className="insight-empty">{t('msgNotEnough', { p: PLATFORM_LABEL[platform] })}</div>
       ) : (
         <>
           <div className="price-totals">
-            <div className="price-total-item" title="Current 5-hour quota left, from the latest reading">
-              <span className="price-total-label">5-hour left</span>
+            <div className="price-total-item" title={t('left5hHint')}>
+              <span className="price-total-label">{t('left5h')}</span>
               <span className="price-total-value">{remain5h === null ? '—' : `${Math.round(remain5h)}%`}</span>
             </div>
-            <div className="price-total-item" title="Current weekly quota left, from the latest reading">
-              <span className="price-total-label">Weekly left</span>
+            <div className="price-total-item" title={t('leftWeekHint')}>
+              <span className="price-total-label">{t('leftWeek')}</span>
               <span className="price-total-value">{remain7d === null ? '—' : `${Math.round(remain7d)}%`}</span>
             </div>
             {/* 模型专属周限额（Claude Fable 那条）：与全模型周额度同时生效、各算各的*/}
@@ -159,42 +165,42 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                   <div
                     key={w.kind}
                     className="price-total-item"
-                    title={`${name} has its own weekly limit on top of the all-models one; whichever runs out first stops ${name}`}
+                    title={t('scopedLeftHint', { name })}
                   >
-                    <span className="price-total-label">{name} limit left</span>
+                    <span className="price-total-label">{t('scopedLeft', { name })}</span>
                     <span className="price-total-value">{r === null ? '—' : `${Math.round(r)}%`}</span>
                   </div>
                 )
               })}
             <div
               className="price-total-item"
-              title="Messages you sent since the current weekly window started, on this account"
+              title={t('sentWeekHint')}
             >
-              <span className="price-total-label">Sent this week</span>
-              <span className="price-total-value">{week ? week.total_turns.toLocaleString('en-US') : '—'}</span>
+              <span className="price-total-label">{t('sentWeek')}</span>
+              <span className="price-total-value">{week ? fmt.number(week.total_turns) : '—'}</span>
             </div>
             <div
               className="price-total-item"
               title={
                 resetsInRange.length
-                  ? resetsInRange.map((r) => `${stamp(r.t)}${r.early ? ' · early' : ''}`).join('\n')
-                  : 'No weekly reset seen in this range'
+                  ? resetsInRange.map((r) => `${stamp(r.t)}${r.early ? t('resetEarlyMark') : ''}`).join('\n')
+                  : t('resetNone')
               }
             >
-              <span className="price-total-label">Weekly resets</span>
+              <span className="price-total-label">{t('resets')}</span>
               <span className="price-total-value">
                 {resetsInRange.length}
-                {early > 0 && <span className="price-total-aside"> ({early} early)</span>}
+                {early > 0 && <span className="price-total-aside">{t('resetEarlyCount', { n: early })}</span>}
               </span>
             </div>
           </div>
           <table className="price-table">
             <thead>
               <tr>
-                <th className="price-col-model">Model</th>
-                <th title="Messages left at the current 5-hour quota / messages in a full 5-hour window">5-hour left / full</th>
-                <th title="Messages left at the current weekly quota / messages in a full weekly window">Weekly left / full</th>
-                <th title="Messages sent since the current weekly window started">Sent this week</th>
+                <th className="price-col-model">{t('colModel')}</th>
+                <th title={t('col5hHint')}>{t('col5h')}</th>
+                <th title={t('colWeekHint')}>{t('colWeek')}</th>
+                <th title={t('colSentHint')}>{t('sentWeek')}</th>
               </tr>
             </thead>
             <tbody>
@@ -204,9 +210,11 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                     className="price-col-model"
                     title={
                       `${r.model_key}\n${basisText(r)}` +
-                      `\nAverage message ≈ $${r.usd_per_turn.toFixed(2)} at this model's list price` +
-                      `\nA full 5-hour window ≈ $${(100 / r.quota_factor).toFixed(0)} of this model at list price ` +
-                      (r.factor_measured ? '(measured on your readings)' : '(platform average — not enough readings on this model yet)')
+                      '\n' + t('avgMessage', { usd: r.usd_per_turn.toFixed(2) }) +
+                      '\n' + t('fullWindow', {
+                        usd: (100 / r.quota_factor).toFixed(0),
+                        basis: r.factor_measured ? t('factorMeasured') : t('factorPlatform'),
+                      })
                     }
                   >
                     <span className="legend-swatch" style={{ background: colorFor(r.model_key) }} />
@@ -214,18 +222,18 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                   </td>
                   <td>{pair(remain5h, r.pct_per_turn)}</td>
                   <td title={weekTitle(r, snap?.windows, nowSec)}>{weekCell(r, snap?.windows, nowSec)}</td>
-                  <td>{(sent.get(r.model_key) ?? 0).toLocaleString('en-US')}</td>
+                  <td>{fmt.number(sent.get(r.model_key) ?? 0)}</td>
                 </tr>
               ))}
-              {extra.map((t) => (
-                <tr key={t.model_key}>
-                  <td className="price-col-model" title={`${t.model_key}\nToo few messages in the last 30 days to estimate`}>
-                    <span className="legend-swatch" style={{ background: colorFor(t.model_key) }} />
-                    {shortModelName(t.model_key)}
+              {extra.map((row) => (
+                <tr key={row.model_key}>
+                  <td className="price-col-model" title={`${row.model_key}\n${t('tooFewToEstimate')}`}>
+                    <span className="legend-swatch" style={{ background: colorFor(row.model_key) }} />
+                    {shortModelName(row.model_key)}
                   </td>
                   <td>—</td>
                   <td>—</td>
-                  <td>{t.turns.toLocaleString('en-US')}</td>
+                  <td>{fmt.number(row.turns)}</td>
                 </tr>
               ))}
             </tbody>
@@ -233,17 +241,10 @@ export default function MessagesCard({ platform, range, refreshTick }: {
           {/* 说明只留一行：完整口径放 hover,避免卡片底部堆成一段*/}
           <p
             className="price-note"
-            title={
-              'A message is one prompt you send, averaged with big tasks included and subagent and auto-review overhead spread in.\n' +
-              'A model you use a lot is sized on its own recent messages; one you have not used lately on its own last 30 days; ' +
-              'one you have barely used on all your recent messages, priced for it.\n' +
-              'Each model uses its own measured share of the quota per dollar — platforms do not charge every model at list price.\n' +
-              'The weekly window follows the platform\'s own resets and can reset early. Two accounts on the same plan cannot be told apart, and switching between them can look like a reset.'
-            }
+            title={t('msgNoteHint')}
           >
-            Estimates from your own messages and each model's measured quota use; weekly window follows actual resets.
-            Hover a model or this line for details.
-            {week && week.scale === null && ' Weekly columns need more readings on this plan.'}
+            {t('msgNote')}
+            {week && week.scale === null && t('msgNoteNeedReadings')}
           </p>
         </>
       )}

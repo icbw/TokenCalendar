@@ -84,7 +84,6 @@ import {
   HOVER_GRACE_MS,
   INACTIVE_BADGE_DAYS,
   ITEM_MIN_PX,
-  MONTH_ABBR,
   PEEK_DELAY_MS,
   STRIP_SHADOW_PAD_PX,
   BAR_ACTIONS_PX,
@@ -100,11 +99,14 @@ import {
   addDays,
   daysBetween,
   clockLabel,
+  dayDate,
   dayParts,
   localDay,
   shortDay,
 } from './timelineConfig'
 import type { TimelineForm } from '../../services/windowService'
+import { localizeProjectLabel } from '../../services/projectLabels'
+import { fmt, getT, useT } from '../../lib/i18n'
 import './timeline.css'
 
 type PickRule = 'latest' | 'earliest' | 'longest'
@@ -128,11 +130,19 @@ function itemLabel(it: TimelineSession): string {
 }
 
 function itemSub(it: TimelineSession): string {
-  return `${it.turns} ${it.turns === 1 ? 'turn' : 'turns'} · ${formatCompact(it.tokens)}`
+  const t = getT('timeline')
+  return `${t(it.turns === 1 ? 'itemTurnsOne' : 'itemTurnsOther', { n: it.turns })} · ${formatCompact(it.tokens)}`
 }
 
 function itemTip(it: TimelineSession): string {
-  return `${itemLabel(it)}\n${clockLabel(it.startedAt)} – ${clockLabel(it.lastActiveAt)} · ${it.agent}\n${it.turns} turns · ${formatFull(it.tokens)} tokens\nDouble-click to open in ${it.agent}`
+  return getT('timeline')('itemTip', {
+    label: itemLabel(it),
+    start: clockLabel(it.startedAt),
+    end: clockLabel(it.lastActiveAt),
+    agent: it.agent,
+    turns: it.turns,
+    tokens: formatFull(it.tokens),
+  })
 }
 
 interface SessionCellProps {
@@ -157,6 +167,7 @@ interface SessionCellProps {
  * 双击会话条 = 跳转到该会话的 agent（open_agent_session：窗口在 → 前置;不在 → 启动宿主;找不到 → 打开目录）。
  * 跳转对象取**第一下按下时**指着的会话：双击的第一下可能先把格子展开,第二下落点已是另一条。 */
 function SessionCell({ cell, cls, limit, isToday, pick, reverse, heatOf }: SessionCellProps) {
+  useT('timeline') // 订阅语言:会话条文字 / 提示随切换重渲染
   const ref = useRef<HTMLDivElement | null>(null)
   const hovered = useRef(false)
   const [expanded, setExpanded] = useState(false)
@@ -262,10 +273,18 @@ function SessionCell({ cell, cls, limit, isToday, pick, reverse, heatOf }: Sessi
   )
 }
 
-/** 日轴表头：日号;首列与每月 1 号带月份缩写。 */
+/** 日轴表头：日号;首列与每月 1 号带月份（英文缩写 / 中文「9月5日」）。
+ * 日标签列宽固定（DAY_LABEL_COL_PX）:中文两位月 + 两位日（如「12月23日」）放不下,改用「12/23」。 */
 function dayHeadLabel(day: string, first: boolean): string {
   const { m, d } = dayParts(day)
-  return first || d === 1 ? `${MONTH_ABBR[m - 1]} ${d}` : String(d)
+  if (!(first || d === 1)) return String(d)
+  const mon = fmt.date(dayDate(day), { month: 'short' })
+  return getT('timeline')(m >= 10 && d >= 10 ? 'dayHeadMonthNarrow' : 'dayHeadMonth', { mon, m, d })
+}
+
+/** 日轴 hover 提示：短日期;中文补星期（「9月23日周二」）。 */
+function dayTitle(day: string): string {
+  return getT('timeline')('dayTitle', { date: shortDay(day), weekday: fmt.date(dayDate(day), { weekday: 'short' }) })
 }
 
 /** 折条：内容收向上缘。 */
@@ -330,9 +349,10 @@ interface ProjectAttention {
 
 /** 距今时长：<1m / Nm / Nh。 */
 function ago(ms: number, now: number): string {
+  const t = getT('timeline')
   const m = Math.floor(Math.max(0, now - ms) / 60_000)
-  if (m < 1) return '<1m'
-  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h`
+  if (m < 1) return t('agoUnderMinute')
+  return m < 60 ? t('agoMinutes', { n: m }) : t('agoHours', { n: Math.floor(m / 60) })
 }
 
 function itemKey(it: AttentionItem): string {
@@ -376,6 +396,7 @@ function readPrefs(p: DesignPrefs): TimelinePrefs {
 }
 
 export default function TimelineWindow() {
+  const t = useT('timeline')
   useShowOnLoad()
   useWidgetThemeSync()
   useRadiusSchemeSync('widget')
@@ -772,13 +793,13 @@ export default function TimelineWindow() {
   const hoverFolder = hoverProject ? folderByKey.get(hoverProject.key) ?? false : false
   const hoverAttention = hoverProject ? attentionByProject.get(hoverProject.key) ?? null : null
   const hoverStatus = !hoverAttention
-    ? 'Idle'
+    ? t('idle')
     : [
-        hoverAttention.waiting.length > 0 ? `${hoverAttention.waiting.length} waiting` : '',
-        hoverAttention.running > 0 ? `${hoverAttention.running} running` : '',
+        hoverAttention.waiting.length > 0 ? t('statusWaiting', { n: hoverAttention.waiting.length }) : '',
+        hoverAttention.running > 0 ? t('statusRunning', { n: hoverAttention.running }) : '',
       ]
         .filter(Boolean)
-        .join(' · ') || 'Idle'
+        .join(' · ') || t('idle')
   const nowMs = Date.now()
   const openFolder = () => {
     if (hoverProject && hoverFolder) void projectService.openProjectFolder(hoverProject.key)
@@ -808,17 +829,17 @@ export default function TimelineWindow() {
   const dayClass = (day: string) => (day === todayKey ? 'is-today' : day > todayKey ? 'is-future' : 'is-past')
 
   const projectHead = (p: TimelineProject, inBar: boolean) => {
-    const badge = p.inactiveDays != null && p.inactiveDays >= INACTIVE_BADGE_DAYS ? `${p.inactiveDays}d` : null
+    const badge = p.inactiveDays != null && p.inactiveDays >= INACTIVE_BADGE_DAYS ? t('inactiveBadge', { n: p.inactiveDays }) : null
     const level = attentionByProject.get(p.key)?.level ?? null
     const lit = level === 'waiting' || level === 'pending'
     const isStale = !lit && stale.has(p.key)
     const tip =
       level === 'waiting'
-        ? `${p.key}\nAn agent is waiting for your reply (click to bring its window to the front)`
+        ? `${p.key}\n${t('tipWaiting')}`
         : level === 'pending'
-          ? `${p.key}\nA tool call has been pending for a while, maybe an approval (click to bring its window to the front)`
+          ? `${p.key}\n${t('tipPending')}`
           : isStale
-            ? `${p.key}\nLast stopped here: the agent window is gone (click to open the folder)`
+            ? `${p.key}\n${t('tipStale')}`
             : p.key
     const drag = dragProps(inBar && !lit && !isStale)
     return (
@@ -831,12 +852,12 @@ export default function TimelineWindow() {
         onMouseLeave={onProjectLeave}
         onClick={lit ? () => activateProject(p.key) : isStale ? () => openStaleProject(p.key) : undefined}
       >
-        {(lit || isStale) && <span className="tl-dot" aria-label={level === 'waiting' ? 'Waiting for reply' : level === 'pending' ? 'Tool pending' : 'Last stopped here'} />}
+        {(lit || isStale) && <span className="tl-dot" aria-label={t(level === 'waiting' ? 'dotWaiting' : level === 'pending' ? 'dotPending' : 'dotStale')} />}
         <span className="tl-proj-label" {...drag}>
-          {p.label}
+          {localizeProjectLabel(p.key, p.label)}
         </span>
         {badge && (
-          <span className="tl-badge" {...drag} title={`No activity for ${p.inactiveDays} days`}>
+          <span className="tl-badge" {...drag} title={t('inactiveTip', { n: p.inactiveDays ?? 0 })}>
             ⚠ {badge}
           </span>
         )}
@@ -854,7 +875,7 @@ export default function TimelineWindow() {
   }
 
   const dayHead = (day: string, i: number, inBar: boolean) => (
-    <div key={`d:${day}`} className={`tl-day ${dayClass(day)}`} title={shortDay(day)} {...dragProps(inBar)}>
+    <div key={`d:${day}`} className={`tl-day ${dayClass(day)}`} title={dayTitle(day)} {...dragProps(inBar)}>
       {dayHeadLabel(day, i === 0 || i === days.length - 1)}
     </div>
   )
@@ -888,16 +909,16 @@ export default function TimelineWindow() {
             )}
           </div>
           <div className="tl-bar-actions" {...dragProps(true)}>
-            <button type="button" className="tl-icon" onClick={foldToStrip} title="Fold into a strip at the top of the screen (double-click the strip to expand)">
+            <button type="button" className="tl-icon" onClick={foldToStrip} title={t('foldTitle')}>
               <FoldIcon />
             </button>
           </div>
         </div>
         <div className="timeline-body" ref={bodyRef} onScroll={syncBarScroll}>
           {failed && data === null ? (
-            <div className="tl-empty">Service not running</div>
+            <div className="tl-empty">{t('serviceNotRunning')}</div>
           ) : empty ? (
-            <div className="tl-empty">No project activity yet</div>
+            <div className="tl-empty">{t('noActivityYet')}</div>
           ) : (
             <div className="tl-grid" style={gridStyle}>
               {grid}
@@ -914,10 +935,10 @@ export default function TimelineWindow() {
             {hoverProject && (
               <>
                 <div className="tl-hover-title" title={hoverProject.key}>
-                  {hoverProject.label}
+                  {localizeProjectLabel(hoverProject.key, hoverProject.label)}
                 </div>
                 <div className="tl-hover-row">
-                  <span>Status</span>
+                  <span>{t('status')}</span>
                   <span className={hoverAttention && hoverAttention.unacked.length > 0 ? 'tl-hover-accent' : undefined}>{hoverStatus}</span>
                 </div>
                 {hoverAttention?.waiting.slice(0, HOVER_ATTENTION_MAX).map((it) => {
@@ -925,40 +946,41 @@ export default function TimelineWindow() {
                   return (
                     <div key={itemKey(it)} className={`tl-hover-row tl-hover-session${it.acked || it.held ? ' is-acked' : ''}`}>
                       <span>
-                        {it.state === 'waiting' ? 'Reply' : 'Tool'} · {ago(it.since, nowMs)}
+                        {t(it.state === 'waiting' ? 'reply' : 'tool')} · {ago(it.since, nowMs)}
                       </span>
                       <span title={label}>{label}</span>
                     </div>
                   )
                 })}
                 <div className="tl-hover-row">
-                  <span>Today</span>
-                  <span>{hoverTodayCell ? `${hoverTodayCell.turns} turns · ${formatCompact(hoverTodayCell.tokens)}` : 'No activity'}</span>
+                  <span>{t('today')}</span>
+                  <span>{hoverTodayCell ? t('todayValue', { turns: hoverTodayCell.turns, tokens: formatCompact(hoverTodayCell.tokens) }) : t('noActivity')}</span>
                 </div>
                 <div className="tl-hover-row">
-                  <span>Last day</span>
+                  <span>{t('lastDay')}</span>
                   <span>
                     {shortDay(hoverProject.lastDay)}
-                    {hoverProject.inactiveDays != null && hoverProject.inactiveDays > 0 ? ` (${hoverProject.inactiveDays}d ago)` : ''}
+                    {hoverProject.inactiveDays != null && hoverProject.inactiveDays > 0 ? t('daysAgo', { n: hoverProject.inactiveDays }) : ''}
                   </span>
                 </div>
                 <div className="tl-hover-row">
-                  <span>Span</span>
+                  <span>{t('span')}</span>
                   <span>{hoverProject.firstDay === hoverProject.lastDay ? shortDay(hoverProject.firstDay) : `${shortDay(hoverProject.firstDay)} – ${shortDay(hoverProject.lastDay)}`}</span>
                 </div>
                 <div className="tl-hover-row">
-                  <span>In window</span>
+                  <span>{t('inWindow')}</span>
                   <span>
-                    {hoverWindowSessions} {hoverWindowSessions === 1 ? 'session' : 'sessions'} · {hoverProject.cells.length} {hoverProject.cells.length === 1 ? 'day' : 'days'}
+                    {t(hoverWindowSessions === 1 ? 'sessionsOne' : 'sessionsOther', { n: hoverWindowSessions })} ·{' '}
+                    {t(hoverProject.cells.length === 1 ? 'daysOne' : 'daysOther', { n: hoverProject.cells.length })}
                   </span>
                 </div>
                 <div className="tl-hover-row">
-                  <span>Agents</span>
+                  <span>{t('agents')}</span>
                   <span>{hoverProject.agents.join(', ') || '—'}</span>
                 </div>
                 <div className="tl-hover-actions">
-                  <button type="button" className="tl-btn" disabled={!hoverFolder} title={hoverFolder ? 'Open in File Explorer' : 'Folder not found on this machine'} onClick={openFolder}>
-                    Open Folder
+                  <button type="button" className="tl-btn" disabled={!hoverFolder} title={hoverFolder ? t('openInExplorer') : t('folderNotFound')} onClick={openFolder}>
+                    {t('openFolder')}
                   </button>
                 </div>
               </>
@@ -970,7 +992,7 @@ export default function TimelineWindow() {
           （按钮天然豁免 drag-region,点击 = 确认）;双击展开（条态不可缩放,tauri 双击最大化不生效）。*/}
       <div className="tl-strip" aria-hidden={!strip} data-tauri-drag-region="deep" onDoubleClick={expandToBoard}>
         <div className="tl-strip-inner" ref={stripInnerRef}>
-          {stripProjects.length === 0 && <span className="tl-strip-name is-muted">Timeline</span>}
+          {stripProjects.length === 0 && <span className="tl-strip-name is-muted">{t('stripEmpty')}</span>}
           {stripProjects.map((p) => {
             const level = attentionByProject.get(p.key)?.level ?? null
             if (level === 'waiting' || level === 'pending') {
@@ -979,11 +1001,11 @@ export default function TimelineWindow() {
                   key={p.key}
                   type="button"
                   className={`tl-strip-name is-${level}`}
-                  title={`${p.key}\n${level === 'waiting' ? 'An agent is waiting for your reply' : 'A tool call has been pending for a while'} (click to bring its window to the front)`}
+                  title={`${p.key}\n${t(level === 'waiting' ? 'stripWaiting' : 'stripPending')}${t('stripClickHint')}`}
                   onClick={() => activateProject(p.key)}
                   onDoubleClick={(e) => e.stopPropagation()}
                 >
-                  {p.label}
+                  {localizeProjectLabel(p.key, p.label)}
                 </button>
               )
             }
@@ -993,21 +1015,21 @@ export default function TimelineWindow() {
                   key={p.key}
                   type="button"
                   className="tl-strip-name is-stale"
-                  title={`${p.key}\nLast stopped here: the agent window is gone (click to open the folder)`}
+                  title={`${p.key}\n${t('tipStale')}`}
                   onClick={() => openStaleProject(p.key)}
                   onDoubleClick={(e) => e.stopPropagation()}
                 >
-                  {p.label}
+                  {localizeProjectLabel(p.key, p.label)}
                 </button>
               )
             }
             return (
               <span key={p.key} className="tl-strip-name" title={p.key}>
-                {p.label}
+                {localizeProjectLabel(p.key, p.label)}
               </span>
             )
           })}
-          <button type="button" className="tl-strip-expand" onClick={expandToBoard} onDoubleClick={(e) => e.stopPropagation()} title="Expand the board">
+          <button type="button" className="tl-strip-expand" onClick={expandToBoard} onDoubleClick={(e) => e.stopPropagation()} title={t('expandTitle')}>
             <ExpandIcon />
           </button>
         </div>

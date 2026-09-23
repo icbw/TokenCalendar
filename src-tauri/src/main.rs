@@ -140,6 +140,7 @@ fn main() {
             timeline_form: Mutex::new(Default::default()),
         })
         .invoke_handler(startup_gate.wrap(tauri::generate_handler![
+            tray::set_ui_locale,
             commands::get_monthly_matrix,
             commands::get_breakdown,
             commands::get_credit_summary,

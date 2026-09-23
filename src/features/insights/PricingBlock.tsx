@@ -30,6 +30,8 @@ import MessagesCard from './MessagesCard'
 import { formatSpan, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
+import { TOKEN_METRIC_LABELS } from './analytics'
+import { fmt, useT } from '../../lib/i18n'
 
 const PLATFORMS: SubscriptionPlatform[] = ['codex', 'claude']
 const PLATFORM_LABEL: Record<SubscriptionPlatform, string> = { codex: 'Codex', claude: 'Claude' }
@@ -37,25 +39,20 @@ const PLATFORM_LABEL: Record<SubscriptionPlatform, string> = { codex: 'Codex', c
 type Unit = 'input' | 'output' | 'cache_write' | 'cache_read'
 /** 四项的展示顺序 = 官方目录的顺序（输入 / 输出 / 缓存写 / 缓存命中）。 */
 const UNITS: Unit[] = ['input', 'output', 'cache_write', 'cache_read']
-const UNIT_LABEL: Record<Unit, string> = {
-  input: 'Input',
-  output: 'Output',
-  cache_write: 'Cache write',
-  cache_read: 'Cache read',
-}
 const unitPrice = (r: PriceModelRow, u: Unit): number =>
   u === 'input' ? r.usd_input : u === 'output' ? r.usd_output : u === 'cache_write' ? r.usd_cache_write : r.usd_cache_read
 
-/** 金额（合计口径）：两位小数 + 千分位。 */
-const usd = (v: number): string => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+/** 金额（合计口径）：两位小数 + 千分位（分组按当前语言,$ 前缀两种语言一致）。 */
+const usd = (v: number): string => `$${fmt.number(v, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 /** 单价口径：跨 $0.005〜$180,固定位数会把小的印成 $0.00 —— 走有效数字。 */
-const price = (v: number): string => (v <= 0 ? '—' : `$${Number(v.toPrecision(3)).toLocaleString('en-US')}`)
+const price = (v: number): string => (v <= 0 ? '—' : `$${fmt.number(Number(v.toPrecision(3)))}`)
+/** 生效日 YYYY-MM-DD:与语言无关的 ISO 日期,表格列宽按它定,两种语言同样显示。 */
 const day = (t: number): string => new Date(t * 1000).toLocaleDateString('en-CA')
 /** 单价变动量：带符号 + 百分比,如 `+$1.25 （+25%)`。 */
 const deltaText = (prev: number, cur: number): string => {
   const d = cur - prev
   const sign = d > 0 ? '+' : '−'
-  const abs = Number(Math.abs(d).toPrecision(3)).toLocaleString('en-US')
+  const abs = fmt.number(Number(Math.abs(d).toPrecision(3)))
   const pct = Number(((Math.abs(d) / prev) * 100).toPrecision(3))
   return `${sign}$${abs} (${sign}${pct}%)`
 }
@@ -68,12 +65,13 @@ interface Sort {
 /** 月均天数（365.25 / 12）:月费按区间天数折算用。 */
 const DAYS_PER_MONTH = 365.25 / 12
 /** 倍数:10× 以下一位小数,以上取整。 */
-const multiple = (v: number): string => (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString('en-US')) + '×'
+const multiple = (v: number): string => (v < 10 ? v.toFixed(1) : fmt.number(Math.round(v))) + '×'
 
 /** 默认 Since 降序：最新上架 / 最近改价的模型排在最上。 */
 const DEFAULT_SORT: Sort = { key: 'since', desc: true }
 
 export default function PricingBlock() {
+  const t = useT('insights')
   const [platform, setPlatform] = useState<SubscriptionPlatform>('codex')
   // 默认平台只自动挑一次（挑「本机用得多的那个」）,之后一律听用户的。
   // 用 ref 不用 state：它一翻转就会把下面那条取数 effect 整个重跑一遍。
@@ -202,7 +200,7 @@ export default function PricingBlock() {
     const { key } = sort
     return [...now.rows].sort((a, b) => {
       let c = 0
-      if (key === 'model') c = a.display_name.localeCompare(b.display_name, 'en', { numeric: true }) * dir
+      if (key === 'model') c = fmt.compare(a.display_name, b.display_name) * dir
       else if (key === 'since') c = (a.effective_from - b.effective_from) * dir
       else {
         const va = unitPrice(a, key)
@@ -213,7 +211,7 @@ export default function PricingBlock() {
       }
       return c || b.usd_input - a.usd_input || a.match_key.localeCompare(b.match_key)
     })
-  }, [now, sort])
+  }, [now, sort, t]) // t:切换语言后按新语言的排序规则重排
 
   // 同列再点翻转方向;换列时价格 / 日期先降序（贵的、新的在上）,名称先升序
   const pickSort = (key: SortKey) =>
@@ -229,7 +227,7 @@ export default function PricingBlock() {
     const active = sort.key === key
     return (
       <th key={key} className={className} aria-sort={active ? (sort.desc ? 'descending' : 'ascending') : undefined}>
-        <button className={`price-th${active ? ' is-active' : ''}`} title="Click to sort" onClick={() => pickSort(key)}>
+        <button className={`price-th${active ? ' is-active' : ''}`} title={t('sortHint')} onClick={() => pickSort(key)}>
           {label}
           <span className="price-th-arrow">{active ? (sort.desc ? '▼' : '▲') : ''}</span>
         </button>
@@ -241,94 +239,92 @@ export default function PricingBlock() {
     <>
       <div className="insight-module-bar">
       <header className="insight-toolbar">
-        <span className="insight-card-title">Pricing</span>
+        <span className="insight-card-title">{t('modPricing')}</span>
         <Seg
           value={platform}
           options={PLATFORMS.map((p) => ({
             v: p,
             label: PLATFORM_LABEL[p],
-            hint: `Official API list prices and equivalent value for ${PLATFORM_LABEL[p]}`,
+            hint: t('pricingPlatformHint', { p: PLATFORM_LABEL[p] }),
           }))}
           onChange={setPlatform}
         />
-        {loading && <span className="matrix-loading">Loading…</span>}
+        {loading && <span className="matrix-loading">{t('loading')}</span>}
       </header>
       <div className="insight-rangebar">
-        <RangeControl selection={selection} noun="Usage" />
+        <RangeControl selection={selection} noun={t('nounUsage')} />
       </div>
       </div>
 
       {/* ---- 1) 美元当量 + 用量 × 价格 ----*/}
       <section className="insight-card">
         <header className="insight-card-header">
-          <span className="insight-card-title">Equivalent API value · {PLATFORM_LABEL[platform]}</span>
+          <span className="insight-card-title">{t('eqValueTitle', { p: PLATFORM_LABEL[platform] })}</span>
           <span className="insight-card-sub">{formatSpan(selection.range)}</span>
         </header>
         {cur === null ? (
-          <div className="insight-empty">Data unavailable (service not running)</div>
+          <div className="insight-empty">{t('dataUnavailable')}</div>
         ) : cur.rows.length === 0 ? (
-          <div className="insight-empty">No {PLATFORM_LABEL[platform]} usage in this range</div>
+          <div className="insight-empty">{t('noPlatformUsage', { p: PLATFORM_LABEL[platform] })}</div>
         ) : (
           <>
             <div className="price-totals">
               <div
                 className="price-total-item"
-                title="What these tokens would cost at the official API list prices. You pay a flat subscription, so this is equivalent value, not a bill."
+                title={t('eqValueHint')}
               >
-                <span className="price-total-label">Equivalent API value</span>
+                <span className="price-total-label">{t('eqValue')}</span>
                 <span className="price-total-value">≈ {usd(cur.usd_total)}</span>
               </div>
               {feeForRange !== null && cur.usd_total > 0 && (
                 <div
                   className="price-total-item"
-                  title={`Equivalent API value ÷ your ${PLATFORM_LABEL[platform]} fee for these ${rangeDays} days (${usd(fee ?? 0)}/month → ${usd(feeForRange)}). How much list-price usage the subscription bought, as a multiple — not money saved. Set the fee in Settings › Subscriptions.`}
+                  title={t('valueVsFeeHint', { p: PLATFORM_LABEL[platform], days: rangeDays, fee: usd(fee ?? 0), feeRange: usd(feeForRange) })}
                 >
-                  <span className="price-total-label">Value vs. fee</span>
+                  <span className="price-total-label">{t('valueVsFee')}</span>
                   <span className="price-total-value">≈ {multiple(cur.usd_total / feeForRange)}</span>
                 </div>
               )}
-              <div className="price-total-item" title="User-initiated turns, summed over the range">
-                <span className="price-total-label">Turns</span>
+              <div className="price-total-item" title={t('turnsHint')}>
+                <span className="price-total-label">{t('turns')}</span>
                 <span className="price-total-value">{formatFull(totalTurns)}</span>
               </div>
-              <div className="price-total-item" title={`${formatFull(totalTokens)} tokens: input + output + cache`}>
-                <span className="price-total-label">Tokens</span>
+              <div className="price-total-item" title={t('tokensHint', { n: formatFull(totalTokens) })}>
+                <span className="price-total-label">{t('mTotal')}</span>
                 <span className="price-total-value">{formatCompact(totalTokens)}</span>
               </div>
               {perDollar !== undefined && (
                 <div
                   className="price-total-item"
-                  title={`Measured on your own readings: $1 of equivalent API usage draws ${perDollar.toFixed(2)}% of the quota, so a full window is worth roughly ${usd(100 / perDollar)}. It follows your plan and shifts as more samples land.`}
+                  title={t('quotaPctHint', { pct: perDollar.toFixed(2), full: usd(100 / perDollar) })}
                 >
-                  <span className="price-total-label">1% of quota</span>
+                  <span className="price-total-label">{t('quotaPct')}</span>
                   <span className="price-total-value">≈ {usd(1 / perDollar)}</span>
                 </div>
               )}
             </div>
             <p className="price-note">
-              What these tokens would cost at official API list prices — you pay a flat subscription, so this is
-              equivalent value, not a bill.
+              {t('priceNote')}
               {cur.usd_unknown > 0 && (
-                <span
-                  className="price-note-warn"
-                  title="Fallback pricing: models with no published price of their own (and the codex-auto-review routing label) are priced by proxy. It marks the part of the number that is estimated — it is not an error bar."
-                >
+                <span className="price-note-warn" title={t('fallbackNoteHint')}>
                   {' '}
-                  {usd(cur.usd_unknown)} ({((cur.usd_unknown / Math.max(cur.usd_total, 1e-9)) * 100).toFixed(1)}%) of it
-                  is priced by fallback.
+                  {t('fallbackNote', {
+                    usd: usd(cur.usd_unknown),
+                    pct: ((cur.usd_unknown / Math.max(cur.usd_total, 1e-9)) * 100).toFixed(1),
+                  })}
                 </span>
               )}
             </p>
             <table className="price-table">
               <thead>
                 <tr>
-                  <th className="price-col-model">Model</th>
-                  <th>Turns</th>
-                  <th>Input</th>
-                  <th>Output</th>
-                  <th>Cache write</th>
-                  <th>Cache read</th>
-                  <th className="price-col-usd">Equivalent</th>
+                  <th className="price-col-model">{t('colModel')}</th>
+                  <th>{t('turns')}</th>
+                  <th>{t('mInput')}</th>
+                  <th>{t('mOutput')}</th>
+                  <th>{t('mCacheWrite')}</th>
+                  <th>{t('mCacheRead')}</th>
+                  <th className="price-col-usd">{t('colEquivalent')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -342,12 +338,15 @@ export default function PricingBlock() {
                         title={
                           `${r.model_key}` +
                           (last
-                            ? `\n${price(last.usd_input)} in / ${price(last.usd_output)} out / ` +
-                              `${price(last.usd_cache_write)} cache write / ${price(last.usd_cache_read)} cache read per Mtok`
+                            ? '\n' +
+                              t('modelPriceTip', {
+                                in: price(last.usd_input),
+                                out: price(last.usd_output),
+                                cw: price(last.usd_cache_write),
+                                cr: price(last.usd_cache_read),
+                              })
                             : '') +
-                          (r.known
-                            ? ''
-                            : `\nFallback pricing, valued as ${r.display_name} — this key has no published price of its own.`)
+                          (r.known ? '' : '\n' + t('modelFallbackTip', { name: r.display_name }))
                         }
                       >
                         <span className="legend-swatch" style={{ background: colorFor(r.model_key) }} />
@@ -357,7 +356,7 @@ export default function PricingBlock() {
                         {r.known ? r.display_name : r.model_key}
                         {!r.known && <span className="price-unknown-mark"> ≈</span>}
                       </td>
-                      <td title="User-initiated turns. Daily-grained, so they are never split across price periods; a routing label such as codex-auto-review has none of its own.">
+                      <td title={t('turnsCellHint')}>
                         {formatFull(r.requests)}
                       </td>
                       <td title={formatFull(r.input_tokens)}>{formatCompact(r.input_tokens)}</td>
@@ -371,7 +370,7 @@ export default function PricingBlock() {
                             style={{ width: `${Math.min(100, share)}%`, background: colorFor(r.model_key) }}
                           />
                         </span>
-                        <span className="price-usd-value" title={`${share.toFixed(1)}% of the range`}>
+                        <span className="price-usd-value" title={t('shareHint', { pct: share.toFixed(1) })}>
                           {usd(r.usd)}
                         </span>
                       </td>
@@ -383,10 +382,13 @@ export default function PricingBlock() {
                       rows.push(
                         <tr key={`${r.model_key}@${s.effective_from ?? 0}`} className="price-seg-row">
                           <td className="price-col-model">
-                            since {s.effective_from === null ? 'unpriced' : day(s.effective_from)} · {price(s.usd_input)}{' '}
-                            in / {price(s.usd_output)} out
+                            {t('segSince', {
+                              day: s.effective_from === null ? t('segUnpriced') : day(s.effective_from),
+                              in: price(s.usd_input),
+                              out: price(s.usd_output),
+                            })}
                           </td>
-                          <td title="Turns are daily-grained and never split across price periods">—</td>
+                          <td title={t('segTurnsHint')}>—</td>
                           <td title={formatFull(s.input_tokens)}>{formatCompact(s.input_tokens)}</td>
                           <td title={formatFull(s.output_tokens)}>{formatCompact(s.output_tokens)}</td>
                           <td title={formatFull(s.cache_write_tokens)}>{formatCompact(s.cache_write_tokens)}</td>
@@ -412,19 +414,19 @@ export default function PricingBlock() {
       {/* ---- 3) 官方价目对照表 ----*/}
       <section className="insight-card">
         <header className="insight-card-header">
-          <span className="insight-card-title">Official price list · {PLATFORM_LABEL[platform]}</span>
-          <span className="insight-card-sub">{now === null ? '' : `USD / Mtok, in effect ${day(now.at)}`}</span>
+          <span className="insight-card-title">{t('listTitle', { p: PLATFORM_LABEL[platform] })}</span>
+          <span className="insight-card-sub">{now === null ? '' : t('listSub', { day: day(now.at) })}</span>
         </header>
         {now === null ? (
-          <div className="insight-empty">Data unavailable (service not running)</div>
+          <div className="insight-empty">{t('dataUnavailable')}</div>
         ) : (
           <>
             <table className="price-table">
               <thead>
                 <tr>
-                  {sortHeader('model', 'Model', 'price-col-model')}
-                  {UNITS.map((u) => sortHeader(u, UNIT_LABEL[u]))}
-                  {sortHeader('since', 'Since')}
+                  {sortHeader('model', t('colModel'), 'price-col-model')}
+                  {UNITS.map((u) => sortHeader(u, TOKEN_METRIC_LABELS[u].label))}
+                  {sortHeader('since', t('colSince'))}
                 </tr>
               </thead>
               <tbody>
@@ -444,13 +446,16 @@ export default function PricingBlock() {
                         const id = `${r.match_key}:${u}`
                         const open = revealed.has(id)
                         return (
-                          <td key={u} title={v > 0 ? '' : 'Not published for this model'}>
+                          <td key={u} title={v > 0 ? '' : t('notPublished')}>
                             {changed && open && <span className={`price-delta ${dir}`}>{deltaText(pv, v)}</span>}
                             {price(v)}
                             {changed ? (
                               <button
                                 className={`price-change ${dir}`}
-                                title={`${v > pv ? 'Raised' : 'Cut'} on ${day(r.effective_from)}: ${price(pv)} → ${price(v)} · click to ${open ? 'hide' : 'show'} the change`}
+                                title={t(
+                                  v > pv ? (open ? 'priceRaisedHide' : 'priceRaisedShow') : open ? 'priceCutHide' : 'priceCutShow',
+                                  { day: day(r.effective_from), from: price(pv), to: price(v) },
+                                )}
                                 onClick={() => toggleReveal(id)}
                               >
                                 {v > pv ? '↑' : '↓'}
@@ -461,7 +466,7 @@ export default function PricingBlock() {
                           </td>
                         )
                       })}
-                      <td title={`Effective from ${new Date(r.effective_from * 1000).toLocaleString()}`}>
+                      <td title={t('effectiveFrom', { t: fmt.dateTime(r.effective_from * 1000) })}>
                         {day(r.effective_from)}
                       </td>
                     </tr>
@@ -472,13 +477,9 @@ export default function PricingBlock() {
             {/* 缓存写按常用档是文案红线,常驻可;其余说明放 hover*/}
             <p
               className="price-note"
-              title={
-                'Shipped with the app and updated with it — hover a model for the source entry.\n' +
-                'An arrow marks a price changed from the model\'s previous period (red up, green down); click it for the amount.\n' +
-                'Cache write uses the common tier: some platforms price it by retention, and local collection keeps a single cache-write bucket.'
-              }
+              title={t('listNoteHint')}
             >
-              Official API list prices; arrows mark a price change (click for the amount). Cache write uses the common tier.
+              {t('listNote')}
             </p>
           </>
         )}

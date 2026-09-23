@@ -1,5 +1,6 @@
 // 月矩阵色阶：分位截断 + log1p 归一化，支持 global / perRow。
 // 与线性 min-max 不同：log1p 压缩让高值与中值不挤在一起。
+import { fmt, type Translator } from '../../lib/i18n'
 
 export type ScaleMode = 'global' | 'perRow'
 export type CellStatus = 'future' | 'zero' | 'normal' | 'estimated' | 'error' | 'today' | 'selected'
@@ -85,9 +86,30 @@ export function cellVisual(
   return { background: normalCellBackground(value, cap), status: 'normal' }
 }
 
-/** 千分位格式化（tooltip 用完整格式） */
+/** 千分位格式化（tooltip 用完整格式；按当前界面语言） */
 export function formatFull(n: number): string {
-  return n.toLocaleString('en-US')
+  return fmt.number(n)
+}
+
+/** 月份缩写字典键（下标 = getMonth）。只存键，文案在渲染时取，切换语言即时生效。 */
+export const MONTH_KEYS = [
+  'monthJan', 'monthFeb', 'monthMar', 'monthApr', 'monthMay', 'monthJun',
+  'monthJul', 'monthAug', 'monthSep', 'monthOct', 'monthNov', 'monthDec',
+] as const
+
+/** 月份缩写（Jan / 1月）。 */
+export function monthShort(t: Translator<'matrix'>, month: number): string {
+  return t(MONTH_KEYS[month])
+}
+
+/** 月 + 日（Sep 23 / 9月23日）。 */
+export function monthDayLabel(t: Translator<'matrix'>, d: Date): string {
+  return t('monthDay', { month: monthShort(t, d.getMonth()), day: d.getDate() })
+}
+
+/** 完整日期（Sep 23, 2026 / 2026年9月23日）。 */
+export function fullDateLabel(t: Translator<'matrix'>, d: Date): string {
+  return t('fullDate', { month: monthShort(t, d.getMonth()), day: d.getDate(), year: d.getFullYear() })
 }
 
 /** 紧凑格式：1.2K / 3.4M */

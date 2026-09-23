@@ -14,7 +14,9 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { events, taskService, usageService } from '../../services'
 import type { TaskPage, TaskRow, TaskSort, TaskSortField, TaskTurn } from '../../services'
-import { formatCompact, formatFull } from '../matrix/matrixScale'
+import { formatCompact } from '../matrix/matrixScale'
+import { fmt, useT, type MessageKey, type Translator } from '../../lib/i18n'
+import { startedLabel } from './taskFormat'
 import { OUTLIER_Z, formatDuration, projectDisplayName, projectTooltip, zScores } from '../insights/analytics'
 import { Seg } from '../insights/Seg'
 import RangeControl from '../insights/RangeControl'
@@ -31,36 +33,28 @@ type LabelMode = 'time' | 'title'
 const PAGE_SIZE = 50
 /** 项目下拉里「Manage projects…」的哨兵值（目录键是归一化路径 / unknown / __scratch,不会撞上）。 */
 const MANAGE_PROJECTS = '__manage_projects__'
-const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const pad2 = (n: number) => String(n).padStart(2, '0')
-
-function startedLabel(ms: number): string {
-  const d = new Date(ms)
-  const year = d.getFullYear() !== new Date().getFullYear() ? `, ${d.getFullYear()}` : ''
-  return `${MONTH_ABBR[d.getMonth()]} ${d.getDate()}${year} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
-}
-
 interface Column {
   id: string
-  label: string
-  hint: string
+  label: MessageKey<'tasks'>
+  hint: MessageKey<'tasks'>
   sort?: TaskSortField
   left?: boolean
 }
 
+// label / hint 存字典键,渲染时再取文案（语言切换即更新）
 const COLUMNS: Column[] = [
-  { id: 'agent', label: 'Agent', hint: 'Agent', left: true },
-  { id: 'project', label: 'Project', hint: 'Project of the first turn (hover a cell for the full path)', left: true },
-  { id: 'started', label: 'Started', hint: 'Session start time', sort: 'started_at', left: true },
-  { id: 'turns', label: 'Turns', hint: 'User turns, including aborted ones', sort: 'turns' },
-  { id: 'steps', label: 'Steps', hint: 'Model calls, including subagents', sort: 'steps' },
-  { id: 'tools', label: 'Tools', hint: 'Tool calls', sort: 'tool_calls' },
-  { id: 'wait', label: 'Wait', hint: 'Sum of turn wall-clock time (same quantity as Task in Time spent)', sort: 'wall_ms' },
-  { id: 'model', label: 'Model', hint: 'Model time (estimated for JSONL sources)', sort: 'model_ms' },
-  { id: 'tool', label: 'Tool', hint: 'Tool time (estimated for JSONL sources)', sort: 'tool_ms' },
-  { id: 'errors', label: 'Errors', hint: 'API and tool errors (aborted turns are not errors)', sort: 'error_count' },
-  { id: 'subagents', label: 'Subagents', hint: 'Subagents spawned · share of steps made by subagents', sort: 'subagent_count' },
-  { id: 'tokens', label: 'Tokens', hint: 'Total tokens', sort: 'total_tokens' },
+  { id: 'agent', label: 'colAgent', hint: 'colAgentHint', left: true },
+  { id: 'project', label: 'colProject', hint: 'colProjectHint', left: true },
+  { id: 'started', label: 'colStarted', hint: 'colStartedHint', sort: 'started_at', left: true },
+  { id: 'turns', label: 'colTurns', hint: 'colTurnsHint', sort: 'turns' },
+  { id: 'steps', label: 'colSteps', hint: 'colStepsHint', sort: 'steps' },
+  { id: 'tools', label: 'colTools', hint: 'colToolsHint', sort: 'tool_calls' },
+  { id: 'wait', label: 'colWait', hint: 'colWaitHint', sort: 'wall_ms' },
+  { id: 'model', label: 'colModel', hint: 'colModelHint', sort: 'model_ms' },
+  { id: 'tool', label: 'colTool', hint: 'colToolHint', sort: 'tool_ms' },
+  { id: 'errors', label: 'colErrors', hint: 'colErrorsHint', sort: 'error_count' },
+  { id: 'subagents', label: 'colSubagents', hint: 'colSubagentsHint', sort: 'subagent_count' },
+  { id: 'tokens', label: 'colTokens', hint: 'colTokensHint', sort: 'total_tokens' },
 ]
 
 const taskKey = (r: { agent: string; sessionId: string }) => `${r.agent}${r.sessionId}`
@@ -97,14 +91,15 @@ function outliersOf(rows: TaskRow[]): Map<string, Outlier> {
   return out
 }
 
-function outlierHint(o: Outlier): string {
-  const lines = ['Outlier on this page (z ≥ 2)']
-  if (o.steps) lines.push(`Steps per turn ${o.steps.value.toFixed(1)} (+${o.steps.z.toFixed(1)}σ)`)
-  if (o.wall) lines.push(`Wait per turn ${formatDuration(o.wall.value)} (+${o.wall.z.toFixed(1)}σ)`)
+function outlierHint(o: Outlier, t: Translator<'tasks'>): string {
+  const lines = [t('outlierTitle')]
+  if (o.steps) lines.push(t('outlierSteps', { v: o.steps.value.toFixed(1), z: o.steps.z.toFixed(1) }))
+  if (o.wall) lines.push(t('outlierWait', { v: formatDuration(o.wall.value), z: o.wall.z.toFixed(1) }))
   return lines.join('\n')
 }
 
 export default function TasksView() {
+  const t = useT('tasks')
   const [agent, setAgent] = useState('')
   const [project, setProject] = useState('')
   const [sort, setSort] = useState<TaskSort>({ field: 'started_at', direction: 'desc' })
@@ -242,18 +237,18 @@ export default function TasksView() {
   return (
     <div className="insights-view tasks-view">
       <header className="insight-toolbar">
-        <span className="insight-card-title">Tasks</span>
+        <span className="insight-card-title">{t('title')}</span>
         <select
           className="matrix-sort"
           value={agent}
-          title="Filter by agent"
-          aria-label="Agent filter"
+          title={t('filterAgentTitle')}
+          aria-label={t('filterAgentAria')}
           onChange={(e) => {
             setAgent(e.target.value)
             resetPaging()
           }}
         >
-          <option value="">All agents</option>
+          <option value="">{t('allAgents')}</option>
           {agentOptions.map((a) => (
             <option key={a.key} value={a.key}>{a.label}</option>
           ))}
@@ -261,8 +256,8 @@ export default function TasksView() {
         <select
           className="matrix-sort tasks-project-select"
           value={project}
-          title={project ? projectTooltip(project) : 'Filter by project'}
-          aria-label="Project filter"
+          title={project ? projectTooltip(project) : t('filterProjectTitle')}
+          aria-label={t('filterProjectAria')}
           onChange={(e) => {
             if (e.target.value === MANAGE_PROJECTS) {
               openProjectManager()
@@ -272,28 +267,28 @@ export default function TasksView() {
             resetPaging()
           }}
         >
-          <option value="">All projects</option>
+          <option value="">{t('allProjects')}</option>
           {projectOptions.map((k) => (
             <option key={k} value={k}>{projectDisplayName(k)}</option>
           ))}
           <option disabled>──────────</option>
-          <option value={MANAGE_PROJECTS}>Manage projects…</option>
+          <option value={MANAGE_PROJECTS}>{t('manageProjects')}</option>
         </select>
         <Seg
           value={labelMode}
           options={[
-            { v: 'time' as LabelMode, label: 'Time', hint: 'Label tasks by start time' },
-            { v: 'title' as LabelMode, label: 'Title', hint: 'Label tasks by session title (falls back to time when empty)' },
+            { v: 'time' as LabelMode, label: t('labelTime'), hint: t('labelTimeHint') },
+            { v: 'title' as LabelMode, label: t('labelTitle'), hint: t('labelTitleHint') },
           ]}
           onChange={pickLabelMode}
         />
-        {loading && <span className="matrix-loading">Loading…</span>}
+        {loading && <span className="matrix-loading">{t('loading')}</span>}
       </header>
       <div className="insight-rangebar">
         <RangeControl
           selection={selection}
-          noun="Turns"
-          note="Time card: turns in range · Task list: tasks started in range"
+          noun={t('rangeNoun')}
+          note={t('rangeNote')}
         />
       </div>
 
@@ -310,36 +305,37 @@ export default function TasksView() {
 
         <section className="insight-card">
           <header className="insight-card-header">
-            <span className="insight-card-title">Task list</span>
+            <span className="insight-card-title">{t('taskList')}</span>
             <span className="insight-card-sub">
-              {data ? `${formatFull(total)} tasks started in range · click a row for per-turn bars` : ''}
+              {data ? t('taskListSub', { n: fmt.number(total) }) : ''}
             </span>
           </header>
           {data === undefined ? (
-            <div className="insight-empty">Loading…</div>
+            <div className="insight-empty">{t('loading')}</div>
           ) : data === null ? (
-            <div className="insight-empty">Data unavailable (service not running)</div>
+            <div className="insight-empty">{t('unavailable')}</div>
           ) : data.rows.length === 0 ? (
-            <div className="insight-empty">No tasks in this range</div>
+            <div className="insight-empty">{t('noTasks')}</div>
           ) : (
             <>
               <div className="task-table-wrap">
                 <table className="task-table">
                   <thead>
                     <tr>
-                      <th className="task-col-flag" aria-label="Expand" />
+                      <th className="task-col-flag" aria-label={t('expand')} />
                       {COLUMNS.map((c) => {
                         const active = c.sort !== undefined && sort.field === c.sort
-                        const label = c.id === 'started' && labelMode === 'title' ? 'Task' : c.label
+                        const label = t(c.id === 'started' && labelMode === 'title' ? 'colTask' : c.label)
+                        const hint = t(c.hint)
                         return (
                           <th key={c.id} className={c.left ? 'is-left' : undefined} aria-sort={active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : undefined}>
                             {c.sort ? (
-                              <button className={`task-th${active ? ' is-active' : ''}`} title={`${c.hint} · click to sort`} onClick={() => pickSort(c.sort!)}>
+                              <button className={`task-th${active ? ' is-active' : ''}`} title={t('sortHint', { hint })} onClick={() => pickSort(c.sort!)}>
                                 {label}
                                 <span className="task-th-arrow">{active ? (sort.direction === 'asc' ? '▲' : '▼') : ''}</span>
                               </button>
                             ) : (
-                              <span className="task-th is-static" title={c.hint}>{label}</span>
+                              <span className="task-th is-static" title={hint}>{label}</span>
                             )}
                           </th>
                         )
@@ -364,7 +360,7 @@ export default function TasksView() {
                           >
                             <td className="task-col-flag">
                               <span className={`task-chevron${isOpen ? ' is-open' : ''}`} aria-hidden="true">›</span>
-                              {flag && <span className="task-flag" title={outlierHint(flag)}>!</span>}
+                              {flag && <span className="task-flag" title={outlierHint(flag, t)}>!</span>}
                             </td>
                             <td className="is-left">{agentLabel.get(r.agent) ?? r.agent}</td>
                             <td
@@ -376,13 +372,13 @@ export default function TasksView() {
                             <td className="is-left task-ellipsis task-label" title={title ? `${title}\n${started}` : started}>
                               {title || started}
                             </td>
-                            <td title={r.abortedCount > 0 ? `${formatFull(r.abortedCount)} aborted` : undefined}>{formatFull(r.turns)}</td>
-                            <td className={flag?.steps ? 'is-outlier-value' : undefined}>{formatFull(r.steps)}</td>
-                            <td>{formatFull(r.toolCalls)}</td>
+                            <td title={r.abortedCount > 0 ? t('abortedN', { n: fmt.number(r.abortedCount) }) : undefined}>{fmt.number(r.turns)}</td>
+                            <td className={flag?.steps ? 'is-outlier-value' : undefined}>{fmt.number(r.steps)}</td>
+                            <td>{fmt.number(r.toolCalls)}</td>
                             <td className={flag?.wall ? 'is-outlier-value' : undefined}>{formatDuration(r.wallMs)}</td>
                             <td className="task-muted">{formatDuration(r.modelMs)}</td>
                             <td className="task-muted">{formatDuration(r.toolMs)}</td>
-                            <td className={r.errorCount > 0 ? 'task-errors' : 'task-muted'}>{r.errorCount > 0 ? formatFull(r.errorCount) : '0'}</td>
+                            <td className={r.errorCount > 0 ? 'task-errors' : 'task-muted'}>{r.errorCount > 0 ? fmt.number(r.errorCount) : '0'}</td>
                             <td className={r.subagentCount > 0 ? undefined : 'task-muted'}>{subagentCell(r)}</td>
                             <td>{formatCompact(r.totalTokens)}</td>
                           </tr>
@@ -401,13 +397,13 @@ export default function TasksView() {
               </div>
               <footer className="task-pager">
                 <span>
-                  {formatFull(from)}–{formatFull(to)} of {formatFull(total)}
+                  {t('pagerRange', { from: fmt.number(from), to: fmt.number(to), total: fmt.number(total) })}
                 </span>
                 <div className="toolbar-group">
                   <button
                     className={`seg${page === 0 ? ' is-disabled' : ''}`}
                     aria-disabled={page === 0 || undefined}
-                    title="Previous page"
+                    title={t('prevPageTitle')}
                     onClick={() => {
                       if (page > 0) {
                         setPage(page - 1)
@@ -415,7 +411,7 @@ export default function TasksView() {
                       }
                     }}
                   >
-                    Prev
+                    {t('prevPage')}
                   </button>
                   <span className="task-pager-page">
                     {page + 1} / {pageCount}
@@ -423,7 +419,7 @@ export default function TasksView() {
                   <button
                     className={`seg${page + 1 >= pageCount ? ' is-disabled' : ''}`}
                     aria-disabled={page + 1 >= pageCount || undefined}
-                    title="Next page"
+                    title={t('nextPageTitle')}
                     onClick={() => {
                       if (page + 1 < pageCount) {
                         setPage(page + 1)
@@ -431,7 +427,7 @@ export default function TasksView() {
                       }
                     }}
                   >
-                    Next
+                    {t('nextPage')}
                   </button>
                 </div>
               </footer>
