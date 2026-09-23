@@ -1,10 +1,11 @@
-//! 订阅价格与读数的**只读查询面**：五条命令,只读、零网络、不碰任何写连接。
+//! 订阅价格与读数的**只读查询面**：六条命令,只读、零网络、不碰任何写连接。
 //!
 //! | 组 | 命令 | 出什么 |
 //! | --- | --- | --- |
 //! | 价格 | `get_price_models` | 某平台**全部模型的全部生效期**（价格梯度图的数据源） |
 //! | 价格 | `get_price_at` | 某**时刻**全线的有效价目（官方价目对照表 / 诊断） |
 //! | 价格 × 用量 | `get_model_usage` | 区间内**分模型 × 价目段**的用量与美元当量 |
+//! | 价格 × 轮次 | `get_message_budget` | 分模型「一轮吃掉多少 5h 额度」（剩余消息数的分母） |
 //! | 读数 | `get_quota_readings` | 归一化读数序列（`quota_reading`） |
 //! | 读数 | `get_quota_days` | 日级汇总（`quota_daily`;年度曲线走这条,别去扫读数层） |
 //!
@@ -276,6 +277,181 @@ pub(super) fn model_usage(
     }
 }
 
+// ---------- 剩余消息数 ----------
+
+/// 每轮代价的取样窗口（天,含今天）：够攒出中位数,又跟得上用法的变化。
+const BUDGET_LOOKBACK_DAYS: i64 = 30;
+/// 一个模型至少要有这么多轮才给估计——两三轮的中位数就是那两三轮本身。
+pub(super) const BUDGET_MIN_TURNS: usize = 5;
+/// 「主力模型」看最近这么多天谁的轮最多（没有就退回整个取样窗口）。
+const MAIN_MODEL_DAYS: i64 = 7;
+
+/// 一个模型的每轮代价。
+#[derive(Debug, Serialize)]
+pub struct MessageCostRow {
+    /// collector 里的模型键,原样。
+    pub model_key: String,
+    /// 命中价目行的展示名（可能是区间名,如「Claude Opus 4.5〜5」;短名由展示层自己取）。
+    pub display_name: String,
+    /// 取样窗口里以它为主的用户轮数（= 中位数的样本数）。
+    pub turns: usize,
+    /// 每轮代价的**中位数**（美元当量,只含根会话自己的 token）。
+    pub median_usd: f64,
+    /// 一轮吃掉 5h 窗口的百分点 = 中位代价 × `overhead` × `scale`。
+    /// 展示层用它去除自己显示的剩余 %,得到还能发几条;100 ÷ 它 = 一个满窗口多少条。
+    pub pct_per_turn: f64,
+}
+
+/// `get_message_budget` 的出口：分模型的「每轮吃掉多少 5h 额度」。
+///
+/// **只给每轮代价,不给剩余条数**——剩余 % 以展示层手里的快照为准,在那边除,
+/// 免得 hover 里的条数与表盘上的百分比来自两个不同时刻。
+#[derive(Debug, Serialize)]
+pub struct MessageBudget {
+    pub platform: Platform,
+    /// 取样窗口起点（本地日,含）。
+    pub from: String,
+    /// 当前标定系数（百分点 / 美元当量,5h 窗口）。
+    pub scale: f64,
+    /// 系数是否已按校准（false = 出厂预设,估计更粗）。
+    pub calibrated: bool,
+    /// 子会话开销倍率 = 全部切片代价 ÷ 根会话切片代价（≥ 1）。
+    /// 子代理 / Codex 自动审查不算用户轮,但吃同一份额度——按比例摊进每一轮。
+    pub overhead: f64,
+    /// 主力模型（最近 7 天用户轮最多的那个;`None` = 没有够样本的模型）。
+    pub main_model: Option<String>,
+    /// 够样本的模型,按轮数降序。
+    pub rows: Vec<MessageCostRow>,
+}
+
+/// 分模型的每轮额度代价（悬浮球 hover 与设置页模型选择的数据源）。
+///
+/// 「消息」= 用户发起的对话轮次（`request_count` 口径）。每轮代价取**中位数**：
+/// 轮体量分布重尾,均值会被少数巨型轮带偏。一轮用了几个模型时归给代价最大的那个。
+#[tauri::command]
+pub fn get_message_budget(
+    platform: String,
+    state: State<'_, AppState>,
+) -> Result<MessageBudget, String> {
+    let platform = platform_of(&platform)?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let from = (chrono::Local::now().date_naive()
+        - chrono::Duration::days(BUDGET_LOOKBACK_DAYS - 1))
+    .format("%Y-%m-%d")
+    .to_string();
+    let parts = crate::commands::with_reader(&state, |store| {
+        Ok(store.turn_model_parts(platform.collector_source(), &from))
+    })?;
+    let pairs = super::calib::sample_count(platform);
+    Ok(message_budget(
+        platform,
+        from,
+        &parts,
+        now_ms,
+        super::calib::scale(platform),
+        pairs >= super::calib::CALIBRATED_PAIRS,
+    ))
+}
+
+/// [`get_message_budget`] 的本体（纯函数,测试直接喂切片）。
+pub(super) fn message_budget(
+    platform: Platform,
+    from: String,
+    parts: &[crate::collector::store::TurnModelPart],
+    now_ms: i64,
+    scale: f64,
+    calibrated: bool,
+) -> MessageBudget {
+    use std::collections::{BTreeMap, HashMap};
+
+    //  切片折价;根会话的切片按轮归拢,子会话的只进开销
+    let (mut all_usd, mut root_usd) = (0.0_f64, 0.0_f64);
+    // （会话, 轮) → （轮起点, 模型 → （代价, 价目可信))
+    let mut turns: BTreeMap<(&str, i64), (i64, HashMap<&str, (f64, bool)>)> = BTreeMap::new();
+    let mut names: HashMap<&str, String> = HashMap::new();
+    for p in parts {
+        let priced = cost::priced_at(platform, &p.model_key, p.started_at.div_euclid(1000));
+        let usd = priced.usd_of(&cost::Tokens {
+            input: p.tokens[0],
+            output: p.tokens[1],
+            cache_read: p.tokens[2],
+            cache_write: p.tokens[3],
+        });
+        all_usd += usd;
+        if !p.root {
+            continue;
+        }
+        root_usd += usd;
+        names.entry(p.model_key.as_str()).or_insert(priced.display_name);
+        let t = turns
+            .entry((p.session_id.as_str(), p.turn_seq))
+            .or_insert_with(|| (p.started_at, HashMap::new()));
+        let e = t.1.entry(p.model_key.as_str()).or_insert((0.0, priced.known));
+        e.0 += usd;
+    }
+    let overhead = if root_usd > 0.0 { (all_usd / root_usd).max(1.0) } else { 1.0 };
+
+    //  每轮归给代价最大的模型;主模型价目不可信（回落 / 路由标签）的轮不进样本
+    let recent_ms = now_ms - MAIN_MODEL_DAYS * 86_400_000;
+    let mut per_model: BTreeMap<&str, (Vec<f64>, usize)> = BTreeMap::new();
+    for (started_at, models) in turns.values() {
+        let cost: f64 = models.values().map(|(u, _)| u).sum();
+        if cost <= 0.0 {
+            continue; // 零 token 的轮（秒中止 / 纯本地命令）不是「一条消息的代价」
+        }
+        let Some((model, (_, known))) = models
+            .iter()
+            .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0).then(b.0.cmp(a.0)))
+        else {
+            continue;
+        };
+        if !known {
+            continue;
+        }
+        let e = per_model.entry(model).or_default();
+        e.0.push(cost);
+        if *started_at >= recent_ms {
+            e.1 += 1;
+        }
+    }
+
+    //  够样本的模型出中位数
+    let mut rows: Vec<(MessageCostRow, usize)> = per_model
+        .into_iter()
+        .filter(|(_, (v, _))| v.len() >= BUDGET_MIN_TURNS)
+        .map(|(model, (mut v, recent))| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            let median = if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 };
+            (
+                MessageCostRow {
+                    model_key: model.to_string(),
+                    display_name: names.get(model).cloned().unwrap_or_else(|| model.to_string()),
+                    turns: n,
+                    median_usd: median,
+                    pct_per_turn: median * overhead * scale,
+                },
+                recent,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.turns.cmp(&a.0.turns).then(a.0.model_key.cmp(&b.0.model_key)));
+    let main_model = rows
+        .iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.0.turns.cmp(&b.0.turns)).then(b.0.model_key.cmp(&a.0.model_key)))
+        .map(|(r, _)| r.model_key.clone());
+
+    MessageBudget {
+        platform,
+        from,
+        scale,
+        calibrated,
+        overhead,
+        main_model,
+        rows: rows.into_iter().map(|(r, _)| r).collect(),
+    }
+}
+
 // ---------- 读数 ----------
 
 /// 归一化读数序列（`[from, to]` 闭区间,unix 秒;`kind` 省略 = 该平台全部窗口种类）。
@@ -533,5 +709,101 @@ mod tests {
         assert_eq!(r.display_name, "claude-没见过的代号", "没命中就回模型键本身");
         assert_eq!(got.usd_unknown, got.usd_total, "整份都是估的");
         assert!((got.usd_total - 2.0).abs() < 1e-9, "Claude 回落 = Sonnet 5 输入价 $2/Mtok");
+    }
+
+    // ---------- 剩余消息数 ----------
+
+    use crate::collector::store::TurnModelPart;
+
+    /// 一个切片：`seq` 轮,`root` = 是否根会话,只给输入 token（夹具价目 steady = $3/Mtok）。
+    fn part(session: &str, seq: i64, root: bool, model: &str, input: i64, at_ms: i64) -> TurnModelPart {
+        TurnModelPart {
+            session_id: session.into(),
+            turn_seq: seq,
+            started_at: at_ms,
+            root,
+            model_key: model.into(),
+            tokens: [input, 0, 0, 0],
+        }
+    }
+
+    /// 中位数而不是均值：一个巨型轮不把每轮代价拖上去;样本不够的模型不出行。
+    #[test]
+    fn budget_takes_the_median_turn_and_needs_enough_turns() {
+        const NOW: i64 = 1_800_000_000_000;
+        let mut parts: Vec<TurnModelPart> = [1, 1, 1, 1, 100]
+            .iter()
+            .enumerate()
+            .map(|(i, m)| part("a", i as i64, true, "claude-steady-1", m * 1_000_000, NOW - 1000))
+            .collect();
+        // 样本不够（4 轮）的模型
+        parts.extend((0..4).map(|i| part("b", i, true, "claude-widget-1", 1_000_000, NOW - 1000)));
+        let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
+        let got = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 0.5, true)
+        });
+        assert_eq!(got.rows.len(), 1, "4 轮不够出估计");
+        let r = &got.rows[0];
+        assert_eq!(r.turns, 5);
+        assert!((r.median_usd - 3.0).abs() < 1e-9, "中位数 = 一轮 1Mtok × $3,{}", r.median_usd);
+        assert!((r.pct_per_turn - 1.5).abs() < 1e-9, "× scale 0.5");
+        assert_eq!(got.main_model.as_deref(), Some("claude-steady-1"));
+        assert_eq!(got.overhead, 1.0, "没有子会话就没有开销");
+    }
+
+    /// 子会话不算轮,但它的代价按比例摊进每一轮;一轮混用模型时归给代价最大的那个。
+    #[test]
+    fn budget_spreads_subagent_cost_and_assigns_mixed_turns_to_the_dominant_model() {
+        const NOW: i64 = 1_800_000_000_000;
+        let mut parts = Vec::new();
+        for i in 0..5 {
+            parts.push(part("root", i, true, "claude-steady-1", 2_000_000, NOW));
+            parts.push(part("root", i, true, "claude-widget-1", 100_000, NOW)); // 顺带用了一点
+            parts.push(part("sub", i, false, "claude-steady-1", 2_100_000, NOW)); // 子代理 = 同量
+        }
+        let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
+        let got = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true)
+        });
+        assert_eq!(got.rows.len(), 1, "widget 从没当过主模型");
+        assert_eq!(got.rows[0].model_key, "claude-steady-1");
+        assert_eq!(got.rows[0].turns, 5, "子会话的切片不算轮");
+        let turn = 2.0 * 3.0 + 0.1 * 10.0; // steady $3 + widget 旧价 $10
+        assert!((got.rows[0].median_usd - turn).abs() < 1e-9, "{}", got.rows[0].median_usd);
+        let overhead = (turn + 2.1 * 3.0) / turn;
+        assert!((got.overhead - overhead).abs() < 1e-9);
+        assert!((got.rows[0].pct_per_turn - turn * overhead).abs() < 1e-9);
+    }
+
+    /// 价目不可信的主模型（回落 / 路由标签）与零代价的轮都不进样本。
+    #[test]
+    fn budget_skips_untrusted_models_and_empty_turns() {
+        const NOW: i64 = 1_800_000_000_000;
+        let mut parts: Vec<TurnModelPart> =
+            (0..6).map(|i| part("a", i, true, "claude-没见过的代号", 1_000_000, NOW)).collect();
+        parts.extend((10..16).map(|i| part("a", i, true, "claude-steady-1", 0, NOW)));
+        let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
+        let got = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, false)
+        });
+        assert!(got.rows.is_empty());
+        assert_eq!(got.main_model, None);
+        assert!(!got.calibrated);
+    }
+
+    /// 主力模型看最近 7 天,不看整个取样窗口的总轮数。
+    #[test]
+    fn main_model_follows_the_last_week() {
+        const NOW: i64 = 1_800_000_000_000;
+        const OLD: i64 = NOW - 20 * 86_400_000;
+        let mut parts: Vec<TurnModelPart> =
+            (0..20).map(|i| part("old", i, true, "claude-widget-1", 1_000_000, OLD)).collect();
+        parts.extend((0..6).map(|i| part("new", i, true, "claude-steady-1", 1_000_000, NOW)));
+        let rows = price::two_segment_fixture(NOW / 1000 + 86_400);
+        let got = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true)
+        });
+        assert_eq!(got.rows[0].model_key, "claude-widget-1", "行按总轮数排");
+        assert_eq!(got.main_model.as_deref(), Some("claude-steady-1"), "主力看最近一周");
     }
 }

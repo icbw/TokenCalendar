@@ -125,6 +125,10 @@ export interface DesignPrefs {
    * 按平台 id 记（绑定集合变化时下标会错位）;该平台未绑定 → 回落第一个已绑定平台,
    * 键保持不动直到用户再切换。undefined = 第一个。 */
   orbPlatform?: SubscriptionPlatform
+  /** 悬浮球 5h 表盘 hover 里显示剩余消息数的模型（按平台,值 = collector 模型键,按此顺序印）。
+   * 缺键 = 自动（只显示主力模型 = 最近 7 天用户轮最多的那个）;空数组 = 不显示。
+   * 选了但近 30 天样本不够的模型静默略过。上限 ORB_MESSAGE_MODELS_MAX 个。 */
+  orbMessageModels?: Partial<Record<SubscriptionPlatform, string[]>>
   /** 应用更新：每次启动后自动检查,有新版就在后台预下载并发系统通知;**从不自动安装**,
    * 安装由用户在设置·About 点 Install。默认关（启动即联网属显式授权行为）。关闭时
    * 仅「Check for updates」手动触发。更新源与签名校验见 services/updateService.ts（仅安装版生效）。 */
@@ -271,6 +275,24 @@ function sanitize(p: Partial<DesignPrefs>): Partial<DesignPrefs> {
   if (p.orbIdleEnabled !== undefined && typeof p.orbIdleEnabled !== 'boolean') delete p.orbIdleEnabled
   if (p.orbPlatform !== undefined && p.orbPlatform !== 'codex' && p.orbPlatform !== 'claude') {
     delete p.orbPlatform
+  }
+  // 剩余消息数的模型选择:只留 codex / claude 两键里的字符串数组（去重、截到上限）。
+  if (p.orbMessageModels !== undefined) {
+    const src = p.orbMessageModels as Record<string, unknown> | null
+    const clean: Partial<Record<SubscriptionPlatform, string[]>> = {}
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      for (const k of ['codex', 'claude'] as SubscriptionPlatform[]) {
+        const v = src[k]
+        if (Array.isArray(v)) {
+          clean[k] = [...new Set(v.filter((m): m is string => typeof m === 'string' && m.length > 0))].slice(
+            0,
+            ORB_MESSAGE_MODELS_MAX,
+          )
+        }
+      }
+    }
+    if (Object.keys(clean).length > 0) p.orbMessageModels = clean
+    else delete p.orbMessageModels
   }
   // 退役键清理：提频档位 orbBoost* 与悬浮球总开关 orbEnabled 已不再使用（可见性单一源在
   // Rust visibility.rs,持久化在 window-state.json 的 orb_visible）。旧 prefs.json 里的
@@ -522,3 +544,6 @@ if (typeof window !== 'undefined') {
     for (const fn of listeners) fn(prefs)
   })
 }
+
+/** 悬浮球 hover 里剩余消息数最多列几个模型（hover 要简短）。 */
+export const ORB_MESSAGE_MODELS_MAX = 4

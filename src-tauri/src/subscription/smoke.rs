@@ -2524,3 +2524,76 @@ fn s2_query_surface_on_real_db() {
     }
     println!("\n全部核对通过。");
 }
+
+/// **S4 剩余消息数**的真库：真 subscriptions.db 副本拟合出 `scale`,真 collector.db
+/// 取近 30 天的轮切片,打出每个平台分模型的「每轮中位代价 / 一轮吃掉几个百分点 /
+/// 满窗口几条」,并核对：行按轮数降序、每行样本够数、开销倍率 ≥ 1、主力模型在行里。
+#[test]
+#[ignore]
+fn message_budget_on_real_db() {
+    let (Some(src), Some(col)) = (real_db(), real_collector_db()) else {
+        eprintln!("没有找到真库,跳过（设 TC_SUB_DB / TC_COLLECTOR_DB）");
+        return;
+    };
+    let out = std::env::var_os("TC_SMOKE_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tc_message_budget_smoke");
+    let _ = std::fs::remove_dir_all(&out);
+    let dst = clone_db(&src, &out);
+    let s = SubStore::open(&dst).expect("open");
+    super::price::load_from(&s);
+    // collector.db 也只动副本（`Store:open` 会做迁移前备份 / 迁移）
+    let col_dst = out.join("collector.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", col.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", col_dst.display())).expect("copy collector.db");
+        }
+    }
+    let store = crate::collector::store::Store::open(&col_dst).expect("collector.db");
+    let from = (chrono::Local::now().date_naive() - chrono::Duration::days(29))
+        .format("%Y-%m-%d")
+        .to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for p in [Platform::Codex, Platform::Claude] {
+        super::calib::refit_from_store(&s, p);
+        let parts = store.turn_model_parts(p.collector_source(), &from);
+        let pairs = super::calib::sample_count(p);
+        let b = super::query::message_budget(
+            p,
+            from.clone(),
+            &parts,
+            now_ms,
+            super::calib::scale(p),
+            pairs >= super::calib::CALIBRATED_PAIRS,
+        );
+        println!(
+            "--- {} --- 切片 {} 条  scale {:.4} %/$（{} 样本）  开销 ×{:.3}  主力 {:?}",
+            p.as_str(),
+            parts.len(),
+            b.scale,
+            pairs,
+            b.overhead,
+            b.main_model
+        );
+        for r in &b.rows {
+            println!(
+                "  {:<22} {:<24} {:>4} 轮  中位 ${:>7.4}  一轮 {:>6.3}%  满窗 ≈{:>6.0} 条",
+                r.model_key,
+                r.display_name,
+                r.turns,
+                r.median_usd,
+                r.pct_per_turn,
+                100.0 / r.pct_per_turn
+            );
+            assert!(r.turns >= super::query::BUDGET_MIN_TURNS);
+            assert!(r.pct_per_turn > 0.0);
+        }
+        assert!(b.rows.windows(2).all(|w| w[0].turns >= w[1].turns), "行按轮数降序");
+        assert!(b.overhead >= 1.0);
+        if let Some(m) = &b.main_model {
+            assert!(b.rows.iter().any(|r| &r.model_key == m), "主力模型必须在行里");
+        }
+    }
+}

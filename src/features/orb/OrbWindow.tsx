@@ -21,6 +21,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLayoutEffect } from 'react'
 import { events, subscriptionService, windowService, type OrbDockState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
 import { getDesignPrefs, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
+import type { MessageBudget } from '../../services/subscriptionService'
+import { budgetLine, pickBudgetRows } from './messageBudget'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
@@ -112,8 +114,8 @@ const REFRESH_MIN_MS = 1200
 const REFRESH_MAX_MS = 4000
 
 /** hover 提示显示延迟：指针在同一区域停满这段时间才出提示——扫过/路过不出。
- * 比系统工具提示（≈1s）快一档。 */
-const HOVER_DELAY_MS = 350
+ * 比系统工具提示（≈1s）快一档;0.3s 是用户定的「确认在悬停」的门槛。 */
+const HOVER_DELAY_MS = 300
 /** 提示收尾宽限：指针离开一个提示区时不立刻收——相邻区域横移途中要
  * 经过不产出提示的空隙（环 → 悬挂按钮、文本行 → 环）,立刻收会闪一帧并
  * 重等一轮延迟。留这一小段等下一区接手,没人接才真收。 */
@@ -448,6 +450,27 @@ export default function OrbWindow() {
   // 用户注意,Rust 侧是**全局**一个布尔（idle.rs）——待机即整体减淡 50%（.is-standby,
   // orb.css）;不分平台,切换平台不会亮度跳变。
   const standby = idleOn && boundSnaps.length > 0 && idle
+
+  // 剩余消息数（5h 表盘 hover）：每轮代价随快照一起重查（快照变 = 刚有新用量,
+  // 中位数可能挪了一点;查询只读本地库、零网络）。剩余 % 用本窗口手里的快照去除。
+  const [budget, setBudget] = useState<MessageBudget | null>(null)
+  const budgetPlatform = snap?.platform
+  useEffect(() => {
+    if (!budgetPlatform) {
+      setBudget(null)
+      return
+    }
+    let stale = false
+    subscriptionService
+      .getMessageBudget(budgetPlatform)
+      .then((b) => !stale && setBudget(b))
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [budgetPlatform, snapshots])
+  const [messageModels, setMessageModels] = useState(() => getDesignPrefs().orbMessageModels)
+  useEffect(() => subscribeDesignPrefs((p) => setMessageModels(p.orbMessageModels)), [])
   const w5h = windowOf(snap, '5h')
   const w7d = windowOf(snap, '7d') ?? windowOf(snap, '7d_opus')
   // 「剩余 = 100 − 已用」换算（口径单侧）。
@@ -795,12 +818,24 @@ export default function OrbWindow() {
           ],
         }
       : statusTip
+  // 剩余消息数行：`GPT-6 Astra: ~3/30`（剩余 / 满窗口,只数用户轮）。平台不对（切换途中
+  // 预算还是上一个平台的）或读数缺席时不出——宁可少一行,不印错的数。
+  const budgetRows =
+    budget && budget.platform === snap?.platform
+      ? pickBudgetRows(budget, snap ? messageModels?.[snap.platform] : undefined)
+      : []
+  const fiveBudgetLines = (remain: number | null) =>
+    remain === null ? [] : budgetRows.map((r) => budgetLine(r, remain))
   const fiveTip: TipContent = fiveIdle
-    ? { label: '5-hour quota', lines: ['idle — updates after first use'] }
+    ? { label: '5-hour quota', lines: ['idle — updates after first use', ...fiveBudgetLines(100)] }
     : w5h
       ? {
           label: '5-hour quota',
-          lines: [`${pctText(remain5h)} / 100 left`, ...(reset5h ? [`resets at ${reset5h}`] : [])],
+          lines: [
+            `${pctText(remain5h)} / 100 left`,
+            ...(reset5h ? [`resets at ${reset5h}`] : []),
+            ...fiveBudgetLines(remain5h),
+          ],
         }
       : statusTip
   const resetTip: TipContent = weekIdle

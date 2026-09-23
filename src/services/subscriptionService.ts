@@ -260,6 +260,44 @@ export async function getModelUsage(
   })
 }
 
+/** 一个模型的每轮额度代价（Rust query:MessageCostRow）。 */
+export interface MessageCostRow {
+  /** collector 里的模型键，原样。 */
+  model_key: string
+  /** 命中价目行的展示名（可能是区间名，如「Claude Opus 4.5〜5」；短名见 messageBudget.ts）。 */
+  display_name: string
+  /** 取样窗口里以它为主的用户轮数（= 中位数的样本数）。 */
+  turns: number
+  /** 每轮代价的中位数（美元当量）。 */
+  median_usd: number
+  /** 一轮吃掉 5h 窗口的百分点。剩余条数 = 剩余 % ÷ 它；满窗口条数 = 100 ÷ 它。 */
+  pct_per_turn: number
+}
+
+/** 分模型的「一轮吃掉多少 5h 额度」（Rust query:MessageBudget）。
+ * **只给每轮代价、不给剩余条数**：剩余 % 以调用方手里的快照为准，在那边除——
+ * hover 里的条数与表盘百分比必须来自同一时刻。 */
+export interface MessageBudget {
+  platform: SubscriptionPlatform
+  /** 取样窗口起点（本地日，含；近 30 天）。 */
+  from: string
+  /** 标定系数（百分点 / 美元当量，5h 窗口）。 */
+  scale: number
+  /** false = 仍是出厂预设系数，估计更粗。 */
+  calibrated: boolean
+  /** 子会话（子代理 / 自动审查）开销倍率，已乘进 pct_per_turn。 */
+  overhead: number
+  /** 最近 7 天用户轮最多的模型（null = 没有够样本的模型）。 */
+  main_model: string | null
+  /** 够样本（≥5 轮）的模型，按轮数降序。 */
+  rows: MessageCostRow[]
+}
+
+/** 分模型每轮额度代价（剩余消息数的分母）。「消息」= 用户发起的对话轮次。 */
+export async function getMessageBudget(platform: SubscriptionPlatform): Promise<MessageBudget | null> {
+  return tryInvoke<MessageBudget>('get_message_budget', { platform })
+}
+
 /** 归一化读数序列的一行（Rust model:QuotaReading）。 */
 export interface QuotaReading {
   /** 读数时刻（unix 秒；语义随 source 不同）。 */

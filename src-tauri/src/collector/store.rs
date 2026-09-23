@@ -1452,6 +1452,40 @@ impl Store {
         it.map(|rs| rs.flatten().collect()).unwrap_or_default()
     }
 
+    /// 自 `from_day`（本地日,含）起每轮的**分模型 token 切片**,附轮起点与是否根会话。
+    ///
+    /// 一行 = （会话, 轮序号, 轮起点 unix 毫秒, 是否根会话, 模型, [输入, 输出, 缓存读, 缓存写])。
+    /// 根会话的轮 = 用户发起的对话轮次（`request_count` 口径）;子会话（子代理 / 审查）的
+    /// 切片也一并给出——它们不算轮,但吃同一份额度,剩余消息数要把这份开销摊进去。
+    pub fn turn_model_parts(&self, agent_key: &str, from_day: &str) -> Vec<TurnModelPart> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT p.session_id, p.turn_seq, r.started_at, s.parent_id IS NULL, p.model_key,
+                    SUM(p.input_tokens), SUM(p.output_tokens),
+                    SUM(p.cache_read_tokens), SUM(p.cache_write_tokens)
+               FROM turn_part p
+               JOIN turn_raw r ON r.agent_key = p.agent_key AND r.session_id = p.session_id
+                              AND r.turn_seq = p.turn_seq
+               LEFT JOIN session s ON s.agent_key = p.agent_key AND s.session_id = p.session_id
+              WHERE p.agent_key = ?1 AND p.day >= ?2
+              GROUP BY p.session_id, p.turn_seq, p.model_key
+              ORDER BY p.session_id, p.turn_seq",
+        ) else {
+            return vec![];
+        };
+        let it = stmt.query_map(rusqlite::params![agent_key, from_day], |r| {
+            Ok(TurnModelPart {
+                session_id: r.get(0)?,
+                turn_seq: r.get(1)?,
+                started_at: r.get(2)?,
+                // 没有 session 行的轮（理论上不该有）LEFT JOIN 出 NULL ⇒ 按根会话算
+                root: r.get(3)?,
+                model_key: r.get(4)?,
+                tokens: [r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?],
+            })
+        });
+        it.map(|rs| rs.flatten().collect()).unwrap_or_default()
+    }
+
     /// 该 agent 有用量记录的日期跨度（`None` = 一条都没有）。
     /// 查询面用它把「区间没给」折成「全部历史」。
     pub fn agent_day_span(&self, agent_key: &str) -> Option<(String, String)> {
@@ -1464,6 +1498,19 @@ impl Store {
             .ok()
             .and_then(|(a, b)| Some((a?, b?)))
     }
+}
+
+/// [`Store:turn_model_parts`] 的一行。
+#[derive(Debug, Clone)]
+pub struct TurnModelPart {
+    pub session_id: String,
+    pub turn_seq: i64,
+    /// 轮起点（unix **毫秒**,与 `turn_raw.started_at` 同单位）。
+    pub started_at: i64,
+    /// 根会话的轮 = 用户轮;子会话的切片只算开销。
+    pub root: bool,
+    pub model_key: String,
+    pub tokens: [i64; 4],
 }
 
 #[cfg(test)]

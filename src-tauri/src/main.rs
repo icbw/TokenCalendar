@@ -224,6 +224,7 @@ fn main() {
             subscription::query::get_price_models,
             subscription::query::get_price_at,
             subscription::query::get_model_usage,
+            subscription::query::get_message_budget,
             subscription::query::get_quota_readings,
             subscription::query::get_quota_days,
             subscription::idle::get_subscription_idle,

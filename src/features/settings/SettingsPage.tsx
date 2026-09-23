@@ -10,10 +10,12 @@ import { useEffect, useRef, useState } from 'react'
 import { HexColorPicker, HexColorInput } from 'react-colorful'
 import { autostartService, collectorService, dataService, events, exportService, subscriptionService, updateService, windowService, type AutostartInfo, type CredentialInfo, type EstimatorState, type ExportResult, type DataInfo, type SubscriptionSnapshot, type ReadyUpdate, type UpdateCheck, type UpdateProgress } from '../../services'
 import { currentMonth } from '../../lib/time'
-import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, MONTHLY_USD_MAX, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
+import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RADIUS_PRESETS, SUBSCRIPTION_FETCH_PCT, MONTHLY_USD_MAX, ORB_MESSAGE_MODELS_MAX, applySubscriptionFetchPolicy, subscriptionFetchPct, subscriptionTightenLow, type DesignPrefs, type SizePreset, type WeekStart } from './designPrefs'
 import { deriveWidgetTheme } from './widgetTheme'
 import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
+import type { MessageBudget } from '../../services/subscriptionService'
+import { shortModelName } from '../orb/messageBudget'
 import './settings.css'
 
 export type SettingsTab = 'general' | 'appearance' | 'projects' | 'data' | 'subscriptions' | 'about'
@@ -1414,6 +1416,23 @@ function SubscriptionsTab() {
         </div>
       </div>
 
+      {(['codex', 'claude'] as const).some(boundOf) ? (
+        <>
+          <div className="setting-section">Orb messages</div>
+          <div className="setting-block">
+            {(['codex', 'claude'] as const).filter(boundOf).map((p) => (
+              <MessageModelsRow key={p} platform={p} value={design.orbMessageModels?.[p]} />
+            ))}
+            <div className="setting-note">
+              Shown when hovering the orb's 5-hour dial as messages left / messages in a full window, e.g. “GPT-6 Astra:
+              ~3/30”. A message is one prompt you send. Estimated from your own median
+              cost per message over the last 30 days, so it moves with how you work; models need at least 5 messages
+              in that time to appear. Auto shows only the model you used most in the last 7 days.
+            </div>
+          </div>
+        </>
+      ) : null}
+
       <div className="setting-section">Plan fees</div>
       <div className="setting-block">
         {(['codex', 'claude'] as const).map((p) => (
@@ -1426,6 +1445,84 @@ function SubscriptionsTab() {
         </div>
       </div>
     </>
+  )
+}
+
+/** 一个平台在悬浮球 hover 里显示哪些模型的剩余消息数：Auto（缺键 = 主力模型）/
+ * Off（空数组）/ 逐个模型多选（按点选顺序印,最多 ORB_MESSAGE_MODELS_MAX 个）。
+ * 候选 = 近 30 天够样本的模型;已选但样本掉出窗口的也列出来,好让用户能取消。 */
+function MessageModelsRow({ platform, value }: {
+  platform: 'codex' | 'claude'
+  value: string[] | undefined
+}) {
+  const [budget, setBudget] = useState<MessageBudget | null>(null)
+  useEffect(() => {
+    let stale = false
+    subscriptionService.getMessageBudget(platform).then((b) => !stale && setBudget(b)).catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [platform])
+  const set = (next: string[] | undefined) => {
+    const all = { ...(getDesignPrefs().orbMessageModels ?? {}) }
+    if (next === undefined) delete all[platform]
+    else all[platform] = next
+    setDesignPrefs({ orbMessageModels: Object.keys(all).length > 0 ? all : undefined })
+  }
+  const candidates = [
+    ...(budget?.rows.map((r) => r.model_key) ?? []),
+    ...(value ?? []).filter((k) => !budget?.rows.some((r) => r.model_key === k)),
+  ]
+  const toggle = (key: string) => {
+    const cur = value ?? []
+    if (cur.includes(key)) set(cur.filter((k) => k !== key))
+    else if (cur.length < ORB_MESSAGE_MODELS_MAX) set([...cur, key])
+  }
+  const label = platform === 'claude' ? 'Claude' : 'Codex'
+  const perMsg = (key: string) => {
+    const r = budget?.rows.find((x) => x.model_key === key)
+    return r
+      ? `${r.display_name} · about ${Math.round(100 / r.pct_per_turn)} messages per full 5-hour window (median of ${r.turns} messages)`
+      : 'Not enough messages in the last 30 days to estimate'
+  }
+  return (
+    <div className="setting-row">
+      <span title={`Which ${label} models show messages left in the orb hover`}>{label}</span>
+      <div className="setting-seg is-wrap">
+        <button
+          className={`setting-seg-btn${value === undefined ? ' is-active' : ''}`}
+          title={
+            budget?.main_model
+              ? `Only your most-used model lately (${shortModelName(budget.main_model)})`
+              : 'Only your most-used model lately'
+          }
+          onClick={() => set(undefined)}
+        >
+          Auto
+        </button>
+        <button
+          className={`setting-seg-btn${value !== undefined && value.length === 0 ? ' is-active' : ''}`}
+          title="Don't show messages left"
+          onClick={() => set([])}
+        >
+          Off
+        </button>
+        {candidates.map((k) => {
+          const on = value?.includes(k) ?? false
+          return (
+            <button
+              key={k}
+              className={`setting-seg-btn${on ? ' is-active' : ''}`}
+              title={perMsg(k)}
+              disabled={!on && (value?.length ?? 0) >= ORB_MESSAGE_MODELS_MAX}
+              onClick={() => toggle(k)}
+            >
+              {shortModelName(k)}
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 

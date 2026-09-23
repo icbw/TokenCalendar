@@ -316,6 +316,12 @@
   border-radius: 8px;
 }
 
+/* 多选且候选数不定的分段控件（设置·Orb messages 的模型选择）：放不下就折行,右对齐。 */
+.setting-seg.is-wrap {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .setting-seg-btn {
   font-size: var(--font-size-xs);
   line-height: 1;
