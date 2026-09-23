@@ -303,6 +303,9 @@ pub enum SizeBasis {
 }
 /// 「主力模型」看最近这么多天谁的轮最多（没有就退回整个取样窗口）。
 const MAIN_MODEL_DAYS: i64 = 7;
+/// 专属周限额的每条份额要当前窗口里这个模型至少发过这么多条、且已用至少这么多个百分点才给。
+const SCOPED_MIN_SENT: usize = 10;
+const SCOPED_MIN_USED_PCT: f64 = 5.0;
 /// 周窗口的名义长度。实际窗口可能更短（平台会主动提前重置）,所以它只当上界用。
 const WEEK_SECS: i64 = 7 * 86_400;
 
@@ -330,6 +333,11 @@ pub struct MessageCostRow {
     pub pct_per_turn: f64,
     /// 一条消息吃掉**周**窗口的百分点（周系数样本不够时 `None`,且只在带 `week` 查询时给）。
     pub pct_per_turn_week: Option<f64>,
+    /// 这个模型**自己的**周限额窗口（如 Claude Fable 的 `7d_fable`;没有 = `None`）。
+    /// 它与全模型周限额同时生效,哪条先到顶算哪条——展示层两者取紧的那个。
+    pub scoped_kind: Option<String>,
+    /// 一条消息吃掉那条专属周限额的百分点（样本不够 = `None`,展示层只看全模型周限额）。
+    pub pct_per_turn_scoped: Option<f64>,
 }
 
 /// `get_message_budget` 的出口：分模型的「一条消息吃掉多少额度」。
@@ -439,6 +447,7 @@ pub fn get_message_budget(
             (
                 super::calib::week_scale_from_store(&store, platform),
                 store.quota_readings(platform, "7d", i64::MIN / 2, i64::MAX / 2),
+                store.load_snapshot(platform).map(|s| s.windows).unwrap_or_default(),
             )
         });
         (factors, week_data)
@@ -452,8 +461,8 @@ pub fn get_message_budget(
         pairs >= super::calib::CALIBRATED_PAIRS,
         &factors,
     );
-    if let Some((fit, readings)) = week_data {
-        budget.attach_week(platform, &parts, &readings, fit, now_ms);
+    if let Some((fit, readings, windows)) = week_data {
+        budget.attach_week(platform, &parts, &readings, fit, &windows, now_ms);
     }
     Ok(budget)
 }
@@ -603,6 +612,8 @@ pub(super) fn message_budget(
                         basis_n: list.len(),
                         pct_per_turn: usd * overhead * quota_factor,
                         pct_per_turn_week: None,
+                        scoped_kind: None,
+                        pct_per_turn_scoped: None,
                     },
                     recent,
                 )
@@ -639,6 +650,7 @@ impl MessageBudget {
         parts: &[crate::collector::store::TurnModelPart],
         readings: &[super::model::QuotaReading],
         fit: Option<(f64, u32)>,
+        windows: &[super::model::QuotaWindow],
         now_ms: i64,
     ) {
         use std::collections::HashMap;
@@ -663,14 +675,36 @@ impl MessageBudget {
             }
         }
         let mut list: Vec<WeekTurns> = counts
-            .into_iter()
-            .map(|(m, n)| WeekTurns {
+            .iter()
+            .map(|(&m, &n)| WeekTurns {
                 model_key: m.to_string(),
                 display_name: names.get(m).cloned().unwrap_or_else(|| m.to_string()),
                 turns: n,
             })
             .collect();
         list.sort_by(|a, b| b.turns.cmp(&a.turns).then(a.model_key.cmp(&b.model_key)));
+
+        // 模型专属周限额（Claude Fable 的 `7d_fable` 等）：每条吃掉多少 = 它的已用 % ÷ 这个模型
+        // 在当前周窗口里已经发了几条——直接,不经过价格。窗口刚开头条数太少 / 读数太低时
+        // 除出来全是噪声,不给（展示层就只看全模型周限额）;已过期的窗口不算。
+        let now = now_ms.div_euclid(1000);
+        for r in &mut self.rows {
+            let key = r.model_key.to_lowercase().replace(['-', '.'], "_");
+            let Some(win) = windows.iter().find(|w| {
+                w.kind
+                    .strip_prefix("7d_")
+                    .is_some_and(|name| !name.is_empty() && key.contains(name))
+            }) else {
+                continue;
+            };
+            r.scoped_kind = Some(win.kind.clone());
+            let live = win.resets_at.is_none_or(|t| t > now);
+            let sent = counts.get(r.model_key.as_str()).copied().unwrap_or(0);
+            if live && sent >= SCOPED_MIN_SENT && win.used_percent >= SCOPED_MIN_USED_PCT {
+                r.pct_per_turn_scoped = Some(win.used_percent / sent as f64);
+            }
+        }
+
         self.week = Some(WeekForecast {
             scale,
             pairs,
@@ -1337,6 +1371,37 @@ mod tests {
         assert_eq!(w.resets_at, Some(ea));
     }
 
+    /// 模型专属周限额：已用 % ÷ 这个模型本周已发条数;条数太少不给;名字挂到含它的模型键上。
+    #[test]
+    fn a_model_scoped_weekly_limit_is_measured_per_message() {
+        use crate::subscription::model::QuotaWindow;
+        const NOW: i64 = 1_800_000_000_000;
+        let start = NOW / 1000 - D;
+        let parts: Vec<TurnModelPart> =
+            (0..20).map(|i| part("a", i, true, "claude-steady-1", 1_000_000, NOW - 1000)).collect();
+        let rows = price::two_segment_fixture(NOW / 1000 + D);
+        let mut b = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true, &no_factors())
+        });
+        let readings = vec![rd(start + 60, 3.0, Some(start + 7 * D), "max")];
+        let windows = vec![
+            QuotaWindow { kind: "7d".into(), used_percent: 40.0, resets_at: Some(start + 7 * D) },
+            QuotaWindow { kind: "7d_steady".into(), used_percent: 50.0, resets_at: Some(start + 7 * D) },
+        ];
+        price::with_rows(&rows, || b.attach_week(Platform::Claude, &parts, &readings, None, &windows, NOW));
+        let r = &b.rows[0];
+        assert_eq!(r.scoped_kind.as_deref(), Some("7d_steady"));
+        assert!((r.pct_per_turn_scoped.unwrap() - 2.5).abs() < 1e-9, "50% ÷ 20 条");
+        // 条数不够：只挂窗口,不给份额
+        let few = &parts[..5];
+        let mut b2 = price::with_rows(&rows, || {
+            message_budget(Platform::Claude, "x".into(), few, NOW, 1.0, true, &no_factors())
+        });
+        price::with_rows(&rows, || b2.attach_week(Platform::Claude, few, &readings, None, &windows, NOW));
+        assert_eq!(b2.rows[0].scoped_kind.as_deref(), Some("7d_steady"));
+        assert_eq!(b2.rows[0].pct_per_turn_scoped, None);
+    }
+
     /// 窗尾已过、新窗口还没读到：窗尾记一次按期重置,窗口从那里起算,窗尾未知。
     #[test]
     fn an_expired_window_resets_at_its_tail() {
@@ -1361,7 +1426,7 @@ mod tests {
             message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true, &no_factors())
         });
         let readings = vec![rd(start + 60, 3.0, Some(start + 7 * D), "max")];
-        price::with_rows(&rows, || b.attach_week(Platform::Claude, &parts, &readings, Some((0.1, 30)), NOW));
+        price::with_rows(&rows, || b.attach_week(Platform::Claude, &parts, &readings, Some((0.1, 30)), &[], NOW));
         let w = b.week.as_ref().unwrap();
         assert_eq!(w.start, Some(start));
         assert_eq!(w.total_turns, 5, "窗口起点之前的 3 轮不算");
@@ -1374,7 +1439,7 @@ mod tests {
         let mut b2 = price::with_rows(&rows, || {
             message_budget(Platform::Claude, "x".into(), &parts, NOW, 1.0, true, &no_factors())
         });
-        price::with_rows(&rows, || b2.attach_week(Platform::Claude, &parts, &readings, None, NOW));
+        price::with_rows(&rows, || b2.attach_week(Platform::Claude, &parts, &readings, None, &[], NOW));
         assert_eq!(b2.rows[0].pct_per_turn_week, None);
     }
 }

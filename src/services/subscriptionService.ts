@@ -288,6 +288,11 @@ export interface MessageCostRow {
   pct_per_turn: number
   /** 一条消息吃掉周窗口的百分点（周系数样本不够 / 没带 week 查询 → null）。 */
   pct_per_turn_week: number | null
+  /** 这个模型自己的周限额窗口（如 Claude Fable 的 '7d_fable'；没有 = null）。与全模型周限额
+   * 同时生效，展示层两者取紧的那个。 */
+  scoped_kind: string | null
+  /** 一条消息吃掉那条专属周限额的百分点（本周样本不够 = null → 只看全模型周限额）。 */
+  pct_per_turn_scoped: number | null
 }
 
 /** 一次周重置（Rust query:WeekReset）。 */

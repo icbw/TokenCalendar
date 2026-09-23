@@ -22,7 +22,7 @@ import { useLayoutEffect } from 'react'
 import { events, subscriptionService, windowService, type OrbDockState, type SubscriptionPlatform, type SubscriptionSnapshot } from '../../services'
 import { getDesignPrefs, orbIdleEnabled, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import type { MessageBudget } from '../../services/subscriptionService'
-import { budgetLine, pickBudgetRows } from './messageBudget'
+import { budgetLine, pickBudgetRows, remainOfWindow, weekBudgetLine } from './messageBudget'
 import { deriveWidgetTheme } from '../settings/widgetTheme'
 import { useShowOnLoad } from '../window/useShowOnLoad'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
@@ -462,7 +462,7 @@ export default function OrbWindow() {
     }
     let stale = false
     subscriptionService
-      .getMessageBudget(budgetPlatform)
+      .getMessageBudget(budgetPlatform, true)
       .then((b) => !stale && setBudget(b))
       .catch(() => {})
     return () => {
@@ -807,17 +807,6 @@ export default function OrbWindow() {
     lines: [hint.text],
     level: hint.level,
   }
-  const weeklyTip: TipContent = weekIdle
-    ? { label: 'Weekly quota', lines: ['idle — updates after first use'] }
-    : w7d
-      ? {
-          label: 'Weekly quota',
-          lines: [
-            `${pctText(remain7d)} / 100 left`,
-            ...(weekReset ? [`resets in ${weekReset}`] : []),
-          ],
-        }
-      : statusTip
   // 剩余消息数行：`GPT-6 Astra: ~3/30`（剩余 / 满窗口,只数用户轮）。平台不对（切换途中
   // 预算还是上一个平台的）或读数缺席时不出——宁可少一行,不印错的数。
   const budgetRows =
@@ -826,6 +815,33 @@ export default function OrbWindow() {
       : []
   const fiveBudgetLines = (remain: number | null) =>
     remain === null ? [] : budgetRows.map((r) => budgetLine(r, remain))
+  // 周 hover:全模型周额度 + 模型专属周限额（Claude Fable 那条,平台另算、同时生效）+ 各模型
+  // 约剩 / 满窗条数（两条限额取紧的那条,见 weekCounts）。
+  const nowSec = Date.now() / 1000
+  const scopedLines = (snap?.windows ?? [])
+    .filter((w) => w.kind.startsWith('7d_') && w.kind !== '7d_opus' && w.kind !== '7d_sonnet')
+    .map((w) => {
+      const r = remainOfWindow(snap?.windows, w.kind, nowSec)
+      const name = w.kind.slice(3).replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
+      return r === null ? null : `${name} limit ${pctText(r)} / 100 left`
+    })
+    .filter((l): l is string => l !== null)
+  const weekBudgetLines = budgetRows
+    .map((r) => weekBudgetLine(r, snap?.windows, nowSec))
+    .filter((l): l is string => l !== null)
+  const weeklyTip: TipContent = weekIdle
+    ? { label: 'Weekly quota', lines: ['idle — updates after first use'] }
+    : w7d
+      ? {
+          label: 'Weekly quota',
+          lines: [
+            `${pctText(remain7d)} / 100 left`,
+            ...(weekReset ? [`resets in ${weekReset}`] : []),
+            ...scopedLines,
+            ...weekBudgetLines,
+          ],
+        }
+      : statusTip
   const fiveTip: TipContent = fiveIdle
     ? { label: '5-hour quota', lines: ['idle — updates after first use', ...fiveBudgetLines(100)] }
     : w5h

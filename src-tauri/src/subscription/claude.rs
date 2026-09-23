@@ -29,6 +29,12 @@ fn ua_usage() -> String {
     format!("claude-code/{CLAUDE_CODE_VERSION}")
 }
 
+/// 真库 smoke 用（与线上同一个 UA,别在测试里另写一份版本号）。
+#[cfg(test)]
+pub(super) fn ua_usage_for_smoke() -> String {
+    ua_usage()
+}
+
 /// OAuth 刷新端点 UA（走的是另一套桶：`claude-cli/... （external, cli)`）。
 pub(super) fn ua_cli() -> String {
     format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)")
@@ -171,8 +177,10 @@ pub fn parse_usage(cred: &super::credentials::RawCredential, body: &str, now: i6
     let mut windows = vec![];
     // 只取语义明确的三个窗口：omelette / cowork / 各种代号窗口（nimbus_quill 等）
     // 是活动型/实验型限额,归到 "7d_opus" 属错标,一律不取。
-    // 注：新响应另带 `limits[]`（session / weekly_all / weekly_scoped）结构化视图,
-    // 目前与上述三个窗口同源,故仍按旧键解析（端点改版时再迁）。
+    // 注：新响应另带 `limits[]`（session / weekly_all / weekly_scoped）结构化视图;
+    // session / weekly_all 与上面的旧键同源,仍按旧键解析。`weekly_scoped` 是**逐模型的独立
+    // 周限额**（Max 5x 上 Fable 有自己的一条,与全模型周限额同时生效、各算各的）,
+    // 旧键里没有它,见 [`scoped_windows`]。
     for (key, kind) in [
         ("five_hour", "5h"),
         ("seven_day", "7d"),
@@ -188,6 +196,12 @@ pub fn parse_usage(cred: &super::credentials::RawCredential, body: &str, now: i6
             .and_then(|x| x.as_str())
             .and_then(rfc3339_to_unix);
         windows.push(QuotaWindow { kind: kind.into(), used_percent: util, resets_at });
+    }
+
+    for w in scoped_windows(&v) {
+        if !windows.iter().any(|x| x.kind == w.kind) {
+            windows.push(w);
+        }
     }
 
     if windows.is_empty() {
@@ -228,5 +242,66 @@ fn error_snapshot(status: FetchStatus) -> SubscriptionSnapshot {
         fetched_at: None,
         status,
         source: SnapshotSource::Api,
+    }
+}
+
+/// 模型专属周限额的窗口种类：`7d_` + 模型名（小写,非字母数字换成 `_`）,如 Fable → `7d_fable`。
+/// 展示层按「模型键里含这个名字」把它挂到对应模型上。
+pub fn scoped_kind(model_name: &str) -> String {
+    let slug: String = model_name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("7d_{slug}")
+}
+
+/// `limits[]` 里**按模型划定**的周限额（`kind = weekly_scoped` 且 `scope.model` 有名字）。
+///
+/// 形状：
+/// `{"kind":"weekly_scoped","percent":94,"resets_at":"…","scope":{"model":{"display_name":"Fable","id":null},"surface":null}}`。
+/// 按 surface 划定的（`scope.surface`）不取——它不是某个模型的额度,挂不到消息数上。
+fn scoped_windows(v: &serde_json::Value) -> Vec<QuotaWindow> {
+    let Some(limits) = v.get("limits").and_then(|x| x.as_array()) else {
+        return vec![];
+    };
+    limits
+        .iter()
+        .filter(|l| l.get("kind").and_then(|x| x.as_str()) == Some("weekly_scoped"))
+        .filter_map(|l| {
+            let name = l.pointer("/scope/model/display_name").and_then(|x| x.as_str())?;
+            let used = l.get("percent").and_then(|x| x.as_f64())?;
+            let resets_at = l.get("resets_at").and_then(|x| x.as_str()).and_then(rfc3339_to_unix);
+            Some(QuotaWindow { kind: scoped_kind(name), used_percent: used, resets_at })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 实测响应的形状：Fable 的独立周限额读成 `7d_fable`;全模型周限额与按 surface 的不取。
+    #[test]
+    fn weekly_scoped_limits_become_their_own_windows() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"limits":[
+                {"kind":"session","percent":16,"resets_at":"2026-09-23T12:40:00+00:00","scope":null},
+                {"kind":"weekly_all","percent":81,"resets_at":"2026-09-23T15:00:00+00:00","scope":null},
+                {"kind":"weekly_scoped","percent":94,"resets_at":"2026-09-23T15:00:00.094370+00:00",
+                 "scope":{"model":{"display_name":"Fable","id":null},"surface":null}},
+                {"kind":"weekly_scoped","percent":10,"resets_at":null,
+                 "scope":{"model":null,"surface":{"display_name":"Cowork"}}}
+            ]}"#,
+        )
+        .unwrap();
+        let w = scoped_windows(&v);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].kind, "7d_fable");
+        assert_eq!(w[0].used_percent, 94.0);
+        assert_eq!(w[0].resets_at, rfc3339_to_unix("2026-09-23T15:00:00+00:00"));
+        assert!(scoped_windows(&serde_json::json!({})).is_empty(), "老响应没有 limits[] 不报错");
+        assert_eq!(scoped_kind("Opus 5"), "7d_opus_5");
     }
 }

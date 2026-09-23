@@ -16,7 +16,7 @@ import { events, subscriptionService } from '../../services'
 import type { SubscriptionPlatform, SubscriptionSnapshot } from '../../services'
 import type { MessageBudget, MessageCostRow } from '../../services/subscriptionService'
 import type { DayRange } from '../../services/types'
-import { abbrevCount, shortModelName } from '../orb/messageBudget'
+import { abbrevCount, shortModelName, weekCounts } from '../orb/messageBudget'
 import { colorFor } from './charts'
 
 const PLATFORM_LABEL: Record<SubscriptionPlatform, string> = { codex: 'Codex', claude: 'Claude' }
@@ -41,6 +41,25 @@ function basisText(r: MessageCostRow): string {
   if (r.basis === 'recent_own') return `Sized on your last ${r.basis_n} ${name} messages (last 14 days)`
   if (r.basis === 'history_own') return `Sized on your ${r.basis_n} ${name} messages from the last 30 days (little recent use)`
   return `Sized on all your ${r.basis_n} recent messages, priced for ${name} (too few of its own)`
+}
+
+/** 周一格：全模型周限额与模型专属周限额（Claude Fable 那条）取紧的那条。 */
+function weekCell(r: MessageCostRow, windows: SubscriptionSnapshot['windows'] | undefined, nowSec: number): string {
+  const c = weekCounts(r, windows, nowSec)
+  if (!c) return '—'
+  const full = abbrevCount(Math.round(c.full))
+  return c.left === null ? `— / ${full}` : `~${abbrevCount(c.left)} / ${full}`
+}
+
+/** 周一格的悬停说明：是哪条限额在卡。 */
+function weekTitle(r: MessageCostRow, windows: SubscriptionSnapshot['windows'] | undefined, nowSec: number): string {
+  const c = weekCounts(r, windows, nowSec)
+  if (!c || !r.scoped_kind) return ''
+  const name = r.scoped_kind.slice(3).replace(/_/g, ' ').replace(/^\w/, (ch) => ch.toUpperCase())
+  if (c.limitedBy === 'own') return `Limited by the separate ${name} weekly limit, which is tighter than the all-models one`
+  return r.pct_per_turn_scoped
+    ? `The all-models weekly limit is tighter than the separate ${name} one`
+    : `${name} also has its own weekly limit; too few ${name} messages this week to size it yet`
 }
 
 /** 「~剩 / 满」一格;每条代价未知 → —。 */
@@ -130,6 +149,23 @@ export default function MessagesCard({ platform, range, refreshTick }: {
               <span className="price-total-label">Weekly left</span>
               <span className="price-total-value">{remain7d === null ? '—' : `${Math.round(remain7d)}%`}</span>
             </div>
+            {/* 模型专属周限额（Claude Fable 那条）：与全模型周额度同时生效、各算各的*/}
+            {(snap?.windows ?? [])
+              .filter((w) => w.kind.startsWith('7d_') && w.kind !== '7d_opus' && w.kind !== '7d_sonnet')
+              .map((w) => {
+                const name = w.kind.slice(3).replace(/_/g, ' ').replace(/^\w/, (ch) => ch.toUpperCase())
+                const r = remainOf(snap, w.kind, nowSec)
+                return (
+                  <div
+                    key={w.kind}
+                    className="price-total-item"
+                    title={`${name} has its own weekly limit on top of the all-models one; whichever runs out first stops ${name}`}
+                  >
+                    <span className="price-total-label">{name} limit left</span>
+                    <span className="price-total-value">{r === null ? '—' : `${Math.round(r)}%`}</span>
+                  </div>
+                )
+              })}
             <div
               className="price-total-item"
               title="Messages you sent since the current weekly window started, on this account"
@@ -177,7 +213,7 @@ export default function MessagesCard({ platform, range, refreshTick }: {
                     {shortModelName(r.model_key)}
                   </td>
                   <td>{pair(remain5h, r.pct_per_turn)}</td>
-                  <td>{pair(remain7d, r.pct_per_turn_week)}</td>
+                  <td title={weekTitle(r, snap?.windows, nowSec)}>{weekCell(r, snap?.windows, nowSec)}</td>
                   <td>{(sent.get(r.model_key) ?? 0).toLocaleString('en-US')}</td>
                 </tr>
               ))}

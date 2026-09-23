@@ -2570,7 +2570,8 @@ fn message_budget_on_real_db() {
             &super::calib::model_scales_from_store(&s, p),
         );
         let readings = s.quota_readings(p, "7d", i64::MIN / 2, i64::MAX / 2);
-        b.attach_week(p, &parts, &readings, super::calib::week_scale_from_store(&s, p), now_ms);
+        let windows = s.load_snapshot(p).map(|x| x.windows).unwrap_or_default();
+        b.attach_week(p, &parts, &readings, super::calib::week_scale_from_store(&s, p), &windows, now_ms);
         println!(
             "--- {} --- 切片 {} 条  样本 {} 条消息  scale {:.4} %/$（{} 样本）  开销 ×{:.3}  主力 {:?}",
             p.as_str(),
@@ -2618,6 +2619,9 @@ fn message_budget_on_real_db() {
                 100.0 / r.pct_per_turn,
                 r.pct_per_turn_week.map_or(f64::NAN, |w| 100.0 / w)
             );
+            if let Some(k) = &r.scoped_kind {
+                println!("      专属周限额 {k}: 一条 {:?}% → 满窗 ≈ {:?} 条", r.pct_per_turn_scoped, r.pct_per_turn_scoped.map(|p| (100.0 / p).round()));
+            }
             assert!(r.turns >= super::query::BUDGET_MIN_TURNS);
             assert!(r.pct_per_turn > 0.0);
         }
@@ -2626,5 +2630,34 @@ fn message_budget_on_real_db() {
         if let Some(m) = &b.main_model {
             assert!(b.rows.iter().any(|r| &r.model_key == m), "主力模型必须在行里");
         }
+    }
+}
+
+/// Claude usage 端点**原始响应**（仅本机手动诊断：看平台新增了哪些限额字段,如逐模型周限额）。
+/// 走与 app 完全相同的凭据读取与请求头;只打印响应体（不含任何凭据）。发一次真实请求。
+#[test]
+#[ignore]
+fn claude_usage_raw_response() {
+    let Some(cred) = super::credentials::read_credential(Platform::Claude) else {
+        eprintln!("本机没有 Claude 凭据,跳过");
+        return;
+    };
+    let agent = super::http_agent().expect("http agent");
+    let resp = agent
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .set("Authorization", &format!("Bearer {}", cred.access_token))
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/json")
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", &super::claude::ua_usage_for_smoke())
+        .timeout(std::time::Duration::from_secs(15))
+        .call();
+    match resp {
+        Ok(r) => {
+            let body = r.into_string().unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        }
+        Err(e) => println!("请求失败：{e}"),
     }
 }
