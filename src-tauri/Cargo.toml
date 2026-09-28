@@ -1,6 +1,6 @@
 [package]
 name = "tokencalendar"
-version = "0.9.6"
+version = "0.9.8"
 description = "TokenCalendar — desktop widget for AI agent token usage"
 license = "MIT"
 edition = "2021"
@@ -38,6 +38,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globali
 # ——apply_mica/apply_acrylic 的 Win32 路径与版本门槛（17763/22000/22523）已按
 # 该版本源码核实，不走 tauri set_effects 的间接映射层。
 window-vibrancy = "0.6"
+
+# 关闭 debug 增量编译：target/debug/incremental 会按配置组合无限累积（曾涨到 82 GB）。
+[profile.dev]
+incremental = false
 
 [profile.release]
 codegen-units = 1

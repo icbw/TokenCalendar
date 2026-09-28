@@ -303,6 +303,9 @@ fn main() {
             // 状态全部就位（窗口状态 / 采集读连接 / 订阅）后才放行前端 IPC——早到的调用
             // 此刻按序重放,读到的是恢复后的状态而非 AppState 初值
             setup_gate.open();
+            // 显示看门狗：前端 window_ready 缺席（开机自启系统忙、WebView2 慢/卡）
+            // 时兜底补显示,防止「标志说可见、窗口实际没显示」（悬浮球自启后不出现）
+            visibility::spawn_show_watchdog(handle.clone());
             Ok(())
         })
         .on_window_event(|window, event| match event {

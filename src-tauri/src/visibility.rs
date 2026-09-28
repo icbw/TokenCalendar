@@ -114,7 +114,52 @@ pub fn ready(window: &WebviewWindow) {
     let state = app.state::<AppState>();
     if is_visible(&state, label) {
         let _ = window.show();
+        // orb 补显隐钩子（与 set_visible 同款）：tao 的 show 会 apply_diff 把整组
+        // 带框样式写回并触发框架重算（region 被重置回整窗）——托盘召回走
+        // set_visible 有钩子兜，启动首秀走这里也必须有，两条路径副作用一致。
+        if label == ORB_LABEL {
+            crate::orb_dock::reset_pointer_pass(window, true);
+        }
     }
+}
+
+/// 启动显示看门狗（setup 末尾 spawn）：前端 window_ready 缺席的兜底。
+///
+/// 背景：首次显示的唯一路径是「前端首帧 → window_ready IPC → ready show」。
+/// 开机自启时系统忙，WebView2 逐窗初始化慢、页面加载与 IPC 往返都可能缺席或
+/// 迟到（orb 还多一层 get_orb_form 前置），这条链一旦断掉，后端没有任何机制
+/// 会发现「标志说可见、窗口实际没显示」——悬浮球就停在不可，直到用户手动
+/// 托盘开关（自启后托盘在、悬浮球不在）。手动启动 WebView2 秒级
+/// 就绪，链路瞬间闭合，所以从未暴露。
+///
+/// 做法：延迟两轮（8s / 25s）核对全部窗口——「可见性标志 = true 但窗口实际
+/// 隐藏」即统一 set_visible（true) 补显示（含 orb 钩子 / 落盘 / 托盘同步 /
+/// 事件广播）。安全性：前端正常路径（毫秒级 ready）下窗口已显示，核对跳过、
+/// 零干预；用户若先手动隐藏（标志翻 false）自动豁免；两轮后不再干预。
+pub fn spawn_show_watchdog(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        // 第一轮 8s 兜住大多数慢启动；第二轮累计 25s 兜极端慢（登入瞬间
+        // 磁盘/CPU 饱和、杀软扫描）。再晚的缺席说明前端已死透，强 show 也
+        // 只是空窗，交给用户手动处理。
+        const CHECK_DELAYS_SECS: [u64; 2] = [8, 17];
+        for delay in CHECK_DELAYS_SECS {
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+            let Some(state) = app.try_state::<AppState>() else { return };
+            for label in [WIDGET_LABEL, MAIN_LABEL, ORB_LABEL, TIMELINE_LABEL] {
+                if !is_visible(&state, label) {
+                    continue;
+                }
+                let Some(window) = app.get_webview_window(label) else { continue };
+                if window.is_visible().unwrap_or(true) {
+                    continue;
+                }
+                crate::dev_log!("[watchdog] {} flagged visible but hidden, forcing show", label);
+                if let Err(e) = set_visible(&app, label, true) {
+                    crate::dev_log!("[watchdog] force show {} failed: {}", label, e);
+                }
+            }
+        }
+    });
 }
 
 #[tauri::command]
