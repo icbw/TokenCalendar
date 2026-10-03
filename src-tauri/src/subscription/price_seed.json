@@ -7,6 +7,8 @@
     "四项 usd_* 均为 **USD / Mtok** 的官方 API 定价,按模型名精确对准、不做归一化",
     "（存绝对价目,不只存派生值）。match_key 是小写子串模式,匹配时**最长键优先**;",
     "effective_from 为 unix 秒,一个模型的一段生效期 = 一行。",
+    "超长上下文档（单次请求输入超过门槛时整请求另一档）= 同族兄弟键 `<match_key>#long`,",
+    "门槛记在该行的 over_tokens（其余行省略该字段 = 0）。",
     "",
     "**本文件不写生成时间**：写了就会每次重跑都产生 diff,而维护契约要求\"只在数据真的",
     "动了时才提交\"。\"什么时候核对的\"由本文件自己的 git 历史回答 —— 定时重跑 + 只在",
@@ -102,6 +104,17 @@
       "source_note": "models.dev/anthropic · claude-sonnet-5 · 上游 last_updated 2026-06-30"
     },
     {
+      "platform": "claude",
+      "match_key": "sonnet-5-5",
+      "effective_from": 1790553600,
+      "display_name": "Claude Sonnet 5.5",
+      "usd_input": 2,
+      "usd_output": 10,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/anthropic · claude-sonnet-5-5 · 上游 last_updated 2026-09-28"
+    },
+    {
       "platform": "codex",
       "match_key": "gpt-5",
       "effective_from": 1754524800,
@@ -165,7 +178,7 @@
       "usd_output": 15,
       "usd_cache_read": 0.25,
       "usd_cache_write": 0,
-      "source_note": "models.dev/openai · gpt-5.4 · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.4 · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · 超长上下文档(输入>272K)见 gpt-5-4#long"
     },
     {
       "platform": "codex",
@@ -198,7 +211,31 @@
       "usd_output": 180,
       "usd_cache_read": 0,
       "usd_cache_write": 0,
-      "source_note": "models.dev/openai · gpt-5.4-pro · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.4-pro · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 超长上下文档(输入>272K)见 gpt-5-4-pro#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4-pro#long",
+      "effective_from": 1772668800,
+      "display_name": "GPT-5.4 Pro (>272K)",
+      "usd_input": 60,
+      "usd_output": 270,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.4-pro · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-4#long",
+      "effective_from": 1772668800,
+      "display_name": "GPT-5.4 (>272K)",
+      "usd_input": 5,
+      "usd_output": 22.5,
+      "usd_cache_read": 0.5,
+      "usd_cache_write": 0,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.4 · 上游 last_updated 2026-03-05 · cache_write:上游无此项(不计价) · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -209,7 +246,7 @@
       "usd_output": 30,
       "usd_cache_read": 0.5,
       "usd_cache_write": 0,
-      "source_note": "models.dev/openai · gpt-5.5 · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.5 · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · 超长上下文档(输入>272K)见 gpt-5-5#long"
     },
     {
       "platform": "codex",
@@ -220,7 +257,31 @@
       "usd_output": 180,
       "usd_cache_read": 0,
       "usd_cache_write": 0,
-      "source_note": "models.dev/openai · gpt-5.5-pro · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.5-pro · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 超长上下文档(输入>272K)见 gpt-5-5-pro#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-5-pro#long",
+      "effective_from": 1776902400,
+      "display_name": "GPT-5.5 Pro (>272K)",
+      "usd_input": 60,
+      "usd_output": 270,
+      "usd_cache_read": 0,
+      "usd_cache_write": 0,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.5-pro · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · cache_read:上游无此项(不计价) · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-5#long",
+      "effective_from": 1776902400,
+      "display_name": "GPT-5.5 (>272K)",
+      "usd_input": 10,
+      "usd_output": 45,
+      "usd_cache_read": 1,
+      "usd_cache_write": 0,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.5 · 上游 last_updated 2026-04-23 · cache_write:上游无此项(不计价) · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -231,7 +292,7 @@
       "usd_output": 20,
       "usd_cache_read": 0.4,
       "usd_cache_write": 5,
-      "source_note": "models.dev/openai · gpt-5.6 · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.6 · 上游 last_updated 2026-07-09 · 超长上下文档(输入>272K)见 gpt-5-6#long"
     },
     {
       "platform": "codex",
@@ -242,7 +303,19 @@
       "usd_output": 1.2,
       "usd_cache_read": 0.02,
       "usd_cache_write": 0.25,
-      "source_note": "models.dev/openai · gpt-5.6-luna · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.6-luna · 上游 last_updated 2026-07-09 · 超长上下文档(输入>272K)见 gpt-5-6-luna#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-luna#long",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Luna (>272K)",
+      "usd_input": 0.4,
+      "usd_output": 1.8,
+      "usd_cache_read": 0.04,
+      "usd_cache_write": 0.5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.6-luna · 上游 last_updated 2026-07-09 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -253,7 +326,19 @@
       "usd_output": 20,
       "usd_cache_read": 0.4,
       "usd_cache_write": 5,
-      "source_note": "models.dev/openai · gpt-5.6-sol · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.6-sol · 上游 last_updated 2026-07-09 · 超长上下文档(输入>272K)见 gpt-5-6-sol#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-sol#long",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Sol (>272K)",
+      "usd_input": 8,
+      "usd_output": 30,
+      "usd_cache_read": 0.8,
+      "usd_cache_write": 10,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.6-sol · 上游 last_updated 2026-07-09 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -264,7 +349,31 @@
       "usd_output": 12,
       "usd_cache_read": 0.2,
       "usd_cache_write": 2.5,
-      "source_note": "models.dev/openai · gpt-5.6-terra · 上游 last_updated 2026-07-09 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-5.6-terra · 上游 last_updated 2026-07-09 · 超长上下文档(输入>272K)见 gpt-5-6-terra#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6-terra#long",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 Terra (>272K)",
+      "usd_input": 4,
+      "usd_output": 18,
+      "usd_cache_read": 0.4,
+      "usd_cache_write": 5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.6-terra · 上游 last_updated 2026-07-09 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-5-6#long",
+      "effective_from": 1783555200,
+      "display_name": "GPT-5.6 (>272K)",
+      "usd_input": 8,
+      "usd_output": 30,
+      "usd_cache_read": 0.8,
+      "usd_cache_write": 10,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-5.6 · 上游 last_updated 2026-07-09 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -301,6 +410,29 @@
     },
     {
       "platform": "codex",
+      "match_key": "gpt-6-1-sol",
+      "effective_from": 1790640000,
+      "display_name": "GPT-6.1 Sol",
+      "usd_input": 2,
+      "usd_output": 10,
+      "usd_cache_read": 0.1,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/openai · gpt-6.1-sol · 上游 last_updated 2026-09-29 · 超长上下文档(输入>272K)见 gpt-6-1-sol#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-1-sol#long",
+      "effective_from": 1790640000,
+      "display_name": "GPT-6.1 Sol (>272K)",
+      "usd_input": 4,
+      "usd_output": 15,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6.1-sol · 上游 last_updated 2026-09-29 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
       "match_key": "gpt-6-astra",
       "effective_from": 1788480000,
       "display_name": "GPT-6 Astra",
@@ -308,7 +440,19 @@
       "usd_output": 50,
       "usd_cache_read": 1,
       "usd_cache_write": 12.5,
-      "source_note": "models.dev/openai · gpt-6-astra · 上游 last_updated 2026-09-04 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openai · gpt-6-astra · 上游 last_updated 2026-09-04 · 超长上下文档(输入>272K)见 gpt-6-astra#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-astra#long",
+      "effective_from": 1788480000,
+      "display_name": "GPT-6 Astra (>272K)",
+      "usd_input": 20,
+      "usd_output": 75,
+      "usd_cache_read": 2,
+      "usd_cache_write": 25,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6-astra · 上游 last_updated 2026-09-04 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -319,7 +463,19 @@
       "usd_output": 0.5,
       "usd_cache_read": 0.01,
       "usd_cache_write": 0.125,
-      "source_note": "models.dev/openrouter · openai/gpt-6-luna · 上游 last_updated 2026-09-22 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openrouter · openai/gpt-6-luna · 上游 last_updated 2026-09-22 · 超长上下文档(输入>272K)见 gpt-6-luna#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-luna#long",
+      "effective_from": 1790035200,
+      "display_name": "GPT-6 Luna (>272K)",
+      "usd_input": 0.2,
+      "usd_output": 0.75,
+      "usd_cache_read": 0.02,
+      "usd_cache_write": 0.25,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6-luna · 上游 last_updated 2026-09-22 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",
@@ -330,7 +486,19 @@
       "usd_output": 10,
       "usd_cache_read": 0.2,
       "usd_cache_write": 2.5,
-      "source_note": "models.dev/openrouter · openai/gpt-6-sol · 上游 last_updated 2026-09-22 · 长上下文档位 272k:上游有,本版未实现"
+      "source_note": "models.dev/openrouter · openai/gpt-6-sol · 上游 last_updated 2026-09-22 · 超长上下文档(输入>272K)见 gpt-6-sol#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-sol#long",
+      "effective_from": 1790035200,
+      "display_name": "GPT-6 Sol (>272K)",
+      "usd_input": 4,
+      "usd_output": 15,
+      "usd_cache_read": 0.4,
+      "usd_cache_write": 5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6-sol · 上游 last_updated 2026-09-22 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     }
   ]
 }

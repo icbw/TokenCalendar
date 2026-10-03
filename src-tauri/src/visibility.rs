@@ -27,7 +27,7 @@ fn label_ok(label: &str) -> bool {
     label == WIDGET_LABEL || label == MAIN_LABEL || label == ORB_LABEL || label == TIMELINE_LABEL
 }
 
-fn is_visible(state: &AppState, label: &str) -> bool {
+pub(crate) fn is_visible(state: &AppState, label: &str) -> bool {
     match label {
         WIDGET_LABEL => state.widget_visible.load(Ordering::SeqCst),
         MAIN_LABEL => state.main_visible.load(Ordering::SeqCst),

@@ -35,7 +35,7 @@ use super::price;
 ///
 /// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
 /// 基准）,存量行不变,下一次 refit 自动用新先验。
-pub const WEIGHT_VERSION: u32 = 4;
+pub const WEIGHT_VERSION: u32 = 6;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
@@ -124,17 +124,43 @@ impl Priced {
     }
 }
 
+fn is_auto_review(platform: Platform, model_key: &str) -> bool {
+    matches!(platform, Platform::Codex) && price::normalized(model_key).contains(AUTO_REVIEW)
+}
+
+/// 超长上下文档：单次调用的**提示长度**（含缓存的全部输入 token）超过该模型的门槛时,
+/// 那次调用的 token 要记到 `<模型>#long` 名下（价目表里有同族的 `#long` 行,单价另一档）。
+/// 没有超长档的模型 / 没越线 / 键已带后缀 ⇒ 原样返回。
+///
+/// 只有**看得到单次调用**的采集点才能调它（Codex 的 rollout 每条 `token_count` 是一次调用）;
+/// 按小时 / 按轮汇总之后就分不出哪次越线了。`at` = 该调用的时刻。
+pub fn tag_long(platform: Platform, model_key: &str, prompt_tokens: i64, at: i64) -> String {
+    if model_key.ends_with(price::LONG_SUFFIX) {
+        return model_key.to_string();
+    }
+    // 路由标签按它路由到的模型判门槛（与 `priced_at` 的折价同一条路径）
+    let lookup = if is_auto_review(platform, model_key) { AUTO_REVIEW_ROUTES_TO } else { model_key };
+    match price::long_threshold(platform, lookup, at) {
+        Some(over) if prompt_tokens > over => format!("{model_key}{}", price::LONG_SUFFIX),
+        _ => model_key.to_string(),
+    }
+}
+
 /// 取该模型在该时刻实际生效的一组单价（口径见 [`Priced`]）。
 pub fn priced_at(platform: Platform, model_key: &str, at: i64) -> Priced {
     let fb = match platform {
         Platform::Claude => CLAUDE_FALLBACK,
         Platform::Codex => CODEX_FALLBACK,
     };
-    let auto_review =
-        matches!(platform, Platform::Codex) && price::normalized(model_key).contains(AUTO_REVIEW);
+    // 超长档键 `<模型>#long`：先剥掉后缀判路由,再把后缀接回去查价——这样路由标签的
+    // 超长档也能落到它路由目标的超长档行;没有超长档行的模型按子串落回基础键的价
+    let long = model_key.ends_with(price::LONG_SUFFIX);
+    let bare = model_key.strip_suffix(price::LONG_SUFFIX).unwrap_or(model_key);
+    let auto_review = is_auto_review(platform, bare);
     // 路由标签:折成当前路由的价,但不给 known——理由见 AUTO_REVIEW
-    let lookup_key = if auto_review { AUTO_REVIEW_ROUTES_TO } else { model_key };
-    match price::price_at(platform, lookup_key, at) {
+    let routed = if auto_review { AUTO_REVIEW_ROUTES_TO } else { bare };
+    let lookup_key = if long { format!("{routed}{}", price::LONG_SUFFIX) } else { routed.to_string() };
+    match price::price_at(platform, &lookup_key, at) {
         Some(r) => Priced {
             effective_from: Some(r.effective_from),
             display_name: r.display_name,
@@ -439,6 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn sonnet_5_5_has_its_own_row_apart_from_sonnet_5() {
+        // 'sonnet-5' 是 'sonnet-5-5' 的子串,没有独立键就会被借走;价目现在相同,展示名与日后调价不能相同
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        let after = 1_790_553_600 + 3_600;
+        let (c, known) = cost_of(Platform::Claude, "claude-sonnet-5-5", &t, after);
+        assert!(known && (c - 14.7).abs() < 1e-12, "得到 {c}");
+        let row = price::price_at(Platform::Claude, "claude-sonnet-5-5", after).expect("有价目");
+        assert_eq!(row.match_key, "sonnet-5-5");
+        let row = price::price_at(Platform::Claude, "claude-sonnet-5", after).expect("有价目");
+        assert_eq!(row.match_key, "sonnet-5");
+    }
+
+    #[test]
+    fn gpt_6_1_sol_reads_cache_at_half_the_gpt_6_sol_rate() {
+        // 6.1 Sol 缓存读 0.1（6 Sol 是 0.2）,其余三项相同;'gpt-6-1-sol' 与 'gpt-6-sol' 互不包含
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        let after = 1_790_640_000 + 3_600;
+        let (c, known) = cost_of(Platform::Codex, "gpt-6.1-sol", &t, after);
+        assert!(known && (c - (2.0 + 10.0 + 0.1 + 2.5)).abs() < 1e-9, "得到 {c}");
+        let (c, _) = cost_of(Platform::Codex, "gpt-6-sol", &t, after);
+        assert!((c - (2.0 + 10.0 + 0.2 + 2.5)).abs() < 1e-9, "6 Sol 不受影响,得到 {c}");
+    }
+
+    #[test]
     fn gpt_6_sizes_are_not_confused_with_5_6() {
         // 键 gpt-6-sol / gpt-5-6-sol 互不包含;每项 100 万 token 求和对账官网短上下文档
         let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
@@ -452,6 +502,83 @@ mod tests {
             let (c, known) = cost_of(Platform::Codex, model, &t, after);
             assert!(known && (c - want).abs() < 1e-9, "{model}: 得到 {c},应为 {want}");
         }
+    }
+
+    /// 100 万 token 每项,按 `at` 时刻算整笔;超长档对账官方页（standard 档）。
+    fn million_each(platform: Platform, model: &str, at: i64) -> (f64, bool) {
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        cost_of(platform, model, &t, at)
+    }
+
+    #[test]
+    fn long_context_rows_price_the_whole_request_at_the_tier() {
+        let after = 1_790_640_000 + 3_600;
+        // GPT-6.1 Sol 超长档 4 / 15 / 0.2 / 5;GPT-6 Sol 4 / 15 / 0.4 / 5;5.5 无缓存写 10 / 45 / 1
+        for (model, want) in [
+            ("gpt-6.1-sol#long", 4.0 + 15.0 + 0.2 + 5.0),
+            ("gpt-6-sol#long", 4.0 + 15.0 + 0.4 + 5.0),
+            ("gpt-6-luna#long", 0.2 + 0.75 + 0.02 + 0.25),
+            ("gpt-5.6-sol#long", 8.0 + 30.0 + 0.8 + 10.0),
+            ("gpt-5.5#long", 10.0 + 45.0 + 1.0),
+        ] {
+            let (c, known) = million_each(Platform::Codex, model, after);
+            assert!(known && (c - want).abs() < 1e-9, "{model}: 得到 {c},应为 {want}");
+        }
+        // 基础键不受影响
+        let (c, _) = million_each(Platform::Codex, "gpt-6.1-sol", after);
+        assert!((c - (2.0 + 10.0 + 0.1 + 2.5)).abs() < 1e-9, "得到 {c}");
+    }
+
+    #[test]
+    fn a_model_without_a_tier_prices_a_long_tag_like_its_base() {
+        // gpt-5.3 没有超长档:带后缀的键按子串落回基础价,不是未知
+        let after = 1_790_640_000 + 3_600;
+        let base = million_each(Platform::Codex, "gpt-5.3-codex", after);
+        let tagged = million_each(Platform::Codex, "gpt-5.3-codex#long", after);
+        assert_eq!(base, tagged);
+        assert!(tagged.1, "价目可信");
+        // Claude 目前没有任何超长档
+        let a = million_each(Platform::Claude, "claude-sonnet-5-5", after);
+        let b = million_each(Platform::Claude, "claude-sonnet-5-5#long", after);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tag_long_only_marks_calls_strictly_over_the_threshold() {
+        let at = 1_790_640_000 + 3_600;
+        let tag = |m: &str, n: i64| tag_long(Platform::Codex, m, n, at);
+        assert_eq!(tag("gpt-6.1-sol", 272_000), "gpt-6.1-sol", "恰好等于门槛不算越线（官方：超过 272K）");
+        assert_eq!(tag("gpt-6.1-sol", 272_001), "gpt-6.1-sol#long");
+        assert_eq!(tag("gpt-6.1-sol", 10_000), "gpt-6.1-sol");
+        assert_eq!(tag("gpt-6.1-sol#long", 10_000), "gpt-6.1-sol#long", "已带后缀原样返回,不会叠两层");
+        // 没有超长档的模型 / 没命中价目键的模型永远不打标
+        assert_eq!(tag("gpt-5.3-codex", 900_000), "gpt-5.3-codex");
+        assert_eq!(tag("some-unknown-model", 900_000), "some-unknown-model");
+        assert_eq!(tag_long(Platform::Claude, "claude-opus-5", 900_000, at), "claude-opus-5");
+    }
+
+    #[test]
+    fn the_auto_review_route_follows_its_target_into_the_long_tier() {
+        // codex-auto-review 路由到 gpt-5.6-luna,超长档也要跟着走;仍标记为不可信
+        let at = 1_790_640_000 + 3_600;
+        let tagged = tag_long(Platform::Codex, "codex-auto-review", 300_000, at);
+        assert_eq!(tagged, "codex-auto-review#long");
+        let p = priced_at(Platform::Codex, &tagged, at);
+        assert_eq!(p.match_key.as_deref(), Some("gpt-5-6-luna#long"));
+        assert!(!p.known);
+        assert!((p.usd_input - 0.4).abs() < 1e-12 && (p.usd_output - 1.8).abs() < 1e-12);
+        assert_eq!(tag_long(Platform::Codex, "codex-auto-review", 100_000, at), "codex-auto-review");
+    }
+
+    #[test]
+    fn a_breakdown_splits_one_model_across_the_tier_boundary() {
+        let at = 1_790_640_000 + 3_600;
+        let mut b = BTreeMap::new();
+        b.insert("gpt-6.1-sol".to_string(), [1_000_000, 0, 0, 0]);
+        b.insert("gpt-6.1-sol#long".to_string(), [1_000_000, 0, 0, 0]);
+        let (total, unknown) = cost_of_breakdown(Platform::Codex, &b, at);
+        assert!((total - (2.0 + 4.0)).abs() < 1e-9, "短档 $2 + 超长档 $4,得到 {total}");
+        assert_eq!(unknown, 0.0);
     }
 
     #[test]

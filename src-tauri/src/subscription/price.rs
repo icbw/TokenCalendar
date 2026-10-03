@@ -45,6 +45,19 @@ pub struct PriceRow {
     /// "什么时候核对的"由 `price_seed.json` 自己的 git 历史回答。
     #[serde(default)]
     pub source_note: String,
+    /// 超长上下文档的门槛（token）：**只有 `<match_key>#long` 行有值**（其余为 0）。单次请求的
+    /// 提示长度超过它时,整请求按这一行的单价计——OpenAI 对 GPT-5.4 以来的模型都有这一档。
+    #[serde(default)]
+    pub over_tokens: i64,
+}
+
+/// 超长上下文档的键后缀：模型 `gpt-6.1-sol` 的超长档行 = `gpt-6-1-sol#long`,计价侧把越线
+/// 调用的 token 记到 `gpt-6.1-sol#long` 名下,其余一切仍按模型键走。
+pub const LONG_SUFFIX: &str = "#long";
+
+/// 该价目行是不是某个模型的超长档行（价目表展示据此并进原模型、不单列一行）。
+pub fn is_long_tier(row: &PriceRow) -> bool {
+    row.over_tokens > 0 || row.match_key.ends_with(LONG_SUFFIX)
 }
 
 #[derive(serde::Deserialize)]
@@ -139,6 +152,35 @@ fn pick<'a>(groups: &'a [KeyGroup], k: &str, at: i64) -> Option<&'a PriceRow> {
         .rev()
         .find(|s| s.effective_from <= at)
         .or_else(|| g.segments.first())
+}
+
+/// 在当前生效的索引（或单测夹具）上跑一次纯查表。
+fn with_groups<T>(platform: Platform, f: impl Fn(&[KeyGroup]) -> Option<T>) -> Option<T> {
+    #[cfg(test)]
+    if let Some(r) = OVERRIDE.with(|o| {
+        o.borrow().as_ref().map(|idx| idx.by_platform.get(&platform).and_then(|g| f(g)))
+    }) {
+        return r;
+    }
+    let idx = index();
+    f(idx.by_platform.get(&platform)?)
+}
+
+/// 超长上下文档的门槛：单次请求提示长度**超过**它时,该模型整请求按 `<match_key>#long` 那一档计。
+/// `None` = 没有超长档（或没命中任何价目键）。入参可带 [`LONG_SUFFIX`],等同于不带。
+///
+/// 取段规则与 [`price_at`] 一致（含「`at` 早于首段则取首段」）。
+pub fn long_threshold(platform: Platform, model_key: &str, at: i64) -> Option<i64> {
+    let k = normalized(model_key);
+    let k = k.strip_suffix(LONG_SUFFIX).unwrap_or(&k);
+    with_groups(platform, |groups| {
+        // k 里没有 '#',不可能命中任何 `#long` 组 ⇒ 这里找到的一定是基础键
+        let base = groups.iter().find(|g| k.contains(g.match_key.as_str()))?;
+        let sibling = format!("{}{}", base.match_key, LONG_SUFFIX);
+        let g = groups.iter().find(|g| g.match_key == sibling)?;
+        let seg = g.segments.iter().rev().find(|s| s.effective_from <= at).or_else(|| g.segments.first())?;
+        (seg.over_tokens > 0).then_some(seg.over_tokens)
+    })
 }
 
 /// 从库装载索引（启动时调一次,**必须排在重算之前**）。
@@ -262,6 +304,7 @@ pub(super) fn two_segment_fixture(t: i64) -> Vec<PriceRow> {
         usd_cache_read: usd_input * 0.1,
         usd_cache_write: usd_input * 1.25,
         source_note: "夹具".into(),
+        over_tokens: 0,
     };
     vec![
         base("claude-widget-1", t - 10_000_000, 10.0),

@@ -18,6 +18,7 @@ mod text_scale;
 mod timeline_form;
 mod tray;
 mod visibility;
+mod window_guard;
 mod window_state;
 
 use std::sync::atomic::AtomicBool;
@@ -306,6 +307,9 @@ fn main() {
             // 显示看门狗：前端 window_ready 缺席（开机自启系统忙、WebView2 慢/卡）
             // 时兜底补显示,防止「标志说可见、窗口实际没显示」（悬浮球自启后不出现）
             visibility::spawn_show_watchdog(handle.clone());
+            // 运行期对账：悬浮球 / 时间轴条态的置顶位被外部拿掉或窗口被系统藏起来时补回
+            // （标志与托盘勾选态不会知道——久置后「托盘说开着、屏幕上看不见」）
+            window_guard::spawn(handle.clone());
             Ok(())
         })
         .on_window_event(|window, event| match event {

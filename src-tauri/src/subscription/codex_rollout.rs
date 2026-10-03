@@ -488,6 +488,9 @@ fn parse_call(payload: &Value, t: i64, model: &str) -> Option<Call> {
     let get = |k: &str| usage.get(k).and_then(|x| x.as_i64()).unwrap_or(0).max(0);
     // 两个字段名并存：新格式 cached_input_tokens / 旧 cache_read_input_tokens
     let cache_read = get("cached_input_tokens").max(get("cache_read_input_tokens"));
+    // 提示长度 = `input_tokens` 原值（含缓存）——官方超长档判的就是它。越线的那一次调用整笔
+    // 记到 `<模型>#long` 名下:单次值只有在这里看得,汇总成区间之后就分不出了。
+    let prompt_tokens = get("input_tokens");
     let tokens = [
         (get("input_tokens") - cache_read).max(0),
         get("output_tokens"),
@@ -498,7 +501,7 @@ fn parse_call(payload: &Value, t: i64, model: &str) -> Option<Call> {
         return None;
     }
     let model = if model.is_empty() { UNKNOWN_MODEL } else { model };
-    Some(Call { t, model: model.to_string(), tokens })
+    Some(Call { t, model: cost::tag_long(Platform::Codex, model, prompt_tokens, t), tokens })
 }
 
 /// 纯逻辑：由读数序列 + 调用序列构造标定样本（可单测,不碰 IO）。
@@ -1217,6 +1220,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(out.readings.len(), 1, "坏字节之后的行必须照常读到");
         assert_eq!(out.calls.len(), 1);
+    }
+
+    #[test]
+    fn a_call_over_the_long_context_threshold_is_booked_under_the_long_key() {
+        // 提示长度 = input_tokens 原值（含缓存）;门槛 272K,严格大于才算越线
+        let at = 1_790_640_000 + 3_600; // GPT-6.1 Sol 上线之后
+        let mk = |input: i64, cached: i64| {
+            line(&format!(
+                r#"{{"info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":100}}}}}}"#
+            ))
+        };
+        let long = parse_call(&mk(300_000, 250_000), at, "gpt-6.1-sol").unwrap();
+        assert_eq!(long.model, "gpt-6.1-sol#long", "缓存也算提示长度:30 万 > 27.2 万");
+        assert_eq!(long.tokens, [50_000, 100, 250_000, 0], "token 分项原样,只有键变了");
+        let edge = parse_call(&mk(272_000, 0), at, "gpt-6.1-sol").unwrap();
+        assert_eq!(edge.model, "gpt-6.1-sol", "恰好等于门槛不算越线");
+        let short = parse_call(&mk(200_000, 190_000), at, "gpt-6.1-sol").unwrap();
+        assert_eq!(short.model, "gpt-6.1-sol");
+        // 没有超长档的模型,再长也不打标
+        let no_tier = parse_call(&mk(900_000, 0), at, "gpt-5.3-codex").unwrap();
+        assert_eq!(no_tier.model, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn one_interval_splits_a_model_into_short_and_long_buckets() {
+        // 同一区间里一次普通调用 + 一次越线调用:明细分成两个键,代价按各自那档合计
+        let readings = vec![reading(1_000, 0.0, "edu"), reading(1_060, 8.0, "edu")];
+        let calls = vec![
+            Call { t: 1_010, model: "gpt-6.1-sol".into(), tokens: [100_000, 0, 0, 0] },
+            Call { t: 1_040, model: "gpt-6.1-sol#long".into(), tokens: [300_000, 0, 0, 0] },
+        ];
+        let out = build_pairs(&readings, &calls, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2["gpt-6.1-sol"][0], 100_000);
+        assert_eq!(out[0].2["gpt-6.1-sol#long"][0], 300_000);
+        // 短档 $2/M × 0.1M + 超长档 $4/M × 0.3M
+        assert!((out[0].0.cost - (0.2 + 1.2)).abs() < 1e-9, "得到 {}", out[0].0.cost);
+        assert_eq!(out[0].0.unknown_cost, 0.0, "两个键的价目都可信");
+    }
+
+    /// 链路验收：rollout 文件 → 扫描（打标）→ 建样本（分档明细）→ 落库,一条龙。
+    /// 三条读数、两次调用（一次越线一次没越线）;库里 `breakdown` 里要分出 `#long` 键。
+    #[test]
+    fn a_long_context_call_survives_the_whole_ingest_chain_into_the_breakdown() {
+        let base = 1_790_640_000 + 100_000; // GPT-6.1 Sol 上线之后
+        let stamp = |t: i64| {
+            chrono::DateTime::from_timestamp(t, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let tc = |t: i64, input: i64, cached: i64, out: i64, used5: f64| {
+            format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{out}}}}},"rate_limits":{{"primary":{{"used_percent":{used5},"window_minutes":300,"resets_at":{r5}}},"secondary":{{"used_percent":40.0,"window_minutes":10080,"resets_at":{r7}}},"plan_type":"plus"}}}}}}"#,
+                stamp(t),
+                r5 = base + 14_000,
+                r7 = base + 500_000,
+            )
+        };
+        let lines = [
+            format!(
+                r#"{{"timestamp":"{}","type":"turn_context","payload":{{"model":"gpt-6.1-sol"}}}}"#,
+                stamp(base - 5)
+            ),
+            tc(base, 1_000, 0, 10, 20.0),
+            tc(base + 60, 400_000, 100_000, 5_000, 30.0), // 越线：提示 40 万 > 27.2 万
+            tc(base + 120, 100_000, 50_000, 1_000, 30.9), // 没越线
+        ];
+        let dir = std::env::temp_dir().join(format!("tc_cxroll_long_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut scan = Scan::default();
+        scan_file(&path, 0, &mut scan, &mut Marks::default());
+        assert_eq!(scan.readings.len(), 3);
+        let models: Vec<&str> = scan.calls.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, ["gpt-6.1-sol", "gpt-6.1-sol#long", "gpt-6.1-sol"]);
+
+        let pairs = build_pairs(&scan.readings, &scan.calls, None);
+        assert_eq!(pairs.len(), 2, "两个区间都可用");
+        let keys = |i: usize| pairs[i].2.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(0), ["gpt-6.1-sol#long"]);
+        assert_eq!(keys(1), ["gpt-6.1-sol"]);
+        // 超长档: 未命中 30 万 × $4/M + 缓存读 10 万 × $0.2/M + 输出 5000 × $15/M
+        assert!((pairs[0].0.cost - (1.2 + 0.02 + 0.075)).abs() < 1e-9, "得到 {}", pairs[0].0.cost);
+        // 短档: 未命中 5 万 × $2/M + 缓存读 5 万 × $0.1/M + 输出 1000 × $10/M
+        assert!((pairs[1].0.cost - (0.1 + 0.005 + 0.01)).abs() < 1e-9, "得到 {}", pairs[1].0.cost);
+
+        // 落库：breakdown 是原始输入,`#long` 键原样存下来（重算与标定都靠它）
+        let dbp = dir.join("subscriptions.db");
+        let store = super::super::store::SubStore::open(&dbp).unwrap();
+        let items: Vec<_> = pairs
+            .into_iter()
+            .map(|(p, u7, b, _)| (p, u7, serde_json::to_string(&b).unwrap()))
+            .collect();
+        assert_eq!(store.insert_pairs(Platform::Codex, &items, PAIR_SRC, "plus").unwrap(), 2);
+        let stored = store.pairs_with_breakdown(Platform::Codex, "plus");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|(_, b)| b.contains("gpt-6.1-sol#long")));
+        // 当前修订号下重算不改数（`#long` 键由 `priced_at` 认得）
+        let before: Vec<f64> = stored.iter().map(|(p, _)| p.cost).collect();
+        store.recompute_stale_costs(Platform::Codex).unwrap();
+        let after: Vec<f64> =
+            store.pairs_with_breakdown(Platform::Codex, "plus").iter().map(|(p, _)| p.cost).collect();
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-9, "重算不该改变已是当前修订的行: {b} → {a}");
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

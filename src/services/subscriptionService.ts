@@ -172,6 +172,9 @@ export interface PriceModelRow {
   usd_cache_write: number
   /** 出处（这张表是可审计的官方价格快照，要能回答「这个数从哪儿来」）。 */
   source_note: string
+  /** 超长上下文档门槛（token）：只有 `<match_key>#long` 行 > 0。价目表命令已把这些行并进
+   * 基础模型、不单列，这里只为契约完整。 */
+  over_tokens: number
 }
 
 /** 某平台全部模型的全部生效期（按 match_key、生效期升序）。 */

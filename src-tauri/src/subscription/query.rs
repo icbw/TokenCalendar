@@ -59,7 +59,10 @@ fn local_hour_ts(day: &str, hour: u8) -> Option<i64> {
 /// 有第二行的模型就是被官方降过价的,价格梯度图里的台阶正是这些行。
 #[tauri::command]
 pub fn get_price_models(platform: String) -> Result<Vec<PriceRow>, String> {
-    Ok(price::rows_for(platform_of(&platform)?))
+    let mut rows = price::rows_for(platform_of(&platform)?);
+    // 超长档行（`#long`）并进它的基础模型,不单列一个模型——它们只给计价侧用
+    rows.retain(|r| !price::is_long_tier(r));
+    Ok(rows)
 }
 
 /// 某时刻全线的有效价目（`at` 省略 = 此刻）。
@@ -77,7 +80,9 @@ pub struct PriceAtResult {
 pub fn get_price_at(platform: String, at: Option<i64>) -> Result<PriceAtResult, String> {
     let platform = platform_of(&platform)?;
     let at = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
-    Ok(PriceAtResult { platform, at, rows: price::rows_at(platform, at) })
+    let mut rows = price::rows_at(platform, at);
+    rows.retain(|r| !price::is_long_tier(r)); // 同 get_price_models:超长档并进基础模型
+    Ok(PriceAtResult { platform, at, rows })
 }
 
 // ---------- 价格 × 用量 ----------
@@ -957,6 +962,19 @@ mod tests {
             // 全量读口仍然出三行（两段 + 对照）
             assert_eq!(price::rows_for(Platform::Claude).len(), 3);
         });
+    }
+
+    /// 价目表命令不单列超长档行：它们并进基础模型,只给计价侧用。
+    #[test]
+    fn long_tier_rows_stay_out_of_the_price_listings() {
+        let at = 1_790_640_000 + 3_600;
+        assert!(price::rows_at(Platform::Codex, at).iter().any(|r| r.match_key == "gpt-6-1-sol#long"), "计价侧看得到");
+        let listed = get_price_at("codex".into(), Some(at)).unwrap();
+        assert!(listed.rows.iter().any(|r| r.match_key == "gpt-6-1-sol"), "基础模型照常列出");
+        assert!(listed.rows.iter().all(|r| !r.match_key.ends_with("#long") && r.over_tokens == 0));
+        let all = get_price_models("codex".into()).unwrap();
+        assert!(all.iter().any(|r| r.match_key == "gpt-6-1-sol"));
+        assert!(all.iter().all(|r| !r.match_key.ends_with("#long")));
     }
 
     /// 取价入口唯一：`priced_at` 给的单价折出来的数 == `cost_of` 的数,

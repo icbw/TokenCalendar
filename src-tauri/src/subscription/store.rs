@@ -25,6 +25,7 @@ pub(super) struct SchemaGaps {
     pub need_sample_plan: bool,
     pub need_pair_resets: bool,
     pub need_pair_aged: bool,
+    pub need_price_over_tokens: bool,
 }
 
 impl SchemaGaps {
@@ -37,6 +38,7 @@ impl SchemaGaps {
             || self.need_sample_plan
             || self.need_pair_resets
             || self.need_pair_aged
+            || self.need_price_over_tokens
     }
 }
 
@@ -160,6 +162,9 @@ impl SubStore {
                  usd_output      REAL    NOT NULL,
                  usd_cache_read  REAL    NOT NULL,
                  usd_cache_write REAL    NOT NULL,
+                 -- 超长上下文档门槛（token）：只有 `<match_key>#long` 行 > 0。单次请求提示长度
+                 -- 超过它时整请求按这一行单价计;其余行 0 = 不是超长档行。
+                 over_tokens     INTEGER NOT NULL DEFAULT 0,
                  -- **出处 + 上游核对信息**:这张表是可审计的官方价格快照,任何时候要能
                  -- 回答「这个数从哪儿来」。「什么时候核对的」由 price_seed.json 的 git
                  -- 历史回答——定时重跑生成器 + 只在数据真动时提交,其 commit history
@@ -306,6 +311,7 @@ impl SubStore {
             need_sample_plan: col("desktop_sample", "plan_type"),
             need_pair_resets: col("usage_pair", "resets5_0"),
             need_pair_aged: col("usage_pair", "aged_cost"),
+            need_price_over_tokens: col("price_model", "over_tokens"),
         }
     }
 
@@ -338,6 +344,7 @@ impl SubStore {
             need_sample_plan,
             need_pair_resets,
             need_pair_aged,
+            need_price_over_tokens,
         } = *gaps;
         if need_pair_src {
             conn.execute_batch("ALTER TABLE usage_pair ADD COLUMN src TEXT NOT NULL DEFAULT 'online';")
@@ -401,6 +408,12 @@ impl SubStore {
                 "ALTER TABLE usage_pair ADD COLUMN aged_cost REAL NOT NULL DEFAULT 0;",
             )
             .map_err(|e| e.to_string())?;
+        }
+        if need_price_over_tokens {
+            // 存量行留 0 = **不是超长档行**,正是它们的事实（超长档行是随种子 upsert 进来的新行）。
+            // 一行都不动、一行都不删;门槛值在随后的种子 upsert 里补到 `#long` 行上。
+            conn.execute_batch("ALTER TABLE price_model ADD COLUMN over_tokens INTEGER NOT NULL DEFAULT 0;")
+                .map_err(|e| e.to_string())?;
         }
         if price_table_added {
             // price_model 由上面的 CREATE TABLE IF NOT EXISTS 建好,这里只记一笔。
@@ -497,11 +510,11 @@ impl SubStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO price_model (platform, match_key, effective_from, display_name,
-                         usd_input, usd_output, usd_cache_read, usd_cache_write, source_note)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         usd_input, usd_output, usd_cache_read, usd_cache_write, source_note, over_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(platform, match_key, effective_from) DO UPDATE SET
                        display_name = ?4, usd_input = ?5, usd_output = ?6,
-                       usd_cache_read = ?7, usd_cache_write = ?8, source_note = ?9",
+                       usd_cache_read = ?7, usd_cache_write = ?8, source_note = ?9, over_tokens = ?10",
                 )
                 .map_err(|e| e.to_string())?;
             for r in rows {
@@ -515,6 +528,7 @@ impl SubStore {
                     r.usd_cache_read,
                     r.usd_cache_write,
                     r.source_note,
+                    r.over_tokens,
                 ])
                 .map_err(|e| e.to_string())?;
             }
@@ -527,7 +541,7 @@ impl SubStore {
     pub fn price_rows(&self) -> Vec<super::price::PriceRow> {
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT platform, match_key, effective_from, display_name,
-                    usd_input, usd_output, usd_cache_read, usd_cache_write, source_note
+                    usd_input, usd_output, usd_cache_read, usd_cache_write, source_note, over_tokens
                FROM price_model ORDER BY platform, match_key, effective_from",
         ) else {
             return vec![];
@@ -543,6 +557,7 @@ impl SubStore {
                 usd_cache_read: r.get(6)?,
                 usd_cache_write: r.get(7)?,
                 source_note: r.get(8)?,
+                over_tokens: r.get(9)?,
             })
         });
         rows.map(|rs| rs.flatten().collect()).unwrap_or_default()
@@ -2412,6 +2427,7 @@ mod tests {
             usd_cache_read: 0.9,
             usd_cache_write: 11.25,
             source_note: "旧版本".into(),
+            over_tokens: 0,
         };
         s.upsert_price_seed(&[legacy]).unwrap();
         s.upsert_price_seed(super::super::price::factory_seed()).unwrap();
@@ -2435,6 +2451,41 @@ mod tests {
             .collect();
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].usd_input, 8.0, "同一段生效期的修正就地生效");
+    }
+
+    #[test]
+    fn an_existing_price_table_gains_over_tokens_in_place() {
+        // 升级前的 price_model（没有 over_tokens）+ 一行历史价目:升级只补列,历史行不动,
+        // 随后的种子 upsert 把门槛写到 `#long` 行上
+        let dir = std::env::temp_dir().join(format!("tc_sub_price_over_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subscriptions.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE price_model (platform TEXT NOT NULL, match_key TEXT NOT NULL,
+                     effective_from INTEGER NOT NULL, display_name TEXT NOT NULL,
+                     usd_input REAL NOT NULL, usd_output REAL NOT NULL, usd_cache_read REAL NOT NULL,
+                     usd_cache_write REAL NOT NULL, source_note TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (platform, match_key, effective_from));
+                 INSERT INTO price_model VALUES ('claude','legacy-only',1000000000,'旧段',9,45,0.9,11.25,'旧版本');",
+            )
+            .unwrap();
+        }
+        let s = SubStore::open(&path).unwrap();
+        let rows = s.price_rows();
+        let legacy = rows.iter().find(|r| r.match_key == "legacy-only").expect("历史行不能在升级里丢");
+        assert_eq!((legacy.usd_input, legacy.over_tokens), (9.0, 0), "存量行 over_tokens 默认 0");
+        let long = rows
+            .iter()
+            .find(|r| r.platform == "codex" && r.match_key == "gpt-6-1-sol#long")
+            .expect("种子里的超长档行已 upsert 进库");
+        assert_eq!(long.over_tokens, 272_000);
+        assert!(super::super::price::is_long_tier(long));
+        assert!(rows.iter().filter(|r| r.over_tokens > 0).all(|r| r.match_key.ends_with("#long")));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
