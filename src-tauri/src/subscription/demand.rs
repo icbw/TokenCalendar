@@ -120,6 +120,8 @@ struct Track {
     due: i64,
     /// rollout 取数计划给出的应检时刻（0 = 本地读数追得上,不必取;仅 Codex）。
     rollout_due: i64,
+    /// 窗口重置取数计划给出的应检时刻（0 = 没有要等的重置;两平台都有,见 `set_reset_plan`）。
+    reset_due: i64,
     /// rollout 这一路「活着」的截止时刻（最新 5h 读数 + `ROLLOUT_LIVE_SECS`）。
     rollout_live_until: i64,
     /// 最近一次发了请求且取到新读数的时刻（0 = 本进程还没有）。
@@ -216,6 +218,17 @@ pub fn next_due(platform: Platform, now: i64) -> Option<i64> {
     })
 }
 
+/// 该平台是否有已到期的**窗口重置**取数（独立于 token / rollout 两路,不看 rollout 是否活着
+/// ——本地读数永远看不见窗口刚翻过去）。
+pub fn reset_due_now(platform: Platform, now: i64) -> bool {
+    tracks().get(&platform).is_some_and(|t| t.reset_due > 0 && now >= t.reset_due)
+}
+
+/// 窗口重置的应检时刻（主轮询算睡眠时长用;无 → None）。
+pub fn next_reset_due(platform: Platform) -> Option<i64> {
+    tracks().get(&platform).and_then(|t| (t.reset_due > 0).then_some(t.reset_due))
+}
+
 /// 最近一次**取到新读数的 API 请求**的时刻（0 = 本进程还没有）。它反映请求之前
 /// 已结束的全部调用——rollout 取数计划的「最新被反映时刻」要把它算进去。
 pub fn last_api_reading(platform: Platform) -> i64 {
@@ -251,6 +264,22 @@ pub fn set_rollout_plan(platform: Platform, due: Option<i64>, latest_reading: i6
     apply_rollout_plan(g.entry(platform).or_default(), due, latest_reading);
 }
 
+/// 纯逻辑：落一份窗口重置计划（见 `set_reset_plan`）。同样不早于最小间隔 / 退避允许的时刻。
+fn apply_reset_plan(t: &mut Track, due: Option<i64>) {
+    t.reset_due = due.map_or(0, |d| d.max(earliest_retry(t)));
+}
+
+/// 窗口重置取数计划（主轮询每轮据最新快照重算）：`due` = 快照里下一个已开始窗口的窗尾 +
+/// 余量（`model:reset_refresh_due`;None = 没有要等的重置）。
+///
+/// 触发证据 = 服务端自己申报的窗尾;退出 = 取到晚于窗尾的读数后计划自然消失（新窗口没开始
+/// 就没有窗尾）。离开电脑时最坏请求率 = 每个已开始的窗口翻过去一次,之后只剩兜底。
+/// 受最小间隔与退避约束:取数失败按退避推后重试,重算不会把它拉回来。
+pub fn set_reset_plan(platform: Platform, due: Option<i64>) {
+    let mut g = tracks();
+    apply_reset_plan(g.entry(platform).or_default(), due);
+}
+
 /// 距上次读数的预计消耗。
 pub fn estimated_pct(platform: Platform) -> f64 {
     let scale = super::calib::scale(platform);
@@ -270,15 +299,19 @@ fn record_attempt(t: &mut Track, now: i64, advanced: bool, networked: bool) {
         }
         // 取到了新读数:这份计划要等下次收割按新的「最新被反映时刻」重算
         t.rollout_due = 0;
+        // 重置计划同理:新读数若已晚于窗尾,下次重算它就是 None;窗尾还在后面则排到那时
+        t.reset_due = 0;
         return;
     }
     // 需求仍挂着（账目不清,下轮照样该取）,只是把重试推后。
     // 只推**已到期**的需求：兜底轮 / 手动刷新轮与尚未到期的 token 需求无关,
     // 拿失败去改它会把一个更晚的应检时刻提前（backoff 反而成了提前量）。
-    // rollout 计划同理（它与 t.due 是同一个需求的两种来源,退避计数共用、只计一次）。
+    // rollout 计划、重置计划同理（它们与 t.due 是同一个「该取而没取到」的三种来源,
+    // 退避计数共用、只计一次）。
     let due_hit = t.due > 0 && now >= t.due;
     let rollout_hit = t.rollout_due > 0 && now >= t.rollout_due;
-    if due_hit || rollout_hit {
+    let reset_hit = t.reset_due > 0 && now >= t.reset_due;
+    if due_hit || rollout_hit || reset_hit {
         t.fail_streak = t.fail_streak.saturating_add(1);
         let next = now + backoff_secs(t.fail_streak);
         if due_hit {
@@ -286,6 +319,9 @@ fn record_attempt(t: &mut Track, now: i64, advanced: bool, networked: bool) {
         }
         if rollout_hit {
             t.rollout_due = next;
+        }
+        if reset_hit {
+            t.reset_due = next;
         }
     }
 }
@@ -310,6 +346,7 @@ pub fn take_account(platform: Platform, now: i64) -> Account {
     t.breakdown.clear();
     t.due = 0;
     t.rollout_due = 0;
+    t.reset_due = 0;
     t.since = now;
     acc
 }
@@ -508,6 +545,42 @@ mod tests {
         // 最新 5h 读数超过 ROLLOUT_LIVE_SECS → 不再活着,退回预计消耗
         t.due = 3_000;
         assert!(due(&t, 1_020 + ROLLOUT_LIVE_SECS + 1_000), "不活时按预计消耗的 due");
+    }
+
+    /// 窗口重置计划:受最小间隔约束;到点取失败按退避推后,重算（快照没变,应取时刻仍在过去）
+    /// 拉不回来;取到新读数即清空。
+    #[test]
+    fn reset_plan_is_gated_by_min_gap_and_backs_off() {
+        let mut t = Track { last_attempt_at: 990, ..Track::default() };
+        // 窗口翻过去（应取 1_000）,但 10 秒前刚发过请求 → 推到最小间隔之后
+        apply_reset_plan(&mut t, Some(1_000));
+        assert_eq!(t.reset_due, 990 + MIN_GAP_SECS);
+        // 没有要等的重置 → 清空
+        apply_reset_plan(&mut t, None);
+        assert_eq!(t.reset_due, 0);
+        // 到点取失败 → 退避;下一轮重算不许把它拉回来
+        apply_reset_plan(&mut t, Some(1_000));
+        record_attempt(&mut t, 1_060, false, true);
+        assert_eq!((t.fail_streak, t.reset_due), (1, 1_060 + backoff_secs(1)));
+        apply_reset_plan(&mut t, Some(1_000));
+        assert_eq!(t.reset_due, 1_060 + backoff_secs(1), "重算不抹掉退避");
+        // 取到新读数 → 计划清空、退避清零
+        record_attempt(&mut t, 1_200, true, true);
+        assert_eq!((t.reset_due, t.fail_streak), (0, 0));
+    }
+
+    /// 重置计划不是 token 需求的替身:没到期时失败的轮不碰它;到期的几路同轮失败只计一次退避。
+    #[test]
+    fn reset_plan_shares_one_backoff_with_the_other_sources() {
+        // 重置计划还没到期,兜底轮失败 → 不动它,也不计退避
+        let mut t = Track { last_attempt_at: 1_000, reset_due: 5_500, ..Track::default() };
+        record_attempt(&mut t, 5_000, false, true);
+        assert_eq!((t.reset_due, t.fail_streak), (5_500, 0), "未到期的计划不受别的轮失败影响");
+        // token 需求与重置计划同时到期、同一轮失败 → 退避只计一次,两路一起推后
+        let mut t = Track { last_attempt_at: 1_000, due: 5_000, reset_due: 5_010, ..Track::default() };
+        record_attempt(&mut t, 5_020, false, true);
+        let next = 5_020 + backoff_secs(1);
+        assert_eq!((t.fail_streak, t.due, t.reset_due), (1, next, next));
     }
 
     /// 本地零成本读取（桌面端探测 / 判死跳过）不占最小间隔:紧随其后的真实需求照常立即排。

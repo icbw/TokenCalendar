@@ -200,6 +200,43 @@ pub fn window_started(platform: Platform, w: &QuotaWindow, fetched_at: Option<i6
     }
 }
 
+/// 窗尾过后等多久再取数（秒）：让服务端把窗口翻过去、也给本机与服务端的时钟偏差留余量。
+/// 真库里窗尾后 24 秒的 Claude 读数、66 秒的 Codex 读数都已是新窗口。
+pub const RESET_SETTLE_SECS: i64 = 20;
+
+/// 这份快照下一次**该为窗口重置取一轮**的时刻（None = 没有要等的重置）。
+///
+/// 服务端自己申报了窗尾，到点余量必然回到 100%；而本机读数是滚动的、没有任何本地信号
+/// 能看见「窗口刚翻过去」——不取，球上就停在翻过去之前的读数，直到兜底轮（30 分钟）。
+/// 所以窗尾本身就是取数时刻，不是轮询：取一次、读到新窗口、这条计划自然消失。
+///
+/// 只认**读数里还会发生的重置**：
+/// - 窗口必须已开始计时（`window_started`，按读数时刻判）——Codex 没开始的窗口给的是
+///   **滚动窗尾**（读数时刻 + 窗口长度，每次取数都后漂），照它排会每隔 5 小时空取一次；
+/// - 读数得早于「窗尾 + `RESET_SETTLE_SECS`」——晚于它的读数已经是翻过去之后的，没有可等的了。
+///   这条同时是终止条件：取数发生在应取时刻之后 ⇒ 新读数一定不满足它，不会连环重取，
+///   服务端哪怕一直报一个过期窗尾也不会；
+/// - 状态须是 `ok` / `rate_limited` / `network_failed`：后两者保留着上次的窗口，到点照样要重试
+///   （退避归 demand.rs）；凭据失效 / 订阅过期 / 未绑定取了也没用，不排。
+///
+/// 取最近的一个窗口（5h 与 7d 同理：周窗口翻过去后周额度也停在旧读数上）。
+pub fn reset_refresh_due(snap: &SubscriptionSnapshot) -> Option<i64> {
+    if !matches!(
+        snap.status,
+        FetchStatus::Ok | FetchStatus::RateLimited | FetchStatus::NetworkFailed
+    ) {
+        return None;
+    }
+    let fetched = snap.fetched_at?;
+    snap.windows
+        .iter()
+        .filter(|w| window_started(snap.platform, w, Some(fetched), fetched))
+        .filter_map(|w| w.resets_at)
+        .map(|reset| reset + RESET_SETTLE_SECS)
+        .filter(|&due| due > fetched)
+        .min()
+}
+
 /// 前端读口的快照形状：快照原样展开，另附**派生的**「已开始的窗口」列表。
 /// 只在命令面现算，不落库——`resets_at` 与读数时刻都在库里，随时能重新算出来。
 #[derive(Debug, Clone, Serialize)]
@@ -340,6 +377,85 @@ mod tests {
     #[test]
     fn codex_without_fetched_at_is_not_started() {
         assert!(!window_started(Platform::Codex, &w("5h", 0.0, Some(T + 9_000)), None, T));
+    }
+
+    fn snap_of(platform: Platform, windows: Vec<QuotaWindow>, fetched: i64, status: FetchStatus) -> SubscriptionSnapshot {
+        SubscriptionSnapshot {
+            platform,
+            plan_type: "max".into(),
+            windows,
+            fetched_at: Some(fetched),
+            status,
+            source: SnapshotSource::Api,
+        }
+    }
+
+    /// 2026-10-03 真库：Claude 5h 窗尾 19:40:00，最后一次读数 19:13:18 用量 21%。
+    #[test]
+    fn a_started_window_is_refreshed_just_after_its_reset() {
+        let reset = T + 1_600;
+        let s = snap_of(Platform::Claude, vec![w("5h", 21.0, Some(reset))], T, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&s), Some(reset + RESET_SETTLE_SECS));
+    }
+
+    #[test]
+    fn nothing_to_wait_for_once_the_reading_is_past_the_reset() {
+        let reset = T - 300;
+        // 读数在窗尾 + 余量之后：已经是翻过去之后的读数，不再排（终止条件）
+        let s = snap_of(Platform::Claude, vec![w("5h", 3.0, Some(reset))], reset + RESET_SETTLE_SECS, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&s), None);
+        // 读数落在余量之内：可能抢在服务端翻窗口之前，再读一次（落在余量点上）
+        let early = snap_of(Platform::Claude, vec![w("5h", 21.0, Some(reset))], reset + 5, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&early), Some(reset + RESET_SETTLE_SECS));
+        // 服务端一直报一个过期窗尾也不会连环重取：下一次读数一定晚于余量点
+        let stuck = snap_of(Platform::Claude, vec![w("5h", 21.0, Some(reset))], reset + RESET_SETTLE_SECS + 1, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&stuck), None);
+    }
+
+    #[test]
+    fn unstarted_windows_have_no_reset_to_wait_for() {
+        // Claude：没开始 = 没有窗尾
+        let s = snap_of(Platform::Claude, vec![w("5h", 0.0, None)], T, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&s), None);
+        // Codex：没开始给的是滚动窗尾（读数时刻 + 5h），照它排会每 5 小时空取一次
+        let rolling = snap_of(Platform::Codex, vec![w("5h", 0.0, Some(T + 18_002))], T, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&rolling), None);
+        // Codex 已开始的窗口（窗尾固定、用量 0 或 >0）照常排
+        let fixed = snap_of(Platform::Codex, vec![w("5h", 93.0, Some(T + 900))], T, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&fixed), Some(T + 900 + RESET_SETTLE_SECS));
+    }
+
+    #[test]
+    fn the_nearest_window_wins_and_weekly_resets_count_too() {
+        let s = snap_of(
+            Platform::Claude,
+            vec![w("7d", 19.0, Some(T + 86_400)), w("5h", 6.0, Some(T + 3_600)), w("7d_fable", 0.0, Some(T + 86_400))],
+            T,
+            FetchStatus::Ok,
+        );
+        assert_eq!(reset_refresh_due(&s), Some(T + 3_600 + RESET_SETTLE_SECS), "5h 先到点");
+        let week_only = snap_of(Platform::Claude, vec![w("5h", 0.0, None), w("7d", 19.0, Some(T + 86_400))], T, FetchStatus::Ok);
+        assert_eq!(reset_refresh_due(&week_only), Some(T + 86_400 + RESET_SETTLE_SECS), "5h 没开始时看周窗口");
+    }
+
+    #[test]
+    fn only_states_where_a_retry_can_help_keep_the_plan() {
+        let windows = vec![w("5h", 21.0, Some(T + 600))];
+        for (status, keep) in [
+            (FetchStatus::Ok, true),
+            (FetchStatus::RateLimited, true),
+            (FetchStatus::NetworkFailed, true),
+            (FetchStatus::AuthFailed, false),
+            (FetchStatus::PlanInactive, false),
+            (FetchStatus::ParseFailed, false),
+            (FetchStatus::Idle, false),
+        ] {
+            let s = snap_of(Platform::Claude, windows.clone(), T, status);
+            assert_eq!(reset_refresh_due(&s).is_some(), keep, "{status:?}");
+        }
+        let mut never = snap_of(Platform::Claude, windows, T, FetchStatus::Ok);
+        never.fetched_at = None;
+        assert_eq!(reset_refresh_due(&never), None, "从未读到过数：没有可比的读数时刻");
     }
 
     #[test]

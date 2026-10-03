@@ -5,7 +5,9 @@
 //! - 存储：`<数据根>/subscriptions.db`（快照 + 绑定开关;凭据永不落库）;
 //! - 取数节奏：**按预计消耗取数**——采集线程报来的分模型 token 经 cost.rs 折成代价、
 //!   经 calib.rs 的标定系数换成「大约消耗了百分之几」,达到阈值就取一轮（demand.rs）;
-//!   本地无 token 则不取。固定间隔只是**兜底**,覆盖不产生本地 token 的在线 / 网页用量;
+//!   本地无 token 则不取。**窗口翻过去的那一刻另排一次**（`model:reset_refresh_due`:
+//!   服务端申报的窗尾 + 余量）——没有任何本地信号看得见「窗口刚重置、余量回到 100%」,
+//!   不取读数就停在翻过去之前。固定间隔只是**兜底**,覆盖不产生本地 token 的在线 / 网页用量;
 //!   Claude 侧兜底先用桌面端采样零请求探测有没有涨（claude_desktop:probe_growth）——
 //!   **没涨也会把样本里的下降正进快照**（滚动窗口空闲期余量会自己恢复,
 //!   `apply_flat_sample`）。本地 token 静默即待机（idle.rs,只翻转悬浮球减淡,不改取数
@@ -463,6 +465,16 @@ fn file_mtime(db: &std::path::Path) -> Option<i64> {
         .max()
 }
 
+/// 把各已绑定平台最新快照里「下一次窗口重置」同步进取数计划（demand.rs）。
+/// 一次单行读库,每次醒来、睡眠前各调一次:快照在一轮里可能换了（取数 / rollout 推进）,
+/// 睡眠时长要按**新**快照的窗尾算,否则窗口翻过去的那一刻会被睡过去。
+fn sync_reset_plans(store: &SubStore, bound: &[Platform]) {
+    for platform in bound {
+        let due = store.load_snapshot(*platform).and_then(|s| model::reset_refresh_due(&s));
+        demand::set_reset_plan(*platform, due);
+    }
+}
+
 fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     crate::dev_log!("[subscription] thread started");
     // 本地读数的收割 + 增量标定路径（零网络零凭据）：
@@ -530,6 +542,8 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         let bound = write_store.bound_platforms();
         idle::prune(&bound);
         demand::prune(&bound);
+        // 在 rollout 收割之后:它可能刚把快照推进到新窗口,不该再为旧窗尾白取一次
+        sync_reset_plans(&write_store, &bound);
         let mut changed_any = false;
         if !bound.is_empty() {
             let base = poll_secs();
@@ -540,16 +554,21 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                 // 取数来源：
                 // - wake:手动刷新 / 绑定 / 间隔变更的全量轮;
                 // - token:本地 token 驱动（demand.rs）已到应检时刻;
+                // - reset:已开始的窗口翻过去了（窗尾 + 余量）,要读一次新窗口。排在 fallback
+                //   之前:兜底轮的桌面端零请求短路会拿「没涨」糊弄过去,而这一轮要的正是真读数;
                 // - fallback:兜底轮（覆盖不产生本地 token 的在线 / 网页用量）。
                 let by_token = demand::due_now(*platform, now);
+                let by_reset = demand::reset_due_now(*platform, now);
                 let by_fallback = idle::due(*platform, now);
-                if !woke && !by_token && !by_fallback {
+                if !woke && !by_token && !by_reset && !by_fallback {
                     continue;
                 }
                 let via = if woke {
                     "wake"
                 } else if by_token {
                     "token"
+                } else if by_reset {
+                    "reset"
                 } else {
                     "fallback"
                 };
@@ -657,6 +676,8 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         }
 
         let now = chrono::Utc::now().timestamp();
+        // 取数可能换了快照（新窗口 / 新窗尾）:睡眠前按最新快照重排重置计划
+        sync_reset_plans(&write_store, &bound);
         // 待机判据 = 安静起点距今满 STANDBY_QUIET_SECS（idle.rs）:每次醒来重算一次,翻转即广播
         if idle::evaluate(now) {
             idle::emit_idle(&app);
@@ -676,6 +697,12 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
         // Codex 的应检时刻不走兜底表（见 note_local_tokens）,单独并进睡眠时长
         if let Some(due) = demand::next_due(Platform::Codex, now) {
             wait = wait.min((due - now).max(1) as u64);
+        }
+        // 窗口重置的应检时刻同样不走兜底表:睡到窗尾 + 余量,别睡过那一刻
+        for platform in &bound {
+            if let Some(due) = demand::next_reset_due(*platform) {
+                wait = wait.min((due - now).max(1) as u64);
+            }
         }
         // Codex 活跃期缩短睡眠:一轮收工的 `task_complete` 不带 token,采集线程不会为它
         // 报信,只能靠这里按世代闸门看见（零网络,文件没长只是 stat）。
