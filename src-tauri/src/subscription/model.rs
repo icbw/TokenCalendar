@@ -189,15 +189,65 @@ pub fn window_started(platform: Platform, w: &QuotaWindow, fetched_at: Option<i6
     match platform {
         Platform::Claude => true,
         Platform::Codex => {
-            let len = match w.kind.as_str() {
-                "5h" => 5 * 3600,
-                "7d" => 7 * 86_400,
-                // 未知窗口没有长度可比；窗尾在未来就当作已开始（与 Claude 同判）
-                _ => return true,
+            // 未知窗口没有长度可比；窗尾在未来就当作已开始（与 Claude 同判）
+            let Some(len) = window_len_secs(&w.kind) else {
+                return true;
             };
             fetched_at.is_some_and(|t| reset - t < len - ROLLING_RESET_TOLERANCE_SECS)
         }
     }
+}
+
+/// 窗口长度（秒）；不认识的窗口种类没有长度可比。
+fn window_len_secs(kind: &str) -> Option<i64> {
+    match kind {
+        "5h" => Some(5 * 3600),
+        "7d" => Some(7 * 86_400),
+        _ => None,
+    }
+}
+
+/// 两个窗口「隐含开始时刻」（窗尾 − 窗口长度）算作同一刻的容差（秒）。
+/// 真库里重置卡之后两个窗口的窗尾逐秒相同，api 与 rollout 两路读数也一致，留 3 秒只是兜时钟取整。
+const SHARED_START_TOLERANCE_SECS: i64 = 3;
+
+/// Codex 窗口的单读数判据说「没开始」（窗尾贴着读数时刻 + 窗口长），但**另一个窗口已开始、
+/// 且两者的窗尾指向同一个开始时刻**——那这个窗尾就不是滚动的，窗口其实已经开始了。
+///
+/// 为什么需要：滚动窗尾与「刚开始、窗尾固定」在开始后最初的 120 秒（`ROLLING_RESET_TOLERANCE_SECS`）里
+/// 单看一条读数分不开。重置卡 / 窗口首次计费会让两个窗口**同一刻**重开，此刻 5h 常已有 1〜3%，
+/// 而周窗口折合不到 1%（整数读数为 0），于是周窗口被判成「本周未使用」，球上要等下一条读数才纠正
+/// （重置卡后 7d 读数 0、窗尾 10-10 23:05:02，与 5h 窗尾 04:05:02 同起点）。
+///
+/// 滚动窗尾的开始时刻就是读数时刻，只会在「读数恰好落在另一个窗口开始后 3 秒内」时与对方重合，
+/// 那一刻两个窗口本就是同时开始的。**不能**反过来用「5h 有用量 ⇒ 周窗口一定开始了」：
+/// 真库里 edu 套餐出现过 5h 已用 81%、周窗口读数 0 且窗尾仍在滚动。
+fn shares_start_with_started_sibling(snap: &SubscriptionSnapshot, w: &QuotaWindow, now: i64) -> bool {
+    let (Some(len), Some(reset)) = (window_len_secs(&w.kind), w.resets_at.filter(|&r| r > now)) else {
+        return false;
+    };
+    let start = reset - len;
+    snap.windows.iter().filter(|s| s.kind != w.kind).any(|s| {
+        let Some((sibling_len, sibling_reset)) = window_len_secs(&s.kind).zip(s.resets_at) else {
+            return false;
+        };
+        (sibling_reset - sibling_len - start).abs() <= SHARED_START_TOLERANCE_SECS
+            && window_started(snap.platform, s, snap.fetched_at, now)
+    })
+}
+
+/// 快照里**已开始计时**的窗口 kind：单读数判据（[`window_started`]）为主，
+/// Codex 再补一条跨窗口证据（[`shares_start_with_started_sibling`]）。
+/// 前端的「未使用」与窗口重置取数（[`reset_refresh_due`]）都认这一份。
+pub fn started_kinds(snap: &SubscriptionSnapshot, now: i64) -> Vec<String> {
+    snap.windows
+        .iter()
+        .filter(|w| {
+            window_started(snap.platform, w, snap.fetched_at, now)
+                || (snap.platform == Platform::Codex && shares_start_with_started_sibling(snap, w, now))
+        })
+        .map(|w| w.kind.clone())
+        .collect()
 }
 
 /// 窗尾过后等多久再取数（秒）：让服务端把窗口翻过去、也给本机与服务端的时钟偏差留余量。
@@ -211,7 +261,7 @@ pub const RESET_SETTLE_SECS: i64 = 20;
 /// 所以窗尾本身就是取数时刻，不是轮询：取一次、读到新窗口、这条计划自然消失。
 ///
 /// 只认**读数里还会发生的重置**：
-/// - 窗口必须已开始计时（`window_started`，按读数时刻判）——Codex 没开始的窗口给的是
+/// - 窗口必须已开始计时（`started_kinds`，按读数时刻判）——Codex 没开始的窗口给的是
 ///   **滚动窗尾**（读数时刻 + 窗口长度，每次取数都后漂），照它排会每隔 5 小时空取一次；
 /// - 读数得早于「窗尾 + `RESET_SETTLE_SECS`」——晚于它的读数已经是翻过去之后的，没有可等的了。
 ///   这条同时是终止条件：取数发生在应取时刻之后 ⇒ 新读数一定不满足它，不会连环重取，
@@ -228,9 +278,10 @@ pub fn reset_refresh_due(snap: &SubscriptionSnapshot) -> Option<i64> {
         return None;
     }
     let fetched = snap.fetched_at?;
+    let started = started_kinds(snap, fetched);
     snap.windows
         .iter()
-        .filter(|w| window_started(snap.platform, w, Some(fetched), fetched))
+        .filter(|w| started.contains(&w.kind))
         .filter_map(|w| w.resets_at)
         .map(|reset| reset + RESET_SETTLE_SECS)
         .filter(|&due| due > fetched)
@@ -243,18 +294,13 @@ pub fn reset_refresh_due(snap: &SubscriptionSnapshot) -> Option<i64> {
 pub struct FrontendSnapshot {
     #[serde(flatten)]
     pub snap: SubscriptionSnapshot,
-    /// 已开始计时的窗口 kind（见 [`window_started`]）。
+    /// 已开始计时的窗口 kind（见 [`started_kinds`]）。
     pub started_windows: Vec<String>,
 }
 
 impl FrontendSnapshot {
     pub fn from_snapshot(snap: SubscriptionSnapshot, now: i64) -> Self {
-        let started_windows = snap
-            .windows
-            .iter()
-            .filter(|w| window_started(snap.platform, w, snap.fetched_at, now))
-            .map(|w| w.kind.clone())
-            .collect();
+        let started_windows = started_kinds(&snap, now);
         Self { snap, started_windows }
     }
 }
@@ -456,6 +502,68 @@ mod tests {
         let mut never = snap_of(Platform::Claude, windows, T, FetchStatus::Ok);
         never.fetched_at = None;
         assert_eq!(reset_refresh_due(&never), None, "从未读到过数：没有可比的读数时刻");
+    }
+
+    /// 2026-10-03 23:05:02 用了重置卡：5h 窗尾 04:05:02、7d 窗尾 10-10 23:05:02（逐秒同起点）。
+    /// 下面三条是真库里重置后的前三个 Codex 读数（5h 已用 2〜3，周窗口折合不到 1% ⇒ 读数 0）。
+    const CARD_5H_END: i64 = 1_791_079_502;
+    const CARD_7D_END: i64 = 1_791_666_302;
+
+    fn codex_snap(windows: Vec<QuotaWindow>, fetched: i64) -> SubscriptionSnapshot {
+        SubscriptionSnapshot {
+            platform: Platform::Codex,
+            plan_type: "plus".into(),
+            windows,
+            fetched_at: Some(fetched),
+            status: FetchStatus::Ok,
+            source: SnapshotSource::Api,
+        }
+    }
+
+    #[test]
+    fn a_window_reopened_together_with_a_started_sibling_is_started() {
+        // 单读数判据对周窗口说「没开始」（窗尾距读数 604,788 / 604,762 / 604,738，都在 120 秒容差内）…
+        for (fetched, used5) in [(1_791_061_514, 2.0), (1_791_061_540, 3.0), (1_791_061_564, 3.0)] {
+            let week = w("7d", 0.0, Some(CARD_7D_END));
+            assert!(!window_started(Platform::Codex, &week, Some(fetched), fetched));
+            // …但 5h 已开始，且两个窗尾指向同一个开始时刻 ⇒ 周窗口窗尾是固定的
+            let s = codex_snap(vec![w("5h", used5, Some(CARD_5H_END)), week], fetched);
+            assert_eq!(started_kinds(&s, fetched), vec!["5h".to_string(), "7d".to_string()], "{fetched}");
+        }
+    }
+
+    #[test]
+    fn a_rolling_window_beside_a_started_one_stays_unstarted() {
+        // 2026-09-20 edu：5h 已用 81%（19 分钟前开始），周窗口读数 0、窗尾仍是滚动的（读数时刻 + 7d）
+        let edu = codex_snap(
+            vec![w("5h", 81.0, Some(T + 18_000 - 1_137)), w("7d", 0.0, Some(T + 604_800 + 1))],
+            T,
+        );
+        assert_eq!(started_kinds(&edu, T), vec!["5h".to_string()]);
+        // 两个窗口都没开始：开始时刻都是读数时刻，彼此重合但谁也没开始，不能互相背书
+        let idle = codex_snap(vec![w("5h", 0.0, Some(T + 18_002)), w("7d", 0.0, Some(T + 604_803))], T);
+        assert!(started_kinds(&idle, T).is_empty());
+    }
+
+    #[test]
+    fn sibling_start_must_coincide_and_the_window_must_still_be_running() {
+        let fetched = 1_791_061_514;
+        // 起点差 10 秒：不是同一刻
+        let apart = codex_snap(vec![w("5h", 2.0, Some(CARD_5H_END)), w("7d", 0.0, Some(CARD_7D_END + 10))], fetched);
+        assert_eq!(started_kinds(&apart, fetched), vec!["5h".to_string()]);
+        // 差 2 秒：算同一刻
+        let near = codex_snap(vec![w("5h", 2.0, Some(CARD_5H_END)), w("7d", 0.0, Some(CARD_7D_END + 2))], fetched);
+        assert_eq!(started_kinds(&near, fetched), vec!["5h".to_string(), "7d".to_string()]);
+        // 周窗口窗尾已过：翻过去了，不论兄弟窗口怎样都不算在跑（5h 靠 used > 0 照旧判已开始）
+        let expired = codex_snap(vec![w("5h", 2.0, Some(CARD_5H_END)), w("7d", 0.0, Some(CARD_7D_END))], CARD_7D_END + 1);
+        assert_eq!(started_kinds(&expired, CARD_7D_END + 1), vec!["5h".to_string()]);
+    }
+
+    #[test]
+    fn claude_is_not_affected_by_the_sibling_rule() {
+        // Claude 没开始就没有窗尾，本来就不靠这条
+        let s = snap_of(Platform::Claude, vec![w("5h", 12.0, Some(T + 900)), w("7d", 0.0, None)], T, FetchStatus::Ok);
+        assert_eq!(started_kinds(&s, T), vec!["5h".to_string()]);
     }
 
     #[test]
