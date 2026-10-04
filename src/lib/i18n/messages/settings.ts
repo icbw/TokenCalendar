@@ -334,6 +334,10 @@ export default {
   windowKind7d: ['{kind}', '每周'],
   windowKindModel: ['{kind}', '{model} 每周'],
   statusAuthFailed: ['Credentials expired — run the agent CLI to refresh', '凭据已过期——运行 Agent CLI 以刷新'],
+  statusStaleClaude: [
+    'Reading is out of date — click the context-window button at the bottom of a chat (or right-click the Claude tray icon) to resume, or run claude once in a terminal to renew credentials',
+    '读数已过期——点一下对话底部的上下文窗口按钮（或右键 Claude 托盘图标）即可恢复，也可在终端运行一次 claude 续期凭据',
+  ],
   statusPlanInactive: ['Subscription inactive — resumes after renewal', '订阅未生效——续订后恢复'],
   statusRateLimited: ['Rate limited — retrying automatically', '请求受限——自动重试中'],
   statusNetworkFailed: ['Network error — showing last known data', '网络错误——显示最近一次数据'],

@@ -52,6 +52,11 @@ const MAX_POLL_SECS: u64 = 1800;
 /// 的读数正（`apply_flat_sample`）最多滞后这么久。mtime 没变时这一轮只花一次 stat。
 const HARVEST_SECS: u64 = 300;
 
+/// 桌面端采样文件的**看一眼**节律（秒）：Claude 已绑定且采样文件存在时,主轮询最长睡这么久。
+/// 只是一次 stat（文件没动什么都不做）——样本一落地球上就跟上,不必等取数轮 / 收割节律。
+/// 与 `HARVEST_SECS`（收割 + 标定,5 分钟）是两件事。
+const DESKTOP_POLL_SECS: u64 = 30;
+
 /// Codex 本地 token 最近这么多秒内出现过 = 活跃期（见主轮询的睡眠时长）。
 const CODEX_ACTIVE_SECS: i64 = 180;
 /// 活跃期主轮询最长睡这么久（秒）:一轮收工后最多这么久就能排上那次取数。
@@ -487,6 +492,8 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     // ——理由见下面的注释。
     let mut last_harvest_mtime: (Option<i64>, Option<i64>) = (None, None);
     let mut last_rollout_gen: Option<(i64, u64)> = None;
+    // 桌面端采样文件上次看到的 mtime（给零请求推进当闸门;与上面收割的闸门各自独立）
+    let mut last_advance_mtime: Option<i64> = None;
     let mut last_mtime: std::collections::HashMap<Platform, Option<i64>> =
         std::collections::HashMap::new();
     // wake 代际：wait 返回后代际有变 = 手动刷新/bind/间隔调整唤醒 → 全量一轮
@@ -535,6 +542,34 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                     codex_rollout::ingest(&write_store, chrono::Utc::now().timestamp());
                 if snapshot_changed {
                     emit_changed(&app);
+                }
+            }
+        }
+
+        // Claude 桌面端采样（零网络零凭据）：采样文件有了更新的样本,而 Claude 快照本来就靠
+        // 本地读数撑着（凭据失效 / 无凭据）→ 立刻推进快照并广播,不等取数轮。取数轮在凭据
+        // 判死时同样只能读这份样本,所以这一步只是把「最多晚一个取数周期」压成秒级。
+        // 推进即清 Claude 的预计消耗账目——这条读数已经覆盖了那些 token（与 Codex rollout 同款）。
+        {
+            let m = claude_desktop::history_mtime();
+            if m.is_some() && m != last_advance_mtime {
+                last_advance_mtime = m;
+                if write_store.bound_platforms().contains(&Platform::Claude) {
+                    let now = chrono::Utc::now().timestamp();
+                    let prev = write_store.load_snapshot(Platform::Claude);
+                    if let Some(next) = claude_desktop::advance_candidate(prev.as_ref(), now) {
+                        if write_store.save_snapshot(&next).is_ok() {
+                            let dropped = demand::take_account(Platform::Claude, now);
+                            crate::dev_log!(
+                                "[subscription] claude snapshot from desktop sample: 5h={:.0}% 7d={:.0}% age={}s (no request, est {:.2}% cleared)",
+                                next.windows.iter().find(|w| w.kind == "5h").map_or(0.0, |w| w.used_percent),
+                                next.windows.iter().find(|w| w.kind == "7d").map_or(0.0, |w| w.used_percent),
+                                next.fetched_at.map_or(0, |t| now - t),
+                                dropped.cost * calib::scale(Platform::Claude)
+                            );
+                            emit_changed(&app);
+                        }
+                    }
                 }
             }
         }
@@ -703,6 +738,10 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
             if let Some(due) = demand::next_reset_due(*platform) {
                 wait = wait.min((due - now).max(1) as u64);
             }
+        }
+        // Claude 已绑定且桌面端采样文件在：缩短睡眠按 mtime 看一眼（零网络,一次 stat）
+        if bound.contains(&Platform::Claude) && claude_desktop::history_mtime().is_some() {
+            wait = wait.min(DESKTOP_POLL_SECS);
         }
         // Codex 活跃期缩短睡眠:一轮收工的 `task_complete` 不带 token,采集线程不会为它
         // 报信,只能靠这里按世代闸门看见（零网络,文件没长只是 stat）。

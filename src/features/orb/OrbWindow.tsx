@@ -167,7 +167,7 @@ function windowUnderOne(w: QuotaWindow | undefined, idle: boolean): boolean {
 /** 状态文案（auth_failed 与 plan_inactive 语义勿混）：
  * auth_failed = 凭据失效,需要用户重新登录 agent CLI;
  * plan_inactive = 凭据仍有效但订阅过期/降级,续费后自动恢复,用户零操作。 */
-function statusHint(status: string): { text: string; level: 'ok' | 'warn' | 'error' | 'muted' } {
+function statusHint(status: string, platform?: string): { text: string; level: 'ok' | 'warn' | 'error' | 'muted' } {
   const t = getT('orb')
   switch (status) {
     case 'ok':
@@ -175,7 +175,9 @@ function statusHint(status: string): { text: string; level: 'ok' | 'warn' | 'err
     case 'plan_inactive':
       return { text: t('statusPlanInactive'), level: 'warn' }
     case 'auth_failed':
-      return { text: t('statusAuthFailed'), level: 'error' }
+      // Claude 只用桌面端时凭据文件不会被续期,读数全靠桌面端采样;采样暂停且样本过期才会走到这里
+      //（见 claude_desktop.rs 模块头）——此时圆环上仍是旧读数,提示要说「读数已过期」并给恢复办法
+      return { text: t(platform === 'claude' ? 'statusStaleClaude' : 'statusAuthFailed'), level: 'error' }
     case 'rate_limited':
       return { text: t('statusRateLimited'), level: 'warn' }
     case 'network_failed':
@@ -490,7 +492,7 @@ export default function OrbWindow() {
   // 未使用态（5h 表盘 / 7d 周行）：判据与显示口径见 windowIdle。
   const fiveIdle = windowIdle(snap, w5h)
   const weekIdle = windowIdle(snap, w7d)
-  const hint = statusHint(snap?.status ?? 'idle')
+  const hint = statusHint(snap?.status ?? 'idle', snap?.platform)
   // 竖条外轮廓水位线（从顶部往下、两侧一起退）：周额度剩余 ↦ 遮罩矩形的纵向位移——
   // 100% → 线抬到 −FADE（整圈含顶边全亮）,0% → 落在 SPAN（连淡出段一起沉到轮廓下方 = 全灭）。
   const pillLevelY =
@@ -1074,6 +1076,9 @@ export default function OrbWindow() {
               hoverTip('plan', statusTip, e.clientX, e.clientY)
             }}
           >
+            {/* 读数已过期（凭据失效 → 圆环上是最后一次的旧数）:套餐名前亮一枚红点,hover 说明恢复办法。
+                只在 auth_failed 出——其余状态（限流 / 网络）数据仍可信,维持「状态只放 hover」。*/}
+            {snap?.status === 'auth_failed' ? <i className="orb-orb-plan-dot" aria-hidden="true" /> : null}
             <span className="orb-orb-plan-name">{planTitle}</span>
           </div>
           <div

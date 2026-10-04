@@ -5,6 +5,11 @@ export default {
   statusActive: ['Active', '正常'],
   statusPlanInactive: ['Subscription inactive — resumes after renewal', '订阅未生效——续费后自动恢复'],
   statusAuthFailed: ['Credentials expired — run the agent CLI to refresh', '凭据已失效——运行 Agent CLI 以刷新'],
+  // Claude 专属：凭据失效且桌面端样本已过期（采样暂停）。读数是旧的,告诉用户怎么恢复。
+  statusStaleClaude: [
+    'Reading is out of date — click the context-window button at the bottom of a chat (or right-click the Claude tray icon) to resume, or run claude once in a terminal to renew credentials',
+    '读数已过期——点一下对话底部的上下文窗口按钮（或右键 Claude 托盘图标）即可恢复，也可在终端运行一次 claude 续期凭据',
+  ],
   statusRateLimited: ['Rate limited — retrying automatically', '请求受限——正在自动重试'],
   statusNetworkFailed: ['Network error — showing last known data', '网络错误——显示最近一次数据'],
   statusParseFailed: ['Upstream response unrecognized', '上游响应无法识别'],

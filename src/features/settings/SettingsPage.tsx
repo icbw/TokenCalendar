@@ -1407,7 +1407,7 @@ function SubscriptionsTab() {
             snap?.status === 'ok'
               ? t('statusActive', { windows: snap.windows.map((w) => t('windowLeft', { kind: windowKindLabel(t, w.kind), pct: (100 - w.used_percent).toFixed(0) })).join(t('listSep')) })
               : snap?.status === 'auth_failed'
-                ? t('statusAuthFailed')
+                ? t(info.platform === 'claude' ? 'statusStaleClaude' : 'statusAuthFailed')
                 : snap?.status === 'plan_inactive'
                   ? t('statusPlanInactive')
                   : snap?.status === 'rate_limited'

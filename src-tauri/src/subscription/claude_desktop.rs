@@ -4,13 +4,24 @@
 //! **Claude 桌面端**（含其 Code 标签页拉起的 claude.exe）自持登录态,不回写这份文件——
 //! 只用桌面端的用户,文件内 token 过期后悬浮球会一直停在 auth_failed。
 //!
-//! 桌面端自己每 ~15 分钟把订阅用量采样写进 `plan-usage-history.json`：
+//! 桌面端取用量时顺带把订阅用量采样写进 `plan-usage-history.json`：
 //! `{"version":2,"samples":[{"t":<unix ms>,"org":"<uuid>","u":{"fh":<5h %>,"sd":<7d %>}}]}`
 //! （整数百分比,无 resets_at,无 opus/sonnet 分窗）。本模块只读这个文件的最新样本,
 //! **不碰桌面端的加密 token 缓存**（config.json `oauth:tokenCache*`）——凭据红线不变。
 //!
+//! **采样节律**：不是无条件每 15 分钟。
+//! 启动时取一次;之后后台定时器按「距最近一次**交互**多久」分档——30 分钟内每 5 分钟,
+//! 之后每 15 分钟。**交互** = 点对话底部的上下文窗口按钮（用量弹窗）或右键托盘图标
+//! （config.json `planUsageLastTrayOpenAt` 记最近一次）。每个 tick 还要过两道闸：
+//!  服务端配置 `pollRequiresTrayOpenWithinHours` 生效且距最近交互超过该小时数 → 暂停
+//! （日志 `background poll paused: tray not opened recently`;具体小时数读不到,已知 < 6 天）;
+//!  系统锁屏 / 空闲 >= 10 分钟 → 跳过（回来后立刻补一条）。写样本另有 4.5 分钟去重。
+//! 所以**只要用户近期在桌面端操作过,这份文件就是活的**（≤ 5〜15 分钟滞后）;长时间没交互
+//! 才会停在上次启动那一条。弹窗里的实时数（每次回复后在 claude.exe 进程内存里更新）不落盘。
+//!
 //! 取舍：仅当主路径拿不到数（auth_failed / 无凭据文件）时回落到这里;样本超过
-//! `MAX_SAMPLE_AGE_SECS` 视为桌面端没在跑,不回落（旧读数冒充 ok 比显示失败更误导）。
+//! `MAX_SAMPLE_AGE_SECS` 视为采样已暂停,不回落（旧读数冒充 ok 比显示失败更误导）——
+//! 此时前端按 `auth_failed` 提示用户去点一下上下文窗口按钮恢复。
 //!
 //! 路径：MSIX 安装（商店 / 新版安装器）的 Roaming 被虚拟化到
 //! `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`;传统安装在
@@ -24,7 +35,7 @@ use super::model::{FetchStatus, Platform, QuotaWindow, SnapshotSource, Subscript
 
 const HISTORY_FILE: &str = "plan-usage-history.json";
 
-/// 可回落样本的最大年龄（秒）：桌面端 15 分钟一采,留足睡眠唤醒 / 采样抖动余量。
+/// 可回落样本的最大年龄（秒）：交互后最慢 15 分钟一采,留足睡眠唤醒 / 采样抖动余量。
 pub const MAX_SAMPLE_AGE_SECS: i64 = 3600;
 
 /// 候选文件（存在者;mtime 新者在前）。
@@ -262,6 +273,33 @@ fn apply_sample(
     out
 }
 
+/// 零请求推进：桌面端采样文件有了**更新的**样本,而当前快照本来就靠本地读数撑着
+/// （凭据失效 / 无凭据 / 上一条也是桌面端样本）→ 返回应落库的新快照。
+///
+/// 与 `fallback` 同一判据（只在 API 主路径给不出数时介入）:API 读数在手时不动它——
+/// 那条有服务端实时值、`source=api` 还要留给在线标定;限流冷却期（rate_limited）同理不碰。
+/// 推进条件是严格更新（`fetched_at` 变大）,所以重复调用是幂等的。没有它,样本落地后球上
+/// 要等下一次取数轮才看得见（token 驱动 / 30 分钟兜底）。
+pub fn advance_candidate(prev: Option<&SubscriptionSnapshot>, now: i64) -> Option<SubscriptionSnapshot> {
+    decide_advance(prev, snapshot(now)?)
+}
+
+/// 纯逻辑（单测直接覆盖）：见 `advance_candidate`。
+fn decide_advance(prev: Option<&SubscriptionSnapshot>, cand: SubscriptionSnapshot) -> Option<SubscriptionSnapshot> {
+    let Some(prev) = prev else { return Some(cand) };
+    let on_local = match prev.status {
+        FetchStatus::AuthFailed | FetchStatus::Idle => true,
+        FetchStatus::Ok => prev.source == SnapshotSource::Desktop,
+        _ => false,
+    };
+    let newer = match (cand.fetched_at, prev.fetched_at) {
+        (Some(c), Some(p)) => c > p,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    (on_local && (newer || prev.status != FetchStatus::Ok)).then_some(cand)
+}
+
 /// 主路径结果的回落：仅 Claude 的 auth_failed / idle（无凭据）才换成桌面端样本。
 pub fn fallback(snap: SubscriptionSnapshot, now: i64) -> SubscriptionSnapshot {
     if snap.platform != Platform::Claude
@@ -359,6 +397,29 @@ mod tests {
         let prev = ok_snapshot(1_000, 30.0, 20.0);
         let now = 1_500 + MAX_SAMPLE_AGE_SECS + 1;
         assert_eq!(apply_sample(&prev, (1_500, 5.0, 2.0), now), prev, "桌面端没在跑,旧样本不作数");
+    }
+
+    fn status_snapshot(status: FetchStatus, source: SnapshotSource, fetched: Option<i64>) -> SubscriptionSnapshot {
+        SubscriptionSnapshot { status, source, fetched_at: fetched, ..ok_snapshot(0, 0.0, 0.0) }
+    }
+
+    /// 只在 API 主路径给不出数时推进;API 读数在手 / 限流冷却期都不动;严格更新才推进。
+    #[test]
+    fn advance_only_when_running_on_local_readings() {
+        use FetchStatus::*;
+        use SnapshotSource::{Api, Desktop};
+        let cand = || build(2_000, 7.0, 3.0, 2_100).unwrap();
+        let adv = |prev: &SubscriptionSnapshot| decide_advance(Some(prev), cand()).is_some();
+        assert!(decide_advance(None, cand()).is_some(), "刚绑定、还没有快照");
+        assert!(adv(&status_snapshot(AuthFailed, Api, None)), "凭据失效 → 本地读数顶上");
+        assert!(adv(&status_snapshot(Idle, Api, None)));
+        assert!(adv(&status_snapshot(AuthFailed, Api, Some(9_999))), "失败态不看时刻,有读数就顶");
+        assert!(adv(&status_snapshot(Ok, Desktop, Some(1_000))), "上一条也是本地读数,新的更新");
+        assert!(!adv(&status_snapshot(Ok, Desktop, Some(2_000))), "同一条读数不重复推进");
+        assert!(!adv(&status_snapshot(Ok, Desktop, Some(3_000))), "比快照旧不退回去");
+        assert!(!adv(&status_snapshot(Ok, Api, Some(1_000))), "API 读数在手不动");
+        assert!(!adv(&status_snapshot(RateLimited, Api, None)), "限流冷却期不碰");
+        assert!(!adv(&status_snapshot(NetworkFailed, Api, None)));
     }
 
     #[test]
