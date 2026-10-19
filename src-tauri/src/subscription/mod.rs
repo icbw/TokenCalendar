@@ -504,7 +504,7 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
     loop {
         // 收割桌面端采样 + 按样本时刻增量建标定样本（零网络）。
         // 放在取数之前：的兜底短路要用最新样本做读数正。
-        // **不看绑定**——桌面端历史只滚动保留 14 天,绑定前错过的样本以后再也拿不回来,
+        // **不看绑定**——桌面端历史只滚动保留 30 天,绑定前错过的样本以后再也拿不回来,
         // 而收割本身只是本机文件读 + 幂等写。
         if let Some(db) = collector_db.as_ref() {
             let mtime = claude_desktop::history_mtime();
@@ -570,6 +570,29 @@ fn run(app: AppHandle, write_store: SubStore, adapters: Arc<Adapters>) {
                             emit_changed(&app);
                         }
                     }
+                }
+            }
+            // 反方向：本地读数过期（桌面端采样已暂停 / 没在跑）→ 当场落成 auth_failed,红点立刻
+            // 亮,不等下一个取数轮（兜底最长 30 分钟）。不看 mtime 闸门——过期是时间走出来的,
+            // 文件不会动。只有快照正靠桌面端样本撑着时才多读一次凭据文件。
+            if m.is_some() && write_store.bound_platforms().contains(&Platform::Claude) {
+                let now = chrono::Utc::now().timestamp();
+                let prev = write_store.load_snapshot(Platform::Claude);
+                let primary_live = || {
+                    !adapters.claude.is_dead(Platform::Claude)
+                        && credentials::read_credential(Platform::Claude).is_some_and(|c| !c.access_expired)
+                };
+                if claude_desktop::stale_candidate(prev.as_ref(), now, primary_live)
+                    && write_store.save_snapshot(&dead_snapshot(Platform::Claude)).is_ok()
+                {
+                    let gate = claude_desktop::sampler_gate();
+                    crate::dev_log!(
+                        "[subscription] claude desktop reading stale → auth_failed (sample age={}s, sampler paused={}, paused_at={:?})",
+                        prev.as_ref().and_then(|p| p.fetched_at).map_or(-1, |t| now - t),
+                        gate.is_paused(now),
+                        gate.paused_at()
+                    );
+                    emit_changed(&app);
                 }
             }
         }
