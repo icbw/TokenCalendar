@@ -89,6 +89,18 @@ export default {
   turnErrors: ['Errors: {n}', '错误：{n}'],
   turnRetries: ['Retries: {n}', '重试：{n}'],
 
+  // 消耗字段
+  colSpend: ['Spend', '消耗'],
+  colSpendHint: ['Quota-dollar equivalent of all turns (children merged), priced at each turn time; hover for ≈%', '任务全部轮的美元当量（子代理已并入，按各自轮时刻取价）；悬停看 ≈百分点'],
+  spendTitle: ['{usd} · ≈{pct}% of quota\n≈% = measured scale × $; readings are integer-percent, so it never reconciles exactly', '{usd} · ≈占额度 {pct}%\n≈% = 实测系数 × $；读数是整数百分点，对不齐是正常的'],
+  spendTitleUsd: ['{usd}\n≈% unavailable (no calibration yet)', '{usd}\n暂无实测系数，≈% 不可用'],
+  turnsSpend: ['Σ ≈{pct}% · {usd}', '合计 ≈{pct}% · {usd}'],
+  turnsSpendUsd: ['Σ {usd}', '合计 {usd}'],
+  turnsSpendHint: ['Sum of per-turn dollar equivalents (children merged); ≈% = measured scale × $', '全部轮美元当量之和（子代理已并入）；≈% = 实测系数 × $'],
+  turnCost: ['Cost ≈{pct}% ({usd})', '成本 ≈{pct}%（{usd}）'],
+  turnCostUsd: ['Cost {usd}', '成本 {usd}'],
+  turnModelCost: ['{model}: {usd}', '{model}：{usd}'],
+
   // Time 卡：空档
   modeGaps: ['Idle gaps', '空档'],
   modeGapsHint: ['Distribution of gaps between turns', '轮间空档分布'],

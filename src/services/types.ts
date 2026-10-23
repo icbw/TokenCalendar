@@ -98,6 +98,8 @@ export interface TaskRow {
   subagentCount: number
   subagentCalls: number
   totalTokens: number
+  /** 任务级消耗（$ 当量,会话树全部轮）;非订阅平台 null。 */
+  spendUsd: number | null
 }
 
 export interface TaskPage {
@@ -127,6 +129,10 @@ export interface TaskTurn {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  /** 轮成本（$ 当量,含并入的子代理切片）;非订阅平台 null。 */
+  usd: number | null
+  /** 分模型 $ 明细（按 $ 降序）。 */
+  usdByModel: { modelKey: string; usd: number }[] | null
 }
 
 /** 本地日闭区间（数据跨度 / 项目生命周期）。 */

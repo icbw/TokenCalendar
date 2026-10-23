@@ -17,3 +17,6 @@ export function clockLabel(ms: number): string {
   const d = new Date(ms)
   return `${fmt.date(d, { month: 'short', day: 'numeric' })} ${hm(d)}`
 }
+
+/** 金额（轮 / 任务级消耗）:两位小数 + 千分位,$ 前缀两种语言一致（与 PricingBlock 合计口径同款）。 */
+export const usd2 = (v: number): string => `$${fmt.number(v, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`

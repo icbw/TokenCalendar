@@ -731,6 +731,167 @@ export function ComboChart({ parts, groups, credits, buckets, height = 230 }: {
   )
 }
 
+// ---- 额度历史柱状图（读数日级汇总;y 轴固定 0-100,缺日无柱） ----
+// x 轴 = 完整日历日序列（不只有读数的日）——空档保持真实时间距离;
+// 一日一根柱 = 日末已用 %,无读数的日不画柱:空档不伪装成 0,也不像断线那样碎
+// （目测反馈:一年里应用没开的日子多,断线曲线视觉碎,改柱状）。
+// tooltip 一天明细:日初 / 峰 / 谷 + 观测消耗（下界）/ 回收 / 重置 / 读数条数;
+// 首笔读数距前一条超过 6 小时加一行空档提示（空档后攒下的涨幅记在落地那天）。
+
+export interface QuotaPoint {
+  day: string
+  usedFirst: number
+  usedLast: number
+  usedMax: number
+  usedMin: number
+  gain: number
+  drop: number
+  resets: number
+  carrySecs: number
+  n: number
+}
+
+/** tooltip 行文案（由装配组件本地化后传入;carry 带空档时长参数）。 */
+export interface QuotaText {
+  first: string
+  high: string
+  low: string
+  gain: string
+  drop: string
+  resets: string
+  readings: string
+  carry: (h: string) => string
+}
+
+export function QuotaBars({ days, points, color, text, height = 220 }: {
+  /** 完整日历日序列（'YYYY-MM-DD',与 points 下标对齐）;30 天 / 365 天由装配组件切换。 */
+  days: string[]
+  /** 每日读数汇总;null = 该日无读数（无柱）。 */
+  points: (QuotaPoint | null)[]
+  color: string
+  text: QuotaText
+  height?: number
+}) {
+  const width = 760
+  const n = days.length
+  const [hover, setHover] = useState<HoverState | null>(null)
+  const svgRef = useRef<SVGSVGElement>(null)
+  const svgScale = useSvgScale(svgRef)
+  const margin: Margin = MARGIN
+  const plot = { w: width - margin.left - margin.right, h: height - margin.top - margin.bottom }
+  const yMax = 100
+  const slot = n > 0 ? plot.w / n : plot.w
+  const barW = Math.max(1, Math.min(slot * 0.72, 26))
+  const xOf = (i: number) => margin.left + (i + 0.5) * slot
+  const yOf = (v: number) => margin.top + plot.h - (v / yMax) * plot.h
+  const pct = (v: number) => `${Math.round(v)}%`
+
+  const onMove = (e: React.MouseEvent) => {
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (!rect || n === 0) return
+    const x = ((e.clientX - rect.left) / rect.width) * width
+    const i = Math.floor((x - margin.left) / slot)
+    if (i < 0 || i >= n) {
+      setHover(null)
+      return
+    }
+    setHover({ index: i, x: xOf(i), y: e.clientY - rect.top })
+  }
+
+  const p = hover === null ? null : points[hover.index]
+  const rows = p
+    ? [
+        { label: text.first, value: pct(p.usedFirst) },
+        { label: text.high, value: pct(p.usedMax) },
+        { label: text.low, value: pct(p.usedMin) },
+        { label: text.gain, value: `+${pct(p.gain)}` },
+        { label: text.drop, value: `−${pct(p.drop)}` },
+        { label: text.resets, value: `${p.resets}` },
+        { label: text.readings, value: `${p.n}` },
+      ]
+    : []
+  const carry = p !== null && p.carrySecs > 6 * 3600 ? text.carry(`${Math.round(p.carrySecs / 3600)} h`) : null
+  const inv = 1 / svgScale
+  const cardW = 210 * inv
+  const cardH = (32 + rows.length * 18 + (carry ? 16 : 0)) * inv
+  const flip = hover !== null && hover.x > plot.w / 2
+
+  return (
+    <svg
+      ref={svgRef} viewBox={`0 0 ${width} ${height}`} style={{ width: '100%', display: 'block' }}
+      onMouseMove={onMove} onMouseLeave={() => setHover(null)}
+    >
+      {yTicks(yMax).map((t, i) => (
+        <g key={i}>
+          <line x1={margin.left} x2={margin.left + plot.w} y1={yOf(t)} y2={yOf(t)} stroke="var(--border)" strokeWidth={1} />
+          <text x={margin.left - 6} y={yOf(t) + 3} textAnchor="end" fontSize={10} fill="var(--text-faint)">
+            {t}%
+          </text>
+        </g>
+      ))}
+      {days.map((b, i) => {
+        const lbl = xTickLabel(b, n, i)
+        return lbl ? (
+          <text key={b} x={xOf(i)} y={height - 6} textAnchor="middle" fontSize={10} fill="var(--text-faint)">{lbl}</text>
+        ) : null
+      })}
+      {days.map((b, i) => {
+        const d = points[i]
+        // 无读数的日无柱;日末 0% 是有效读数但柱高为 0,同样不可见——hover 该日仍出明细
+        if (d === null || d.usedLast <= 0) return null
+        const h = (d.usedLast / yMax) * plot.h
+        const x = xOf(i) - barW / 2
+        const y = margin.top + plot.h - h
+        const r = Math.min(3, barW / 2)
+        return (
+          <path
+            key={b}
+            // 顶部圆角（与堆叠柱同款;柱宽 < 2 或高度贴顶圆角放不下时退直角）
+            d={r > 0 && h > r
+              ? `M${x},${y + r} Q${x},${y} ${x + r},${y} L${x + barW - r},${y} Q${x + barW},${y} ${x + barW},${y + r} L${x + barW},${margin.top + plot.h} L${x},${margin.top + plot.h} Z`
+              : `M${x},${y} L${x + barW},${y} L${x + barW},${y + h} L${x},${y + h} Z`}
+            fill={color}
+          />
+        )
+      })}
+      {hover && (
+        <g>
+          <line x1={hover.x} x2={hover.x} y1={margin.top} y2={margin.top + plot.h} stroke="var(--border-strong)" strokeDasharray="3 3" strokeWidth={1} />
+          {p !== null && (
+            <foreignObject
+              x={Math.max(2, Math.min(flip ? hover.x - cardW - 12 : hover.x + 12, width - cardW - 2))}
+              y={margin.top}
+              width={cardW}
+              height={cardH}
+            >
+              <div
+                style={{
+                  background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 8,
+                  boxShadow: 'var(--shadow-2)', padding: '6px 10px', fontSize: 11, color: 'var(--text)',
+                  transform: `scale(${inv})`, transformOrigin: 'top left',
+                  width: 210, boxSizing: 'border-box', pointerEvents: 'none', whiteSpace: 'nowrap',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontWeight: 700, marginBottom: 3 }}>
+                  <span>{p.day}</span>
+                  <span style={{ fontVariantNumeric: 'tabular-nums' }}>{pct(p.usedLast)}</span>
+                </div>
+                {rows.map((r) => (
+                  <div key={r.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, lineHeight: '18px' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>{r.label}</span>
+                    <span style={{ fontVariantNumeric: 'tabular-nums' }}>{r.value}</span>
+                  </div>
+                ))}
+                {carry && <div style={{ color: 'var(--text-faint)', lineHeight: '16px' }}>{carry}</div>}
+              </div>
+            </foreignObject>
+          )}
+        </g>
+      )}
+    </svg>
+  )
+}
+
 // ---- 环形占比图（圆环居中,图例分列环体左右,压缩高度） ----
 // 每条目 = 色点 + 名称 | tokens 值 + 百分比（值/百分比放条目行两端）;
 // 超过每侧 6 项截断,余量并入「+N more」行（title 提示完整清单,不做 tooltip 卡）。

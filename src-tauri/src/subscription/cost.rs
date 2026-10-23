@@ -35,7 +35,7 @@ use super::price;
 ///
 /// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
 /// 基准）,存量行不变,下一次 refit 自动用新先验。
-pub const WEIGHT_VERSION: u32 = 6;
+pub const WEIGHT_VERSION: u32 = 7;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
@@ -475,6 +475,34 @@ mod tests {
         assert_eq!(row.match_key, "sonnet-5-5");
         let row = price::price_at(Platform::Claude, "claude-sonnet-5", after).expect("有价目");
         assert_eq!(row.match_key, "sonnet-5");
+    }
+
+    #[test]
+    fn sonnet_5_5_cache_read_halves_on_2026_10_07() {
+        // 官方 2026-10-07 降价（路径 B,见 price-keys.json second_segments）：缓存读 0.2 → 0.1,
+        // 其余三项不变;生效日之前的历史样本仍按旧段计价
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        const FROM: i64 = 1_791_331_200; // 2026-10-07 00:00 UTC
+        let (before, known) = cost_of(Platform::Claude, "claude-sonnet-5-5", &t, FROM - 1);
+        assert!(known && (before - 14.7).abs() < 1e-12, "得到 {before}");
+        let (after, known) = cost_of(Platform::Claude, "claude-sonnet-5-5", &t, FROM);
+        assert!(known && (after - (2.0 + 10.0 + 0.1 + 2.5)).abs() < 1e-12, "得到 {after}");
+    }
+
+    #[test]
+    fn haiku_5_5_has_its_own_row_apart_from_haiku() {
+        // 价为 Haiku 4.5 的 1/10 ⇒ 必须分键（'haiku' 是 'haiku-5-5' 的子串,靠最长键优先分）;
+        // 也是 Claude 平台第一个带超长上下文档（>100K）的模型
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        let at = 1_791_331_200 + 3_600;
+        let (c, known) = cost_of(Platform::Claude, "claude-haiku-5-5", &t, at);
+        assert!(known && (c - (0.1 + 0.5 + 0.01 + 0.125)).abs() < 1e-12, "得到 {c}");
+        let row = price::price_at(Platform::Claude, "claude-haiku-5-5", at).expect("有价目");
+        assert_eq!(row.match_key, "haiku-5-5");
+        let row = price::price_at(Platform::Claude, "claude-haiku-4-5", at).expect("有价目");
+        assert_eq!(row.match_key, "haiku");
+        assert_eq!(price::long_threshold(Platform::Claude, "claude-haiku-5-5", at), Some(100_000));
+        assert_eq!(price::long_threshold(Platform::Claude, "claude-haiku-4-5", at), None);
     }
 
     #[test]

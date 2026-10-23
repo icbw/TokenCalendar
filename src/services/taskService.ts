@@ -53,6 +53,7 @@ export async function getTaskList(range: DayRange, filters: TaskFilters, sort: T
       subagentCount: r.subagent_count,
       subagentCalls: r.subagent_calls,
       totalTokens: r.total_tokens,
+      spendUsd: r.spend_usd ?? null,
     })),
   }
 }
@@ -83,6 +84,8 @@ export async function getTaskTurns(agent: string, sessionId: string): Promise<Ta
     inputTokens: t.input_tokens,
     outputTokens: t.output_tokens,
     totalTokens: t.total_tokens,
+    usd: t.usd ?? null,
+    usdByModel: t.usd_by_model?.map((m) => ({ modelKey: m.model_key, usd: m.usd })) ?? null,
   }))
 }
 

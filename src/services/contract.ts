@@ -231,6 +231,8 @@ export interface TaskRowContract {
   subagent_count: number
   subagent_calls: number
   total_tokens: number
+  /** 任务级消耗（$ 当量,会话树全部轮按各自轮时刻取价）;非订阅平台（无价目语义）缺失。 */
+  spend_usd?: number | null
 }
 
 export interface TaskPageContract {
@@ -271,6 +273,10 @@ export interface TaskTurnContract {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  /** 轮成本（$ 当量,含按时间窗并入的子代理切片,按轮起点取价）;非订阅平台缺失。 */
+  usd?: number | null
+  /** 分模型 $ 明细（按 $ 降序）。 */
+  usd_by_model?: { model_key: string; usd: number }[] | null
 }
 
 /** get_effort_series 参数（返回 RangeSeriesResultContract;bucket 仅 day）。 */

@@ -1,9 +1,10 @@
-// Insights 价格面板,三件事一张卡一件：
+// Insights 价格面板,四件事一张卡一件：
 //
 //   1) 美元当量 + 用量 × 价格 —— 这段时间的 token 若按官方 API 单价计费值多少钱,
 //      分模型列出,每个模型按它自己的价目生效段切开;
 //   2) 分模型消息数估计 —— 5h / 周窗口约剩几条、满窗几条、本周已发、周重置次数（MessagesCard）;
-//   3) 官方价目对照表 —— 四项单价 + 出处,它解释了第一块的数字是怎么来的。
+//   3) 额度历史 —— 最近一年读数日级汇总的已用曲线,缺日断线（QuotaHistoryCard）;
+//   4) 官方价目对照表 —— 四项单价 + 出处,它解释了第一块的数字是怎么来的。
 //      可按列排序（默认 Since 降序,新上架 / 刚改价的在上）;某项单价相对该模型
 //      上一段生效期有变动时格内标箭头（涨 = 红↑,降 = 绿↓）,点箭头展开变动量。
 //      原先的「价格梯度」阶梯图已删:官方极少改价,整张图几乎全是平线,参考价值低。
@@ -27,6 +28,7 @@ import { colorFor } from './charts'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import MessagesCard from './MessagesCard'
+import QuotaHistoryCard from './QuotaHistoryCard'
 import { formatSpan, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
 import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
@@ -419,7 +421,10 @@ export default function PricingBlock() {
       {/* ---- 2) 分模型消息数估计（5h / 周剩余、本周已发、周重置） ----*/}
       <MessagesCard platform={platform} range={selection.range} refreshTick={refreshTick} />
 
-      {/* ---- 3) 官方价目对照表 ----*/}
+      {/* ---- 3) 额度历史（读数日级汇总,年度已用曲线,缺日断线） ----*/}
+      <QuotaHistoryCard platform={platform} refreshTick={refreshTick} />
+
+      {/* ---- 4) 官方价目对照表 ----*/}
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">{t('listTitle', { p: PLATFORM_LABEL[platform] })}</span>

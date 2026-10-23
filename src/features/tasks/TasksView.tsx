@@ -12,11 +12,11 @@
 // 下拉末尾「Manage projects…」打开主窗口内的项目管理弹出层,不改变当前筛选。
 // 内容列约束:TaskRow.title 只在本文件的列表单元格渲染（标签开关 = title 时）,不进入展开、导出或其它视图。
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
-import { events, taskService, usageService } from '../../services'
+import { events, subscriptionService, taskService, usageService } from '../../services'
 import type { TaskPage, TaskRow, TaskSort, TaskSortField, TaskTurn } from '../../services'
 import { formatCompact } from '../matrix/matrixScale'
 import { fmt, useT, type MessageKey, type Translator } from '../../lib/i18n'
-import { startedLabel } from './taskFormat'
+import { startedLabel, usd2 } from './taskFormat'
 import { OUTLIER_Z, formatDuration, projectDisplayName, projectTooltip, zScores } from '../insights/analytics'
 import { Seg } from '../insights/Seg'
 import RangeControl from '../insights/RangeControl'
@@ -55,9 +55,22 @@ const COLUMNS: Column[] = [
   { id: 'errors', label: 'colErrors', hint: 'colErrorsHint', sort: 'error_count' },
   { id: 'subagents', label: 'colSubagents', hint: 'colSubagentsHint', sort: 'subagent_count' },
   { id: 'tokens', label: 'colTokens', hint: 'colTokensHint', sort: 'total_tokens' },
+  { id: 'spend', label: 'colSpend', hint: 'colSpendHint' },
 ]
 
 const taskKey = (r: { agent: string; sessionId: string }) => `${r.agent}${r.sessionId}`
+
+/** 任务行 → 订阅平台:claude-code / codex 之外（ZCode、CodeBuddy 等本地源）无订阅额度语义。 */
+const PLATFORM_OF_AGENT: Record<string, 'codex' | 'claude'> = { codex: 'codex', 'claude-code': 'claude' }
+
+/** 消耗列 hover:$ 当量 + ≈百分点。 */
+function spendTitle(r: TaskRow, scale: number | undefined, t: Translator<'tasks'>): string | undefined {
+  if (r.spendUsd === null) return undefined
+  const pct = scale && scale > 0 ? r.spendUsd * scale : null
+  const usd = usd2(r.spendUsd)
+  if (pct !== null && pct > 0) return t('spendTitle', { usd, pct: pct < 0.1 ? '<0.1' : pct.toFixed(1) })
+  return t('spendTitleUsd', { usd })
+}
 
 function subagentCell(r: TaskRow): string {
   if (r.subagentCount === 0 && r.subagentCalls === 0) return '—'
@@ -113,6 +126,31 @@ export default function TasksView() {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [turns, setTurns] = useState<{ key: string; rows: TaskTurn[] | null } | null>(null)
   const [refreshTick, setRefreshTick] = useState(0)
+  // 订阅平台的「百分点 / $」系数（轮 / 任务消耗换算 ≈% 用）;诊断只读,不轮询
+  const [scales, setScales] = useState<Partial<Record<'codex' | 'claude', number>>>({})
+
+  useEffect(() => {
+    let timer = 0
+    let off: (() => void) | null = null
+    const load = () =>
+      void subscriptionService.getEstimator().then((rows) => {
+        if (!rows) return
+        const next: Partial<Record<'codex' | 'claude', number>> = {}
+        for (const r of rows) if (typeof r.scale === 'number' && r.scale > 0) next[r.platform] = r.scale
+        setScales(next)
+      })
+    load()
+    void events.onSubscriptionChanged(() => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(load, 300)
+    }).then((unlisten) => {
+      off = unlisten
+    })
+    return () => {
+      window.clearTimeout(timer)
+      off?.()
+    }
+  }, [])
 
   // usage:changed（采集轮 / 改阈值重算）→ 300ms 去抖:列表、筛选候选、直方图、展开明细一并重取
   useEffect(() => {
@@ -381,13 +419,19 @@ export default function TasksView() {
                             <td className={r.errorCount > 0 ? 'task-errors' : 'task-muted'}>{r.errorCount > 0 ? fmt.number(r.errorCount) : '0'}</td>
                             <td className={r.subagentCount > 0 ? undefined : 'task-muted'}>{subagentCell(r)}</td>
                             <td>{formatCompact(r.totalTokens)}</td>
+                            <td
+                              className={r.spendUsd !== null ? undefined : 'task-muted'}
+                              title={spendTitle(r, PLATFORM_OF_AGENT[r.agent] ? scales[PLATFORM_OF_AGENT[r.agent]] : undefined, t)}
+                            >
+                              {r.spendUsd === null ? '—' : usd2(r.spendUsd)}
+                            </td>
                           </tr>
                           {isOpen && (
-                            <tr className="task-detail">
-                              <td colSpan={COLUMNS.length + 1}>
-                                <TaskTurns turns={turns?.key === k ? turns.rows : undefined} />
-                              </td>
-                            </tr>
+                            <TaskTurns
+                              turns={turns?.key === k ? turns.rows : undefined}
+                              scale={PLATFORM_OF_AGENT[r.agent] ? scales[PLATFORM_OF_AGENT[r.agent]] : undefined}
+                              colCount={COLUMNS.length + 1}
+                            />
                           )}
                         </Fragment>
                       )

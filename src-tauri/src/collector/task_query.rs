@@ -29,6 +29,8 @@ use super::store::{
     StoreRow, StoreSlice,
 };
 use super::project_meta::{project_labels, resolve_cte, ScratchRule, HIDDEN_SLICE_KEY};
+use crate::subscription::model::Platform;
+use crate::subscription::cost;
 
 /// 项目维 metric → daily_project 列或列表达式（白名单;SQL 只拼这里的常量）。
 /// 列名不带表前缀:调用处与之 JOIN 的 pmap 只有 raw_key / eff_key,不会歧义。
@@ -138,6 +140,26 @@ pub struct TaskRow {
     pub subagent_count: i64,
     pub subagent_calls: i64,
     pub total_tokens: i64,
+    /// 任务级消耗（$ 当量,会话树全部轮按各自轮时刻取价）;非订阅平台（无价目语义）→ None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_usd: Option<f64>,
+}
+
+/// 轮成本的分模型明细（hover 展开:同轮多模型 / 子代理用不同模型时各占多少）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCost {
+    pub model_key: String,
+    pub usd: f64,
+}
+
+/// 任务 / 订阅域的 agent → 订阅平台映射。claude-code / codex 之外（ZCode、CodeBuddy、
+/// WorkBuddy、DSH 等本地源）没有订阅额度语义,消耗字段保持 None。
+fn agent_platform(agent: &str) -> Option<Platform> {
+    match agent {
+        "claude-code" => Some(Platform::Claude),
+        "codex" => Some(Platform::Codex),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -172,6 +194,12 @@ pub struct TaskTurn {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    /// 轮成本（$ 当量,含按时间窗并入的子代理切片,按轮起点取价）;非订阅平台 → None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    /// 分模型 $ 明细（按 $ 降序）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usd_by_model: Option<Vec<ModelCost>>,
 }
 
 /// 本地日闭区间（数据跨度 / 项目生命周期）。
@@ -652,6 +680,7 @@ impl Store {
                     subagent_calls: r.get(14)?,
                     total_tokens: r.get(15)?,
                     aborted_count: r.get(16)?,
+                    spend_usd: None,
                 })
             })
             .ok()?;
@@ -663,6 +692,10 @@ impl Store {
         let labels: HashMap<String, String> = keys.iter().cloned().zip(project_labels(&keys, &self.project_aliases())).collect();
         for r in &mut rows {
             r.project_label = labels[&r.project].clone();
+            // 任务级消耗:仅订阅平台有 $ 当量语义;逐行一次会话树聚合（本地索引查询,量小）
+            if let Some(platform) = agent_platform(&r.agent) {
+                r.spend_usd = Some(self.task_spend(platform, &r.agent, &r.session_id));
+            }
         }
         Some(TaskPage { total, rows })
     }
@@ -702,10 +735,142 @@ impl Store {
                     output_tokens: r.get(17)?,
                     total_tokens: r.get(18)?,
                     aborted: r.get::<_, i64>(19)? != 0,
+                    usd: None,
+                    usd_by_model: None,
                 })
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.flatten().enumerate().map(|(i, t)| TaskTurn { turn_seq: i as i64 + 1, ..t }).collect())
+        let mut turns: Vec<TaskTurn> =
+            rows.flatten().enumerate().map(|(i, t)| TaskTurn { turn_seq: i as i64 + 1, ..t }).collect();
+        // 轮级成本:仅订阅平台（claude-code / codex）有 $ 当量语义;子代理切片按时间窗并入父轮,
+        // 与物化层 `turn.total_tokens` 的口径一致（轮条上的 token 列已含子代理）。
+        if let Some(platform) = agent_platform(agent) {
+            let roots: Vec<(i64, i64)> = turns.iter().map(|t| (t.turn_seq, t.started_at)).collect();
+            let costs = self.turn_costs(platform, agent, session_id, &roots);
+            for t in turns.iter_mut() {
+                if let Some((usd, by_model)) = costs.get(&t.turn_seq) {
+                    t.usd = Some(*usd);
+                    t.usd_by_model = Some(
+                        by_model.iter().map(|(m, u)| ModelCost { model_key: m.clone(), usd: *u }).collect(),
+                    );
+                }
+            }
+        }
+        Ok(turns)
+    }
+
+    /// 会话树（根 + 全部隔代子会话）的轮级成本。
+    ///
+    /// 归并规则与 `turn` 物化层一致（task_store 物化注释）:切片按 started_at 落进父轮
+    /// 时间窗 `[开始, 下一轮开始)`,早于父会话首轮 → 挂最后一轮;每窗的分模型 token
+    /// 按**窗起点时刻**取价——与 message budget 的轮时刻口径一致,降价分界落在轮中段
+    /// 时不切分（轮粒度不切价,小时级查询才切）。
+    ///
+    /// 返回:根轮顺序号（重排后 1..n）→ （$合计, 分模型 $ 按 $ 降序)。
+    fn turn_costs(
+        &self,
+        platform: Platform,
+        agent: &str,
+        root: &str,
+        roots: &[(i64, i64)],
+    ) -> BTreeMap<i64, (f64, Vec<(String, f64)>)> {
+        let mut out = BTreeMap::new();
+        if roots.is_empty() {
+            return out;
+        }
+        //  会话树全部 （轮 × 模型) 切片,带各自轮开始时刻（毫秒）
+        let sql = "WITH RECURSIVE tree(sid) AS (
+                       SELECT ?1 UNION ALL
+                       SELECT s.session_id FROM session s JOIN tree t ON s.parent_id = t.sid
+                   )
+                   SELECT r.started_at, p.model_key, SUM(p.input_tokens), SUM(p.output_tokens),
+                          SUM(p.cache_read_tokens), SUM(p.cache_write_tokens)
+                     FROM turn_part p
+                     JOIN turn_raw r ON r.agent_key = p.agent_key AND r.session_id = p.session_id AND r.turn_seq = p.turn_seq
+                    WHERE p.agent_key = ?2 AND p.session_id IN (SELECT sid FROM tree)
+                    GROUP BY p.session_id, p.turn_seq, p.model_key";
+        let Ok(mut stmt) = self.conn().prepare(sql) else { return out };
+        let Ok(mut rows) = stmt.query(rusqlite::params![root, agent]) else { return out };
+        let mut parts: Vec<(i64, String, [i64; 4])> = Vec::new();
+        while let Ok(Some(r)) = rows.next() {
+            let started_at: i64 = match r.get(0) { Ok(v) => v, Err(_) => return out };
+            let model: String = match r.get(1) { Ok(v) => v, Err(_) => return out };
+            let a: i64 = match r.get(2) { Ok(v) => v, Err(_) => return out };
+            let b: i64 = match r.get(3) { Ok(v) => v, Err(_) => return out };
+            let c: i64 = match r.get(4) { Ok(v) => v, Err(_) => return out };
+            let d: i64 = match r.get(5) { Ok(v) => v, Err(_) => return out };
+            parts.push((started_at, model, [a, b, c, d]));
+        }
+        //  时间窗归并
+        let mut acc: BTreeMap<usize, BTreeMap<String, [i64; 4]>> = BTreeMap::new();
+        for (at, model, tok) in parts {
+            let idx = match roots.partition_point(|&(_, t)| t <= at) {
+                0 => roots.len() - 1, // 早于父会话首轮 → 挂最后一轮（物化规则）
+                i => i - 1,           // 落进 [roots[i-1].started_at, roots[i].started_at)
+            };
+            let e = acc.entry(idx).or_default().entry(model).or_insert([0; 4]);
+            for (slot, v) in e.iter_mut().zip(tok) {
+                *slot += v;
+            }
+        }
+        //  每窗按窗起点取价（每模型一次 priced_at,内存价目表查询,量小）
+        for (idx, models) in acc {
+            let at = roots[idx].1.div_euclid(1000);
+            let mut total = 0.0f64;
+            let mut by: Vec<(String, f64)> = Vec::new();
+            for (model, tok) in &models {
+                let tokens = cost::Tokens {
+                    input: tok[0],
+                    output: tok[1],
+                    cache_read: tok[2],
+                    cache_write: tok[3],
+                };
+                if tokens.total() == 0 {
+                    continue;
+                }
+                let usd = cost::priced_at(platform, model, at).usd_of(&tokens);
+                total += usd;
+                by.push((model.clone(), usd));
+            }
+            by.sort_by(|a, b| b.1.total_cmp(&a.1));
+            if let Some(&(seq, _)) = roots.get(idx) {
+                out.insert(seq, (total, by));
+            }
+        }
+        out
+    }
+
+    /// 任务级消耗:会话树全部 （轮 × 模型) 切片按**各自轮时刻**取价求和。
+    /// 列表行只要总数,不做父轮时间窗归并（轮时刻取价 = 逐轮口径,与 turn_costs 的窗口径
+    /// 在同一价目段内一致;跨降价分界的任务两边可能差几分钱,列表总数以本函数为准）。
+    fn task_spend(&self, platform: Platform, agent: &str, root: &str) -> f64 {
+        let sql = "WITH RECURSIVE tree(sid) AS (
+                       SELECT ?1 UNION ALL
+                       SELECT s.session_id FROM session s JOIN tree t ON s.parent_id = t.sid
+                   )
+                   SELECT r.started_at, p.model_key, SUM(p.input_tokens), SUM(p.output_tokens),
+                          SUM(p.cache_read_tokens), SUM(p.cache_write_tokens)
+                     FROM turn_part p
+                     JOIN turn_raw r ON r.agent_key = p.agent_key AND r.session_id = p.session_id AND r.turn_seq = p.turn_seq
+                    WHERE p.agent_key = ?2 AND p.session_id IN (SELECT sid FROM tree)
+                    GROUP BY p.session_id, p.turn_seq, p.model_key";
+        let Ok(mut stmt) = self.conn().prepare(sql) else { return 0.0 };
+        let Ok(mut rows) = stmt.query(rusqlite::params![root, agent]) else { return 0.0 };
+        let mut total = 0.0f64;
+        while let Ok(Some(r)) = rows.next() {
+            let (Ok(at_ms), Ok(model)) = (r.get::<_, i64>(0), r.get::<_, String>(1)) else { continue };
+            let (Ok(a), Ok(b), Ok(c), Ok(d)) =
+                (r.get::<_, i64>(2), r.get::<_, i64>(3), r.get::<_, i64>(4), r.get::<_, i64>(5))
+            else {
+                continue;
+            };
+            let tokens = cost::Tokens { input: a, output: b, cache_read: c, cache_write: d };
+            if tokens.total() == 0 {
+                continue;
+            }
+            total += cost::priced_at(platform, &model, at_ms.div_euclid(1000)).usd_of(&tokens);
+        }
+        total
     }
 
     /// 空档直方图:范围内（按轮的日）根会话轮的 gap_ms 对数分桶 + 阈值两侧合计;隐藏项目的轮不计。
@@ -1356,6 +1521,49 @@ mod tests {
         assert_eq!((turns[1].steps, turns[1].subagent_count, turns[1].gap_ms), (2, 1, Some(58_000)));
         assert!(turns.windows(2).all(|w| w[0].started_at <= w[1].started_at));
         assert!(s.task_turns("claude-code", "sub").unwrap().is_empty(), "子会话无独立明细");
+    }
+
+    #[test]
+    fn turn_costs_price_and_window_merge() {
+        let s = fixture();
+        let platform = agent_platform("claude-code").unwrap();
+        let turns = s.task_turns("claude-code", "s1").unwrap();
+        // 模型 m1/m2/m3 不在价目表 → 回落常量计价,$ 值存在;每轮都有分模型明细
+        assert!(turns.iter().all(|t| t.usd.is_some() && t.usd.unwrap() > 0.0));
+        assert!(turns.iter().all(|t| t.usd_by_model.as_ref().is_some_and(|m| !m.is_empty())));
+        // 子会话 sub 的 m3 切片（start = T+61s）按时间窗并入父会话第 2 轮（[T+60s, T+7260s)）
+        let second: Vec<&str> =
+            turns[1].usd_by_model.as_ref().unwrap().iter().map(|m| m.model_key.as_str()).collect();
+        assert!(second.contains(&"m1") && second.contains(&"m3"), "子会话切片按时间窗并入父轮");
+        for t in &turns {
+            let by: f64 = t.usd_by_model.as_ref().unwrap().iter().map(|m| m.usd).sum();
+            assert!((by - t.usd.unwrap()).abs() < 1e-9, "分模型明细之和 = 轮合计");
+        }
+        // 任务级 spend（逐轮时刻口径）与轮窗合计在同一价目段内相等
+        let spend = s.task_spend(platform, "claude-code", "s1");
+        let total: f64 = turns.iter().filter_map(|t| t.usd).sum();
+        assert!((spend - total).abs() < 1e-6, "两种口径在同价目段内一致");
+        // 早于父会话首轮的切片 → 挂最后一轮（与物化同规则）;自定义时间窗验证
+        let shifted = s.turn_costs(platform, "claude-code", "s1", &[(1, T + 100_000), (2, T + 200_000)]);
+        assert!(!shifted.contains_key(&1), "全部切片都晚于自定义首轮起点");
+        let last: Vec<&str> = shifted[&2].1.iter().map(|(m, _)| m.as_str()).collect();
+        assert!(
+            last.contains(&"m1") && last.contains(&"m2") && last.contains(&"m3"),
+            "早于首轮的切片挂最后一轮"
+        );
+    }
+
+    #[test]
+    fn spend_none_for_non_subscription_agents() {
+        assert!(agent_platform("codebuddy").is_none());
+        assert!(agent_platform("zcode").is_none());
+        assert_eq!(agent_platform("claude-code"), Some(Platform::Claude));
+        assert_eq!(agent_platform("codex"), Some(Platform::Codex));
+        // codex 任务也有 spend（fixture s2 一轮 m1 300 tok）
+        let s = fixture();
+        let page = s.task_list(0, i64::MAX, &TaskFilters::default(), &TaskSort::default(), &TaskPageReq::default(), OFF).unwrap();
+        let codex = page.rows.iter().find(|r| r.agent == "codex").unwrap();
+        assert!(codex.spend_usd.is_some_and(|v| v > 0.0));
     }
 
     #[test]

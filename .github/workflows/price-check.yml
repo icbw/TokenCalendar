@@ -1,0 +1,48 @@
+# 上游价目核对：models.dev 目录 vs 仓内出厂种子（price_seed.json）。
+#
+# 定时跑 `scripts/price-seed-gen.mjs --check`（生成器的维护契约门）：上游对已覆盖模型
+# 调价 / 改名 / 下架而规格未声明时非零退出，并自动开一个 issue 提醒（已有同标题
+# open issue 时不重复开）。
+#
+# 边界：--check 只看得见**已覆盖键**的变化——上游出了**新模型**不会报警；新模型是否
+# 收键是语义判断（Codex 不路由的系列就不收），仍靠人工例行核对。失败后的处置见
+# scripts/price-keys.json 的维护契约：second_segments 声明生效日或加键 → 重跑生成器
+# 复核 diff → 升 cost.rs WEIGHT_VERSION → 提交。
+
+name: price-seed check
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # 每周一 17:00（北京时间）
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 比对仓内种子与 models.dev 现值
+        run: node scripts/price-seed-gen.mjs --check
+      - name: 有差异时开 issue 提醒（去重）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: '上游价目数据有变化（models.dev ≠ price_seed.json）'
+        run: |
+          node scripts/price-seed-gen.mjs --check > "$RUNNER_TEMP/detail.log" 2>&1 || true
+          if gh issue list --state open --json title --jq '.[].title' | grep -qF "$TITLE"; then
+            echo "已有同标题 open issue，不重复开"
+          else
+            gh issue create --title "$TITLE" --body "**自动核对失败：上游价目与仓内种子不一致。** 处置按 price-keys.json 维护契约（second_segments 声明生效日或加键 → 重跑生成器复核 diff → 升 cost.rs WEIGHT_VERSION）。详细差异：
+
+          \`\`\`
+          $(tail -n 40 "$RUNNER_TEMP/detail.log")
+          \`\`\`"
+          fi
+          exit 1
