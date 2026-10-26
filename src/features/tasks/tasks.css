@@ -453,3 +453,39 @@ button.task-th:hover,
 .tspent-notice {
   margin-bottom: 4px;
 }
+
+/* ---------- 额度 × 执行双轨 ---------- */
+.quota-align-card { overflow: hidden; }
+.quota-align-header { flex-wrap: wrap; }
+.quota-align-heading { display: flex; flex-direction: column; gap: 3px; min-width: 220px; flex: 1; }
+.quota-align-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.quota-align-range { margin: -2px 0 6px; font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.quota-align-evidence { display: flex; flex-direction: column; gap: 3px; margin: 0 0 8px; padding: 7px 10px; border-left: 2px solid var(--border-strong); border-radius: 4px; background: var(--panel-strong); color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.quota-align-evidence.is-sparse { border-left-color: var(--accent); }
+.quota-align-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-strong); }
+.quota-align-chart { display: block; width: 100%; min-width: 760px; height: auto; }
+.quota-align-window { fill: var(--accent-weak); opacity: .3; }
+.quota-align-gap { fill: var(--zero-bg); opacity: .75; }
+.quota-align-grid { stroke: var(--border); stroke-width: 1; }
+.quota-align-tick { fill: var(--text-faint); font-size: 10px; font-variant-numeric: tabular-nums; }
+.quota-align-axis-title { fill: var(--text-muted); font-size: 11px; font-weight: 600; }
+.quota-align-line { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.quota-align-point { fill: var(--accent); stroke: var(--panel-strong); stroke-width: .5; }
+.quota-align-reading-label { fill: var(--text-muted); stroke: var(--panel-strong); stroke-width: 2px; paint-order: stroke; font-size: 10px; font-weight: 600; pointer-events: none; }
+.quota-align-boundary { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 4 4; }
+.quota-align-disc { stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.quota-align-disc.is-reset { stroke: var(--success); }
+.quota-align-disc-band { fill: var(--warn); opacity: .1; }
+.quota-align-unknown { fill: var(--warn); font-size: 13px; font-weight: 700; }
+.quota-align-lane-line { stroke: var(--border); stroke-width: 1; opacity: .7; }
+.quota-align-task-label { fill: var(--text-muted); font-size: 11px; }
+.quota-align-turn { fill: var(--accent); stroke: var(--panel-strong); stroke-width: .6; opacity: .88; }
+.quota-align-turn.is-aborted { fill: var(--danger); }
+.quota-align-turn.is-open { fill: var(--warn); opacity: .8; }
+.quota-align-empty { fill: var(--text-faint); font-size: 12px; }
+.quota-align-show-all { margin-top: 8px; }
+.quota-align-footer { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 11px; color: var(--text-faint); }
+.quota-align-warning { color: var(--warn); }
+@media (max-width: 1000px) {
+  .quota-align-controls { width: 100%; justify-content: flex-start; }
+}

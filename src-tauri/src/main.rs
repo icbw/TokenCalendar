@@ -229,6 +229,7 @@ fn main() {
             subscription::query::get_message_budget,
             subscription::query::get_quota_readings,
             subscription::query::get_quota_days,
+            subscription::query::get_quota_alignment,
             subscription::idle::get_subscription_idle,
             subscription::idle::set_subscription_idle_enabled,
             subscription::idle::note_subscription_attention,

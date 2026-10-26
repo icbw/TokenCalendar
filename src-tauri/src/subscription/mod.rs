@@ -15,6 +15,9 @@
 //!   demand.rs 的退避推后重试**,故障期间不按采集频率空转;
 //! - 红线：凭据文件只读不写,刷新 token 只存内存;单平台失败不拖垮整体。
 
+pub mod alignment;
+#[cfg(test)]
+mod alignment_smoke;
 pub mod bootstrap;
 pub mod calib;
 pub mod claude;

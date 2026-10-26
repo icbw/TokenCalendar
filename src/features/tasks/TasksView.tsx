@@ -20,6 +20,7 @@ import { startedLabel, usd2 } from './taskFormat'
 import { OUTLIER_Z, formatDuration, projectDisplayName, projectTooltip, zScores } from '../insights/analytics'
 import { Seg } from '../insights/Seg'
 import RangeControl from '../insights/RangeControl'
+import QuotaAlignmentCard from './QuotaAlignmentCard'
 import { useRangeSelection } from '../insights/useRangeSelection'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import TaskTurns from './TaskTurns'
@@ -340,6 +341,8 @@ export default function TasksView() {
           refreshTick={refreshTick}
           onPickTask={pickTask}
         />
+
+        <QuotaAlignmentCard project={project} />
 
         <section className="insight-card">
           <header className="insight-card-header">

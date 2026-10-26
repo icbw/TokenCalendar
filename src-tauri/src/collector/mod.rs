@@ -4,6 +4,7 @@
 //! 单源失败只降级该源状态（source_state 表）,不拖垮整体。
 //! UI 只读聚合结果（commands.rs）,批次提交后 emit `usage:changed`。
 
+pub mod alignment_query;
 pub mod attention;
 pub mod claude_code;
 pub mod codebuddy;

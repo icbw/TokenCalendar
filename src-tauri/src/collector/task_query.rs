@@ -162,6 +162,49 @@ fn agent_platform(agent: &str) -> Option<Platform> {
     }
 }
 
+/// 轮成本的纯计算部分：批量取出演进切片后复用同一套归并 / 取价口径。
+/// `roots` 必须是同一根会话按开始时间排序的 `（turn_seq, started_at)`。
+pub(super) fn price_turn_parts(
+    platform: Platform,
+    roots: &[(i64, i64)],
+    parts: Vec<(i64, String, [i64; 4])>,
+) -> BTreeMap<i64, (f64, Vec<(String, f64)>)> {
+    let mut out = BTreeMap::new();
+    if roots.is_empty() {
+        return out;
+    }
+    let mut acc: BTreeMap<usize, BTreeMap<String, [i64; 4]>> = BTreeMap::new();
+    for (at, model, tok) in parts {
+        let idx = match roots.partition_point(|&(_, t)| t <= at) {
+            0 => roots.len() - 1,
+            i => i - 1,
+        };
+        let entry = acc.entry(idx).or_default().entry(model).or_insert([0; 4]);
+        for (slot, value) in entry.iter_mut().zip(tok) {
+            *slot += value;
+        }
+    }
+    for (idx, models) in acc {
+        let at = roots[idx].1.div_euclid(1000);
+        let mut total = 0.0f64;
+        let mut by = Vec::new();
+        for (model, tok) in &models {
+            let tokens = cost::Tokens { input: tok[0], output: tok[1], cache_read: tok[2], cache_write: tok[3] };
+            if tokens.total() == 0 {
+                continue;
+            }
+            let usd = cost::priced_at(platform, model, at).usd_of(&tokens);
+            total += usd;
+            by.push((model.clone(), usd));
+        }
+        by.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if let Some(&(seq, _)) = roots.get(idx) {
+            out.insert(seq, (total, by));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 pub struct TaskPage {
     /// 过滤后的任务总数（分页前）。
@@ -774,7 +817,7 @@ impl Store {
         root: &str,
         roots: &[(i64, i64)],
     ) -> BTreeMap<i64, (f64, Vec<(String, f64)>)> {
-        let mut out = BTreeMap::new();
+        let out = BTreeMap::new();
         if roots.is_empty() {
             return out;
         }
@@ -801,43 +844,9 @@ impl Store {
             let d: i64 = match r.get(5) { Ok(v) => v, Err(_) => return out };
             parts.push((started_at, model, [a, b, c, d]));
         }
-        //  时间窗归并
-        let mut acc: BTreeMap<usize, BTreeMap<String, [i64; 4]>> = BTreeMap::new();
-        for (at, model, tok) in parts {
-            let idx = match roots.partition_point(|&(_, t)| t <= at) {
-                0 => roots.len() - 1, // 早于父会话首轮 → 挂最后一轮（物化规则）
-                i => i - 1,           // 落进 [roots[i-1].started_at, roots[i].started_at)
-            };
-            let e = acc.entry(idx).or_default().entry(model).or_insert([0; 4]);
-            for (slot, v) in e.iter_mut().zip(tok) {
-                *slot += v;
-            }
-        }
-        //  每窗按窗起点取价（每模型一次 priced_at,内存价目表查询,量小）
-        for (idx, models) in acc {
-            let at = roots[idx].1.div_euclid(1000);
-            let mut total = 0.0f64;
-            let mut by: Vec<(String, f64)> = Vec::new();
-            for (model, tok) in &models {
-                let tokens = cost::Tokens {
-                    input: tok[0],
-                    output: tok[1],
-                    cache_read: tok[2],
-                    cache_write: tok[3],
-                };
-                if tokens.total() == 0 {
-                    continue;
-                }
-                let usd = cost::priced_at(platform, model, at).usd_of(&tokens);
-                total += usd;
-                by.push((model.clone(), usd));
-            }
-            by.sort_by(|a, b| b.1.total_cmp(&a.1));
-            if let Some(&(seq, _)) = roots.get(idx) {
-                out.insert(seq, (total, by));
-            }
-        }
-        out
+        drop(rows);
+        drop(stmt);
+        price_turn_parts(platform, roots, parts)
     }
 
     /// 任务级消耗:会话树全部 （轮 × 模型) 切片按**各自轮时刻**取价求和。
@@ -1564,6 +1573,37 @@ mod tests {
         let page = s.task_list(0, i64::MAX, &TaskFilters::default(), &TaskSort::default(), &TaskPageReq::default(), OFF).unwrap();
         let codex = page.rows.iter().find(|r| r.agent == "codex").unwrap();
         assert!(codex.spend_usd.is_some_and(|v| v > 0.0));
+    }
+
+    #[test]
+    fn alignment_selects_overlapping_turns_and_keeps_p1_costs() {
+        let s = fixture();
+        let out = s.task_alignment(Platform::Claude, T + 30_000, T + 90_000, None, OFF).unwrap();
+        assert_eq!((out.total_tasks, out.returned_tasks, out.returned_turns), (1, 1, 1));
+        let task = &out.tasks[0];
+        assert_eq!(task.session_id, "s1", "会话早于区间开始，但区间内有轮，不能漏掉");
+        assert_eq!(task.turns[0].turn_seq, 2);
+        let models: Vec<&str> = task.turns[0].usd_by_model.as_ref().unwrap().iter().map(|row| row.model_key.as_str()).collect();
+        assert!(models.contains(&"m1") && models.contains(&"m3"), "子代理切片仍并入同一父轮");
+
+        let crossing = s.task_alignment(Platform::Claude, T + 61_000, T + 63_000, None, OFF).unwrap();
+        assert_eq!(crossing.tasks[0].turns[0].turn_seq, 2, "轮跨左边界仍计入");
+        let filtered = s.task_alignment(Platform::Claude, T, T + 90_000, Some("e:/work/app"), OFF).unwrap();
+        assert_eq!(filtered.returned_turns, 2);
+        let absent = s.task_alignment(Platform::Claude, T, T + 90_000, Some("d:/other/app"), OFF).unwrap();
+        assert_eq!(absent.returned_turns, 0);
+    }
+
+    #[test]
+    fn alignment_open_turn_is_a_point_not_an_eternal_block() {
+        let s = fixture();
+        s.conn()
+            .execute("UPDATE turn SET ended_at = NULL WHERE agent_key = 'claude-code' AND session_id = 's1' AND turn_seq = 2", [])
+            .unwrap();
+        let at_start = s.task_alignment(Platform::Claude, T + 30_000, T + 90_000, None, OFF).unwrap();
+        assert_eq!(at_start.returned_turns, 1);
+        let later = s.task_alignment(Platform::Claude, T + 90_000, T + 120_000, None, OFF).unwrap();
+        assert_eq!(later.returned_turns, 0, "开放结束时间不向后续所有区间延续");
     }
 
     #[test]

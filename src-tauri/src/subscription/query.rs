@@ -1,4 +1,4 @@
-//! 订阅价格与读数的**只读查询面**：六条命令,只读、零网络、不碰任何写连接。
+//! 订阅价格与读数的**只读查询面**：七条命令,只读、零网络、不碰任何写连接。
 //!
 //! | 组 | 命令 | 出什么 |
 //! | --- | --- | --- |
@@ -8,6 +8,7 @@
 //! | 价格 × 轮次 | `get_message_budget` | 分模型「一轮吃掉多少 5h 额度」（剩余消息数的分母） |
 //! | 读数 | `get_quota_readings` | 归一化读数序列（`quota_reading`） |
 //! | 读数 | `get_quota_days` | 日级汇总（`quota_daily`;年度曲线走这条,别去扫读数层） |
+//! | 双轨 | `get_quota_alignment` | 5h 证据窗口 + 重叠任务轮块（顺序读两库） |
 //!
 //! 两条口径红线,写在这里免得展示层自己发明：
 //!
@@ -20,8 +21,10 @@
 use serde::Serialize;
 use tauri::State;
 
+use super::alignment::{self, QuotaTimeline};
 use super::cost;
 use super::model::{Platform, QuotaDay, QuotaReading};
+use crate::collector::alignment_query::AlignmentTasks;
 use super::price::{self, PriceRow};
 use super::SubscriptionReader;
 use crate::AppState;
@@ -875,6 +878,55 @@ pub(super) fn week_window(readings: &[super::model::QuotaReading], now: i64) -> 
 }
 
 // ---------- 读数 ----------
+
+/// 5h 额度读数 × 任务执行块的双轨组合读口。只读两个本地库，零网络。
+/// 读数用秒级闭区间；任务块在内部换成毫秒半开区间，按重叠而非会话开始筛选。
+#[derive(Debug, Serialize)]
+pub struct QuotaAlignment {
+    pub platform: Platform,
+    pub kind: String,
+    pub from: i64,
+    pub to: i64,
+    pub quota: QuotaTimeline,
+    pub tasks: AlignmentTasks,
+}
+
+#[tauri::command]
+pub fn get_quota_alignment(
+    platform: String,
+    from: i64,
+    to: i64,
+    project: Option<String>,
+    state: State<'_, AppState>,
+    sub: State<'_, SubscriptionReader>,
+) -> Result<QuotaAlignment, String> {
+    let span = to.checked_sub(from).ok_or_else(|| "invalid alignment range".to_string())?;
+    if span <= 0 || span > 86_400 {
+        return Err("alignment range must be within 24 hours".into());
+    }
+    let from_ms = from.checked_mul(1000).ok_or_else(|| "alignment range overflow".to_string())?;
+    let to_ms = to.checked_mul(1000).ok_or_else(|| "alignment range overflow".to_string())?;
+    let platform = platform_of(&platform)?;
+    let (before, readings, after) = {
+        let store = sub.0.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            store.quota_reading_before(platform, "5h", from),
+            store.quota_readings(platform, "5h", from, to),
+            store.quota_reading_after(platform, "5h", to),
+        )
+    };
+    let quota = alignment::rebuild_5h(platform, before, readings, after, from, to);
+    let tasks = crate::commands::with_reader(&state, |store| {
+        store.task_alignment(
+            platform,
+            from_ms,
+            to_ms,
+            project.as_deref(),
+            &crate::collector::project_meta::scratch_rule(),
+        )
+    })?;
+    Ok(QuotaAlignment { platform, kind: "5h".into(), from, to, quota, tasks })
+}
 
 /// 归一化读数序列（`[from, to]` 闭区间,unix 秒;`kind` 省略 = 该平台全部窗口种类）。
 ///

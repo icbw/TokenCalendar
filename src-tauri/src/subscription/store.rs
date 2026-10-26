@@ -1744,6 +1744,35 @@ impl SubStore {
             .collect()
     }
 
+    /// 区间左侧最近一条读数（同一时刻的多来源仍按 `api > rollout > desktop` 收敛）。
+    /// 双轨重建只把它当边界上下文，不把它混进区间内读数。
+    pub fn quota_reading_before(&self, platform: Platform, kind: &str, from: i64) -> Option<super::model::QuotaReading> {
+        let t = self
+            .conn
+            .query_row(
+                "SELECT MAX(t) FROM quota_reading WHERE platform = ?1 AND kind = ?2 AND t < ?3",
+                rusqlite::params![platform.as_str(), kind, from],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()?;
+        self.quota_readings(platform, kind, t, t).into_iter().next()
+    }
+
+    /// 区间右侧最近一条读数，只用于判断证据段是否越过后续视口。
+    pub fn quota_reading_after(&self, platform: Platform, kind: &str, to: i64) -> Option<super::model::QuotaReading> {
+        let t = self
+            .conn
+            .query_row(
+                "SELECT MIN(t) FROM quota_reading WHERE platform = ?1 AND kind = ?2 AND t > ?3",
+                rusqlite::params![platform.as_str(), kind, to],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()?;
+        self.quota_readings(platform, kind, t, t).into_iter().next()
+    }
+
     /// 日级汇总（`[from_day, to_day]` 闭区间,`YYYY-MM-DD`;按日期升序）。
     /// 年度曲线与统计指标的读口（命令面 `get_quota_days`）。
     pub fn quota_days(
