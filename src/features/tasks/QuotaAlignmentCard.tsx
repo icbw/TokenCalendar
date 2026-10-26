@@ -7,22 +7,24 @@ import { formatCompact } from '../matrix/matrixScale'
 import { formatDuration } from '../insights/analytics'
 import { usd2 } from './taskFormat'
 
-const FIVE_HOURS = 5 * 3600
+const VIEWPORT_HOURS = [5, 12, 24] as const
+type ViewportHours = (typeof VIEWPORT_HOURS)[number]
 const GAP_SECONDS = 30 * 60
 const VISIBLE_TASKS = 12
 const WIDTH = 1000
 const LEFT = 190
 const RIGHT = 20
 const TOP = 10
-const QUOTA_HEIGHT = 140
-const AXIS_Y = 170
-const LANES_Y = 190
-const ROW_HEIGHT = 28
-const BOTTOM = 28
+const QUOTA_HEIGHT = 120
+const AXIS_Y = TOP + QUOTA_HEIGHT + 20
+const LANES_Y = AXIS_Y + 20
+const ROW_HEIGHT = 24
+const BOTTOM = 24
 
 const fullTime = (seconds: number) =>
   fmt.dateTime(seconds * 1000, { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 const tickTime = (seconds: number) => fmt.dateTime(seconds * 1000, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+const timeOnly = (seconds: number) => fmt.dateTime(seconds * 1000, { hour: '2-digit', minute: '2-digit' })
 const clamp = (value: number, lo: number, hi: number) => Math.max(lo, Math.min(value, hi))
 const clipped = (value: string, max = 24) => {
   const chars = Array.from(value)
@@ -30,6 +32,67 @@ const clipped = (value: string, max = 24) => {
 }
 const sourceLabel = (source: string) =>
   source === 'api' ? 'API' : source === 'desktop' ? 'Desktop' : source === 'rollout' ? 'Rollout' : source
+
+type LabelAnchor = 'start' | 'middle' | 'end'
+interface ReadingLabelInput {
+  key: string
+  text: string
+  shortText: string
+  x: number
+  y: number
+}
+interface ReadingLabel {
+  key: string
+  text: string
+  x: number
+  y: number
+  anchor: LabelAnchor
+}
+interface LabelBox {
+  left: number
+  right: number
+  top: number
+  bottom: number
+}
+
+function layoutReadingLabels(inputs: ReadingLabelInput[]): ReadingLabel[] {
+  const labels: ReadingLabel[] = []
+  const boxes: LabelBox[] = []
+  for (const input of inputs) {
+    let match: { label: ReadingLabel; box: LabelBox } | undefined
+    const texts = input.text === input.shortText ? [input.text] : [input.text, input.shortText]
+    for (const text of texts) {
+      const width = Array.from(text).reduce((n, char) => n + (char.charCodeAt(0) > 255 ? 10 : 5.8), 4)
+      const candidates: { dx: number; dy: number; anchor: LabelAnchor }[] = []
+      const sides = input.x + width + 12 > WIDTH - RIGHT ? [-1, 1] : [1, -1]
+      for (const side of sides) {
+        for (const dy of [-7, 17, -21, 31]) {
+          candidates.push({ dx: side * 7, dy, anchor: side < 0 ? 'end' : 'start' })
+        }
+      }
+      candidates.push({ dx: 0, dy: -21, anchor: 'middle' }, { dx: 0, dy: 29, anchor: 'middle' })
+      for (const candidate of candidates) {
+        const labelX = input.x + candidate.dx
+        const baseline = clamp(input.y + candidate.dy, TOP + 11, TOP + QUOTA_HEIGHT - 3)
+        const left = candidate.anchor === 'start' ? labelX : candidate.anchor === 'end' ? labelX - width : labelX - width / 2
+        const box = { left, right: left + width, top: baseline - 10, bottom: baseline + 2 }
+        if (box.left < LEFT || box.right > WIDTH - RIGHT || box.top < TOP || box.bottom > TOP + QUOTA_HEIGHT) continue
+        if (boxes.some((other) => box.left < other.right + 3 && box.right + 3 > other.left && box.top < other.bottom + 3 && box.bottom + 3 > other.top)) continue
+        match = {
+          label: { key: input.key, text, x: labelX, y: baseline, anchor: candidate.anchor },
+          box,
+        }
+        break
+      }
+      if (match) break
+    }
+    if (match) {
+      labels.push(match.label)
+      boxes.push(match.box)
+    }
+  }
+  return labels
+}
 
 function reasonText(t: Translator<'tasks'>, reason: QuotaDiscontinuityReason): string {
   switch (reason) {
@@ -63,13 +126,13 @@ function turnTitle(turn: QuotaAlignmentTurn, t: Translator<'tasks'>): string {
   return lines.join('\n')
 }
 
-function AlignmentChart({ data, showAll, onToggleTasks }: {
+function AlignmentChart({ data, showAll }: {
   data: QuotaAlignmentResult
   showAll: boolean
-  onToggleTasks: () => void
 }) {
   const t = useT('tasks')
   const { from, to } = data
+  const sameDay = new Date(from * 1000).toDateString() === new Date(to * 1000).toDateString()
   const plotWidth = WIDTH - LEFT - RIGHT
   const x = (seconds: number) => LEFT + ((clamp(seconds, from, to) - from) / (to - from)) * plotWidth
   const y = (used: number) => TOP + (1 - clamp(used, 0, 100) / 100) * QUOTA_HEIGHT
@@ -96,6 +159,28 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
     }
     flush()
   }
+
+  const readingGroups = new Map<string, { t: number; used: number; sources: Set<string> }>()
+  if (data.quota.raw_readings <= 5) {
+    for (const window of data.quota.windows) {
+      for (const reading of window.readings) {
+        const key = `${reading.t}:${reading.used_percent}`
+        const group = readingGroups.get(key)
+        if (group) group.sources.add(sourceLabel(reading.source))
+        else readingGroups.set(key, { t: reading.t, used: reading.used_percent, sources: new Set([sourceLabel(reading.source)]) })
+      }
+    }
+  }
+  const readingLabels = layoutReadingLabels(Array.from(readingGroups, ([key, group]) => {
+    const pct = fmt.number(group.used, { maximumFractionDigits: 1 })
+    return {
+      key,
+      text: `${Array.from(group.sources).join(' + ')} · ${pct}%`,
+      shortText: `${pct}%`,
+      x: x(group.t),
+      y: y(group.used),
+    }
+  }))
 
   return (
     <>
@@ -125,9 +210,10 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
           ))}
           {[0, 1, 2, 3, 4].map((index) => {
             const at = from + ((to - from) * index) / 4
+            const label = sameDay && index > 0 && index < 4 ? timeOnly(at) : tickTime(at)
             return (
               <text key={at} x={x(at)} y={AXIS_Y} textAnchor={index === 0 ? 'start' : index === 4 ? 'end' : 'middle'} className="quota-align-tick">
-                {tickTime(at)}
+                {label}
               </text>
             )
           })}
@@ -170,31 +256,23 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
             <polyline key={line.key} points={line.points} className="quota-align-line" />
           ))}
           {data.quota.windows.flatMap((window) =>
-            window.readings.map((reading) => {
-              const pointX = x(reading.t)
-              const pointY = y(reading.used_percent)
-              const nearRight = pointX > WIDTH - RIGHT - 110
-              const anchor = nearRight ? 'end' : 'start'
-              return (
-                <g key={`${window.id}-${reading.t}-${reading.source}`}>
-                  <circle cx={pointX} cy={pointY} r={2.4} className="quota-align-point">
-                    <title>{[
-                      fullTime(reading.t),
-                      t('alignUsed', { pct: fmt.number(reading.used_percent, { maximumFractionDigits: 1 }) }),
-                      t('alignSource', { source: sourceLabel(reading.source) }),
-                      reading.plan_type ? t('alignPlan', { plan: reading.plan_type }) : '',
-                      reading.resets_at === null ? t('alignNoReset') : t('alignResetAt', { time: fullTime(reading.resets_at) }),
-                    ].filter(Boolean).join('\n')}</title>
-                  </circle>
-                  {data.quota.raw_readings <= 5 && (
-                    <text x={pointX + (nearRight ? -6 : 6)} y={Math.max(TOP + 11, pointY - 7)} textAnchor={anchor} className="quota-align-reading-label">
-                      {`${sourceLabel(reading.source)} · ${fmt.number(reading.used_percent, { maximumFractionDigits: 1 })}%`}
-                    </text>
-                  )}
-                </g>
-              )
-            }),
+            window.readings.map((reading) => (
+              <circle key={`${window.id}-${reading.t}-${reading.source}`} cx={x(reading.t)} cy={y(reading.used_percent)} r={2.4} className="quota-align-point">
+                <title>{[
+                  fullTime(reading.t),
+                  t('alignUsed', { pct: fmt.number(reading.used_percent, { maximumFractionDigits: 1 }) }),
+                  t('alignSource', { source: sourceLabel(reading.source) }),
+                  reading.plan_type ? t('alignPlan', { plan: reading.plan_type }) : '',
+                  reading.resets_at === null ? t('alignNoReset') : t('alignResetAt', { time: fullTime(reading.resets_at) }),
+                ].filter(Boolean).join('\n')}</title>
+              </circle>
+            )),
           )}
+          {readingLabels.map((label) => (
+            <text key={label.key} x={label.x} y={label.y} textAnchor={label.anchor} className="quota-align-reading-label">
+              {label.text}
+            </text>
+          ))}
           {data.quota.raw_readings === 0 && (
             <text x={LEFT + plotWidth / 2} y={TOP + QUOTA_HEIGHT / 2} textAnchor="middle" className="quota-align-empty">{t('alignNoReadings')}</text>
           )}
@@ -207,7 +285,7 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
             return (
               <g key={`${task.agent}-${task.session_id}`}>
                 <line x1={LEFT} x2={WIDTH - RIGHT} y1={laneY + ROW_HEIGHT} y2={laneY + ROW_HEIGHT} className="quota-align-lane-line" />
-                <text x={8} y={laneY + 18} className="quota-align-task-label">
+                <text x={8} y={laneY + 16} className="quota-align-task-label">
                   {clipped(`${task.project_label} · ${task.turns.length}`, 28)}
                   <title>{laneTitle}</title>
                 </text>
@@ -222,9 +300,9 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
                     <rect
                       key={`${task.session_id}-${turn.turn_seq}-${turn.started_at}`}
                       x={clamp(left - (ended === null ? 2 : 0), LEFT, WIDTH - RIGHT - width)}
-                      y={laneY + 7}
+                      y={laneY + 5}
                       width={width}
-                      height={13}
+                      height={14}
                       rx={ended === null ? 2 : 3}
                       className={`quota-align-turn${turn.aborted ? ' is-aborted' : ''}${ended === null ? ' is-open' : ''}`}
                     >
@@ -237,11 +315,6 @@ function AlignmentChart({ data, showAll, onToggleTasks }: {
           })}
         </svg>
       </div>
-      {data.tasks.tasks.length > VISIBLE_TASKS && (
-        <button className="seg quota-align-show-all" onClick={onToggleTasks}>
-          {showAll ? t('alignShowFewer') : t('alignShowAll')}
-        </button>
-      )}
     </>
   )
 }
@@ -266,33 +339,35 @@ function EvidenceNote({ data }: { data: QuotaAlignmentResult }) {
   const sources = Array.from(counts, ([source, count]) => `${sourceLabel(source)} ×${count}`).join(' · ')
 
   return (
-    <div className={`quota-align-evidence${sparse ? ' is-sparse' : ''}`} role="note">
+    <span className="quota-align-evidence" role="note">
       {sparse && <span>{t('alignSparseReadings', { n: fmt.number(raw), sources })}</span>}
       {latestUnknown && (
-        <span>
+        <span className="quota-align-warning">
           {latest?.resets_at === null
             ? t('alignLatestNoTail', { source: sourceLabel(latest.source) })
             : t('alignLatestUnknown')}
         </span>
       )}
-    </div>
+    </span>
   )
 }
 
 export default function QuotaAlignmentCard({ project }: { project: string }) {
   const t = useT('tasks')
   const [platform, setPlatform] = useState<SubscriptionPlatform>('codex')
+  const [viewportHours, setViewportHours] = useState<ViewportHours>(24)
   const [to, setTo] = useState(() => Math.floor(Date.now() / 1000))
   const [followLatest, setFollowLatest] = useState(true)
   const [refreshTick, setRefreshTick] = useState(0)
   const [data, setData] = useState<QuotaAlignmentResult | null | undefined>(undefined)
   const [loading, setLoading] = useState(false)
   const [showAll, setShowAll] = useState(false)
+  const viewportSeconds = viewportHours * 3600
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    void alignmentService.getQuotaAlignment(platform, to - FIVE_HOURS, to, project).then((result) => {
+    void alignmentService.getQuotaAlignment(platform, to - viewportSeconds, to, project).then((result) => {
       if (cancelled) return
       setData(result)
       setLoading(false)
@@ -300,9 +375,9 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
     return () => {
       cancelled = true
     }
-  }, [platform, to, project, refreshTick])
+  }, [platform, to, project, refreshTick, viewportSeconds])
 
-  useEffect(() => setShowAll(false), [platform, project])
+  useEffect(() => setShowAll(false), [platform, project, viewportHours])
 
   useEffect(() => {
     if (!followLatest) return
@@ -342,29 +417,39 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
     <section className="insight-card quota-align-card">
       <header className="insight-card-header quota-align-header">
         <div className="quota-align-heading">
-          <span className="insight-card-title">{t('alignTitle')}</span>
-          <span className="insight-card-sub">{t('alignSubtitle')}</span>
+          <span className="insight-card-title" title={t('alignSubtitle')}>{t('alignTitle')}</span>
         </div>
         <div className="quota-align-controls">
           <Seg value={platform} options={[{ v: 'codex', label: 'Codex' }, { v: 'claude', label: 'Claude' }]} onChange={setPlatform} />
+          <Seg<ViewportHours>
+            value={viewportHours}
+            options={VIEWPORT_HOURS.map((hours) => ({ v: hours, label: `${hours}h`, hint: t('alignViewportHint', { hours }) }))}
+            onChange={setViewportHours}
+          />
           <div className="toolbar-group">
-            <button className="seg" title={t('alignPrevHint')} onClick={() => { setFollowLatest(false); setTo((value) => value - FIVE_HOURS) }}>
-              {t('alignPrev')}
+            <button
+              className="seg quota-align-nav"
+              aria-label={t('alignPrev', { hours: viewportHours })}
+              title={t('alignPrevHint', { hours: viewportHours })}
+              onClick={() => { setFollowLatest(false); setTo((value) => value - viewportSeconds) }}
+            >
+              ←
             </button>
             <button
-              className={`seg${followLatest ? ' is-disabled' : ''}`}
+              className={`seg quota-align-nav${followLatest ? ' is-disabled' : ''}`}
+              aria-label={t('alignNext', { hours: viewportHours })}
               aria-disabled={followLatest || undefined}
-              title={t('alignNextHint')}
+              title={t('alignNextHint', { hours: viewportHours })}
               onClick={() => {
                 if (followLatest) return
-                const next = to + FIVE_HOURS
+                const next = to + viewportSeconds
                 if (next >= Math.floor(Date.now() / 1000)) latest()
                 else setTo(next)
               }}
             >
-              {t('alignNext')}
+              →
             </button>
-            <button className={`seg${followLatest ? ' is-active' : ''}`} title={t('alignLatestHint')} onClick={latest}>
+            <button className={`seg${followLatest ? ' is-active' : ''}`} title={t('alignLatestHint', { hours: viewportHours })} onClick={latest}>
               {t('alignLatest')}
             </button>
           </div>
@@ -377,13 +462,23 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
         <div className="insight-empty">{t('alignUnavailable')}</div>
       ) : (
         <>
-          <div className="quota-align-range">{fullTime(data.from)} — {fullTime(data.to)}</div>
-          <EvidenceNote data={data} />
-          <AlignmentChart data={data} showAll={showAll} onToggleTasks={() => setShowAll((value) => !value)} />
+          <div className="quota-align-meta">
+            <span className="quota-align-range" title={`${fullTime(data.from)} — ${fullTime(data.to)}`}>
+              {tickTime(data.from)} – {tickTime(data.to)}
+            </span>
+            <span>{t('alignSubtitle')}</span>
+            <EvidenceNote data={data} />
+          </div>
+          <AlignmentChart data={data} showAll={showAll} />
           <footer className="quota-align-footer">
             <span>{t('alignTasksShown', { shown: data.tasks.returned_tasks, total: data.tasks.total_tasks })}</span>
             {data.quota.downsampled && <span>{t('alignDownsampled', { shown: data.quota.returned_readings, raw: data.quota.raw_readings })}</span>}
             {data.tasks.truncated && <span className="quota-align-warning">{t('alignTruncated', { tasks: data.tasks.returned_tasks, total: data.tasks.total_tasks, turns: data.tasks.returned_turns })}</span>}
+            {data.tasks.tasks.length > VISIBLE_TASKS && (
+              <button className="seg quota-align-show-all" onClick={() => setShowAll((value) => !value)}>
+                {showAll ? t('alignShowFewer') : t('alignShowAll')}
+              </button>
+            )}
           </footer>
         </>
       )}

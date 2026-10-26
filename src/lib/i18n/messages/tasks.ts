@@ -16,7 +16,7 @@ export default {
   labelTitleHint: ['Label tasks by session title (falls back to time when empty)', '按会话标题标注任务（标题为空时显示时间）'],
   loading: ['Loading…', '加载中…'],
   rangeNoun: ['Turns', '轮次'],
-  rangeNote: ['Time card: turns in range · Task list: tasks started in range', '时间卡：范围内的轮次 · 任务列表：范围内开始的任务'],
+  rangeNote: ['Time: turns in range · Tasks: started in range', '时间卡按轮次 · 任务列表按开始时间'],
   unavailable: ['Data unavailable (service not running)', '数据不可用（服务未运行）'],
 
   // 任务列表
@@ -101,15 +101,16 @@ export default {
   turnCostUsd: ['Cost {usd}', '成本 {usd}'],
   turnModelCost: ['{model}: {usd}', '{model}：{usd}'],
 
-  // 5h 额度读数 × 任务执行双轨
+  // 5h 额度读数 × 任务执行双轨（视口可选 5 / 12 / 24h）
   alignTitle: ['Quota × execution', '额度 × 执行'],
-  alignSubtitle: ['5h readings and task turns on one absolute timeline · time alignment, not exact reconciliation', '5h 额度读数与任务轮次共用绝对时间轴 · 时间对照，不是严格对账'],
+  alignSubtitle: ['5h quota · shared timeline · not exact reconciliation', '5h 额度 · 共用时间轴 · 非严格对账'],
+  alignViewportHint: ['View {hours}h · quota windows remain 5h', '每屏查看 {hours} 小时 · 额度窗口仍为 5h'],
   alignLatest: ['Latest', '最新'],
-  alignLatestHint: ['Follow the latest 5h viewport', '跟随最近 5h 视口'],
-  alignPrev: ['Previous 5h', '上一段'],
-  alignPrevHint: ['Move 5h back', '向前移动 5h'],
-  alignNext: ['Next 5h', '下一段'],
-  alignNextHint: ['Move 5h forward', '向后移动 5h'],
+  alignLatestHint: ['Follow the latest {hours}h viewport', '跟随最近 {hours} 小时'],
+  alignPrev: ['Previous {hours}h', '前 {hours} 小时'],
+  alignPrevHint: ['Move {hours}h back', '向前查看 {hours} 小时'],
+  alignNext: ['Next {hours}h', '后 {hours} 小时'],
+  alignNextHint: ['Move {hours}h forward', '向后查看 {hours} 小时'],
   alignNoReadings: ['No 5h readings in this viewport', '此视口没有 5h 读数'],
   alignNoTasks: ['No task turns in this viewport', '此视口没有任务轮次'],
   alignUnavailable: ['Alignment unavailable (service not running)', '双轨数据不可用（服务未运行）'],
@@ -138,9 +139,9 @@ export default {
   alignSessionStart: ['Session started {time}', '会话开始 {time}'],
   alignQuotaAxis: ['Quota used', '额度已用'],
   alignTasksAxis: ['Tasks (root sessions)', '任务（根会话）'],
-  alignSparseReadings: ['Only {n} readings in this viewport · {sources} · observed points only', '本视口仅 {n} 条读数 · {sources} · 仅显示观测点'],
-  alignLatestNoTail: ['Latest reading is from {source}; no window tail was supplied, so this segment has unknown boundaries', '最新读数来自 {source}，未提供窗尾；该段窗口边界未知'],
-  alignLatestUnknown: ['Latest reading cannot establish the window boundaries; this segment remains unknown', '最新读数无法证明窗口起止；该段窗口边界未知'],
+  alignSparseReadings: ['{n} readings · {sources} · observed points only', '{n} 读数 · {sources} · 仅观测点'],
+  alignLatestNoTail: ['{source} supplied no window tail · boundaries unknown', '{source} 未提供窗尾 · 边界未知'],
+  alignLatestUnknown: ['Window boundaries unknown', '窗口边界未知'],
 
   // Time 卡：空档
   modeGaps: ['Idle gaps', '空档'],

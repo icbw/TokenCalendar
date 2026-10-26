@@ -157,9 +157,15 @@ export function smoothPath(pts: [number, number][]): string {
 }
 
 function xTickLabel(bucket: string, total: number, i: number): string {
-  // 自适应密度:最多 ~8 个刻度
-  const step = Math.max(1, Math.ceil(total / 8))
-  if (i % step !== 0 && i !== total - 1) return ''
+  const tickCount = Math.min(total, 8)
+  if (tickCount === 0 || i < 0 || i >= total) return ''
+  if (tickCount === 1) {
+    if (i !== 0) return ''
+  } else {
+    const step = (total - 1) / (tickCount - 1)
+    const tick = Math.round(i / step)
+    if (i !== Math.round(tick * step)) return ''
+  }
   if (bucket.includes(' ')) return bucket.slice(5, 10) // hour bucket "YYYY-MM-DD HH" → "MM-DD"
   return bucket.slice(5).replace(/^0/, '')
 }

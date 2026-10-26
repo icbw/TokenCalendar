@@ -2686,11 +2686,13 @@ mod tests {
         let p = Platform::Codex;
         let d1 = today();
         let d0 = day_before(&d1);
+        let t1 = at_local(&d1, 600);
+        let t0 = t1 - 1_200;
         s.insert_readings(
             p,
             &[
-                reading(at_local(&d0, 86_400 - 600), "5h", 10.0, SnapshotSource::Rollout),
-                reading(at_local(&d1, 600), "5h", 18.0, SnapshotSource::Rollout),
+                reading(t0, "5h", 10.0, SnapshotSource::Rollout),
+                reading(t1, "5h", 18.0, SnapshotSource::Rollout),
             ],
         )
         .unwrap();
@@ -2710,13 +2712,14 @@ mod tests {
         let p = Platform::Codex;
         let d2 = today();
         let d1 = day_before(&d2);
-        let d0 = day_before(&d1);
+        let t1 = at_local(&d2, 36_000);
+        let t0 = t1 - 2 * 86_400;
         s.insert_readings(
             p,
             &[
-                reading(at_local(&d0, 36_000), "5h", 10.0, SnapshotSource::Rollout),
+                reading(t0, "5h", 10.0, SnapshotSource::Rollout),
                 // d1 整天没有任何读数（关机 / 源文件被清掉）
-                reading(at_local(&d2, 36_000), "5h", 24.0, SnapshotSource::Rollout),
+                reading(t1, "5h", 24.0, SnapshotSource::Rollout),
             ],
         )
         .unwrap();
@@ -2724,7 +2727,7 @@ mod tests {
         let day = &s.quota_days(p, "5h", &d2, &d2)[0];
         assert_eq!(day.n, 1);
         assert!((day.gain_pct - 14.0).abs() < 1e-9);
-        assert_eq!(day.carry_secs, 2 * 86_400, "这 14% 是跨两天攒出来的,看得见");
+        assert_eq!(day.carry_secs, 2 * 86_400, "这 14% 是跨 48 小时攒出来的,看得见");
     }
 
     /// 派生层的形状变了就整表丢掉重建（读数层永远不许这么干）。
