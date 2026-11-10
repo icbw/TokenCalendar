@@ -100,7 +100,7 @@ NSIS 出包会为更新包签名（`src-tauri/tauri.conf.json` 的 `plugins.upda
 
 ## 版本
 
-- **1.2.1** —— 主窗口精简为矩阵与洞察，项目和任务分析按需查看，同步更新 Fable 5.2 与 GPT-6.1 Terra 价目。
+- **1.2.2** —— 主窗口精简为矩阵与洞察，项目和任务分析按需查看，同步更新 Fable 5.2 与 GPT-6.1 Terra 价目。
 
 - **1.1.9** —— 修 Claude Fable 5.2 的价格匹配，补齐 GPT-6.1 Terra 及其长上下文价目。
 
