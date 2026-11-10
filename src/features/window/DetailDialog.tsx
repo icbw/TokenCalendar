@@ -3,11 +3,14 @@ import { useT } from '../../lib/i18n'
 import './details.css'
 
 /** 浮层 DOM 常驻；浏览器负责焦点圈定、背景 inert 与关闭后的焦点恢复。 */
-export default function DetailDialog({ open, title, onClose, children }: {
+export default function DetailDialog({ open, title, onClose, children, size = 'full', closeLabel, closeDisabled = false }: {
   open: boolean
   title: string
   onClose: () => void
   children: ReactNode
+  size?: 'full' | 'settings'
+  closeLabel?: string
+  closeDisabled?: boolean
 }) {
   const t = useT('window')
   const ref = useRef<HTMLDialogElement>(null)
@@ -20,15 +23,15 @@ export default function DetailDialog({ open, title, onClose, children }: {
   return (
     <dialog
       ref={ref}
-      className="detail-dialog"
+      className={`detail-dialog${size === 'settings' ? ' is-settings' : ''}`}
       aria-label={title}
-      onCancel={(event) => { event.preventDefault(); onClose() }}
-      onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
+      onCancel={(event) => { event.preventDefault(); if (!closeDisabled) onClose() }}
+      onClick={(event) => { if (!closeDisabled && event.target === event.currentTarget) onClose() }}
     >
       <section className="detail-panel">
         <header className="detail-header">
           <h2>{title}</h2>
-          <button className="seg" onClick={onClose} autoFocus>{t('closeDetails')}</button>
+          <button className="seg" onClick={onClose} disabled={closeDisabled} autoFocus>{closeLabel ?? t('closeDetails')}</button>
         </header>
         <div className="detail-body">{children}</div>
       </section>

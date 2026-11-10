@@ -15,6 +15,7 @@ import { deriveWidgetTheme } from './widgetTheme'
 import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
 import Disclosure from '../window/Disclosure'
+import SettingsDetail from './SettingsDetail'
 import type { MessageBudget } from '../../services/subscriptionService'
 import { shortModelName } from '../orb/messageBudget'
 import { useT, fmt, type MessageKey, type Translator } from '../../lib/i18n'
@@ -382,6 +383,8 @@ function GeneralTab() {
           checked={timelineVisible}
           onChange={toggleTimeline}
         />
+        <SettingsDetail title={t('timelineBehavior')}
+          summary={t('timelineBehaviorSummary', { days: design.timelinePastDays ?? 7, sessions: design.timelineTodaySessions ?? 5 })}>
         <div className="setting-row">
           <span title={t('pastDaysHint')}>{t('pastDays')}</span>
           <div className="setting-seg">
@@ -484,6 +487,7 @@ function GeneralTab() {
             ))}
           </div>
         </div>
+        </SettingsDetail>
       </div>
 
       <div className="setting-section">{t('sectionWidget')}</div>
@@ -505,6 +509,8 @@ function GeneralTab() {
             ))}
           </div>
         </div>
+        <SettingsDetail title={t('widgetBehavior')}
+          summary={t('widgetBehaviorSummary', { locked: t(design.locked ? 'on' : 'off'), snap: t(snapEnabled ? 'on' : 'off') })}>
         <ToggleRow
           label={t('lockWidget')}
           title={t('lockWidgetHint')}
@@ -532,6 +538,7 @@ function GeneralTab() {
             {t('resetWidgetSize')}
           </button>
         </div>
+        </SettingsDetail>
       </div>
     </>
   )
@@ -687,7 +694,7 @@ function AppearanceTab() {
         </div>
       </div>
 
-      <div className="setting-section">{t('sectionWidgetAppearance')}</div>
+      <SettingsDetail title={t('sectionWidgetAppearance')} summary={t('appearanceSummary', { color: custom ? custom.toUpperCase() : t('autoFollowsSystem'), opacity: Math.round(design.bgOpacity * 100) })} onClose={() => setPickerFor(null)}>
       <div className="setting-block">
         <div className="setting-row">
           <span title={t('cardColorHint')}>
@@ -754,8 +761,9 @@ function AppearanceTab() {
           </button>
         </div>
       </div>
+      </SettingsDetail>
 
-      <div className="setting-section">{t('sectionMainInterface')}</div>
+      <SettingsDetail title={t('sectionMainInterface')} summary={t('mainAppearanceSummary', { color: design.panelBg?.toUpperCase() ?? t('autoFollowsSystem'), opacity: Math.round((design.titlebarAlpha ?? 0.8) * 100) })} onClose={() => setPickerFor(null)}>
       <div className="setting-block">
         <div className="setting-row">
           <span title={t('titlebarColorHint')}>{t('titlebarColor')}</span>
@@ -805,9 +813,10 @@ function AppearanceTab() {
           </button>
         </div>
       </div>
+      </SettingsDetail>
 
       {/* 时间轴外观：窗口风格 + 三档背景 alpha,经 storage 桥即时同步到 timeline 窗口;与挂件 / 主界面零关联*/}
-      <div className="setting-section">{t('sectionTimelineAppearance')}</div>
+      <SettingsDetail title={t('sectionTimelineAppearance')} summary={t('timelineAppearanceSummary', { color: design.timelineAccent?.toUpperCase() ?? t('autoFollowsSystem'), style: t((design.timelineWindowStyle ?? 'shadow') === 'shadow' ? 'styleShadow' : 'styleFlat') })} onClose={() => setPickerFor(null)}>
       <div className="setting-block">
         <div className="setting-row">
           <span title={t('themeColorHint')}>{t('themeColor')}</span>
@@ -861,6 +870,8 @@ function AppearanceTab() {
           </button>
         </div>
       </div>
+      </SettingsDetail>
+
     </>
   )
 }
@@ -981,6 +992,7 @@ function DataTab() {
   const [resTarget, setResTarget] = useState('')
   const [busy, setBusy] = useState<'migrate' | 'backup' | 'restore' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [noticeKind, setNoticeKind] = useState<'migrate' | 'backup' | 'restore' | null>(null)
   // credit 卡开关（insightsCredit）归在本 tab。
   const [design, setDesign] = useState<DesignPrefs>(getDesignPrefs)
   useEffect(() => subscribeDesignPrefs(setDesign), [])
@@ -1013,6 +1025,7 @@ function DataTab() {
 
   const run = async (kind: 'migrate' | 'backup' | 'restore') => {
     setBusy(kind)
+    setNoticeKind(kind)
     setNotice(null)
     try {
       if (kind === 'migrate') {
@@ -1025,6 +1038,9 @@ function DataTab() {
         const r = await dataService.restoreData(resTarget.trim())
         setNotice(r ? t('restartToApply', { msg: r }) : t('restoreFailed'))
       }
+    } catch (error) {
+      console.error('[data management]', error)
+      setNotice(t(kind === 'migrate' ? 'migrationFailed' : kind === 'backup' ? 'backupFailed' : 'restoreFailed'))
     } finally {
       setBusy(null)
     }
@@ -1078,13 +1094,13 @@ function DataTab() {
         />
       </div>
 
-      <div className="setting-section">{t('sectionMigrate')}</div>
+      <SettingsDetail title={t('sectionMigrate')} summary={t('migrateSummary')} busy={busy !== null}>
       <div className="setting-block">
         <div className="setting-note">
           {t('migrateNote')}
         </div>
         <div className="setting-actions">
-          <input className="setting-input" placeholder="D:\Data\TokenCalendar" value={migTarget} onChange={(e) => setMigTarget(e.target.value)} />
+          <input className="setting-input" placeholder="D:\Data\TokenCalendar" aria-label={t('pickMigrate')} value={migTarget} onChange={(e) => setMigTarget(e.target.value)} />
           <button className="setting-btn" onClick={() => void pickInto(setMigTarget, dirPick.migrate)} title={t('pickFolder')}>{t('browse')}</button>
           <button
             className="setting-btn"
@@ -1095,13 +1111,15 @@ function DataTab() {
             {busy === 'migrate' ? t('migrating') : t('migrate')}
           </button>
         </div>
+        {noticeKind === 'migrate' && notice ? <div className="setting-note" role="status">{notice}</div> : null}
       </div>
+      </SettingsDetail>
 
-      <div className="setting-section">{t('sectionBackup')}</div>
+      <SettingsDetail title={t('sectionBackup')} summary={t('backupSummary')} busy={busy !== null}>
       <div className="setting-block">
         <div className="setting-note">{t('backupNote')}</div>
         <div className="setting-actions">
-          <input className="setting-input" placeholder="E:\Backup\TokenCalendar" value={bakTarget} onChange={(e) => setBakTarget(e.target.value)} />
+          <input className="setting-input" placeholder="E:\Backup\TokenCalendar" aria-label={t('pickBackup')} value={bakTarget} onChange={(e) => setBakTarget(e.target.value)} />
           <button className="setting-btn" onClick={() => void pickInto(setBakTarget, dirPick.backup)} title={t('pickFolder')}>{t('browse')}</button>
           <button
             className="setting-btn"
@@ -1112,15 +1130,17 @@ function DataTab() {
             {busy === 'backup' ? t('backingUp') : t('backupNow')}
           </button>
         </div>
+        {noticeKind === 'backup' && notice ? <div className="setting-note" role="status">{notice}</div> : null}
       </div>
+      </SettingsDetail>
 
-      <div className="setting-section">{t('sectionRestore')}</div>
+      <SettingsDetail title={t('sectionRestore')} summary={t('restoreSummary')} busy={busy !== null}>
       <div className="setting-block">
         <div className="setting-note">
           {t('restoreNote')}
         </div>
         <div className="setting-actions">
-          <input className="setting-input" placeholder="E:\Backup\TokenCalendar" value={resTarget} onChange={(e) => setResTarget(e.target.value)} />
+          <input className="setting-input" placeholder="E:\Backup\TokenCalendar" aria-label={t('pickRestore')} value={resTarget} onChange={(e) => setResTarget(e.target.value)} />
           <button className="setting-btn" onClick={() => void pickInto(setResTarget, dirPick.restore)} title={t('pickFolder')}>{t('browse')}</button>
           <button
             className="setting-btn"
@@ -1131,8 +1151,11 @@ function DataTab() {
             {busy === 'restore' ? t('restoring') : t('restore')}
           </button>
         </div>
-        {notice ? <div className="setting-note">{notice}</div> : null}
+        {noticeKind === 'restore' && notice ? <div className="setting-note" role="status">{notice}</div> : null}
       </div>
+      </SettingsDetail>
+
+      {notice ? <div className="setting-note" role="status">{notice}</div> : null}
 
       <div className="setting-section">{t('sectionExportMonth', { month })}</div>
       <div className="setting-block">
@@ -1172,6 +1195,7 @@ function SubscriptionsTab() {
   const [snapshots, setSnapshots] = useState<SubscriptionSnapshot[]>([])
   const [estimator, setEstimator] = useState<EstimatorState[]>([])
   const [notice, setNotice] = useState<string | null>(null)
+  const [feeNotice, setFeeNotice] = useState<string | null>(null)
 
   useEffect(() => subscribeDesignPrefs(setDesign), [])
 
@@ -1473,6 +1497,7 @@ function SubscriptionsTab() {
         </div>
       </div>
 
+      <SettingsDetail title={t('subscriptionPersonalization')} summary={t('subscriptionPersonalizationSummary')}>
       {(['codex', 'claude'] as const).some(boundOf) ? (
         <>
           <div className="setting-section">{t('sectionOrbMessages')}</div>
@@ -1490,12 +1515,14 @@ function SubscriptionsTab() {
       <div className="setting-section">{t('sectionPlanFees')}</div>
       <div className="setting-block">
         {(['codex', 'claude'] as const).map((p) => (
-          <MonthlyFeeRow key={p} platform={p} value={design.subscriptionMonthlyUsd?.[p]} onNotice={setNotice} />
+          <MonthlyFeeRow key={p} platform={p} value={design.subscriptionMonthlyUsd?.[p]} onNotice={setFeeNotice} />
         ))}
         <div className="setting-note">
           {t('planFeesNote')}
         </div>
+        {feeNotice ? <div className="setting-note" role="status">{feeNotice}</div> : null}
       </div>
+      </SettingsDetail>
     </>
   )
 }
@@ -1759,9 +1786,9 @@ function AboutTab() {
           ) : null}
         </div>
         {result?.status === 'available' && result.notes ? (
-          <div className="setting-note">{result.notes}</div>
+          <Disclosure title={t('releaseDetails')}><div className="setting-note">{result.notes}</div></Disclosure>
         ) : ready?.notes && result?.status !== 'available' ? (
-          <div className="setting-note">{ready.notes}</div>
+          <Disclosure title={t('releaseDetails')}><div className="setting-note">{ready.notes}</div></Disclosure>
         ) : null}
         {note ? <div className="setting-note">{note}</div> : null}
 

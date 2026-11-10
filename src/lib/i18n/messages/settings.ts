@@ -1,6 +1,19 @@
 // settings 命名空间:每个键 = [英文, 简体中文]。术语。
 // 覆盖：设置页 General / Appearance / Data / Subscriptions（About 页在 update 命名空间）。
 export default {
+  closeSettingDetails: ['Back to settings', '返回设置'],
+  timelineBehavior: ['Timeline layout and behavior', '时间轴布局与行为'],
+  timelineBehaviorSummary: ['{days} past days · {sessions} sessions today', '过去 {days} 天 · 今日 {sessions} 个会话'],
+  widgetBehavior: ['Widget interaction', '挂件交互'],
+  widgetBehaviorSummary: ['Lock: {locked} · Snap to grid: {snap}', '锁定：{locked} · 格网吸附：{snap}'],
+  appearanceSummary: ['{color} · Opacity {opacity}%', '{color} · 不透明度 {opacity}%'],
+  mainAppearanceSummary: ['Panel {color} · Title bar opacity {opacity}%', '面板 {color} · 顶栏不透明度 {opacity}%'],
+  timelineAppearanceSummary: ['{color} · {style}', '{color} · {style}'],
+  migrateSummary: ['Choose a new data folder and migrate existing data', '选择新数据目录并迁移已有数据'],
+  backupSummary: ['Save a snapshot to a folder you choose', '将数据快照保存到指定目录'],
+  restoreSummary: ['Choose a backup and review the restore instructions', '选择备份并查看恢复说明'],
+  subscriptionPersonalization: ['Quota display and subscription fees', '额度显示与订阅费用'],
+  subscriptionPersonalizationSummary: ['Message estimate models and monthly fees for equivalent value', '消息估计模型，以及用于计算订阅当量的月费'],
   showWidget: ['Show desktop widget', '显示桌面挂件'],
   showWidgetHint: ['Show or hide the heatmap widget', '显示或隐藏热力图挂件'],
   advancedMonitoring: ['Advanced monitoring', '高级监测'],

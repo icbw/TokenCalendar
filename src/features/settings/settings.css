@@ -1,6 +1,5 @@
-/* 设置页：内容区全幅独立视图，三子 tab。
-   视图替换而非浮层：占满 .shell-main，无遮罩无滑入 overlay（规避透明窗口
-   脏像素风险面）。转场仅内容淡入（tokens v2 动效语言）。 */
+/* 设置页：六个分区保留常用项与摘要，细项使用常驻 DOM 的二级配置弹层。
+   主视图占满 .shell-main，转场仅内容淡入。 */
 
 .settings-page {
   display: flex;
@@ -9,6 +8,31 @@
   min-height: 0;
   animation: settings-fade var(--dur-normal) var(--ease-out);
 }
+
+.settings-detail-entry { flex: none; min-width: 0; }
+.settings-detail-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  cursor: pointer;
+}
+.settings-detail-link:hover { border-color: var(--accent); }
+.settings-detail-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.settings-detail-label { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.settings-detail-label strong { font-size: var(--font-size-sm); font-weight: 600; }
+.settings-detail-label > span { color: var(--text-muted); font-size: var(--font-size-xs); overflow-wrap: anywhere; }
+.settings-detail-arrow { margin-left: auto; color: var(--text-faint); font-size: 1.4em; }
+.settings-detail-content { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+.settings-detail-content > .setting-block { min-width: 0; }
+.settings-detail-content .setting-actions { flex-wrap: wrap; }
+.settings-detail-content .setting-input { min-width: 0; }
 
 @keyframes settings-fade {
   from { opacity: 0; }

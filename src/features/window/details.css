@@ -63,3 +63,5 @@
 .shell.is-expanded .shell-view[hidden] { display: none; }
 .detail-action { margin-left: auto; flex-shrink: 0; }
 .setting-block > .detail-disclosure { margin: 6px 0; }
+.detail-dialog.is-settings > .detail-panel { width: min(760px, 100%); height: auto; max-height: 100%; }
+.detail-dialog.is-settings .detail-body { display: block; overflow-y: auto; }

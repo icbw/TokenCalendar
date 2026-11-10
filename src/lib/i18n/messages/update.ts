@@ -1,6 +1,7 @@
 // update 命名空间:每个键 = [英文, 简体中文]。术语。
 // 覆盖：设置·About 页 + updateService（错误文案 / 系统通知）。
 export default {
+  releaseDetails: ['Release details', '更新详情'],
   // About 页
   sectionUpdates: ['Updates', '更新'],
   version: ['Version', '版本'],
