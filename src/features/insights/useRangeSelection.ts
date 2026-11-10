@@ -23,10 +23,13 @@ export interface RangeSelection {
   applyProjectSpan: () => void
 }
 
-export function useRangeSelection(project: string, refreshTick: number): RangeSelection {
-  const [sel, setSel] = useState<RangeSel>(DEFAULT_RANGE)
+export function useRangeSelection(project: string, refreshTick: number, initialRange?: DayRange, active = true): RangeSelection {
+  const initial: RangeSel = initialRange ? { kind: 'custom', ...initialRange } : DEFAULT_RANGE
+  const [sel, setSel] = useState<RangeSel>(initial)
+  const originProject = useRef(project)
+  const keepContextRange = useRef(!!initialRange)
   // 进入项目生命周期模式前的范围（取消项目时回到这里）
-  const plainRef = useRef<RangeSel>(DEFAULT_RANGE)
+  const plainRef = useRef<RangeSel>(initial)
   const [auto, setAuto] = useState(() => getDesignPrefs().projectAutoRange ?? true)
   useEffect(() => subscribeDesignPrefs((p) => setAuto(p.projectAutoRange ?? true)), [])
 
@@ -34,6 +37,7 @@ export function useRangeSelection(project: string, refreshTick: number): RangeSe
   const [projectSpan, setProjectSpan] = useState<{ project: string; span: DaySpan | null } | null>(null)
 
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     void taskService.getProjectSpan().then((res) => {
       if (!cancelled) setDataSpan(res)
@@ -41,9 +45,10 @@ export function useRangeSelection(project: string, refreshTick: number): RangeSe
     return () => {
       cancelled = true
     }
-  }, [refreshTick])
+  }, [refreshTick, active])
 
   useEffect(() => {
+    if (!active) return
     if (!project) {
       setProjectSpan(null)
       return
@@ -55,11 +60,13 @@ export function useRangeSelection(project: string, refreshTick: number): RangeSe
     return () => {
       cancelled = true
     }
-  }, [project, refreshTick])
+  }, [project, refreshTick, active])
 
   const span = projectSpan && projectSpan.project === project ? projectSpan.span : null
 
   useEffect(() => {
+    if (project !== originProject.current) keepContextRange.current = false
+    if (keepContextRange.current) return
     if (!project) {
       setSel((cur) => (cur.kind === 'project' ? plainRef.current : cur))
       return
@@ -82,6 +89,7 @@ export function useRangeSelection(project: string, refreshTick: number): RangeSe
   )
 
   const applyProjectSpan = useCallback(() => {
+    keepContextRange.current = false
     setDesignPrefs({ projectAutoRange: true })
     if (project && span) setSel({ kind: 'project', project, startDay: span.firstDay, endDay: span.lastDay })
   }, [project, span])

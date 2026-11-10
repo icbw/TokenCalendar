@@ -1,5 +1,8 @@
 // window 命名空间:每个键 = [英文, 简体中文]。术语。
 export default {
+  executionDetails: ['Execution details', '执行详情'],
+  openExecution: ['View execution details', '查看执行详情'],
+  closeDetails: ['Back to overview', '返回概览'],
   // 标题栏视图 / 窗口开关
   orbit: ['Orbit', '悬浮球'],
   showOrb: ['Show orbit orb', '显示悬浮球'],

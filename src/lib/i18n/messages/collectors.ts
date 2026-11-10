@@ -1,6 +1,7 @@
 // collectors 命名空间:每个键 = [英文, 简体中文]。术语。
 // 覆盖：主窗口底部采集器健康状态条（CollectorHealth）。
 export default {
+  healthy: ['Collection up to date', '采集正常'],
   // 汇总
   loading: ['Loading collectors…', '正在加载采集器…'],
   paused: ['Collection paused', '采集已暂停'],

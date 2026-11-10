@@ -1,0 +1,65 @@
+.detail-dialog {
+  position: fixed;
+  inset: 8px;
+  width: calc(100% - 16px);
+  height: calc(100% - 16px);
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 16px;
+  border: 0;
+  background: rgb(0 0 0 / 0.22);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  visibility: hidden;
+  pointer-events: none;
+}
+.detail-dialog[open] { visibility: visible; pointer-events: auto; }
+.detail-dialog::backdrop { background: transparent; }
+.detail-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(1200px, 100%);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-3);
+}
+.detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.detail-header h2 { margin: 0; font-size: var(--font-size-md); }
+.detail-body { display: flex; flex: 1; min-height: 0; }
+.detail-body > .tasks-view { max-width: none; }
+.detail-disclosure {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  flex: none;
+}
+.detail-disclosure > summary {
+  padding: 10px 12px;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+.detail-disclosure > summary:hover { color: var(--accent); }
+.detail-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.detail-disclosure-body { padding: 0 10px 10px; min-width: 0; overflow-x: auto; }
+.detail-disclosure-body > .insight-card { border: 0; padding: 8px 2px; }
+.shell.is-expanded .shell-view { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.shell.is-expanded .shell-view[hidden] { display: none; }
+.detail-action { margin-left: auto; flex-shrink: 0; }
+.setting-block > .detail-disclosure { margin: 6px 0; }

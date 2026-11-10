@@ -1,6 +1,7 @@
 // tasks 命名空间:每个键 = [英文, 简体中文]。术语。
 // 时长沿用 insights/formatDuration 的紧凑写法（3h 20m）,直方图轴刻度同为紧凑 s / m / h / d,两种语言一致。
 export default {
+  timeAnalysis: ['Time and idle gaps', '时间与空档分析'],
   // 工具栏
   title: ['Tasks', '任务'],
   filterAgentTitle: ['Filter by agent', '按 Agent 筛选'],

@@ -28,6 +28,8 @@ import { colorFor } from './charts'
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import MessagesCard from './MessagesCard'
+import Disclosure from '../window/Disclosure'
+import { openExecutionDetails } from '../window/detailNavigation'
 import QuotaHistoryCard from './QuotaHistoryCard'
 import { formatSpan, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
@@ -310,15 +312,7 @@ export default function PricingBlock() {
                 <span className="price-total-label">{t('mTotal')}</span>
                 <span className="price-total-value">{formatCompact(totalTokens)}</span>
               </div>
-              {perDollar !== undefined && (
-                <div
-                  className="price-total-item"
-                  title={t('quotaPctHint', { pct: perDollar.toFixed(2), full: usd(100 / perDollar) })}
-                >
-                  <span className="price-total-label">{t('quotaPct')}</span>
-                  <span className="price-total-value">≈ {usd(1 / perDollar)}</span>
-                </div>
-              )}
+
             </div>
             <p className="price-note">
               {t('priceNote')}
@@ -332,6 +326,8 @@ export default function PricingBlock() {
                 </span>
               )}
             </p>
+            <Disclosure title={t('modelUsageDetails')}>
+              {perDollar !== undefined && <p className="price-note">{t('quotaPct')}: ≈ {usd(1 / perDollar)}</p>}
             <table className="price-table">
               <thead>
                 <tr>
@@ -414,17 +410,26 @@ export default function PricingBlock() {
                 })}
               </tbody>
             </table>
+            </Disclosure>
           </>
         )}
       </section>
 
       {/* ---- 2) 分模型消息数估计（5h / 周剩余、本周已发、周重置） ----*/}
-      <MessagesCard platform={platform} range={selection.range} refreshTick={refreshTick} />
+      <button className="seg" onClick={() => openExecutionDetails({ section: 'quota', platform, agent: platform === 'claude' ? 'claude-code' : 'codex', range: selection.range })}>
+        {t('quotaExecutionDetails')}
+      </button>
+      <Disclosure title={t('messageDetails')}>
+        {(open) => <MessagesCard platform={platform} range={selection.range} refreshTick={refreshTick} active={open} />}
+      </Disclosure>
 
       {/* ---- 3) 额度历史（读数日级汇总,年度已用曲线,缺日断线） ----*/}
-      <QuotaHistoryCard platform={platform} refreshTick={refreshTick} />
+      <Disclosure title={t('quotaHistoryDetails')}>
+        {(open) => <QuotaHistoryCard platform={platform} refreshTick={refreshTick} active={open} />}
+      </Disclosure>
 
       {/* ---- 4) 官方价目对照表 ----*/}
+      <Disclosure title={t('officialPriceDetails')}>
       <section className="insight-card">
         <header className="insight-card-header">
           <span className="insight-card-title">{t('listTitle', { p: PLATFORM_LABEL[platform] })}</span>
@@ -497,6 +502,7 @@ export default function PricingBlock() {
           </>
         )}
       </section>
+      </Disclosure>
     </>
   )
 }

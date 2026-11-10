@@ -14,6 +14,7 @@ import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs, SIZE_PRESETS, RAD
 import { deriveWidgetTheme } from './widgetTheme'
 import { TIMELINE_BAR_ALPHA, TIMELINE_BG_ALPHA, TIMELINE_CELL_ALPHA } from '../timeline/timelineConfig'
 import ProjectManager from '../projects/ProjectManager'
+import Disclosure from '../window/Disclosure'
 import type { MessageBudget } from '../../services/subscriptionService'
 import { shortModelName } from '../orb/messageBudget'
 import { useT, fmt, type MessageKey, type Translator } from '../../lib/i18n'
@@ -101,14 +102,15 @@ function hexToTriple(hex: string): string | null {
 export default function SettingsPage({ onBack, initialTab }: { onBack(): void; initialTab?: SettingsTab }) {
   const t = useT('settings')
   const [tab, setTab] = useState<SettingsTab>(initialTab ?? 'general')
+  useEffect(() => { if (initialTab) setTab(initialTab) }, [initialTab])
   return (
     <div className="settings-page">
       {/* 工具栏内容限宽 720px 与中间面板对齐（返回键在 General 左侧）*/}
       <div className="settings-toolbar">
         <div className="settings-toolbar-inner">
-          <button className="settings-back" onClick={onBack} title={t('backToMatrix')} aria-label={t('backToMatrix')}>
+          <button className="settings-back" onClick={onBack} title={t('backToOverview')} aria-label={t('backToOverview')}>
             <BackIcon />
-            <span>{t('backMatrix')}</span>
+            <span>{t('backOverview')}</span>
           </button>
           <div className="settings-tabs" role="tablist" aria-label={t('settingsSections')}>
             {TABS.map((tb) => (
@@ -172,6 +174,17 @@ function GeneralTab() {
   // timeline-visibility-changed 广播跟随;托盘勾选、窗口关闭钮都汇入那里，
   // 前端不存第二份镜像（可见性持久化在 window-state.json）。
   const [timelineVisible, setTimelineVisible] = useState(false)
+  const [widgetVisible, setWidgetVisible] = useState(false)
+  useEffect(() => {
+    let disposed = false
+    let off: (() => void) | undefined
+    void windowService.getVisibility().then((v) => { if (!disposed && v) setWidgetVisible(v.widget) }).catch(console.error)
+    void events.onWidgetVisibilityChanged(setWidgetVisible).then((unlisten) => {
+      if (disposed) unlisten()
+      else off = unlisten
+    })
+    return () => { disposed = true; off?.() }
+  }, [])
 
   // Pull the real backend state every time the tab mounts — the tray
   // checkboxes can change while the page was hidden.
@@ -475,6 +488,8 @@ function GeneralTab() {
 
       <div className="setting-section">{t('sectionWidget')}</div>
       <div className="setting-block">
+        <ToggleRow label={t('showWidget')} title={t('showWidgetHint')} checked={widgetVisible}
+          onChange={() => { windowService.toggleWidget().catch(console.error) }} />
         <div className="setting-row">
           <span title={t('widgetSizeHint')}>{t('widgetSize')}</span>
           <div className="setting-seg">
@@ -1215,8 +1230,8 @@ function SubscriptionsTab() {
   }
 
   // 悬浮球总开关：状态**直接取可见性单一源**——Rust visibility.rs 的 orb_visible,
-  // get_visibility 初查 + orb-visibility-changed 广播跟随;顶栏 Orbit 钮、托盘勾选、
-  // orb 自身右键「Hide orb」三条路径都汇入那里（与顶栏按钮完全同款消费方式）,
+  // get_visibility 初查 + orb-visibility-changed 广播跟随；托盘与悬浮球隐藏操作
+  // 都汇入同一可见性状态，设置不维护持久化镜像，
   // 因此任一路径改动这里都能跟随。可见性的持久化在 window-state.json 的 orb_visible
   // （Rust 唯一源）,前端不存第二份镜像。
   const [orbVisible, setOrbVisible] = useState(false)
@@ -1287,6 +1302,7 @@ function SubscriptionsTab() {
           checked={orbVisible}
           onChange={toggleOrb}
         />
+        <Disclosure title={t('advancedMonitoring')}>
         {/* 按预计消耗取数（取数主路径）：本地 token 按模型加权折算出代价,
             乘以自动校准的系数 → 「距上次读数大约消耗了百分之几」,达到阈值就取一次读数。*/}
         <div className="setting-row">
@@ -1374,6 +1390,7 @@ function SubscriptionsTab() {
             ))}
           </div>
         </div>
+        </Disclosure>
         {/* Standby monitoring：待机看的是**本地 agent 十分钟没有新 token**
             → 悬浮球减淡;新 token / 手动刷新·展开·切换平台立即退出。
             取数频次不受待机影响（兜底本身已是封顶档）。默认开。*/}

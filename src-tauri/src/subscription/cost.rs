@@ -35,7 +35,7 @@ use super::price;
 ///
 /// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
 /// 基准）,存量行不变,下一次 refit 自动用新先验。
-pub const WEIGHT_VERSION: u32 = 7;
+pub const WEIGHT_VERSION: u32 = 8;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn only_fable_5_1_has_the_cheap_cache_read() {
+    fn fable_5_1_cache_read_is_cheaper_than_fable_5() {
         // 5.1 的缓存读 0.25（自身输入价的 0.025）;Fable 5 与 Mythos 5 都是通行的 0.1
         let t = Tokens { cache_read: 100_000, ..Default::default() };
         let cheap = cost_of(Platform::Claude, "claude-fable-5-1", &t, NOW).0;
@@ -708,6 +708,25 @@ mod tests {
         let mythos = cost_of(Platform::Claude, "claude-mythos-5", &t, NOW).0;
         assert!((plain / cheap - 4.0).abs() < 1e-9, "Fable 5 的缓存读是 5.1 的 4 倍");
         assert!((mythos - plain).abs() < 1e-12);
+    }
+
+    #[test]
+    fn november_models_do_not_inherit_broad_family_prices() {
+        let at = 1_794_268_800; // 2026-11-10 00:00 UTC
+        let t = Tokens { input: 1_000_000, output: 1_000_000, cache_read: 1_000_000, cache_write: 1_000_000 };
+        for (platform, model, expected) in [
+            (Platform::Claude, "claude-fable-5-2", 58.2),
+            (Platform::Claude, "claude-fable-5.2", 58.2),
+            (Platform::Claude, "claude-fable-5", 73.5),
+            (Platform::Claude, "claude-fable-5-1", 72.75),
+            (Platform::Codex, "gpt-6.1-terra", 7.3),
+            (Platform::Codex, "gpt-6.1-terra#long", 12.1),
+        ] {
+            let (value, known) = cost_of(platform, model, &t, at);
+            assert!(known && (value - expected).abs() < 1e-9, "{model}: {value}");
+        }
+        assert_eq!(tag_long(Platform::Codex, "gpt-6.1-terra", 272_000, at), "gpt-6.1-terra");
+        assert_eq!(tag_long(Platform::Codex, "gpt-6.1-terra", 272_001, at), "gpt-6.1-terra#long");
     }
 
     #[test]

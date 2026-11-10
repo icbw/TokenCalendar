@@ -32,9 +32,10 @@ const kindRank = (k: string): number => (k === '5h' ? 0 : k === '7d' ? 1 : 2)
 /** Seg 显示:数据键原样;专属周窗取派生名（与 orb / MessagesCard 同款:7d_opus → Opus）。 */
 const kindLabel = (k: string): string => (k.startsWith('7d_') ? k.slice(3).replace(/_/g, ' ') : k)
 
-export default function QuotaHistoryCard({ platform, refreshTick }: {
+export default function QuotaHistoryCard({ platform, refreshTick, active = true }: {
   platform: SubscriptionPlatform
   refreshTick: number
+  active?: boolean
 }) {
   const t = useT('insights')
   const [rows, setRows] = useState<QuotaDay[] | null>(null)
@@ -44,22 +45,27 @@ export default function QuotaHistoryCard({ platform, refreshTick }: {
 
   // 读数一变（subscription:changed）就重查——quota_daily 随读数增量重算,本地只读零请求
   useEffect(() => {
+    if (!active) return
+    let cancelled = false
     let timer = 0
     let off: (() => void) | null = null
     void events.onSubscriptionChanged(() => {
       window.clearTimeout(timer)
       timer = window.setTimeout(() => setSubTick((v) => v + 1), 300)
     }).then((unlisten) => {
-      off = unlisten
+      if (cancelled) unlisten()
+      else off = unlisten
     })
     return () => {
+      cancelled = true
       window.clearTimeout(timer)
       off?.()
     }
-  }, [])
+  }, [active])
 
   // 最近一年（含今日,共 365 个日历日;未来日不会出现,endDay = 今天）
   useEffect(() => {
+    if (!active) return
     let stale = false
     const to = new Date()
     const from = new Date(to)
@@ -70,7 +76,7 @@ export default function QuotaHistoryCard({ platform, refreshTick }: {
     return () => {
       stale = true
     }
-  }, [platform, subTick, refreshTick])
+  }, [platform, subTick, refreshTick, active])
 
   // kinds 数据驱动（Codex: 5h / 7d;Claude 另有专属周窗）;当前 kind 不在数据里时回落首个
   const kinds = useMemo(

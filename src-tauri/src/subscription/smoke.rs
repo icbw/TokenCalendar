@@ -19,6 +19,56 @@ fn real_db() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// 在 SQLite 一致性备份上复用生产拟合与拒收判据，按时间段审计监测样本。
+/// TC_SUB_DB 必须指向调用方事先用 SQLite backup API 创建的副本，避免复制活库 WAL 竞态。
+/// 不采集、不请求网络；输出聚合量，不输出账号、项目或原始 breakdown。
+#[test]
+#[ignore]
+fn monitoring_strategy_on_db_backup() {
+    use super::{calib, cost, price};
+    use std::collections::BTreeMap;
+    let src = std::env::var_os("TC_SUB_DB").expect("TC_SUB_DB 必须指向 SQLite 一致性备份");
+    let out = std::env::temp_dir().join(format!(
+        "tc-monitoring-audit-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis()
+    ));
+    let dst = clone_db(&PathBuf::from(src), &out);
+    let s = SubStore::open(&dst).expect("open working copy of backup");
+    price::load_from(&s);
+    for platform in [Platform::Claude, Platform::Codex] {
+        s.recompute_stale_costs(platform).expect("recompute backup costs");
+        let plan = s.load_snapshot(platform).map(|s| s.plan_type).unwrap_or_default();
+        cost::set_plan(platform, &plan);
+        let all = s.pairs_for_fit(platform, &plan);
+        for since in ["2026-09-19", "2026-10-23"] {
+            let from = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d")
+                .unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+            let pairs: Vec<_> = all.iter().filter(|p| p.t1 >= from).cloned().collect();
+            let (scale, fitted_n) = calib::fit(platform, &pairs);
+            let mut rejected: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut accepted = 0;
+            let mut gain = 0.0;
+            let mut effective_cost = 0.0;
+            let mut flat_expensive_cost = 0.0;
+            for p in &pairs {
+                if let Some(reason) = p.reject_reason(scale) {
+                    *rejected.entry(reason).or_default() += 1;
+                    if reason == "Δ=0 但代价过大" { flat_expensive_cost += p.effective_cost(); }
+                } else {
+                    accepted += 1;
+                    gain += p.used5_1 - p.used5_0;
+                    effective_cost += p.effective_cost();
+                }
+            }
+            println!("{}", serde_json::json!({
+                "platform": platform.as_str(), "since_utc": since, "pairs": pairs.len(),
+                "scale": scale, "fitted_n": fitted_n, "accepted_before_trim": accepted,
+                "accepted_gain_pct": gain, "accepted_effective_usd": effective_cost,
+                "flat_expensive_effective_usd": flat_expensive_cost, "rejected": rejected,
+            }));
+        }
+    }
+}
+
 /// 把真库（含 -wal / -shm）整份复制到工作目录,返回副本路径。
 fn clone_db(src: &PathBuf, out: &PathBuf) -> PathBuf {
     std::fs::create_dir_all(out).expect("create out dir");

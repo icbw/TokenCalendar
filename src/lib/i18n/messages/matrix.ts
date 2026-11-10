@@ -1,5 +1,7 @@
 // matrix 命名空间:每个键 = [英文, 简体中文]。术语。
 export default {
+  executionDetails: ['Execution details', '执行详情'],
+  executionHint: ['View tasks for the selected dates; project and agent selections carry over', '查看所选日期的任务；带入项目或 Agent 筛选'],
   // 月份缩写（热力图月标签 / 表头 / 日期拼接）
   monthJan: ['Jan', '1月'],
   monthFeb: ['Feb', '2月'],

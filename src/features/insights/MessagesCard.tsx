@@ -70,10 +70,11 @@ function pair(remain: number | null, pct: number | null | undefined): string {
   return remain === null ? `— / ${full}` : `~${abbrevCount(remain / pct)} / ${full}`
 }
 
-export default function MessagesCard({ platform, range, refreshTick }: {
+export default function MessagesCard({ platform, range, refreshTick, active = true }: {
   platform: SubscriptionPlatform
   range: DayRange
   refreshTick: number
+  active?: boolean
 }) {
   const t = useT('insights')
   const [budget, setBudget] = useState<MessageBudget | null>(null)
@@ -82,21 +83,26 @@ export default function MessagesCard({ platform, range, refreshTick }: {
 
   // 读数一变（subscription:changed）就重查快照与每条代价——落新样本会重拟合系数
   useEffect(() => {
+    if (!active) return
+    let cancelled = false
     let timer = 0
     let off: (() => void) | null = null
     void events.onSubscriptionChanged(() => {
       window.clearTimeout(timer)
       timer = window.setTimeout(() => setSubTick((t) => t + 1), 300)
     }).then((unlisten) => {
-      off = unlisten
+      if (cancelled) unlisten()
+      else off = unlisten
     })
     return () => {
+      cancelled = true
       window.clearTimeout(timer)
       off?.()
     }
-  }, [])
+  }, [active])
 
   useEffect(() => {
+    if (!active) return
     let stale = false
     void Promise.all([subscriptionService.getMessageBudget(platform, true), subscriptionService.getSnapshots()]).then(
       ([b, s]) => {
@@ -108,7 +114,7 @@ export default function MessagesCard({ platform, range, refreshTick }: {
     return () => {
       stale = true
     }
-  }, [platform, refreshTick, subTick])
+  }, [platform, refreshTick, subTick, active])
 
   const week = budget?.platform === platform ? budget.week : null
   const snap = snaps.find((s) => s.platform === platform && s.status !== 'idle')

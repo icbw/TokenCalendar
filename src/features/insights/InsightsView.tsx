@@ -15,9 +15,10 @@ import { OUTLIER_Z, PART_PRICE_ORDER, TOKEN_METRICS, TOKEN_METRIC_LABELS, TOKEN_
 import { Seg } from './Seg'
 import RangeControl from './RangeControl'
 import PricingBlock from './PricingBlock'
+import Disclosure from '../window/Disclosure'
 import { HOUR_BUCKET_MAX_DAYS, rangeShortLabel, spanDays } from './range'
 import { useRangeSelection } from './useRangeSelection'
-import { openProjectManager } from '../projects/projectManagerStore'
+import { openProjectSettings, openExecutionDetails } from '../window/detailNavigation'
 import { projectColor } from './projectColors'
 import { fmt, useT, type MessageKey } from '../../lib/i18n'
 import '../projects/projects.css'
@@ -236,6 +237,11 @@ function useTrendBlock() {
           options={TOKEN_METRICS.map((m) => ({ v: m as Metric, label: TOKEN_METRIC_LABELS[m].short, hint: TOKEN_METRIC_LABELS[m].hint }))}
           onChange={setMetric}
         />
+        <button className="seg detail-action" title={t('executionHint')} onClick={() => openExecutionDetails({
+          project: dimension === 'project' ? filterKey : '',
+          agent: dimension === 'agent' ? filterKey : '',
+          range: selection.range,
+        })}>{t('executionDetails')}</button>
         {loading && <span className="matrix-loading">{t('loading')}</span>}
       </header>
       <div className="insight-rangebar">
@@ -259,9 +265,9 @@ function useTrendBlock() {
                 {o.label}
               </button>
             ))}
-            {/* 项目维图例即项目选择器,末尾放管理入口（打开主窗口内弹出层,不改筛选）*/}
+            {/* 项目维图例即项目选择器,末尾放管理入口（导航到设置中的唯一管理面）*/}
             {dimension === 'project' && (
-              <button className="legend-item pm-manage-link" onClick={openProjectManager} title={t('manageProjectsHint')}>
+              <button className="legend-item pm-manage-link" onClick={openProjectSettings} title={t('manageProjectsHint')}>
                 {t('manageProjects')}
               </button>
             )}
@@ -698,7 +704,7 @@ export default function InsightsView() {
   // 当前模块 = 顶边已经越过滚动区顶部的最后一个模块;滚到底时取最后一个
   const spy = useCallback(() => {
     const box = scrollRef.current
-    if (!box || jumping.current) return
+    if (!box || !box.clientHeight || jumping.current) return
     const top = box.getBoundingClientRect().top
     const sections = Array.from(box.querySelectorAll<HTMLElement>('[data-module]'))
     let cur = sections[0]?.dataset.module as ModuleId | undefined
@@ -765,7 +771,7 @@ export default function InsightsView() {
         <section className="insight-module" data-module="trend">
           {trend.toolbar}
           {trend.card}
-          <AnomalyBlock />
+          <Disclosure title={t('anomalyDetails')}><AnomalyBlock /></Disclosure>
         </section>
         <section className="insight-module" data-module="pricing">
           <PricingBlock />

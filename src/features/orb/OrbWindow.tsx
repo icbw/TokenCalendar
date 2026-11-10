@@ -527,7 +527,7 @@ export default function OrbWindow() {
   }, [applySize])
 
   // 右键菜单只留「隐藏悬浮球」一项：展开/刷新/打开设置都有既有入口（双击、刷新钮、
-  // 订阅设置钮）;隐藏后从托盘/设置页/顶栏 Orbit 钮可再开。
+  // 订阅设置钮）;隐藏后从托盘/设置页可再开。
   // 弹出位置按菜单实际尺寸 clamp 到交互主体内;收起态放不下菜单。处理器在刷新段之后
   // （收起态右键 = 刷新,要用到 refreshNow——提前定义会撞 TDZ）。
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)

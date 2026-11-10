@@ -1,6 +1,11 @@
 // settings 命名空间:每个键 = [英文, 简体中文]。术语。
 // 覆盖：设置页 General / Appearance / Data / Subscriptions（About 页在 update 命名空间）。
 export default {
+  showWidget: ['Show desktop widget', '显示桌面挂件'],
+  showWidgetHint: ['Show or hide the heatmap widget', '显示或隐藏热力图挂件'],
+  advancedMonitoring: ['Advanced monitoring', '高级监测'],
+  backToOverview: ['Return to the previous overview', '返回之前的概览'],
+  backOverview: ['Back', '返回'],
   // 工具栏 / 页签
   backToMatrix: ['Back to matrix', '返回矩阵'],
   backMatrix: ['Matrix', '矩阵'],

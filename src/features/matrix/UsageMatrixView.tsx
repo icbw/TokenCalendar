@@ -12,6 +12,7 @@ import { getDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import { TOKEN_METRICS, projectDisplayName, projectTooltip } from '../insights/analytics'
 import { fmt, useT, type MessageKey } from '../../lib/i18n'
 import { monthDayLabel, monthShort } from './matrixScale'
+import { openExecutionDetails } from '../window/detailNavigation'
 import './matrixView.css'
 
 /** project 维走 get_project_month_rows / get_project_breakdown;agent / model 维走月矩阵命令。 */
@@ -159,6 +160,7 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
   })
   const [scaleMode, setScaleMode] = useState<'global' | 'perRow'>('global')
   const [selected, setSelected] = useState<{ rowKey: string; day: number } | null>(null)
+  useEffect(() => setSelected(null), [effectiveGroupBy])
   const [internalExpanded, setInternalExpanded] = useState<string | null>(null)
   const effectiveExpanded = selectedRow !== undefined ? selectedRow : internalExpanded
   const [expandedData, setExpandedData] = useState<BreakdownDay[] | null>(null)
@@ -459,6 +461,18 @@ export default function UsageMatrixView({ groupBy, onGroupByChange, selectedRow,
               </button>
             ))}
           </div>
+          <button className="seg detail-action" title={t('executionHint')} disabled={loading || useMock} onClick={() => {
+            const candidate = selected?.rowKey ?? effectiveExpanded ?? ''
+            const row = matrixRows.some((r) => r.key === candidate) ? candidate : ''
+            const index = selected?.day
+            const from = index === undefined ? 0 : bucket === 'day' ? index : bucket === 'week' ? Math.floor(index / 7) * 7 : 0
+            const to = index === undefined ? WINDOW_DAYS - 1 : bucket === 'week' ? Math.min(from + 6, WINDOW_DAYS - 1) : index
+            openExecutionDetails({
+              project: effectiveGroupBy === 'project' ? row : '',
+              agent: effectiveGroupBy === 'agent' ? row : '',
+              range: { startDay: ymd(WINDOW_DATES[from]), endDay: ymd(WINDOW_DATES[to]) },
+            })
+          }}>{t('executionDetails')}</button>
           {loading && <span className="matrix-loading">{t('loading')}</span>}
         </div>
       </div>

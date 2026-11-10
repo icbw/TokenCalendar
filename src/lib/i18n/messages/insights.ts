@@ -1,5 +1,13 @@
 // insights 命名空间:每个键 = [英文, 简体中文]。术语。
 export default {
+  executionDetails: ['Execution details', '执行详情'],
+  executionHint: ['View tasks for this range; project and agent filters carry over', '查看此区间的任务；带入项目或 Agent 筛选'],
+  anomalyDetails: ['Unusual usage days', '异常用量日'],
+  modelUsageDetails: ['Usage and value by model', '分模型用量与当量'],
+  messageDetails: ['Estimated messages by model', '分模型消息数估计'],
+  quotaHistoryDetails: ['Quota history', '额度历史'],
+  officialPriceDetails: ['Official prices and sources', '官方价目与出处'],
+  quotaExecutionDetails: ['Explore quota and execution', '查看额度与执行详情'],
   // ---- 通用 ----
   loading: ['Loading…', '加载中…'],
   dataUnavailable: ['Data unavailable (service not running)', '数据不可用（服务未运行）'],

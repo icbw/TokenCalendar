@@ -1,4 +1,4 @@
-// 项目管理面板:Settings·Projects tab 与主窗口内弹出层（ProjectManagerModal）共用。
+// 项目管理面板：设置页 Projects 是唯一完整管理入口。
 // 结构:规则区（自动折叠开关 + 两个阈值 + Unknown 归 Scratch + Scratch 显隐）/ 列表区（筛选 · 排序 · 批量条 · 表格）。
 // 时间轴监测:名称列左侧 pin 图标切换;置顶行在任何排序下都额外提前（按置顶先后）;筛选条 All 与 Active 之间的
 // pin 按钮 = 只看置顶。

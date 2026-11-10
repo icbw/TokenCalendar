@@ -10,7 +10,8 @@ import UsageMatrixView from '../matrix/UsageMatrixView'
 import MatrixPanel from '../matrix/MatrixPanel'
 import CollectorHealth from '../collectors/CollectorHealth'
 import SettingsPage, { type SettingsTab } from '../settings/SettingsPage'
-import ProjectManagerModal from '../projects/ProjectManagerModal'
+import DetailDialog from './DetailDialog'
+import { subscribeExecutionDetails, subscribeProjectSettings, type ExecutionContext } from './detailNavigation'
 import InsightsView from '../insights/InsightsView'
 import TasksView from '../tasks/TasksView'
 import type { GroupBy as MatrixGroupBy } from '../matrix/UsageMatrixView'
@@ -23,9 +24,8 @@ import { useMaterialSync } from '../settings/materialTheme'
 import { useRadiusSchemeSync } from '../settings/radiusTheme'
 import './shell.css'
 
-// 主内容区四态互斥：'matrix'（热力图）/ 'insights'（洞察图表）/ 'tasks'（任务列表）
-// 三个视图按钮 + 齿轮 'settings'。'matrix' 视图 = 矩阵 + 下方全系列联动曲线（跟随矩阵 groupBy）。
-type MainView = 'matrix' | 'insights' | 'tasks' | 'settings'
+// 概览只有矩阵与洞察；任务在主窗口内的二级详情中查看。
+type MainView = 'matrix' | 'insights' | 'settings'
 
 export default function FullWindow() {
   const t = useT('window')
@@ -46,9 +46,22 @@ export default function FullWindow() {
 
   const [view, setView] = useState<MainView>('matrix')
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
-  const [widgetVisible, setWidgetVisible] = useState(false)
-  // 悬浮球可见性（顶栏 Orbit 按钮；与托盘/设置页同源单一广播）
-  const [orbVisible, setOrbVisible] = useState(false)
+  const [returnView, setReturnView] = useState<MainView>('matrix')
+  const [insightsLoaded, setInsightsLoaded] = useState(false)
+  const [executionContext, setExecutionContext] = useState<ExecutionContext | null>(null)
+  const [executionOpen, setExecutionOpen] = useState(false)
+  useEffect(() => { if (view !== 'settings') setReturnView(view) }, [view])
+
+  useEffect(() => subscribeExecutionDetails((context) => {
+    setExecutionContext(context)
+    setExecutionOpen(true)
+  }), [])
+  useEffect(() => subscribeProjectSettings(() => {
+    setExecutionOpen(false)
+    if (view !== 'settings') setReturnView(view)
+    setSettingsTab('projects')
+    setView('settings')
+  }), [view])
   const [maximized, setMaximized] = useState(false)
 
   // orb「订阅设置」导航中转消费（openMainAtView 写 localStorage——
@@ -124,40 +137,6 @@ export default function FullWindow() {
     setPanelRow((prev) => (prev === rowKey ? null : rowKey))
   }, [])
 
-  // 挂件显隐状态：挂载时拉初值 + 事件跟随（拖动/托盘/挂件侧开合都汇入同一广播）
-  useEffect(() => {
-    void windowService
-      .getVisibility()
-      .then((v) => {
-        if (v) setWidgetVisible(v.widget)
-      })
-      .catch(() => {})
-    let off: (() => void) | null = null
-    void events.onWidgetVisibilityChanged(setWidgetVisible).then((unlisten) => {
-      off = unlisten
-    })
-    return () => {
-      off?.()
-    }
-  }, [])
-
-  // 悬浮球显隐状态（初值与事件同 widget 族；托盘/设置页路径同源汇入）
-  useEffect(() => {
-    void windowService
-      .getVisibility()
-      .then((v) => {
-        if (v) setOrbVisible(Boolean(v.orb))
-      })
-      .catch(() => {})
-    let off: (() => void) | null = null
-    void events.onOrbVisibilityChanged(setOrbVisible).then((unlisten) => {
-      off = unlisten
-    })
-    return () => {
-      off?.()
-    }
-  }, [])
-
   // 最大化状态（Rust Resized 去重广播）：标题栏按钮态 + 内容圆角归零
   useEffect(() => {
     let off: (() => void) | null = null
@@ -185,13 +164,6 @@ export default function FullWindow() {
   const [updateReady, setUpdateReady] = useState<ReadyUpdate | null>(updateService.getReadyUpdate)
   useEffect(() => updateService.subscribeReadyUpdate(setUpdateReady), [])
 
-  const toggleWidget = useCallback(() => {
-    windowService.toggleWidget().catch(console.error)
-  }, [])
-  // 顶栏 Orbit 按钮（widget 左侧，独立功能层级——桌面悬浮球形态开关）
-  const toggleOrb = useCallback(() => {
-    windowService.toggleOrb().catch(console.error)
-  }, [])
   const minimize = useCallback(() => windowService.mainMinimize().catch(console.error), [])
   const toggleMaximize = useCallback(() => windowService.mainToggleMaximize().catch(console.error), [])
   const close = useCallback(() => windowService.mainClose().catch(console.error), [])
@@ -210,24 +182,7 @@ export default function FullWindow() {
           <span className="titlebar-title">TokenCalendar</span>
         </div>
         <div className="titlebar-actions">
-          {/* Orbit 入口（widget 左侧,与其他按钮并列同级——桌面悬浮球
-              独立功能形态;按钮态经 orb-visibility-changed 广播跟随,与托盘/设置页
-              同一单一源）*/}
-          <button
-            className={`seg titlebar-view titlebar-orb${orbVisible ? ' is-active' : ''}`}
-            onClick={toggleOrb}
-            title={orbVisible ? t('hideOrb') : t('showOrb')}
-          >
-            {t('orbit')}
-          </button>
-          <button
-            className={`seg titlebar-widget${widgetVisible ? ' is-active' : ''}`}
-            onClick={toggleWidget}
-            title={widgetVisible ? t('hideWidget') : t('showWidget')}
-          >
-            {t('widget')}
-          </button>
-          {/* Matrix / Insights 文字 seg（与 Widget 同款组件形式）;三态互斥,再点活动按钮回 matrix。*/}
+          {/* 概览导航与设置工具入口分开，桌面形态开关归入设置与托盘。*/}
           <button
             className={`seg titlebar-view${view === 'matrix' ? ' is-active' : ''}`}
             onClick={() => setView('matrix')}
@@ -237,24 +192,18 @@ export default function FullWindow() {
           </button>
           <button
             className={`seg titlebar-view${view === 'insights' ? ' is-active' : ''}`}
-            onClick={() => setView('insights')}
+            onClick={() => { setInsightsLoaded(true); setView('insights') }}
             title={t('insightsHint')}
           >
             {t('insights')}
-          </button>
-          <button
-            className={`seg titlebar-view${view === 'tasks' ? ' is-active' : ''}`}
-            onClick={() => setView('tasks')}
-            title={t('tasksHint')}
-          >
-            {t('tasks')}
           </button>
           <button
             className={`seg titlebar-view${view === 'settings' ? ' is-active' : ''}`}
             onClick={() => {
               // 有新版待安装时,从别处进设置直接落到 About（Install 按钮所在）
               if (updateReady && view !== 'settings') setSettingsTab('about')
-              setView((v) => (v === 'settings' ? 'matrix' : 'settings'))
+              if (view !== 'settings') setReturnView(view)
+              setView((v) => (v === 'settings' ? returnView : 'settings'))
             }}
             title={updateReady ? t('settingsUpdateReady', { version: updateReady.version }) : t('settings')}
           >
@@ -281,14 +230,13 @@ export default function FullWindow() {
 
       <div className="shell-body">
         <main className="shell-main">
-          {view === 'settings' ? (
-            <SettingsPage onBack={() => setView('matrix')} initialTab={settingsTab} />
-          ) : view === 'insights' ? (
-            <InsightsView />
-          ) : view === 'tasks' ? (
-            <TasksView />
-          ) : (
-            <>
+          <div className="shell-view" hidden={view !== 'settings'}>
+            {view === 'settings' && <SettingsPage onBack={() => setView(returnView)} initialTab={settingsTab} />}
+          </div>
+          <div className="shell-view" hidden={view !== 'insights'}>
+            {insightsLoaded && <InsightsView />}
+          </div>
+          <div className="shell-view" hidden={view !== 'matrix'}>
               {/* 热力图主体化——矩阵区 flex:1 全量显示（去滚动）,图表面板
                   固定高度可折叠;点行名联动替换预设曲线,再点恢复（逻辑与 chart 页
                   行联动一致）。矩阵内部行名点击经 onRowSelect 上抛。
@@ -313,12 +261,14 @@ export default function FullWindow() {
                 />
               </div>
               <CollectorHealth />
-            </>
-          )}
+          </div>
         </main>
       </div>
-      {/* 项目管理弹出层（Tasks / Insights 的「Manage projects…」入口;DOM 常驻,只切类名显隐）*/}
-      <ProjectManagerModal />
+      <DetailDialog open={executionOpen} title={t('executionDetails')} onClose={() => setExecutionOpen(false)}>
+        {executionContext && (
+          <TasksView key={JSON.stringify(executionContext)} active={executionOpen} context={executionContext} />
+        )}
+      </DetailDialog>
     </div>
   )
 }

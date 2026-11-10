@@ -122,7 +122,9 @@ export default function CollectorHealth() {
     <footer className="health-footer">
       <span className="health-summary">
         <span className={`health-dot ${ok === items.length && items.length > 0 ? 'is-healthy' : 'is-attention'}`} />
-        {t('summary', { ok, total: items.length })}
+        <span title={t('summary', { ok, total: items.length })}>
+          {ok === items.length && items.length > 0 ? t('healthy') : t('summary', { ok, total: items.length })}
+        </span>
       </span>
       {items.filter((s) => s.level !== 'healthy').map((s) => (
         <span key={s.id} className="health-item" title={s.id}>

@@ -1,4 +1,4 @@
-// Tasks 视图:主窗口第三个视图按钮（与 Matrix / Insights 三态互斥）。
+// 执行详情：继承概览筛选，先看任务列表，时间与额度分析按需展开。
 // 结构:工具栏（固定,洞察页同款 .insight-toolbar + Seg）/ 滚动区 = Time 卡（Idle gaps ⇄ Time spent）、任务列表卡。
 // 两个口径并列:Time 卡按轮所在的本地日（这段时间花在哪）,任务列表按会话开始时间（这段时间开始了哪些任务）。
 // 数据:get_task_list（分页 50、表头排序、范围 / Agent / 项目过滤全在 SQL）;行展开 get_task_turns;
@@ -9,7 +9,7 @@
 // 离群标记:对当前页 steps/turn 与 wall/turn 做 z-score（与异常日同款阈值 |z| ≥ 2、样本 ≥ 7）,
 // 只标偏高一侧（偏低不是异常任务）。
 // 项目:列表 / 筛选 / 下拉候选全部是解析层的有效项目键（合并目标 / Scratch;隐藏项目不出现）;
-// 下拉末尾「Manage projects…」打开主窗口内的项目管理弹出层,不改变当前筛选。
+// 下拉末尾「Manage projects…」导航到设置中的唯一项目管理面。
 // 内容列约束:TaskRow.title 只在本文件的列表单元格渲染（标签开关 = title 时）,不进入展开、导出或其它视图。
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { events, subscriptionService, taskService, usageService } from '../../services'
@@ -25,7 +25,8 @@ import { useRangeSelection } from '../insights/useRangeSelection'
 import { getDesignPrefs, setDesignPrefs, subscribeDesignPrefs } from '../settings/designPrefs'
 import TaskTurns from './TaskTurns'
 import TimeCard from './TimeCard'
-import { openProjectManager } from '../projects/projectManagerStore'
+import { openProjectSettings, type ExecutionContext } from '../window/detailNavigation'
+import Disclosure from '../window/Disclosure'
 import '../insights/insights.css'
 import './tasks.css'
 
@@ -112,10 +113,10 @@ function outlierHint(o: Outlier, t: Translator<'tasks'>): string {
   return lines.join('\n')
 }
 
-export default function TasksView() {
+export default function TasksView({ active, context }: { active: boolean; context: ExecutionContext }) {
   const t = useT('tasks')
-  const [agent, setAgent] = useState('')
-  const [project, setProject] = useState('')
+  const [agent, setAgent] = useState(context.agent ?? '')
+  const [project, setProject] = useState(context.project ?? '')
   const [sort, setSort] = useState<TaskSort>({ field: 'started_at', direction: 'desc' })
   const [page, setPage] = useState(0)
   const [labelMode, setLabelMode] = useState<LabelMode>(() => getDesignPrefs().taskLabelMode ?? 'time')
@@ -131,11 +132,13 @@ export default function TasksView() {
   const [scales, setScales] = useState<Partial<Record<'codex' | 'claude', number>>>({})
 
   useEffect(() => {
+    if (!active) return
+    let cancelled = false
     let timer = 0
     let off: (() => void) | null = null
     const load = () =>
       void subscriptionService.getEstimator().then((rows) => {
-        if (!rows) return
+        if (cancelled || !rows) return
         const next: Partial<Record<'codex' | 'claude', number>> = {}
         for (const r of rows) if (typeof r.scale === 'number' && r.scale > 0) next[r.platform] = r.scale
         setScales(next)
@@ -145,31 +148,37 @@ export default function TasksView() {
       window.clearTimeout(timer)
       timer = window.setTimeout(load, 300)
     }).then((unlisten) => {
-      off = unlisten
+      if (cancelled) unlisten()
+      else off = unlisten
     })
     return () => {
+      cancelled = true
       window.clearTimeout(timer)
       off?.()
     }
-  }, [])
+  }, [active])
 
   // usage:changed（采集轮 / 改阈值重算）→ 300ms 去抖:列表、筛选候选、直方图、展开明细一并重取
   useEffect(() => {
+    if (!active) return
+    let cancelled = false
     let timer = 0
     let off: (() => void) | null = null
     void events.onUsageChanged(() => {
       window.clearTimeout(timer)
       timer = window.setTimeout(() => setRefreshTick((t) => t + 1), 300)
     }).then((unlisten) => {
-      off = unlisten
+      if (cancelled) unlisten()
+      else off = unlisten
     })
     return () => {
+      cancelled = true
       window.clearTimeout(timer)
       off?.()
     }
-  }, [])
+  }, [active])
 
-  const selection = useRangeSelection(project, refreshTick)
+  const selection = useRangeSelection(project, refreshTick, context.range, active)
   const { range, dataSpan } = selection
 
   // 范围变化（手改 / 项目生命周期自动切换 / 跨日）→ 回第 1 页并收起展开
@@ -180,6 +189,7 @@ export default function TasksView() {
 
   // 筛选候选:Agent = 范围内有轮的;项目 = 全部数据跨度内有轮的（按轮数降序）
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     const all = dataSpan ? { startDay: dataSpan.firstDay, endDay: range.endDay } : range
     void Promise.all([
@@ -195,9 +205,10 @@ export default function TasksView() {
     return () => {
       cancelled = true
     }
-  }, [range, dataSpan])
+  }, [range, dataSpan, active])
 
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     setLoading(true)
     void taskService
@@ -210,10 +221,10 @@ export default function TasksView() {
     return () => {
       cancelled = true
     }
-  }, [range, agent, project, sort, page])
+  }, [range, agent, project, sort, page, refreshTick, active])
 
   useEffect(() => {
-    if (expanded === null) return
+    if (!active || expanded === null) return
     const row = data?.rows.find((r) => taskKey(r) === expanded)
     if (!row) return
     let cancelled = false
@@ -225,7 +236,7 @@ export default function TasksView() {
       cancelled = true
     }
     // data 引用在每次列表重取后变化——展开明细随 usage:changed 一起刷新
-  }, [expanded, data])
+  }, [expanded, data, active])
 
   // 刷新后总数变少、当前页越界 → 退到最后一页
   useEffect(() => {
@@ -273,6 +284,12 @@ export default function TasksView() {
   const from = total === 0 ? 0 : page * PAGE_SIZE + 1
   const to = Math.min(total, (page + 1) * PAGE_SIZE)
 
+  const quotaSection = (
+        <Disclosure title={t('alignTitle')} initialOpen={context.section === 'quota'}>
+          {(open) => <QuotaAlignmentCard project={project} active={active && open} initialPlatform={context.platform} />}
+        </Disclosure>
+  )
+
   return (
     <div className="insights-view tasks-view">
       <header className="insight-toolbar">
@@ -299,7 +316,7 @@ export default function TasksView() {
           aria-label={t('filterProjectAria')}
           onChange={(e) => {
             if (e.target.value === MANAGE_PROJECTS) {
-              openProjectManager()
+              openProjectSettings()
               return
             }
             setProject(e.target.value)
@@ -332,18 +349,7 @@ export default function TasksView() {
       </div>
 
       <div className="insights-scroll">
-        <TimeCard
-          range={range}
-          agent={agent}
-          project={project}
-          labelMode={labelMode}
-          agentLabel={labelOfAgent}
-          refreshTick={refreshTick}
-          onPickTask={pickTask}
-        />
-
-        <QuotaAlignmentCard project={project} />
-
+        {context.section === 'quota' && quotaSection}
         <section className="insight-card">
           <header className="insight-card-header">
             <span className="insight-card-title">{t('taskList')}</span>
@@ -481,6 +487,11 @@ export default function TasksView() {
             </>
           )}
         </section>
+        <Disclosure title={t('timeAnalysis')}>
+          <TimeCard range={range} agent={agent} project={project} labelMode={labelMode}
+            agentLabel={labelOfAgent} refreshTick={refreshTick} onPickTask={pickTask} />
+        </Disclosure>
+        {context.section !== 'quota' && quotaSection}
       </div>
     </div>
   )

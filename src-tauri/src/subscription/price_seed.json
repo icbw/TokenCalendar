@@ -39,6 +39,17 @@
     },
     {
       "platform": "claude",
+      "match_key": "fable-5-2",
+      "effective_from": 1794182400,
+      "display_name": "Claude Fable 5.2",
+      "usd_input": 8,
+      "usd_output": 40,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 10,
+      "source_note": "models.dev/anthropic · claude-fable-5-2 · 上游 last_updated 2026-11-09"
+    },
+    {
+      "platform": "claude",
       "match_key": "haiku",
       "effective_from": 1760486400,
       "display_name": "Claude Haiku 4.5",
@@ -464,6 +475,29 @@
       "usd_cache_write": 5,
       "over_tokens": 272000,
       "source_note": "models.dev/openai · gpt-6.1-sol · 上游 last_updated 2026-09-29 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-1-terra",
+      "effective_from": 1792972800,
+      "display_name": "GPT-6.1 Terra",
+      "usd_input": 1,
+      "usd_output": 5,
+      "usd_cache_read": 0.05,
+      "usd_cache_write": 1.25,
+      "source_note": "models.dev/openai · gpt-6.1-terra · 上游 last_updated 2026-10-26 · 超长上下文档(输入>272K)见 gpt-6-1-terra#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-1-terra#long",
+      "effective_from": 1792972800,
+      "display_name": "GPT-6.1 Terra (>272K)",
+      "usd_input": 2,
+      "usd_output": 7.5,
+      "usd_cache_read": 0.1,
+      "usd_cache_write": 2.5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6.1-terra · 上游 last_updated 2026-10-26 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",

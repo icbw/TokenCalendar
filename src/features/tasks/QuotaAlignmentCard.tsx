@@ -352,9 +352,11 @@ function EvidenceNote({ data }: { data: QuotaAlignmentResult }) {
   )
 }
 
-export default function QuotaAlignmentCard({ project }: { project: string }) {
+export default function QuotaAlignmentCard({ project, active = true, initialPlatform = 'codex' }: {
+  project: string; active?: boolean; initialPlatform?: SubscriptionPlatform
+}) {
   const t = useT('tasks')
-  const [platform, setPlatform] = useState<SubscriptionPlatform>('codex')
+  const [platform, setPlatform] = useState<SubscriptionPlatform>(initialPlatform)
   const [viewportHours, setViewportHours] = useState<ViewportHours>(24)
   const [to, setTo] = useState(() => Math.floor(Date.now() / 1000))
   const [followLatest, setFollowLatest] = useState(true)
@@ -365,6 +367,7 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
   const viewportSeconds = viewportHours * 3600
 
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     setLoading(true)
     void alignmentService.getQuotaAlignment(platform, to - viewportSeconds, to, project).then((result) => {
@@ -375,12 +378,12 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
     return () => {
       cancelled = true
     }
-  }, [platform, to, project, refreshTick, viewportSeconds])
+  }, [platform, to, project, refreshTick, viewportSeconds, active])
 
   useEffect(() => setShowAll(false), [platform, project, viewportHours])
 
   useEffect(() => {
-    if (!followLatest) return
+    if (!active || !followLatest) return
     let timer = 0
     let cancelled = false
     let subscriptions: (() => void)[] = []
@@ -405,7 +408,7 @@ export default function QuotaAlignmentCard({ project }: { project: string }) {
       for (const off of subscriptions) off()
       subscriptions = []
     }
-  }, [followLatest])
+  }, [followLatest, active])
 
   const latest = () => {
     setFollowLatest(true)
