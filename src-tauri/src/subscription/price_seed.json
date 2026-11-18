@@ -2,7 +2,7 @@
   "_doc": [
     "price_model 的出厂种子 —— **生成产物,不要手改**。",
     "生成器 scripts/price-seed-gen.mjs,规格 scripts/price-keys.json,",
-    "数据源 https://models.dev/api.json 的第一方目录（sst/models.dev,MIT）。",
+    "数据源 https://models.dev/api.json 的第一方目录（sst/models.dev,MIT），缺项由带出处的官方价目补齐。",
     "",
     "四项 usd_* 均为 **USD / Mtok** 的官方 API 定价,按模型名精确对准、不做归一化",
     "（存绝对价目,不只存派生值）。match_key 是小写子串模式,匹配时**最长键优先**;",
@@ -92,6 +92,28 @@
       "usd_cache_read": 1,
       "usd_cache_write": 12.5,
       "source_note": "models.dev/azure · claude-mythos-5 · 上游 last_updated 2026-06-09"
+    },
+    {
+      "platform": "claude",
+      "match_key": "mythos-5-1",
+      "effective_from": 1788220800,
+      "display_name": "Claude Mythos 5.1",
+      "usd_input": 10,
+      "usd_output": 50,
+      "usd_cache_read": 0.25,
+      "usd_cache_write": 12.5,
+      "source_note": "claude-mythos-5-1 · 官方价目 https://platform.claude.com/docs/en/about-claude/pricing#model-pricing · 上线日期 https://platform.claude.com/docs/en/models/mythos-5-1/overview"
+    },
+    {
+      "platform": "claude",
+      "match_key": "mythos-5-2",
+      "effective_from": 1794182400,
+      "display_name": "Claude Mythos 5.2",
+      "usd_input": 8,
+      "usd_output": 40,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 10,
+      "source_note": "claude-mythos-5-2 · 官方价目 https://platform.claude.com/docs/en/about-claude/pricing#model-pricing · 上线日期 https://platform.claude.com/docs/en/models/mythos-5-2/overview"
     },
     {
       "platform": "claude",
@@ -498,6 +520,52 @@
       "usd_cache_write": 2.5,
       "over_tokens": 272000,
       "source_note": "models.dev/openai · gpt-6.1-terra · 上游 last_updated 2026-10-26 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-2-astra",
+      "effective_from": 1794873600,
+      "display_name": "GPT-6.2 Astra",
+      "usd_input": 8,
+      "usd_output": 40,
+      "usd_cache_read": 0.4,
+      "usd_cache_write": 10,
+      "source_note": "models.dev/openai · gpt-6.2-astra · 上游 last_updated 2026-11-17 · 超长上下文档(输入>272K)见 gpt-6-2-astra#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-2-astra#long",
+      "effective_from": 1794873600,
+      "display_name": "GPT-6.2 Astra (>272K)",
+      "usd_input": 16,
+      "usd_output": 60,
+      "usd_cache_read": 0.8,
+      "usd_cache_write": 20,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6.2-astra · 上游 last_updated 2026-11-17 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-2-sol",
+      "effective_from": 1794873600,
+      "display_name": "GPT-6.2 Sol",
+      "usd_input": 2,
+      "usd_output": 10,
+      "usd_cache_read": 0.1,
+      "usd_cache_write": 2.5,
+      "source_note": "models.dev/openai · gpt-6.2-sol · 上游 last_updated 2026-11-17 · 超长上下文档(输入>272K)见 gpt-6-2-sol#long"
+    },
+    {
+      "platform": "codex",
+      "match_key": "gpt-6-2-sol#long",
+      "effective_from": 1794873600,
+      "display_name": "GPT-6.2 Sol (>272K)",
+      "usd_input": 4,
+      "usd_output": 15,
+      "usd_cache_read": 0.2,
+      "usd_cache_write": 5,
+      "over_tokens": 272000,
+      "source_note": "models.dev/openai · gpt-6.2-sol · 上游 last_updated 2026-11-17 · 超长上下文档:单次请求输入>272K 时整请求按此档计"
     },
     {
       "platform": "codex",

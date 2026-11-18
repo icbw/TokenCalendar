@@ -35,7 +35,7 @@ use super::price;
 ///
 /// **改 [`prior_scale`] 不升版**：它不参与 `cost` 的计算（只当拟合的先验与样本准入带的
 /// 基准）,存量行不变,下一次 refit 自动用新先验。
-pub const WEIGHT_VERSION: u32 = 8;
+pub const WEIGHT_VERSION: u32 = 9;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
@@ -727,6 +727,43 @@ mod tests {
         }
         assert_eq!(tag_long(Platform::Codex, "gpt-6.1-terra", 272_000, at), "gpt-6.1-terra");
         assert_eq!(tag_long(Platform::Codex, "gpt-6.1-terra", 272_001, at), "gpt-6.1-terra#long");
+    }
+
+    #[test]
+    fn gpt_6_2_prices_each_tier_from_launch() {
+        let at = 1_794_873_600; // 2026-11-17 00:00 UTC
+        for (model, base, long) in [
+            ("gpt-6.2-astra", 58.4, 96.8),
+            ("gpt-6.2-sol", 14.6, 24.2),
+        ] {
+            assert_eq!(tag_long(Platform::Codex, model, 272_000, at), model);
+            let tagged = tag_long(Platform::Codex, model, 272_001, at);
+            assert_eq!(tagged, format!("{model}#long"));
+            for (key, expected) in [(model, base), (&tagged, long)] {
+                let row = price::price_at(Platform::Codex, key, at).unwrap();
+                assert_eq!(row.effective_from, at, "{key}");
+                let (value, known) = million_each(Platform::Codex, key, at);
+                assert!(known && (value - expected).abs() < 1e-9, "{key}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn mythos_versions_keep_their_own_historical_prices() {
+        let from_5_1 = 1_788_220_800; // 2026-09-01 00:00 UTC
+        let from_5_2 = 1_794_182_400; // 2026-11-09 00:00 UTC
+        for (model, key, from, expected) in [
+            ("claude-mythos-5.1", "mythos-5-1", from_5_1, 72.75),
+            ("claude-mythos-5-2", "mythos-5-2", from_5_2, 58.2),
+        ] {
+            let row = price::price_at(Platform::Claude, model, from).unwrap();
+            assert_eq!(row.match_key, key);
+            assert_eq!(row.effective_from, from);
+            let (value, known) = million_each(Platform::Claude, model, from);
+            assert!(known && (value - expected).abs() < 1e-9, "{model}: {value}");
+        }
+        let (value, known) = million_each(Platform::Claude, "claude-mythos-5", from_5_2);
+        assert!(known && (value - 73.5).abs() < 1e-9);
     }
 
     #[test]
